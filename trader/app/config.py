@@ -66,6 +66,32 @@ class Settings(BaseSettings):
     max_consecutive_errors: int = 5
     enforce_session: bool = True
 
+    # ---- プロ級リスクエンジン（risk_engine.py）---------------------------
+    # サイズは確信ではなくストップ距離と口座リスクで決める（Kovner）。既定 OFF＝
+    # 明示有効化するまで qty はシグナルのまま（後方互換）。有効化前に account_equity
+    # と risk_value_per_point を必ず実値に合わせること。
+    risk_sizing_enabled: bool = False
+    account_equity: float = 1_000_000.0      # 口座残高（口座通貨。サイジングの基準）
+    risk_per_trade_pct: float = 0.5          # 1 取引で許容する口座割合（%）
+    require_stop_for_sizing: bool = False    # True で stop 無しシグナルを却下
+    lot_step: float = 1000.0                 # 発注ロットの最小刻み（切り捨て）
+    min_lot: float = 1000.0                  # これ未満になるサイズは発注しない
+    # 価格 1.0 動いたときの「1 単位あたり損益（口座通貨）」。JPY 建てペア×JPY 口座は 1.0。
+    # 例: "USDJPY=1.0,EURJPY=1.0"。未指定の銘柄は 1.0 とみなす。
+    risk_value_per_point: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
+    # 週次損失上限（0 で無効）。超過で Kill switch（翌週まで新規停止／手動解除）。
+    max_weekly_loss_jpy: float = 0.0
+    # 連敗スロットル（Lipschutz: 連敗時はサイズ縮小→停止）
+    loss_streak_reduce_at: int = 3           # この連敗数でサイズ縮小
+    loss_streak_reduce_factor: float = 0.5   # 縮小係数（0.5＝半減）
+    loss_streak_halt_at: int = 5             # この連敗数で新規停止（0 で無効）
+    recent_trades_window: int = 50           # 連敗判定に見る直近トレード数
+    # 集中・相関（Lipschutz: 高相関は 1 つの巨大ポジション）
+    max_concurrent_positions: int = 3        # 同時に持てる別銘柄数（0 で無効）
+    max_currency_exposure: float = 0.0       # 1 通貨あたり純エクスポージャ上限（0 で無効）
+    # 重要指標ブラックアウト窓の定義ファイル（無ければ無効）
+    risk_blackout_file: str = "risk_calendar.json"
+
     # ---- 自作戦略（strategy.py）------------------------------------------
     # 既定 OFF。明示的に有効化しない限り自動シグナルは出さない（安全側）。
     strategy_enabled: bool = False
@@ -88,6 +114,26 @@ class Settings(BaseSettings):
         """カンマ区切り文字列を list に変換（空要素は除去）。"""
         if isinstance(v, str):
             return [p.strip() for p in v.split(",") if p.strip()]
+        return v
+
+    @field_validator("risk_value_per_point", mode="before")
+    @classmethod
+    def _parse_value_per_point(cls, v: object) -> object:
+        """"USDJPY=1.0,EURJPY=1.0" 形式を {symbol: float} に変換。
+
+        不正な要素は fail-fast で落とす（設定ミスのまま黙って動かさない）。
+        """
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            out: dict[str, float] = {}
+            for part in v.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                key, _, val = part.partition("=")
+                out[key.strip().upper()] = float(val)
+            return out
         return v
 
     @computed_field  # type: ignore[prop-decorator]

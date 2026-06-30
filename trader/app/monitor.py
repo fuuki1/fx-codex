@@ -96,11 +96,19 @@ def maybe_daily_summary() -> None:
     except Exception:
         n, pnl = 0, 0
     ks = "ON" if common.kill_switch_on() else "OFF"
+    # 期待値・R 倍数・連敗（プロセス検証）を要約として添える。
+    import journal
+
+    j = journal.journal_summary(days=30)
     common.notify(
-        f"📊 日次: 約定{n}件 / 実現損益 {float(pnl):.0f} / KillSwitch {ks} / mode {settings.trading_mode}",
+        f"📊 日次: 約定{n}件 / 実現損益 {float(pnl):.0f} / KillSwitch {ks} / "
+        f"mode {settings.trading_mode}\n" + journal.format_summary(j, 30),
         throttle=False,
     )
-    log.info("daily summary sent", **log_extra(fills=n, pnl=float(pnl)))
+    log.info(
+        "daily summary sent",
+        **log_extra(fills=n, pnl=float(pnl), expectancy_r=j["expectancy_r"], streak=j["current_loss_streak"]),
+    )
 
 
 def main() -> None:

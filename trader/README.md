@@ -33,12 +33,13 @@ monitor（死活監視・日次通知）            reconcile（起動時/定期
 |---|---|
 | `webhook` | シグナル受信（IP+secret 検証・`text/plain` 対応・鮮度・正規化・冪等）。FastAPI / `/health` |
 | `strategy` | 自作戦略（MA クロス+ATR）。`strategy_params.json` をホットリロード。既定 OFF |
-| `risk` | Kill switch / 数量 / セッション / 日次損失 / レート制限。通過分のみ発注へ |
+| `risk` | **プロ級リスクエンジン**: リスク基準サイジング / 連敗スロットル / 日次・週次損失 / 相関・同時保有 / イベントブラックアウト / セッション / レート制限。通過分だけサイズを確定して発注へ（→ [RISK.md](./RISK.md)） |
 | `executor` | IBKR 発注（冪等・realized_pnl 更新・自動再接続）。起動時リコンサイル |
 | `monitor` | 60 秒ごとの死活＆ハートビート監視、毎朝 7 時（JST）日次サマリ |
 | `redis` / `timescaledb` / `ib-gateway` / `ngrok` | 基盤 |
 
 ## ミッションクリティカルの要点
+- **プロ級リスク管理**: 「予測より撤退・サイズ・相関」。サイズはストップ距離×口座リスクで決め（Kovner）、連敗で縮小→停止（Lipschutz）、日次/週次損失・同時保有数・通貨エクスポージャ・重要指標ブラックアウトで「入らない自由」を自動化。期待値/R 倍数をジャーナルで検証（→ [RISK.md](./RISK.md)）。
 - **堅牢な受信**: TradingView は本文を `text/plain` で送るため Content-Type 非依存で JSON パース（`application/json` 期待だと 422 で全弾はじく）。XFF 右端で IP 偽装を防ぎ、`{{timenow}}` でリプレイ拒否。publish 失敗時は idem を解放して再送可能にする。
 - **冪等発注**: webhook で idem を Redis に記録 + executor が `processed_orders`（PK=idem）で二重発注を防止。
 - **クラッシュ復旧**: Redis Streams を成功時のみ ACK、`XAUTOCLAIM` で宙づりを回収、N 回失敗は dead-letter へ。
@@ -66,4 +67,10 @@ make config    # docker compose 構文検証
 make kill-on        # 全発注を即時停止
 make kill-off       # 再開
 make kill-status    # 現在値
+```
+
+## リスク・ジャーナル / DB マイグレーション
+```bash
+make journal        # 直近30日の期待値・R倍数・連敗・PF（勝率に依存しない検証）
+make migrate        # db/migrations/*.sql を既存 DB に適用（冪等。fills へ列追加）
 ```

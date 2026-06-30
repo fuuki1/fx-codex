@@ -1,0 +1,9 @@
+{
+  "_comment": "重要指標ブラックアウト窓。risk が読み込み、窓内の新規発注を抑止する（Marcus/個人モデル: CPI・NFP・FOMC 前後は新規制限）。本番では risk_calendar.json として配置し、経済カレンダーから前後 N 分の窓を生成して更新する。start/end は ISO8601（Z=UTC 可）。ファイルは mtime 監視でホットリロードされる。",
+  "windows": [
+    {"start": "2026-07-02T12:15:00Z", "end": "2026-07-02T12:45:00Z", "label": "US ADP"},
+    {"start": "2026-07-03T12:20:00Z", "end": "2026-07-03T13:00:00Z", "label": "US NFP (Nonfarm Payrolls)"},
+    {"start": "2026-07-15T12:20:00Z", "end": "2026-07-15T13:00:00Z", "label": "US CPI"},
+    {"start": "2026-07-29T17:50:00Z", "end": "2026-07-29T18:45:00Z", "label": "FOMC rate decision"}
+  ]
+}

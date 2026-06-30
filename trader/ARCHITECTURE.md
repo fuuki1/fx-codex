@@ -19,14 +19,18 @@ trader/
 │   ├── domain.py             # 純粋ロジック（正規化 / セッション / レート制限）
 │   ├── webhook.py            # ① 外部シグナル受信（FastAPI）
 │   ├── strategy.py           # ④ 自作戦略（MAクロス+ATR, パラメータ自動再読込）
-│   ├── risk.py               # ② リスク管理・フィルタ
-│   ├── executor.py           # ③ 注文実行（IBKR / ib_async, 冪等, realized_pnl 更新）
+│   ├── risk.py               # ② リスク管理（状態収集 + 純粋エンジンへ委譲 + 副作用）
+│   ├── risk_engine.py        # ② プロ級リスク判断の純粋ロジック（→ RISK.md）
+│   ├── journal.py            # 期待値・R 倍数・連敗の成績分析（純粋 + CLI）
+│   ├── executor.py           # ③ 注文実行（IBKR / ib_async, 冪等, realized_pnl/R 更新）
 │   ├── reconcile.py          # ブローカー実状態 vs DB の突合
-│   ├── monitor.py            # ⑥ 死活監視・日次通知
+│   ├── monitor.py            # ⑥ 死活監視・日次通知（成績サマリ含む）
+│   ├── risk_calendar.example.json # 重要指標ブラックアウト窓の雛形（→ risk_calendar.json）
 │   └── healthz.py            # コンテナ healthcheck（ハートビート鮮度）
 ├── db/init.sql               # events / fills / processed_orders + 索引
-├── optimize/auto_optimize.py # 自律最適化（fx_backtester は別途・範囲外）
-├── tests/                    # pytest（domain / risk / webhook / executor / strategy / optimizer）
+├── db/migrations/            # 既存 DB 向けの冪等マイグレーション（make migrate）
+├── optimize/auto_optimize.py # 自律最適化（OOS 検証で配備可否を判定・fx_backtester は別途）
+├── tests/                    # pytest（domain / risk_engine / journal / webhook / executor / …）
 └── deploy/                   # launchd plist / bootstrap.sh / watchdog.sh / backup.sh
 ```
 
@@ -39,13 +43,16 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 
 ④ strategy.py（並行）: interval ごとに decide()。状態変化時のみ "signals" へ publish
         ▼ Stream "signals"
-② risk.py（Consumer Group "risk"）
-  └ KillSwitch → 数量上限 → 取引時間帯 → 日次損失(超過で自動KillSwitch) → 発注レート
-  └ 通過 → Stream "orders"
+② risk.py（Consumer Group "risk"）→ 純粋判断は risk_engine.evaluate（→ RISK.md）
+  └ KillSwitch(Redis,fail-safe) → 状態収集(残高/日次・週次損益/直近損益/建玉/カレンダー)
+  └ ブラックアウト → セッション → 日次損失 → 週次損失 → 連敗停止 → リスク基準サイジング
+    → 数量上限 → 同時保有数 → 通貨エクスポージャ →（承認後）発注レート
+  └ 日次/週次/連敗停止は自動 KillSwitch + 通知。通過分は qty を確定し intended_risk を載せて
+  └ Stream "orders"
         ▼ Stream "orders"
 ③ executor.py（Consumer Group "exec"）
   └ KillSwitch 再確認 → 本番二重ガード → 冪等claim(processed_orders) → IBKR 発注
-  └ fills 記録 → commissionReport で realized_pnl 更新 → Discord 通知
+  └ fills 記録(intended_risk/stop_distance) → commissionReport で realized_pnl/realized_r 更新 → 通知
   └ 起動時 reconcile（取りこぼし/未完了の検知）
 
 ⑥ monitor.py（並行）: 60秒ごとに health + ハートビート鮮度。毎朝7時(JST)に日次サマリ
@@ -65,9 +72,11 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 
 ## DB スキーマ（TimescaleDB）
 - `events(ts, kind, payload jsonb)` — 全イベント監査（hypertable, idem 索引）
-- `fills(ts, symbol, side, qty, status, broker, ref, realized_pnl, idem)` — 約定記録
+- `fills(ts, symbol, side, qty, status, broker, ref, realized_pnl, idem, intended_risk, stop_distance, realized_r)`
+  — 約定記録。`intended_risk`（発注時の想定最大損失）/ `stop_distance` / `realized_r`（= 実現損益÷想定リスク = R 倍数）を持ち、`journal.py` の期待値・R 倍数集計の基礎にする。
 - `processed_orders(idem PK, client_order_id, submitted_at, broker_ref, status)` — 冪等発注の決め手
 - `daily_pnl`（ビュー）— 日次実現損益の集計
+- 既存 DB への列追加は `db/migrations/0001_risk_columns.sql`（`make migrate`・冪等）。
 
 ## Docker サービス
 | サービス | イメージ | 役割 |
@@ -88,6 +97,10 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 | レート制限の永続化 | ✅ Redis ZSET のスライディングウィンドウ（再起動で消えない） |
 
 ## 追加したミッションクリティカル要素
+- プロ級リスクエンジン（`risk_engine.py`・純粋ロジック）: リスク基準サイジング（ストップ距離×
+  口座リスク）/ 連敗スロットル / 日次・週次損失 / 同時保有数 / 通貨エクスポージャ /
+  イベントブラックアウト。期待値・R 倍数のジャーナル（`journal.py`）と OOS 配備ゲート
+  （`auto_optimize.should_deploy`）。設計と根拠は [RISK.md](./RISK.md)。
 - Webhook 受信の堅牢化（TradingView の `text/plain` を Content-Type 非依存で受理 /
   XFF 右端で IP 偽装迂回を防止 / `{{timenow}}` 鮮度チェックでリプレイ防止 /
   publish 失敗時の idem 解放で永久ロスト防止 / ボディサイズ上限）

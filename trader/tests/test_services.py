@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 
 # ---- common.notify throttle ------------------------------------------------
@@ -50,50 +51,113 @@ def test_classify_symbol():
     assert executor.classify_symbol("AAPL", "us_stock") == "us_stock"
 
 
-# ---- risk.evaluate ---------------------------------------------------------
+# ---- risk service（状態収集をスタブして純粋エンジンの結線を検証）-------------
 def _sig(**over):
     base = {"idem": "i", "symbol": "USDJPY", "asset": "fx", "side": "BUY", "qty": 1000, "type": "MARKET"}
     base.update(over)
     return base
 
 
-def test_risk_qty_over_limit(fake_redis, monkeypatch):
-    import common
-    import risk
-
-    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
-    assert risk.evaluate(_sig(idem="i1", qty=99_999_999)) is False
-
-
-def test_risk_kill_switch(fake_redis, monkeypatch):
-    import common
-    import risk
-
-    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
-    fake_redis.set("kill_switch", "1")
-    assert risk.evaluate(_sig(idem="i2")) is False
-
-
-def test_risk_daily_loss_auto_kill(fake_redis, monkeypatch):
+@pytest.fixture
+def risk_stub(fake_redis, monkeypatch):
+    """risk の DB/通知 I/O を安全な既定にスタブする。"""
     import common
     import risk
 
     monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
     monkeypatch.setattr(common, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_day_pnl", lambda: 0.0)
+    monkeypatch.setattr(risk, "_week_pnl", lambda: 0.0)
+    monkeypatch.setattr(risk, "_recent_pnls", lambda limit: [])
+    monkeypatch.setattr(risk, "_open_positions", lambda: [])
+    monkeypatch.setattr(risk._calendar, "get", lambda: [])
+    return fake_redis
+
+
+def test_risk_qty_over_limit(risk_stub):
+    import risk
+
+    assert risk.evaluate(_sig(idem="i1", qty=99_999_999)) is False
+
+
+def test_risk_kill_switch(risk_stub):
+    import risk
+
+    risk_stub.set("kill_switch", "1")
+    assert risk.evaluate(_sig(idem="i2")) is False
+
+
+def test_risk_daily_loss_auto_kill(risk_stub, monkeypatch):
+    import common
+    import risk
+
     killed: list[bool] = []
     monkeypatch.setattr(common, "set_kill_switch", lambda on, **k: killed.append(on))
-    monkeypatch.setattr(risk, "_today_realized_pnl", lambda: -1_000_000.0)
+    monkeypatch.setattr(risk, "_day_pnl", lambda: -1_000_000.0)
     assert risk.evaluate(_sig(idem="i4")) is False
     assert killed == [True]
 
 
-def test_risk_approve(fake_redis, monkeypatch):
-    import common
+def test_risk_weekly_loss_auto_kill(risk_stub, monkeypatch):
     import risk
 
-    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
-    monkeypatch.setattr(risk, "_today_realized_pnl", lambda: 0.0)
+    monkeypatch.setattr(risk.settings, "max_weekly_loss_jpy", 150_000.0)
+    monkeypatch.setattr(risk, "_week_pnl", lambda: -200_000.0)
+    assert risk.evaluate(_sig(idem="wk")) is False
+
+
+def test_risk_loss_streak_halts(risk_stub, monkeypatch):
+    import risk
+
+    monkeypatch.setattr(risk, "_recent_pnls", lambda limit: [-1.0] * 5)
+    assert risk.evaluate(_sig(idem="ls")) is False
+
+
+def test_risk_blackout_blocks(risk_stub, monkeypatch):
+    import time
+
+    import risk
+
+    now = time.time()
+    monkeypatch.setattr(risk._calendar, "get", lambda: [(now - 60, now + 60, "US CPI")])
+    assert risk.evaluate(_sig(idem="bo")) is False
+
+
+def test_risk_max_concurrent_positions(risk_stub, monkeypatch):
+    import risk
+
+    monkeypatch.setattr(
+        risk, "_open_positions",
+        lambda: [("EURUSD", 1000.0), ("GBPUSD", 1000.0), ("AUDUSD", 1000.0)],
+    )
+    assert risk.evaluate(_sig(idem="mp", symbol="USDJPY")) is False
+
+
+def test_risk_approve(risk_stub):
+    import risk
+
     assert risk.evaluate(_sig(idem="i3")) is True
+
+
+def test_risk_handle_publishes_sized_order(risk_stub, monkeypatch):
+    import json
+
+    import risk
+
+    # サイジングを有効化: ストップ距離 0.5・残高100万・1% → 数量2万・想定リスク1万
+    monkeypatch.setattr(risk.settings, "risk_sizing_enabled", True)
+    monkeypatch.setattr(risk.settings, "account_equity", 1_000_000.0)
+    monkeypatch.setattr(risk.settings, "risk_per_trade_pct", 1.0)
+    monkeypatch.setattr(risk.settings, "lot_step", 1000.0)
+    monkeypatch.setattr(risk.settings, "min_lot", 1000.0)
+    monkeypatch.setattr(risk.settings, "max_position_qty", 100_000.0)
+
+    risk.handle(_sig(idem="sz", stop_distance=0.5))
+    assert risk_stub.xlen("orders") == 1
+    _id, fields = risk_stub.xrange("orders")[0]
+    data = json.loads(fields["data"])
+    assert data["qty"] == 20000
+    assert data["intended_risk"] == pytest.approx(10000.0)
 
 
 # ---- strategy signal -------------------------------------------------------
@@ -131,3 +195,15 @@ def test_optimizer_score():
     # 高 Sharpe・高 PF・低 DD のほうが高スコアになる
     better = auto_optimize.score({"sharpe_ratio": 2.0, "profit_factor": 3.0, "max_drawdown_pct": 5})
     assert better > s
+
+
+def test_optimizer_deploy_gate():
+    import auto_optimize
+
+    # 検証クリーンなら配備可
+    assert auto_optimize.should_deploy({"overfit_warning": False, "insufficient_trades": False}) is True
+    # 過剰最適化 / 取引数不足は配備しない
+    assert auto_optimize.should_deploy({"overfit_warning": True, "insufficient_trades": False}) is False
+    assert auto_optimize.should_deploy({"overfit_warning": False, "insufficient_trades": True}) is False
+    # FXBT_FORCE_DEPLOY 相当の強制
+    assert auto_optimize.should_deploy({"overfit_warning": True}, force=True) is True

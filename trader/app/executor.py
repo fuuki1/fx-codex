@@ -202,10 +202,16 @@ def handle(sig: dict[str, Any]) -> None:
 
 
 def _record_fill(sig: dict[str, Any], *, status: str, ref: str) -> None:
+    # intended_risk / stop_distance は risk のサイジング由来（R 倍数の分母）。
+    intended_risk = float(sig.get("intended_risk") or 0.0)
+    sd = sig.get("stop_distance")
+    stop_distance = float(sd) if sd not in (None, "") else None
     common.db_execute(
-        "INSERT INTO fills (ts, symbol, side, qty, status, broker, ref, realized_pnl, idem) "
-        "VALUES (now(), %s, %s, %s, %s, %s, %s, 0, %s)",
-        (sig["symbol"], sig["side"], float(sig["qty"]), status, "IBKR", ref, sig.get("idem")),
+        "INSERT INTO fills "
+        "(ts, symbol, side, qty, status, broker, ref, realized_pnl, idem, intended_risk, stop_distance) "
+        "VALUES (now(), %s, %s, %s, %s, %s, %s, 0, %s, %s, %s)",
+        (sig["symbol"], sig["side"], float(sig["qty"]), status, "IBKR", ref,
+         sig.get("idem"), intended_risk, stop_distance),
     )
     # 発注が通ったので連続エラーカウンタをリセット
     try:
@@ -236,7 +242,13 @@ def _on_commission(trade: Any, _fill: Any, report: Any) -> None:
     if not ref:
         return
     try:
-        common.db_execute("UPDATE fills SET realized_pnl = %s WHERE ref = %s", (float(pnl), ref))
+        # realized_r（R 倍数）= 実現損益 ÷ 想定リスク額。intended_risk=0 の行は NULL のまま。
+        common.db_execute(
+            "UPDATE fills SET realized_pnl = %s, "
+            "realized_r = CASE WHEN intended_risk > 0 THEN %s / intended_risk ELSE NULL END "
+            "WHERE ref = %s",
+            (float(pnl), float(pnl), ref),
+        )
         log.info("realized pnl updated", **log_extra(ref=ref, pnl=pnl))
     except Exception:
         log.exception("failed to update realized pnl", **log_extra(ref=ref))

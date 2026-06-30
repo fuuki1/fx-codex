@@ -123,6 +123,10 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
 
     asset = str(raw.get("asset", "")).strip().lower() or _infer_asset(symbol)
 
+    # ストップ距離（リスク基準サイジングの入力）。明示の stop_distance を優先し、
+    # 無ければ stop_price と約定基準価格から距離を導出する。どちらも無ければ None。
+    stop_distance = _coerce_stop_distance(raw, price)
+
     # 鮮度判定用の時刻。TradingView は ``{{timenow}}``（発火時刻・ISO）を推奨。
     # 何も無ければ受信時刻（= 常に新鮮扱い）。bar 時刻 ``{{time}}`` は古くなりうるので非推奨。
     ts = parse_ts(raw.get("ts") or raw.get("timenow") or raw.get("time"))
@@ -135,9 +139,46 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
         "qty": qty,
         "type": otype,
         "price": price,
+        "stop_distance": stop_distance,
         "ts": ts,
         "idem": compute_idem(raw),
     }
+
+
+def _coerce_stop_distance(raw: dict[str, Any], price: float | None) -> float | None:
+    """stop_distance（正の価格距離）を導出する。
+
+    優先順位:
+      1. ``stop_distance``（明示・正の値）
+      2. ``stop_price`` と基準価格（``price`` / ``entry``）の差の絶対値
+    解釈できない／非正なら None（= サイジングはシグナル qty にフォールバック）。
+    """
+    sd = raw.get("stop_distance")
+    if sd is not None and sd != "":
+        try:
+            val = float(sd)
+        except (TypeError, ValueError):
+            raise SignalError(f"invalid stop_distance: {sd!r}") from None
+        return val if val > 0 else None
+
+    sp = raw.get("stop_price")
+    if sp is not None and sp != "":
+        try:
+            stop_price = float(sp)
+        except (TypeError, ValueError):
+            raise SignalError(f"invalid stop_price: {sp!r}") from None
+        ref = price
+        if ref is None:
+            ref_raw = raw.get("entry") or raw.get("entry_price")
+            if ref_raw not in (None, ""):
+                try:
+                    ref = float(ref_raw)
+                except (TypeError, ValueError):
+                    ref = None
+        if ref is not None:
+            dist = abs(ref - stop_price)
+            return dist if dist > 0 else None
+    return None
 
 
 def _infer_asset(symbol: str) -> str:

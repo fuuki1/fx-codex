@@ -42,6 +42,20 @@ def score(m: dict) -> float:
     return sharpe * 0.4 + pf * 0.4 - (dd / 100) * 0.2
 
 
+def should_deploy(validation: dict, force: bool = False) -> bool:
+    """OOS 検証結果から「ライブ配備してよいか」を判断する。
+
+    過剰最適化（overfit_warning）や取引数不足（insufficient_trades）のパラメータは
+    既定で配備しない（検証なしに「システムだから安心」と思い込む誤りを避ける）。
+    FXBT_FORCE_DEPLOY=1 で明示的に上書きできる。
+    """
+    if force:
+        return True
+    if validation.get("overfit_warning") or validation.get("insufficient_trades"):
+        return False
+    return True
+
+
 def _grid_args() -> list[str]:
     grid_map = {
         "fast_window": GRID["fast_window"],
@@ -106,8 +120,18 @@ def optimize() -> dict:
         f"OOS/IS={v.get('oos_is_ratio')} stability={v.get('param_stability')} "
         f"OOS_trades={v.get('oos_total_trades')} overfit_warning={v.get('overfit_warning')}"
     )
-    if v.get("overfit_warning") or v.get("insufficient_trades"):
-        log("⚠️ 検証フラグあり: OOS 劣化 or 取引数不足。配備は慎重に（必要なら採用を見送る）。")
+    force = os.environ.get("FXBT_FORCE_DEPLOY", "0") == "1"
+    if not should_deploy(v, force):
+        log(
+            "⛔ 検証フラグあり（overfit_warning / 取引数不足）→ 配備を見送り。"
+            "strategy_params.json は据え置き（FXBT_FORCE_DEPLOY=1 で強制可）。"
+        )
+        log("=== 最適化完了（未配備）===")
+        flush()
+        return best
+
+    if force and (v.get("overfit_warning") or v.get("insufficient_trades")):
+        log("⚠️ FXBT_FORCE_DEPLOY=1: 検証フラグありだが強制配備する。")
 
     best["updated_at"] = datetime.now().isoformat()
     PARAMS_FILE.write_text(json.dumps(best, indent=2, ensure_ascii=False))

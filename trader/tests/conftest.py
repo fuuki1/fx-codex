@@ -22,6 +22,12 @@ os.environ.setdefault("MAX_POSITION_QTY", "10000")
 os.environ.setdefault("MAX_ORDERS_PER_MIN", "1000")
 os.environ.setdefault("MAX_DAILY_LOSS_JPY", "50000")
 os.environ.setdefault("TRADING_MODE", "paper")
+# リスクエンジン: テストは既定で安全側（サイジング OFF・週次/通貨/連敗は無効寄り）。
+# 個々のテストが必要に応じて settings を monkeypatch して有効化する。
+os.environ.setdefault("RISK_SIZING_ENABLED", "0")
+os.environ.setdefault("MAX_WEEKLY_LOSS_JPY", "0")
+os.environ.setdefault("MAX_CURRENCY_EXPOSURE", "0")
+os.environ.setdefault("ACCOUNT_EQUITY", "1000000")
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402
