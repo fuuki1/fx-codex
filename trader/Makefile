@@ -56,12 +56,12 @@ test: ## ローカルで pytest を実行
 
 .PHONY: lint
 lint: ## ruff で lint
-	ruff check app tests optimize
+	ruff check app tests fx-codex/fx_backtester fx-codex/tests
 
 .PHONY: fmt
 fmt: ## ruff で自動整形
-	ruff format app tests optimize
-	ruff check --fix app tests optimize
+	ruff format app tests fx-codex/fx_backtester fx-codex/tests
+	ruff check --fix app tests fx-codex/fx_backtester fx-codex/tests
 
 # ---- 運用 ------------------------------------------------------------------
 .PHONY: backup

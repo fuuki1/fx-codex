@@ -54,6 +54,12 @@ make test      # pytest（外部依存は fakeredis / モック）
 make config    # docker compose 構文検証
 ```
 
+## 分析・最適化（fx_backtester）
+実弾判断に使える「信頼できる分析」のためのバックテスタを [`fx-codex/`](./fx-codex/) に同梱。
+先読みバイアスなし・コスト考慮・**ウォークフォワード/OOS 検証**で過剰最適化を検出する。
+`optimize/auto_optimize.py` がこれを使って `strategy_params.json` を OOS 検証して更新し、
+`strategy.py` がホットリロードする。詳細は [fx-codex/README.md](./fx-codex/README.md)。
+
 ## Kill switch
 ```bash
 make kill-on        # 全発注を即時停止

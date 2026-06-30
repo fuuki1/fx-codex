@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
       - name: Lint (ruff)
-        run: ruff check app tests
+        run: ruff check app tests fx-codex/fx_backtester fx-codex/tests
       - name: Unit tests (pytest)
         run: pytest
       - name: Validate docker-compose
