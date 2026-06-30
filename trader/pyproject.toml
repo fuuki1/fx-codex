@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["optimize"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E501: 日本語コメントで行が伸びがちなので長さは緩める
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
