@@ -37,11 +37,31 @@ def test_loss_streak():
     assert re.loss_streak([-1, 0, -1]) == 2          # 引き分けは無視
 
 
-def test_streak_size_factor():
+def test_streak_size_factor_graduated():
     assert re.streak_size_factor(0, 3, 0.5) == 1.0
     assert re.streak_size_factor(2, 3, 0.5) == 1.0
-    assert re.streak_size_factor(3, 3, 0.5) == 0.5
-    assert re.streak_size_factor(4, 3, 0.5) == 0.5
+    assert re.streak_size_factor(3, 3, 0.5) == 0.5    # reduce_at から縮小開始
+    assert re.streak_size_factor(4, 3, 0.5) == 0.25   # 連敗が深まるほど段階的に縮小
+
+
+def test_in_thin_liquidity():
+    from datetime import UTC, datetime
+
+    win = [(21 * 60, 22 * 60)]  # 21:00-22:00 UTC
+    assert re.in_thin_liquidity(datetime(2024, 1, 3, 21, 30, tzinfo=UTC), win) is True
+    assert re.in_thin_liquidity(datetime(2024, 1, 3, 20, 30, tzinfo=UTC), win) is False
+    # 日跨ぎ 23:30-00:30
+    wrap = [(23 * 60 + 30, 30)]
+    assert re.in_thin_liquidity(datetime(2024, 1, 3, 23, 45, tzinfo=UTC), wrap) is True
+    assert re.in_thin_liquidity(datetime(2024, 1, 3, 0, 15, tzinfo=UTC), wrap) is True
+    assert re.in_thin_liquidity(datetime(2024, 1, 3, 1, 0, tzinfo=UTC), wrap) is False
+    assert re.in_thin_liquidity(datetime(2024, 1, 3, 12, 0, tzinfo=UTC), []) is False
+
+
+def test_reward_risk_ratio():
+    assert re.reward_risk_ratio(0.6, 0.3) == pytest.approx(2.0)
+    assert re.reward_risk_ratio(None, 0.3) is None
+    assert re.reward_risk_ratio(0.6, 0) is None
 
 
 def test_in_blackout():
@@ -231,3 +251,64 @@ def test_evaluate_order_of_checks_blackout_before_session():
     win = [(sat.timestamp() - 10, sat.timestamp() + 10, "CPI")]
     d = re.evaluate(_sig(), _state(now=sat, blackout_windows=win), _params(enforce_session=True))
     assert d.reason == re.R_BLACKOUT
+
+
+# ---- 第2層: 非対称性 / 規律 / DD / 薄商い ----------------------------------
+def test_evaluate_thin_liquidity():
+    wed = datetime(2024, 1, 3, 21, 30, tzinfo=UTC)  # 平日だが薄商い窓内
+    d = re.evaluate(_sig(), _state(now=wed, thin_liquidity_windows=[(21 * 60, 22 * 60)]), _params())
+    assert d.approved is False
+    assert d.reason == re.R_THIN_LIQUIDITY
+
+
+def test_evaluate_drawdown_trips_kill():
+    d = re.evaluate(_sig(), _state(equity_drawdown=120_000), _params(max_drawdown=100_000))
+    assert d.approved is False
+    assert d.reason == re.R_DRAWDOWN
+    assert d.trip_kill_switch is True
+
+
+def test_evaluate_require_reason():
+    d = re.evaluate(_sig(), _state(), _params(require_reason=True))
+    assert d.approved is False
+    assert d.reason == re.R_NO_REASON
+    # 根拠があれば通る
+    d2 = re.evaluate(_sig(reason="ロンドン時間のトレンド継続"), _state(), _params(require_reason=True))
+    assert d2.approved is True
+
+
+def test_evaluate_reward_risk_gate():
+    # R:R = 0.3/0.3 = 1.0 < 2.0 → 却下
+    d = re.evaluate(
+        _sig(stop_distance=0.3, tp_distance=0.3), _state(), _params(min_reward_risk=2.0)
+    )
+    assert d.approved is False
+    assert d.reason == re.R_REWARD_RISK
+    # R:R = 0.9/0.3 = 3.0 >= 2.0 → 通る
+    d2 = re.evaluate(
+        _sig(stop_distance=0.3, tp_distance=0.9), _state(), _params(min_reward_risk=2.0)
+    )
+    assert d2.approved is True
+
+
+def test_evaluate_require_target_for_rr():
+    # 利確目標が無い & require_target_for_rr → 却下
+    d = re.evaluate(
+        _sig(stop_distance=0.3), _state(),
+        _params(min_reward_risk=2.0, require_target_for_rr=True),
+    )
+    assert d.approved is False
+    assert d.reason == re.R_NO_TARGET
+    # require_target_for_rr が無ければ、目標欠如時は R:R を素通り（他チェックへ）
+    d2 = re.evaluate(_sig(stop_distance=0.3), _state(), _params(min_reward_risk=2.0))
+    assert d2.approved is True
+
+
+def test_evaluate_graduated_streak_quarter_size():
+    # 4 連敗（halt=5 未満）→ サイズ 1/4（段階的縮小）
+    d = re.evaluate(
+        _sig(qty=1000), _state(recent_pnls=[-1, -1, -1, -1]),
+        _params(loss_streak_reduce_at=3, loss_streak_reduce_factor=0.5, loss_streak_halt_at=5),
+    )
+    assert d.approved is True
+    assert d.sized_qty == 250

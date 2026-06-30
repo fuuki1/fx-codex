@@ -106,6 +106,10 @@ make ps
 | `MAX_CONCURRENT_POSITIONS` | 同時に持てる別銘柄数（0=無効） |
 | `MAX_CURRENCY_EXPOSURE` | 1 通貨あたり純エクスポージャ上限（0=無効） |
 | `RISK_BLACKOUT_FILE` | 重要指標ブラックアウト窓ファイル（→ `risk_calendar.json`） |
+| `MIN_REWARD_RISK` / `REQUIRE_TARGET_FOR_RR` | 非対称性(R:R)の下限 / 利確目標の必須化（0=無効） |
+| `REQUIRE_REASON` | 根拠(reason)の無いシグナルを却下 |
+| `MAX_DRAWDOWN_PCT` / `DRAWDOWN_LOOKBACK_DAYS` | 実現DDキル（高値からの% / 集計期間。0=無効） |
+| `THIN_LIQUIDITY_WINDOWS` | 薄商い時間帯（UTC `HH:MM-HH:MM` 区切り）で新規抑止 |
 
 > リスクエンジンの詳細・計算式・根拠は [RISK.md](./RISK.md)。
 | `STRATEGY_ENABLED` | 自作戦略のシグナル発行（既定 0=停止） |
@@ -149,7 +153,7 @@ docker compose exec -T timescaledb psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
 | 409 stale signal | `time` が古い/未来。`{{timenow}}` を使う。Mac の NTP 同期を確認 |
 | 400 | JSON 不正 or 必須欠落（symbol/side/qty）。アラート本文を見直す |
 | 503 | Redis 不通 or publish 失敗。idem は解放済みなので復旧後に再送可。`make ps` で redis 確認 |
-| 200 だが発注されない | risk で却下。理由は `events.kind='risk_decision'` の `reason` を確認（`kill_switch_on`/`event_blackout`/`out_of_session`/`daily_loss_exceeded`/`weekly_loss_exceeded`/`loss_streak_halt`/`stop_too_wide_for_risk`/`qty_over_limit`/`max_concurrent_positions`/`currency_exposure`/`rate_limited`）。詳細は [RISK.md](./RISK.md) |
+| 200 だが発注されない | risk で却下。理由は `events.kind='risk_decision'` の `reason` を確認（`kill_switch_on`/`event_blackout`/`thin_liquidity_window`/`out_of_session`/`max_drawdown_exceeded`/`daily_loss_exceeded`/`weekly_loss_exceeded`/`loss_streak_halt`/`missing_trade_reason`/`reward_risk_too_low`/`missing_target_for_rr`/`stop_too_wide_for_risk`/`qty_over_limit`/`max_concurrent_positions`/`currency_exposure`/`rate_limited`）。詳細は [RISK.md](./RISK.md) |
 
 ### 公開トンネルの信頼性（ngrok）
 - ngrok は単一障害点。**無料枠は使わない**——予約ドメイン（`NGROK_DOMAIN`）+ 有料枠で固定 URL に。

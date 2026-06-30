@@ -44,9 +44,10 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 ④ strategy.py（並行）: interval ごとに decide()。状態変化時のみ "signals" へ publish
         ▼ Stream "signals"
 ② risk.py（Consumer Group "risk"）→ 純粋判断は risk_engine.evaluate（→ RISK.md）
-  └ KillSwitch(Redis,fail-safe) → 状態収集(残高/日次・週次損益/直近損益/建玉/カレンダー)
-  └ ブラックアウト → セッション → 日次損失 → 週次損失 → 連敗停止 → リスク基準サイジング
-    → 数量上限 → 同時保有数 → 通貨エクスポージャ →（承認後）発注レート
+  └ KillSwitch(Redis,fail-safe) → 状態収集(残高/日次・週次損益/直近損益/建玉/カレンダー/DD)
+  └ ブラックアウト → 薄商い → セッション → 実現DD → 日次損失 → 週次損失 → 連敗停止
+    → 根拠必須 → 非対称性(R:R) → リスク基準サイジング → 数量上限 → 同時保有数
+    → 通貨エクスポージャ →（承認後）発注レート
   └ 日次/週次/連敗停止は自動 KillSwitch + 通知。通過分は qty を確定し intended_risk を載せて
   └ Stream "orders"
         ▼ Stream "orders"

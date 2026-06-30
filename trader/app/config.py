@@ -17,6 +17,15 @@ IB_PORT_PAPER = 4002
 IB_PORT_LIVE = 4001
 
 
+def _hhmm_to_min(s: str) -> int:
+    """"HH:MM" を 0..1439 の分へ。不正値は fail-fast（設定ミスを起動時に落とす）。"""
+    h, _, m = s.strip().partition(":")
+    minutes = int(h) * 60 + int(m or 0)
+    if not 0 <= minutes <= 1439:
+        raise ValueError(f"invalid HH:MM time: {s!r}")
+    return minutes
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -92,6 +101,20 @@ class Settings(BaseSettings):
     # 重要指標ブラックアウト窓の定義ファイル（無ければ無効）
     risk_blackout_file: str = "risk_calendar.json"
 
+    # ---- プロ級リスクエンジン 第2層（非対称性・規律・DD・薄商い）-----------
+    # 非対称性（相場観より「外れても小さく当たれば大きい」）。報酬/リスク比の下限（0=無効）。
+    # シグナルに利確距離（tp_distance / take_profit / target）がある時のみ評価。
+    min_reward_risk: float = 0.0
+    # True で利確目標の無いシグナルを却下（R:R を必須化）。
+    require_target_for_rr: bool = False
+    # True で「根拠（reason/comment）」の無いシグナルを却下（理由を文章化できないなら入らない）。
+    require_reason: bool = False
+    # 実現損益の高値からのドローダウンが口座の何%でKillSwitch（0=無効）。Report2 §G の強制停止。
+    max_drawdown_pct: float = 0.0
+    drawdown_lookback_days: int = 180        # ドローダウン基準の集計期間
+    # 薄商い時間帯（UTC, "HH:MM-HH:MM" カンマ区切り）。新規を抑止。例: FX ロールオーバ "20:55-22:05"。
+    thin_liquidity_windows: Annotated[list[tuple[int, int]], NoDecode] = Field(default_factory=list)
+
     # ---- 自作戦略（strategy.py）------------------------------------------
     # 既定 OFF。明示的に有効化しない限り自動シグナルは出さない（安全側）。
     strategy_enabled: bool = False
@@ -133,6 +156,26 @@ class Settings(BaseSettings):
                     continue
                 key, _, val = part.partition("=")
                 out[key.strip().upper()] = float(val)
+            return out
+        return v
+
+    @field_validator("thin_liquidity_windows", mode="before")
+    @classmethod
+    def _parse_thin_windows(cls, v: object) -> object:
+        """"HH:MM-HH:MM,HH:MM-HH:MM" を [(start_min, end_min), ...]（UTC 分）へ変換。
+
+        日跨ぎ（例 23:30-00:30）は start>end として表現し、評価側でラップ処理する。
+        """
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            out: list[tuple[int, int]] = []
+            for part in v.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                lo, _, hi = part.partition("-")
+                out.append((_hhmm_to_min(lo), _hhmm_to_min(hi)))
             return out
         return v
 

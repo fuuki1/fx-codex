@@ -50,6 +50,33 @@ def test_normalize_bad_qty():
         normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 0})
 
 
+def test_normalize_carries_stop_tp_reason():
+    sig = normalize_signal({
+        "symbol": "USDJPY", "side": "buy", "qty": 1000,
+        "stop_distance": 0.3, "tp_distance": 0.9, "reason": "trend continuation",
+    })
+    assert sig["stop_distance"] == 0.3
+    assert sig["tp_distance"] == 0.9
+    assert sig["reason"] == "trend continuation"
+
+
+def test_normalize_derives_distances_from_prices():
+    # LIMIT で entry=price、stop_price/take_profit から距離を導出
+    sig = normalize_signal({
+        "symbol": "USDJPY", "side": "buy", "qty": 1000, "type": "limit", "price": 150.0,
+        "stop_price": 149.7, "take_profit": 150.9,
+    })
+    assert sig["stop_distance"] == pytest.approx(0.3)
+    assert sig["tp_distance"] == pytest.approx(0.9)
+
+
+def test_normalize_no_risk_fields_are_none():
+    sig = normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1})
+    assert sig["stop_distance"] is None
+    assert sig["tp_distance"] is None
+    assert sig["reason"] is None
+
+
 def test_normalize_limit_requires_price():
     with pytest.raises(SignalError):
         normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "type": "limit"})

@@ -29,10 +29,15 @@ from domain import within_session
 
 # 却下理由（ログ・テスト・通知で機械可読にするため定数化）
 R_BLACKOUT = "event_blackout"
+R_THIN_LIQUIDITY = "thin_liquidity_window"
 R_SESSION = "out_of_session"
+R_DRAWDOWN = "max_drawdown_exceeded"
 R_DAILY_LOSS = "daily_loss_exceeded"
 R_WEEKLY_LOSS = "weekly_loss_exceeded"
 R_LOSS_STREAK = "loss_streak_halt"
+R_NO_REASON = "missing_trade_reason"
+R_REWARD_RISK = "reward_risk_too_low"
+R_NO_TARGET = "missing_target_for_rr"
 R_NO_STOP = "missing_stop_for_sizing"
 R_STOP_TOO_WIDE = "stop_too_wide_for_risk"
 R_QTY_LIMIT = "qty_over_limit"
@@ -62,14 +67,20 @@ class RiskParams:
     max_daily_loss: float = 50_000.0
     max_weekly_loss: float = 0.0         # 0 で無効
 
-    # 連敗スロットル
-    loss_streak_reduce_at: int = 3       # この連敗数でサイズ縮小
+    # 連敗スロットル（reduce_at から段階的に縮小し、halt_at で停止）
+    loss_streak_reduce_at: int = 3       # この連敗数からサイズ縮小を開始
     loss_streak_reduce_factor: float = 0.5
     loss_streak_halt_at: int = 5         # この連敗数で新規停止（0 で無効）
 
     # 相関・集中
     max_concurrent_positions: int = 3    # 同時に持てる別銘柄ポジション数（0 で無効）
     max_currency_exposure: float = 0.0   # 1 通貨あたりの純エクスポージャ上限（0 で無効）
+
+    # 非対称性・規律・ドローダウン（第2層）
+    min_reward_risk: float = 0.0         # 報酬/リスク比の下限（0 で無効）
+    require_target_for_rr: bool = False  # True で利確目標の無いシグナルを却下
+    require_reason: bool = False         # True で根拠（reason）の無いシグナルを却下
+    max_drawdown: float = 0.0            # 実現損益の高値からの DD 額の上限（口座通貨, 0 で無効）
 
     enforce_session: bool = True
 
@@ -84,6 +95,8 @@ class RiskState:
     recent_pnls: list[float] = field(default_factory=list)  # 直近の確定トレード損益（新しい順）
     open_positions: list[tuple[str, float]] = field(default_factory=list)  # (symbol, 符号付き数量)
     blackout_windows: list[tuple[float, float, str]] = field(default_factory=list)
+    thin_liquidity_windows: list[tuple[int, int]] = field(default_factory=list)  # (開始分, 終了分) UTC
+    equity_drawdown: float = 0.0          # 実現損益の高値からの現在ドローダウン額（口座通貨, >=0）
     value_per_point: float = 1.0          # この銘柄で価格 1.0 動いたときの 1 単位あたり損益（口座通貨）
 
 
@@ -145,10 +158,35 @@ def loss_streak(recent_pnls: list[float]) -> int:
 
 
 def streak_size_factor(streak: int, reduce_at: int, reduce_factor: float) -> float:
-    """連敗数に応じたサイズ係数（停止判定は別途 evaluate で行う）。"""
+    """連敗数に応じたサイズ係数（段階的縮小・停止判定は別途 evaluate で行う）。
+
+    reduce_at から連敗 1 つごとに reduce_factor を累乗で掛ける（例 0.5: 3連敗→0.5, 4連敗→0.25）。
+    連敗が深まるほどサイズを落として再建する（Lipschutz）。
+    """
     if reduce_at > 0 and streak >= reduce_at:
-        return reduce_factor
+        return reduce_factor ** (streak - reduce_at + 1)
     return 1.0
+
+
+def in_thin_liquidity(now: object, windows: list[tuple[int, int]]) -> bool:
+    """現在（UTC 分）が薄商い窓に入っていれば True。start>end は日跨ぎとして扱う。"""
+    if not windows:
+        return False
+    m = _minute_of_day_utc(now)
+    for start, end in windows:
+        if start <= end:
+            if start <= m < end:
+                return True
+        elif m >= start or m < end:   # 日跨ぎ（例 23:30-00:30）
+            return True
+    return False
+
+
+def reward_risk_ratio(tp_distance: float | None, stop_distance: float | None) -> float | None:
+    """報酬/リスク比。利確距離・ストップ距離のどちらかが無効なら None。"""
+    if not (tp_distance and tp_distance > 0 and stop_distance and stop_distance > 0):
+        return None
+    return tp_distance / stop_distance
 
 
 def in_blackout(now_ts: float, windows: list[tuple[float, float, str]]) -> str | None:
@@ -203,6 +241,9 @@ def evaluate(sig: dict, state: RiskState, params: RiskParams) -> RiskDecision:
     req_qty = float(sig.get("qty", 0) or 0)
     sd_raw = sig.get("stop_distance")
     stop_distance = float(sd_raw) if sd_raw not in (None, "") else None
+    tp_raw = sig.get("tp_distance")
+    tp_distance = float(tp_raw) if tp_raw not in (None, "") else None
+    reason_text = str(sig.get("reason") or "").strip()
 
     streak = loss_streak(state.recent_pnls)
 
@@ -218,24 +259,45 @@ def evaluate(sig: dict, state: RiskState, params: RiskParams) -> RiskDecision:
     if label is not None:
         return reject(R_BLACKOUT, label=label)
 
-    # 2) 取引セッション（時間外は新規しない）
+    # 2) 薄商い時間帯（流動性が薄い時間は新規しない）
+    if in_thin_liquidity(state.now, state.thin_liquidity_windows):
+        return reject(R_THIN_LIQUIDITY)
+
+    # 3) 取引セッション（時間外は新規しない）
     if params.enforce_session and not within_session(asset, symbol, state.now):
         return reject(R_SESSION, asset=asset, symbol=symbol)
 
-    # 3) 日次損失（超過で強制停止 → Kill switch）
+    # 4) 最大ドローダウン（実現損益の高値からの DD が上限超で強制停止 → Kill switch）
+    if params.max_drawdown > 0 and state.equity_drawdown >= abs(params.max_drawdown):
+        return reject(R_DRAWDOWN, kill=True, drawdown=state.equity_drawdown, limit=params.max_drawdown)
+
+    # 5) 日次損失（超過で強制停止 → Kill switch）
     if state.day_pnl <= -abs(params.max_daily_loss):
         return reject(R_DAILY_LOSS, kill=True, day_pnl=state.day_pnl, limit=params.max_daily_loss)
 
-    # 4) 週次損失（超過で強制停止 → Kill switch）
+    # 6) 週次損失（超過で強制停止 → Kill switch）
     if params.max_weekly_loss > 0 and state.week_pnl <= -abs(params.max_weekly_loss):
         return reject(R_WEEKLY_LOSS, kill=True, week_pnl=state.week_pnl, limit=params.max_weekly_loss)
 
-    # 5) 連敗による新規停止（レビューに回す）。縮小係数は下のサイジングで使う。
+    # 7) 連敗による新規停止（レビューに回す）。縮小係数は下のサイジングで使う。
     if params.loss_streak_halt_at > 0 and streak >= params.loss_streak_halt_at:
         return reject(R_LOSS_STREAK, kill=True, streak=streak, halt_at=params.loss_streak_halt_at)
     factor = streak_size_factor(streak, params.loss_streak_reduce_at, params.loss_streak_reduce_factor)
 
-    # 6) サイジング（確信ではなくストップ距離と口座リスクで数量を決める）
+    # 8) 根拠の必須化（理由を文章化できないなら入らない）
+    if params.require_reason and not reason_text:
+        return reject(R_NO_REASON)
+
+    # 9) 非対称性（報酬/リスク比）。「外れても小さく当たれば大きい」を満たさなければ却下。
+    if params.min_reward_risk > 0:
+        rr = reward_risk_ratio(tp_distance, stop_distance)
+        if rr is None:
+            if params.require_target_for_rr:
+                return reject(R_NO_TARGET)
+        elif rr < params.min_reward_risk:
+            return reject(R_REWARD_RISK, reward_risk=round(rr, 3), min=params.min_reward_risk)
+
+    # 10) サイジング（確信ではなくストップ距離と口座リスクで数量を決める）
     sized, intended_risk = _decide_size(
         req_qty=req_qty, stop_distance=stop_distance, factor=factor,
         vpp=state.value_per_point, params=params,
@@ -247,11 +309,11 @@ def evaluate(sig: dict, state: RiskState, params: RiskParams) -> RiskDecision:
             R_STOP_TOO_WIDE, stop_distance=stop_distance, min_lot=params.min_lot, factor=factor,
         )
 
-    # 7) 数量上限（サイジング後の最終確認）
+    # 11) 数量上限（サイジング後の最終確認）
     if sized > params.max_position_qty:
         return reject(R_QTY_LIMIT, qty=sized, limit=params.max_position_qty)
 
-    # 8) 同時保有数の上限（新規銘柄のみカウント）
+    # 12) 同時保有数の上限（新規銘柄のみカウント）
     open_symbols = {s for s, q in state.open_positions if q != 0}
     if (
         params.max_concurrent_positions > 0
@@ -260,7 +322,7 @@ def evaluate(sig: dict, state: RiskState, params: RiskParams) -> RiskDecision:
     ):
         return reject(R_MAX_POSITIONS, open=len(open_symbols), limit=params.max_concurrent_positions)
 
-    # 9) 通貨エクスポージャ上限（高相関ポジションを 1 つの賭けとして合算）
+    # 13) 通貨エクスポージャ上限（高相関ポジションを 1 つの賭けとして合算）
     if params.max_currency_exposure > 0:
         ccy = _exposure_breach(symbol, side, sized, state.open_positions, params.max_currency_exposure)
         if ccy is not None:
@@ -344,3 +406,14 @@ def _as_timestamp(now: object) -> float:
     if isinstance(now, (int, float)):
         return float(now)
     return time.time()
+
+
+def _minute_of_day_utc(now: object) -> int:
+    """datetime / epoch / None を UTC の「その日の分（0..1439）」へ。"""
+    from datetime import UTC, datetime
+
+    if isinstance(now, datetime):
+        u = now.astimezone(UTC)
+    else:
+        u = datetime.fromtimestamp(_as_timestamp(now), tz=UTC)
+    return u.hour * 60 + u.minute

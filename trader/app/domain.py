@@ -126,6 +126,11 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
     # ストップ距離（リスク基準サイジングの入力）。明示の stop_distance を優先し、
     # 無ければ stop_price と約定基準価格から距離を導出する。どちらも無ければ None。
     stop_distance = _coerce_stop_distance(raw, price)
+    # 利確距離（非対称性 R:R 判定の入力）。tp_distance / take_profit / target から導出。
+    tp_distance = _coerce_tp_distance(raw, price)
+    # トレード根拠（規律ゲート・ジャーナル用）。理由を文章化できないなら入らない。
+    reason = raw.get("reason") or raw.get("comment")
+    reason = str(reason).strip() if reason not in (None, "") else None
 
     # 鮮度判定用の時刻。TradingView は ``{{timenow}}``（発火時刻・ISO）を推奨。
     # 何も無ければ受信時刻（= 常に新鮮扱い）。bar 時刻 ``{{time}}`` は古くなりうるので非推奨。
@@ -140,6 +145,8 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
         "type": otype,
         "price": price,
         "stop_distance": stop_distance,
+        "tp_distance": tp_distance,
+        "reason": reason,
         "ts": ts,
         "idem": compute_idem(raw),
     }
@@ -177,6 +184,42 @@ def _coerce_stop_distance(raw: dict[str, Any], price: float | None) -> float | N
                     ref = None
         if ref is not None:
             dist = abs(ref - stop_price)
+            return dist if dist > 0 else None
+    return None
+
+
+def _coerce_tp_distance(raw: dict[str, Any], price: float | None) -> float | None:
+    """利確距離（正の価格距離）を導出する。
+
+    優先順位:
+      1. ``tp_distance``（明示・正の値）
+      2. ``take_profit`` / ``target``（利確価格）と基準価格の差の絶対値
+    解釈できない／非正なら None（= R:R 判定はスキップ）。
+    """
+    td = raw.get("tp_distance")
+    if td is not None and td != "":
+        try:
+            val = float(td)
+        except (TypeError, ValueError):
+            raise SignalError(f"invalid tp_distance: {td!r}") from None
+        return val if val > 0 else None
+
+    tp = raw.get("take_profit") or raw.get("target")
+    if tp is not None and tp != "":
+        try:
+            tp_price = float(tp)
+        except (TypeError, ValueError):
+            raise SignalError(f"invalid take_profit: {tp!r}") from None
+        ref = price
+        if ref is None:
+            ref_raw = raw.get("entry") or raw.get("entry_price")
+            if ref_raw not in (None, ""):
+                try:
+                    ref = float(ref_raw)
+                except (TypeError, ValueError):
+                    ref = None
+        if ref is not None:
+            dist = abs(tp_price - ref)
             return dist if dist > 0 else None
     return None
 

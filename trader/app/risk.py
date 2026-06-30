@@ -53,6 +53,10 @@ def build_params() -> risk_engine.RiskParams:
         loss_streak_halt_at=settings.loss_streak_halt_at,
         max_concurrent_positions=settings.max_concurrent_positions,
         max_currency_exposure=settings.max_currency_exposure,
+        min_reward_risk=settings.min_reward_risk,
+        require_target_for_rr=settings.require_target_for_rr,
+        require_reason=settings.require_reason,
+        max_drawdown=settings.max_drawdown_pct / 100.0 * settings.account_equity,
         enforce_session=settings.enforce_session,
     )
 
@@ -81,6 +85,41 @@ def _recent_pnls(limit: int) -> list[float]:
         (limit,),
     )
     return [float(r[0]) for r in rows]
+
+
+KEY_PNL_HWM = "risk:pnl_hwm"  # 実現損益の高値（high-water mark）。ドローダウン算出に使う。
+
+
+def _cumulative_pnl(lookback_days: int) -> float:
+    rows = common.db_query(
+        "SELECT COALESCE(SUM(realized_pnl), 0) FROM fills "
+        "WHERE ts >= now() - make_interval(days => %s)",
+        (lookback_days,),
+    )
+    return float(rows[0][0]) if rows else 0.0
+
+
+def _equity_drawdown() -> float:
+    """実現損益の高値（HWM）からの現在ドローダウン額（>=0）。max_drawdown_pct=0 なら 0。
+
+    Report2 §G の「総資金のドローダウンが一定%を超えたら停止」を実現損益ベースで近似する。
+    HWM は Redis に保持し、最高益を更新したら書き戻す。
+    """
+    if settings.max_drawdown_pct <= 0:
+        return 0.0
+    cum = _cumulative_pnl(settings.drawdown_lookback_days)
+    try:
+        stored = common.r().get(KEY_PNL_HWM)
+        prev = float(stored) if stored is not None else cum
+    except Exception:
+        prev = cum
+    hwm = max(prev, cum)
+    if hwm != prev:
+        try:
+            common.r().set(KEY_PNL_HWM, hwm)
+        except Exception:
+            log.exception("failed to persist pnl HWM")
+    return max(hwm - cum, 0.0)
 
 
 def _open_positions() -> list[tuple[str, float]]:
@@ -169,6 +208,8 @@ def gather_state(sig: dict[str, Any]) -> risk_engine.RiskState:
         recent_pnls=_recent_pnls(settings.recent_trades_window),
         open_positions=_open_positions(),
         blackout_windows=_calendar.get(),
+        thin_liquidity_windows=settings.thin_liquidity_windows,
+        equity_drawdown=_equity_drawdown(),
         value_per_point=_value_per_point(symbol),
     )
 
@@ -241,6 +282,11 @@ def _kill_message(d: risk_engine.RiskDecision) -> str:
         return (
             f"🛑 {d.details.get('streak')} 連敗に到達。新規を停止しレビューへ。"
             f"Kill switch を自動 ON（点検後に手動解除）。"
+        )
+    if d.reason == risk_engine.R_DRAWDOWN:
+        return (
+            f"🛑 実現損益ドローダウンが上限を超過（{d.details.get('drawdown', 0):.0f} "
+            f">= {d.details.get('limit', 0):.0f}）。Kill switch を自動 ON（点検後に手動解除）。"
         )
     return f"🛑 リスク強制停止: {d.reason}"
 
