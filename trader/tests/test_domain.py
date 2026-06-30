@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from domain import SignalError, normalize_signal, rate_limit_allow, within_session
+from domain import (
+    SignalError,
+    normalize_signal,
+    parse_ts,
+    rate_limit_allow,
+    signal_is_stale,
+    within_session,
+)
 
 UTC = UTC
 
@@ -55,6 +62,44 @@ def test_idem_deterministic_and_content_based():
     b = normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "type": "market"})
     assert a["idem"] == b["idem"]
     assert a["idem"].startswith("sha256:")
+
+
+# ---- parse_ts / staleness --------------------------------------------------
+def test_parse_ts_epoch_seconds():
+    assert parse_ts(1_700_000_000) == 1_700_000_000.0
+    assert parse_ts("1700000000") == 1_700_000_000.0
+
+
+def test_parse_ts_epoch_millis():
+    # ミリ秒 epoch は秒へ補正される
+    assert parse_ts(1_700_000_000_000) == 1_700_000_000.0
+
+
+def test_parse_ts_iso8601_tradingview_timenow():
+    # TradingView {{timenow}} 形式（末尾 Z）
+    assert parse_ts("2024-01-01T00:00:00Z") == datetime(2024, 1, 1, tzinfo=UTC).timestamp()
+
+
+def test_parse_ts_unparseable_falls_back_to_now():
+    assert parse_ts("not-a-time", now=123.0) == 123.0
+    assert parse_ts(None, now=123.0) == 123.0
+    assert parse_ts(True, now=123.0) == 123.0  # bool を 1.0 と誤解しない
+
+
+def test_normalize_accepts_iso_ts_without_crashing():
+    # 以前は float("2024-..") で 500 になり得た回帰の防止
+    sig = normalize_signal(
+        {"symbol": "USDJPY", "side": "buy", "qty": 1, "timenow": "2024-01-01T00:00:00Z"}
+    )
+    assert sig["ts"] == datetime(2024, 1, 1, tzinfo=UTC).timestamp()
+
+
+def test_signal_is_stale():
+    now = 1000.0
+    assert signal_is_stale(now - 200, now, 60) is True       # 古すぎ
+    assert signal_is_stale(now + 200, now, 60) is True       # 未来すぎ
+    assert signal_is_stale(now - 30, now, 60) is False       # 範囲内
+    assert signal_is_stale(now - 99999, now, 0) is False     # 0 で無効
 
 
 # ---- within_session --------------------------------------------------------

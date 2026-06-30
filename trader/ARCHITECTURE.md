@@ -33,7 +33,9 @@ trader/
 ## データフロー
 ```
 TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
-  └ IP検証 + secret検証 → 正規化 → idem 冪等(Redis nx,ex=3600) → Stream "signals"
+  └ ボディ上限 → IP検証(XFF右端) → 生ボディJSONパース(CT非依存) → secret検証
+    → 正規化 → 鮮度(MAX_SIGNAL_AGE_SEC) → idem 冪等(Redis nx,ex=3600) → Stream "signals"
+    （publish 失敗時は idem を解放して 503＝再送で復旧、永久ロストを防ぐ）
 
 ④ strategy.py（並行）: interval ごとに decide()。状態変化時のみ "signals" へ publish
         ▼ Stream "signals"
@@ -86,6 +88,9 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 | レート制限の永続化 | ✅ Redis ZSET のスライディングウィンドウ（再起動で消えない） |
 
 ## 追加したミッションクリティカル要素
+- Webhook 受信の堅牢化（TradingView の `text/plain` を Content-Type 非依存で受理 /
+  XFF 右端で IP 偽装迂回を防止 / `{{timenow}}` 鮮度チェックでリプレイ防止 /
+  publish 失敗時の idem 解放で永久ロスト防止 / ボディサイズ上限）
 - 冪等・取りこぼしなし発注（idem + processed_orders + Streams ACK/XAUTOCLAIM/dead-letter）
 - 自動 Kill switch（日次損失・連続エラー）と本番二重ガード（`ALLOW_LIVE`）
 - リコンサイル（起動時・手動）、構造化ログ + 相関 ID、ハートビート監視（ハング検知）
@@ -102,6 +107,18 @@ Webhook URL: `https://<NGROK_DOMAIN>/webhook`
   "side":   "{{strategy.order.action}}",
   "qty":    1000,
   "type":   "market",
+  "time":   "{{timenow}}",
   "id":     "{{timenow}}-{{ticker}}"
 }
 ```
+- **`time`**: 鮮度判定用。発火時刻 `{{timenow}}`（ISO8601）を入れる。`MAX_SIGNAL_AGE_SEC`
+  より古い／未来すぎる受信は 409 で拒否し、リプレイや遅延配信での誤発注を防ぐ。
+  bar 時刻 `{{time}}` は上位足だと古くなり誤拒否の原因になるので使わないこと。
+- **`id`**: 冪等キー。`{{timenow}}-{{ticker}}` のように発火ごとに一意にする。
+- **Content-Type の注意**: TradingView は本文を `text/plain` で送る。webhook は
+  Content-Type に依存せず生ボディを JSON パースするので、そのままで受理できる
+  （`application/json` を期待する実装だと 422 で全弾はじかれる—対策済み）。
+- **送信元 IP**: TradingView 公式の 4 つ（`52.89.214.238 / 34.212.75.30 /
+  54.218.53.128 / 52.32.178.7`）を `TV_ALLOWED_IPS` に設定。ngrok 経由では
+  `X-Forwarded-For` の右端（信頼プロキシが付与した実クライアント）で照合するため、
+  偽の XFF を足しても IP 検証は迂回されない（`TV_TRUSTED_PROXY_HOPS=1`）。

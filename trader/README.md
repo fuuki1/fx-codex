@@ -31,7 +31,7 @@ monitor（死活監視・日次通知）            reconcile（起動時/定期
 ## サービス
 | サービス | 役割 |
 |---|---|
-| `webhook` | シグナル受信（IP+secret 検証・正規化・冪等）。FastAPI / `/health` |
+| `webhook` | シグナル受信（IP+secret 検証・`text/plain` 対応・鮮度・正規化・冪等）。FastAPI / `/health` |
 | `strategy` | 自作戦略（MA クロス+ATR）。`strategy_params.json` をホットリロード。既定 OFF |
 | `risk` | Kill switch / 数量 / セッション / 日次損失 / レート制限。通過分のみ発注へ |
 | `executor` | IBKR 発注（冪等・realized_pnl 更新・自動再接続）。起動時リコンサイル |
@@ -39,6 +39,7 @@ monitor（死活監視・日次通知）            reconcile（起動時/定期
 | `redis` / `timescaledb` / `ib-gateway` / `ngrok` | 基盤 |
 
 ## ミッションクリティカルの要点
+- **堅牢な受信**: TradingView は本文を `text/plain` で送るため Content-Type 非依存で JSON パース（`application/json` 期待だと 422 で全弾はじく）。XFF 右端で IP 偽装を防ぎ、`{{timenow}}` でリプレイ拒否。publish 失敗時は idem を解放して再送可能にする。
 - **冪等発注**: webhook で idem を Redis に記録 + executor が `processed_orders`（PK=idem）で二重発注を防止。
 - **クラッシュ復旧**: Redis Streams を成功時のみ ACK、`XAUTOCLAIM` で宙づりを回収、N 回失敗は dead-letter へ。
 - **自動 Kill switch**: 日次損失超過 / 連続発注エラーで自動 ON ＋ Discord 通知。Redis 不通時は発注停止（fail-safe）。

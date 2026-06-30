@@ -88,9 +88,58 @@ make ps
 | `ENFORCE_SESSION` | 取引時間帯チェックの有効化 |
 | `STRATEGY_ENABLED` | 自作戦略のシグナル発行（既定 0=停止） |
 | `TV_ALLOWED_IPS` / `WEBHOOK_SECRET` | webhook の IP / secret 検証 |
+| `TV_TRUSTED_PROXY_HOPS` | 信頼プロキシ段数（ngrok=1, 直接公開=0）。IP 照合に使う XFF の位置 |
+| `MAX_WEBHOOK_BODY_BYTES` | 受信ボディ上限（超過は 413） |
+| `MAX_SIGNAL_AGE_SEC` | シグナル鮮度上限（0=無効。`time` 付き受信が古い/未来すぎると 409） |
 
-## 9. 既知の制約（拡張ポイント）
+## 9. TradingView Webhook（受信経路）の運用
+ミッションクリティカルでは「アラートが確実に届き、確実に 1 回だけ発注される」ことが要。
+
+### アラート設定（TradingView 側）
+- **URL**: `https://<NGROK_DOMAIN>/webhook`（POST）。
+- **メッセージ（JSON）**: 必ず `secret` と、冪等用の一意な `id`、鮮度用の `time` を入れる。
+  ```json
+  {"secret":"<WEBHOOK_SECRET>","symbol":"USDJPY","asset":"fx",
+   "side":"{{strategy.order.action}}","qty":1000,"type":"market",
+   "time":"{{timenow}}","id":"{{timenow}}-{{ticker}}"}
+  ```
+  - `time` は発火時刻 `{{timenow}}`。bar 時刻 `{{time}}` は上位足で古くなり 409 誤拒否の元なので不可。
+- **Content-Type**: TradingView は `text/plain` で送る。webhook は CT 非依存で受理する（対策済み）。
+
+### 受信できているかの確認（スモークテスト）
+```bash
+# ローカル（127.0.0.1:8000）へ直接。secret を正しく入れて 200/accepted を確認
+curl -s -XPOST localhost:8000/webhook -H 'Content-Type: text/plain' \
+  -d '{"secret":"<WEBHOOK_SECRET>","symbol":"USDJPY","side":"buy","qty":1000,"type":"market","time":"'"$(date -u +%FT%TZ)"'","id":"smoke-'"$(date +%s)"'"}'
+# events と stream に乗ったか
+docker compose exec redis redis-cli XLEN signals
+docker compose exec -T timescaledb psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "select ts,kind from events order by ts desc limit 5;"
+```
+公開 URL の疎通は `curl -s https://<NGROK_DOMAIN>/health`（200/`{"status":"ok"}`）。
+
+### アラートが届かない / 弾かれるとき
+| 症状 | 原因と対処 |
+|---|---|
+| 422 | 旧実装の Content-Type 問題（対策済み）。古いイメージなら `make up` で再ビルド |
+| 403 forbidden | 送信元 IP 不一致。`TV_ALLOWED_IPS` に公式 4 IP、`TV_TRUSTED_PROXY_HOPS=1` を確認 |
+| 401 unauthorized | `secret` 不一致。アラート本文と `.env` の `WEBHOOK_SECRET` を一致させる |
+| 409 stale signal | `time` が古い/未来。`{{timenow}}` を使う。Mac の NTP 同期を確認 |
+| 400 | JSON 不正 or 必須欠落（symbol/side/qty）。アラート本文を見直す |
+| 503 | Redis 不通 or publish 失敗。idem は解放済みなので復旧後に再送可。`make ps` で redis 確認 |
+| 200 だが発注されない | risk で却下（Kill switch/セッション/レート/日次損失）。`events.kind='risk_decision'` を確認 |
+
+### 公開トンネルの信頼性（ngrok）
+- ngrok は単一障害点。**無料枠は使わない**——予約ドメイン（`NGROK_DOMAIN`）+ 有料枠で固定 URL に。
+- より堅牢にするなら **Cloudflare Tunnel（cloudflared）** を推奨：固定ホスト名・冗長経路・無料。
+  TradingView の URL を独自ドメインにできるので URL ローテーション不要。`ngrok` サービスを
+  `cloudflared` コンテナに差し替え、`webhook:8000` を published hostname に向ける。
+- どちらでもトンネル断は webhook 自体の停止ではない。アラート取りこぼし＝発注機会損失なので、
+  TradingView アラートは「重要シグナルは複数回（別 `id`）」か、戦略側 `strategy.py` を冗長化する。
+
+## 10. 既知の制約（拡張ポイント）
 - セッション判定は祝日未考慮（市場休日カレンダーの注入が望ましい）。
 - 戦略のポジション管理は単純化（状態変化時に固定数量を発注）。実運用ロジックは要拡張。
 - exactly-once は近似（claim 後クラッシュ時は重複回避を優先し、reconcile で人手確認）。
+- リプレイ防止は `MAX_SIGNAL_AGE_SEC`（要 `time` 付き）+ idem の二段。`time` 無しは受信時刻扱い。
 - バックテスタ `fx_backtester`（`optimize/auto_optimize.py` が依存）は本リポジトリ範囲外。
