@@ -13,6 +13,9 @@
 - **頑健な指標**: Sharpe / Sortino / Profit Factor / 最大DD / 期待値 / 勝率 / CAGR（ゼロ割安全）。
 - **OOS / ウォークフォワード**: in-sample で最適化→未学習区間で検証。`overfit_warning` と
   パラメータ安定性・取引数の十分性で採否を判断（過剰最適化を検出）。
+- **堅牢性の定量化（`robust.py`・López de Prado / Bailey）**: PSR / Deflated Sharpe（歪度・尖度・
+  標本長＋試行回数で多重検定を補正）、PBO（CSCV による過剰最適化確率）、モンテカルロ（定常
+  ブートストラップで Sharpe・最大DD・勝ち越し確率の分布）。「高 Sharpe だが見せかけ」を弾く。
 
 ## 構成
 ```
@@ -22,10 +25,11 @@ fx_backtester/
   costs.py       # pip→価格コスト
   engine.py      # バー単位ループ（1バー遅延・ストップ・コスト）
   metrics.py     # 指標一式
+  robust.py      # 堅牢性: PSR / Deflated Sharpe / PBO(CSCV) / モンテカルロ
   strategy/      # base.py（契約）+ ma_cross.py
   registry.py    # 戦略レジストリ
-  validation.py  # walk-forward / OOS / 過剰最適化ガード
-  cli.py         # backtest / walkforward / optimize
+  validation.py  # walk-forward / OOS / 過剰最適化ガード（PBO 込み）
+  cli.py         # backtest(--robust) / walkforward / optimize
 examples/        # 決定論的サンプル（generate_sample.py で再生成可）
 tests/           # pytest
 ```
@@ -50,8 +54,14 @@ python -m fx_backtester.cli optimize --data examples/sample_prices.csv ... \
 ```
 
 `backtest` の出力は `sharpe_ratio` / `profit_factor` / `max_drawdown_pct` を含む（既存
-`auto_optimize` と互換）。`optimize` は配備用パラメータ＋`_validation`（OOS 成績・安定性・
-`overfit_warning`）を返す。
+`auto_optimize` と互換）。`--robust` を付けると `robust`（PSR + モンテカルロ分布）も出力。
+`optimize` は配備用パラメータ＋`_validation`（OOS 成績・安定性・**pbo**・`overfit_warning`）を返す。
+
+```bash
+# 堅牢性指標つき単発バックテスト（PSR + モンテカルロ）
+python -m fx_backtester.cli backtest --data examples/sample_prices.csv \
+  --strategy ma_cross --param fast_window=20 --param slow_window=60 --robust
+```
 
 ## データ形式
 - prices: `timestamp,open,high,low,close`（timestamp は UTC パース可能であること）

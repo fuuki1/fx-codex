@@ -139,8 +139,20 @@ class Settings(BaseSettings):
     analyzer_fast_window: int = 20                  # 短期 SMA
     analyzer_slow_window: int = 60                  # 長期 SMA
     analyzer_atr_window: int = 14                   # ATR 期間
-    analyzer_atr_multiple: float = 1.5              # ストップ距離 = ATR × これ
-    analyzer_rr_target: float = 1.5                 # 利確距離 = ストップ距離 × これ（R:R）
+    analyzer_atr_multiple: float = 1.5              # （後方互換）単純ストップの ATR 倍率
+    analyzer_rr_target: float = 1.5                 # （後方互換）単純 R:R
+    # レジーム対応・多因子合議のパラメータ（過剰最適化に強いルールベース）
+    analyzer_er_window: int = 10                     # 効率比・KAMA の窓
+    analyzer_rsi_window: int = 14                    # RSI 期間
+    analyzer_roc_window: int = 10                    # ROC（モメンタム）期間
+    analyzer_bb_window: int = 20                     # ボリンジャー z スコア窓（平均回帰）
+    analyzer_donchian_window: int = 20               # ドンチャン窓（ブレイクアウト）
+    analyzer_atr_lookback: int = 100                 # ATR パーセンタイルの参照本数（ボラ・レジーム）
+    analyzer_signal_threshold: float = 0.25          # 合議スコアの発火しきい値（|score|>=これ）
+    analyzer_adx_trend: float = 25.0                 # ADX >= これ かつ 効率比条件で "trend"
+    analyzer_adx_range: float = 18.0                 # ADX < これ で "range" 寄り
+    analyzer_er_trend: float = 0.30                  # 効率比 >= これ で "trend" 寄り
+    analyzer_er_range: float = 0.20                  # 効率比 < これ で "range" 寄り
     analyzer_htf_granularity: str = "H1"            # 上位足（トレンド方向の判定）
     analyzer_ltf_granularity: str = "M5"            # 下位足（エントリー・タイミング）
     analyzer_candles: int = 200                     # 取得するローソク本数

@@ -12,10 +12,11 @@ from itertools import product
 from statistics import mean
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from . import data as data_mod
-from . import registry
+from . import registry, robust
 from .costs import CostModel
 from .engine import BacktestResult
 from .metrics import compute_metrics
@@ -101,7 +102,31 @@ def walk_forward(
                       "params": best_p, "is": best_m, "oos": oos})
         start += test
 
-    return _aggregate(folds, strategy_name, df, grid, cost, events, min_trades, ppy)
+    report = _aggregate(folds, strategy_name, df, grid, cost, events, min_trades, ppy)
+    # PBO（過剰最適化確率）: 試したグリッド全体で「IS 最良が OOS で沈む」確率。
+    # 0.5 以上なら、選ばれたパラメータは見せかけ（過剰最適化）の疑いが濃い。
+    pbo = _pbo_over_grid(df, strategy_name, combos, cost, events)
+    if pbo == pbo:  # nan でない
+        report["pbo"] = round(pbo, 4)
+        if pbo >= 0.5:
+            report["overfit_warning"] = True
+    else:
+        report["pbo"] = None
+    return report
+
+
+def _pbo_over_grid(
+    df: pd.DataFrame,
+    strategy_name: str,
+    combos: list[dict[str, Any]],
+    cost: CostModel,
+    events: pd.DataFrame | None,
+) -> float:
+    """全パラメータ構成の全期間バーリターンを (T×N) 行列にして PBO を推定する。"""
+    if len(combos) < 2:
+        return float("nan")
+    cols = [run_result(df, strategy_name, p, cost, events).bar_returns.to_numpy() for p in combos]
+    return robust.pbo_cscv(np.column_stack(cols), n_splits=10)
 
 
 def _aggregate(
@@ -182,6 +207,7 @@ def optimize(
             "oos_max_drawdown_mean": report["oos_max_drawdown_mean"],
             "oos_total_trades": report["oos_total_trades"],
             "param_stability": report["param_stability"],
+            "pbo": report.get("pbo"),
             "overfit_warning": report["overfit_warning"],
             "insufficient_trades": report["insufficient_trades"],
         },

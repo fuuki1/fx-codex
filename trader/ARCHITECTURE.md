@@ -25,7 +25,8 @@ trader/
 │   ├── executor.py           # ③ 注文実行（IBKR / ib_async, 冪等, realized_pnl/R 更新）
 │   ├── reconcile.py          # ブローカー実状態 vs DB の突合
 │   ├── oanda.py              # ⑦ OANDA v20 のローソク取得（アドバイザリー分析のデータ源）
-│   ├── analysis.py           # ⑦ MTF 分析の純粋ロジック（HTF トレンド × LTF タイミング + ATR）
+│   ├── indicators.py         # ⑦ テクニカル指標（EMA/KAMA/ADX/RSI/効率比/ドンチャン/ATR…純粋）
+│   ├── analysis.py           # ⑦ レジーム対応・多因子合議の MTF 分析（純粋・適応ストップ）
 │   ├── dashboard.py          # ⑦ アドバイザリー: 分析ループ + チャート Web 表示 + Discord 通知（実売買なし）
 │   ├── monitor.py            # ⑥ 死活監視・日次通知（成績サマリ含む）
 │   ├── risk_calendar.example.json # 重要指標ブラックアウト窓の雛形（→ risk_calendar.json）
@@ -68,10 +69,12 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 ⑥ monitor.py（並行）: 60秒ごとに health + ハートビート鮮度。毎朝7時(JST)に日次サマリ
 
 ⑦ dashboard.py（独立・実売買なし / profile "advisory"）: 発注系に依存しないアドバイザリー。
-     oanda.py で USDJPY の下位足/上位足ローソクを定期取得 → analysis.analyze（MTF: 上位足トレンド ×
-     下位足タイミング + ATR ストップ + R:R）で助言を生成 → 分析中チャート（ローソク+MA+売買マーカー+
-     損切り/利確ライン, Lightweight Charts）を Web 表示（/・/api/state・/health）→ 好機の状態変化時のみ
-     Discord 通知。「入る/入らない・損切り・R:R」を根拠つきで提示するだけで、注文は一切出さない。
+     oanda.py で下位足/上位足ローソクを定期取得 → analysis.analyze（**レジーム対応・多因子合議**:
+     ADX×効率比×ボラで trend/range/high_vol を判定し、トレンド/モメンタム/ブレイクアウト/平均回帰を
+     レジーム別重みで合議。上位足トレンド × 下位足タイミングが一致した時だけ、適応ストップ/レジーム別
+     R:R つきで助言）→ 分析中チャート（ローソク+EMA+売買マーカー+損切り/利確ライン+レジーム/確信度/
+     因子, Lightweight Charts）を Web 表示（/・/api/state・/health）→ 好機の状態変化時のみ Discord 通知。
+     注文は一切出さない。過剰最適化に強いルールベース（重みは学習でなく原則で固定）。
 ```
 
 ## 共通部品（common.py）

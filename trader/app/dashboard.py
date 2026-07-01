@@ -20,10 +20,10 @@ from typing import Any
 
 import analysis
 import common
+import indicators as ind
 import numpy as np
 import oanda
 import pandas as pd
-from analysis import sma
 from config import settings
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -44,6 +44,19 @@ def params_from_settings() -> dict[str, Any]:
         "atr_window": settings.analyzer_atr_window,
         "atr_multiple": settings.analyzer_atr_multiple,
         "rr_target": settings.analyzer_rr_target,
+        # レジーム対応・多因子合議のパラメータ
+        "er_window": settings.analyzer_er_window,
+        "rsi_window": settings.analyzer_rsi_window,
+        "roc_window": settings.analyzer_roc_window,
+        "bb_window": settings.analyzer_bb_window,
+        "donchian_window": settings.analyzer_donchian_window,
+        "atr_lookback": settings.analyzer_atr_lookback,
+        "signal_threshold": settings.analyzer_signal_threshold,
+        "adx_window": settings.analyzer_atr_window,  # ADX は ATR と同窓を既定に
+        "adx_trend": settings.analyzer_adx_trend,
+        "adx_range": settings.analyzer_adx_range,
+        "er_trend": settings.analyzer_er_trend,
+        "er_range": settings.analyzer_er_range,
     }
 
 
@@ -51,13 +64,13 @@ def params_from_settings() -> dict[str, Any]:
 # チャート用ペイロード（Lightweight Charts 形式）
 # ============================================================================
 def build_chart_payload(ltf: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
-    """ローソク + fast/slow SMA + クロス・マーカーを Lightweight Charts 形式で返す。"""
+    """ローソク + fast/slow EMA + クロス・マーカーを Lightweight Charts 形式で返す。"""
     fast = int(params.get("fast_window", 20))
     slow = int(params.get("slow_window", 60))
     df = ltf.reset_index(drop=True)
     times = [int(x.timestamp()) for x in df["time"]]
-    fast_ma = sma(df["close"], fast)
-    slow_ma = sma(df["close"], slow)
+    fast_ma = ind.ema(df["close"], fast)
+    slow_ma = ind.ema(df["close"], slow)
 
     candles = [
         {
@@ -271,6 +284,7 @@ let priceLines = [];
 new ResizeObserver(()=>chart.applyOptions({})).observe(document.getElementById('chart'));
 
 function fmt(x){return (x==null)?'-':Number(x).toFixed(3);}
+function sgn(x){return (x==null)?'-':(x>=0?'+':'')+Number(x).toFixed(2);}
 
 function render(s){
   const b = document.getElementById('banner');
@@ -285,6 +299,15 @@ function render(s){
   b.className = r.action;
   let html = '<span class="act">'+(r.action==='BUY'?'🟢 BUY':r.action==='SELL'?'🔴 SELL':'⚪ WAIT')+'</span>';
   html += ' <span class="muted">'+(r.strength==='strong'?'好機（クロス発生）':r.strength==='setup'?'セットアップ':'')+'</span>';
+  // レジーム・確信度・スコア（分析の"中身"）
+  html += '<div class="lvls"><span>レジーム <b>'+(r.regime||'-')+'</b>（上位 '+(r.regime_htf||'-')+'）</span>'
+        + '<span>確信度 <b>'+Math.round((r.conviction||0)*100)+'%</b></span>'
+        + '<span>ADX <b>'+(r.adx!=null?r.adx:'-')+'</b> 効率比 <b>'+(r.efficiency_ratio!=null?r.efficiency_ratio:'-')+'</b></span>'
+        + '<span>合議 下位 <b>'+sgn(r.score_ltf)+'</b> / 上位 <b>'+sgn(r.score_htf)+'</b></span></div>';
+  if(r.factors){
+    html += '<div class="lvls"><span class="muted">因子</span>'
+          + Object.keys(r.factors).map(k=>'<span>'+k+' <b>'+sgn(r.factors[k])+'</b></span>').join('') + '</div>';
+  }
   if(r.action!=='WAIT'){
     html += '<div class="lvls"><span>現値 <b>'+fmt(r.last_price)+'</b></span>'
           + '<span>損切り <b>'+fmt(r.stop)+'</b></span>'

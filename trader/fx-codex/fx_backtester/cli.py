@@ -22,6 +22,20 @@ from .costs import CostModel
 from .runner import run_backtest
 
 
+def _robust_report(result: Any) -> dict[str, Any]:
+    """単発バックテストの堅牢性指標（PSR + モンテカルロ）。"""
+    from . import robust
+
+    r = result.bar_returns.to_numpy()
+    mc = robust.monte_carlo_bootstrap(r, n_paths=500)
+    return {
+        "psr": round(robust.probabilistic_sharpe_ratio(r), 4),
+        "monte_carlo": {
+            k: (round(v, 4) if isinstance(v, float) else v) for k, v in mc.to_dict().items()
+        },
+    }
+
+
 def _parse_value(v: str) -> Any:
     try:
         return int(v)
@@ -80,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     pb = sub.add_parser("backtest", help="単発バックテスト")
     _add_common(pb)
     pb.add_argument("--param", action="append", default=[])
+    pb.add_argument("--robust", action="store_true",
+                    help="PSR とモンテカルロ（定常ブートストラップ）の堅牢性指標も出力")
 
     for name in ("walkforward", "optimize"):
         pw = sub.add_parser(name, help="ウォークフォワード/最適化")
@@ -103,7 +119,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "backtest":
         params = _parse_params(args.param)
-        metrics, _ = run_backtest(df, args.strategy, params, cost, events)
+        metrics, result = run_backtest(df, args.strategy, params, cost, events)
+        if args.robust:
+            metrics["robust"] = _robust_report(result)
         print(json.dumps(metrics, ensure_ascii=False))
         return 0
 

@@ -35,9 +35,12 @@ def test_analyze_buy_when_both_timeframes_up():
     r = analysis.analyze(up, up_htf, PARAMS, symbol="USDJPY", now=WEEKDAY)
     assert r.action == "BUY"
     assert r.trend_htf == 1 and r.signal_ltf == 1
-    # 損切りは現値より下、利確は上、R:R = 目標
+    # レジーム対応: 一方向トレンドは "trend" と判定され、合議スコア・確信度が正
+    assert r.regime in ("trend", "transition")
+    assert r.score_ltf > 0 and r.conviction > 0
+    # 損切りは現値より下、利確は上、R:R はレジーム別（>1）
     assert r.stop < r.last_price < r.take_profit
-    assert r.rr == 1.5
+    assert r.rr and r.rr > 1.0
     assert r.stop_distance and r.stop_distance > 0
 
 
@@ -78,23 +81,29 @@ def test_analyze_wait_when_insufficient_data():
     assert r.action == "WAIT"
 
 
-def test_fresh_cross_detects_direction_change():
+def test_analyze_stands_aside_in_range():
     import analysis
 
-    # fresh_cross は「最新バーでの」クロスのみ検出する。fast=2/slow=3 で最終バーに上抜けが
-    # 起きる系列を用意（sign(fast-slow) が -1→+1 に反転する）。
-    assert analysis.fresh_cross(_frame([10.0, 8.0, 6.0, 5.0, 9.0]), 2, 3) == 1
-    # 単調上昇はクロス無し（0）
-    assert analysis.fresh_cross(_frame([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), 2, 3) == 0
+    # レンジ（速い往復）は上位足に明確なトレンドが無く WAIT（ダマシ回避 = 今回の主目的）
+    t = np.arange(180)
+    sine = list(150.0 + 0.3 * np.sin(t))          # 周期 ~6 本の細かい往復 → range 判定
+    r = analysis.analyze(_frame(sine), _frame(sine, freq="1h"), PARAMS, symbol="USDJPY", now=WEEKDAY)
+    assert r.action == "WAIT"
 
 
-def test_indicators_sma_atr():
+def test_analyze_high_vol_widens_stop():
     import analysis
 
-    df = _frame([1.0, 2.0, 3.0, 4.0, 5.0])
-    assert analysis.sma(df["close"], 2).iloc[-1] == 4.5
-    a = analysis.atr(df, 2).iloc[-1]
-    assert a > 0
+    base = list(np.linspace(150.0, 151.0, 160))
+    calm = _frame(base)
+    r_calm = analysis.analyze(calm, _frame(base, freq="1h"), PARAMS, symbol="USDJPY", now=WEEKDAY)
+    # 直近だけレンジ幅（high-low）を大きくして高ボラにする
+    spicy = calm.copy()
+    spicy.loc[spicy.index[-20:], "high"] = spicy["close"].iloc[-20:] + 0.6
+    spicy.loc[spicy.index[-20:], "low"] = spicy["close"].iloc[-20:] - 0.6
+    r_hv = analysis.analyze(spicy, _frame(base, freq="1h"), PARAMS, symbol="USDJPY", now=WEEKDAY)
+    if r_calm.action != "WAIT" and r_hv.action != "WAIT":
+        assert r_hv.stop_distance > r_calm.stop_distance     # 高ボラでストップが広がる
 
 
 def test_build_chart_payload_shapes_and_markers():
