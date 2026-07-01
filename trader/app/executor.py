@@ -30,8 +30,47 @@ GROUP = "exec"
 CONSUMER = f"{socket.gethostname()}-{os.getpid()}"
 # IBKR の異常値（PnL 非該当時の sentinel）を弾く閾値
 _PNL_SENTINEL = 1e300
+# 銘柄ごとの「現在保有ポジションのエントリー時リスク額」。R 倍数（realized_pnl ÷ リスク）の
+# 分母に使う。決済 fill 側の intended_risk（別ポジション/0 になりうる）で割ると誤るため、
+# エントリーのリスクを覚えておき、決済で実現損益が出たときにこれで割る。
+KEY_ENTRY_RISK = "risk:entry_risk"
 
 _ib: Any = None  # ib_async.IB インスタンス（接続後に入る）
+
+
+# ============================================================================
+# R 倍数（entry リスク基準）— 純粋 + Redis ヘルパー（テスト可能）
+# ============================================================================
+def realized_r_multiple(pnl: float, entry_risk: float | None) -> float | None:
+    """実現損益 ÷ エントリー時リスク額。リスク不明/非正なら None。"""
+    if entry_risk is None or entry_risk <= 0:
+        return None
+    return pnl / entry_risk
+
+
+def record_entry_risk(symbol: str, intended_risk: float) -> None:
+    """新規建て時のリスク額を銘柄ごとに記録（既に保有中なら上書きしない）。
+
+    hsetnx で「最初のエントリー」のリスクだけを残す（決済注文のリスクで上書きしない）。
+    intended_risk<=0（サイジング無し等）は記録しない → R 倍数は算出不能(NULL)扱い。
+    """
+    if intended_risk <= 0:
+        return
+    try:
+        common.r().hsetnx(KEY_ENTRY_RISK, symbol, intended_risk)
+    except Exception:
+        log.exception("failed to record entry risk", **log_extra(symbol=symbol))
+
+
+def pop_entry_risk(symbol: str) -> float | None:
+    """保有ポジションのエントリー時リスクを取り出して消す（決済＝ポジション解消時）。"""
+    try:
+        v = common.r().hget(KEY_ENTRY_RISK, symbol)
+        common.r().hdel(KEY_ENTRY_RISK, symbol)
+        return float(v) if v is not None else None
+    except Exception:
+        log.exception("failed to pop entry risk", **log_extra(symbol=symbol))
+        return None
 
 
 # ============================================================================
@@ -178,6 +217,8 @@ def handle(sig: dict[str, Any]) -> None:
             ("submitted", ref, idem),
         )
         _record_fill(sig, status=status, ref=ref)
+        # このポジションのエントリー時リスクを覚えておく（決済時に R 倍数の分母として使う）。
+        record_entry_risk(sig["symbol"], float(sig.get("intended_risk") or 0.0))
         common.log_event("order_submitted", {"signal": sig, "status": status, "ref": ref})
         common.notify(
             f"✅ 発注 {sig['side']} {sig['symbol']} x{sig['qty']:g} "
@@ -242,14 +283,18 @@ def _on_commission(trade: Any, _fill: Any, report: Any) -> None:
     if not ref:
         return
     try:
-        # realized_r（R 倍数）= 実現損益 ÷ 想定リスク額。intended_risk=0 の行は NULL のまま。
+        # realized_pnl は決済約定に計上される（=往復損益）。R 倍数はこの決済注文の
+        # intended_risk ではなく「エントリー時のリスク」で割る必要がある。決済 fill の
+        # 正規シンボルを取り、そのポジションのエントリーリスクを引いて割る。
+        rows = common.db_query("SELECT symbol FROM fills WHERE ref = %s LIMIT 1", (ref,))
+        symbol = rows[0][0] if rows else None
+        entry_risk = pop_entry_risk(symbol) if symbol else None
+        r_mult = realized_r_multiple(float(pnl), entry_risk)
         common.db_execute(
-            "UPDATE fills SET realized_pnl = %s, "
-            "realized_r = CASE WHEN intended_risk > 0 THEN %s / intended_risk ELSE NULL END "
-            "WHERE ref = %s",
-            (float(pnl), float(pnl), ref),
+            "UPDATE fills SET realized_pnl = %s, realized_r = %s WHERE ref = %s",
+            (float(pnl), r_mult, ref),
         )
-        log.info("realized pnl updated", **log_extra(ref=ref, pnl=pnl))
+        log.info("realized pnl updated", **log_extra(ref=ref, pnl=pnl, r=r_mult))
     except Exception:
         log.exception("failed to update realized pnl", **log_extra(ref=ref))
 

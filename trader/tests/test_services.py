@@ -32,6 +32,45 @@ def test_kill_switch_fail_safe(monkeypatch):
     assert common.kill_switch_on() is True
 
 
+def test_attempts_field_cleared_on_success(fake_redis):
+    import json
+
+    import common
+
+    stream, group = "teststream", "testgroup"
+    common.ensure_group(stream, group)
+    fields = {"data": json.dumps({"x": 1})}
+    msg_id = fake_redis.xadd(stream, fields)
+    fake_redis.xreadgroup(group, "c", {stream: ">"}, count=1)  # pending にする
+
+    def boom(_obj):
+        raise RuntimeError("boom")
+
+    # 失敗 → attempts フィールドが作られ、未 ACK
+    common._handle_one(stream, group, msg_id, fields, boom)
+    assert fake_redis.hget(f"attempts:{stream}", msg_id) == "1"
+    # 成功 → ACK ＋ attempts フィールドを掃除（肥大化を防ぐ）
+    common._handle_one(stream, group, msg_id, fields, lambda _obj: None)
+    assert fake_redis.hget(f"attempts:{stream}", msg_id) is None
+
+
+# ---- config: リスク設定の範囲検証（誤設定を起動時に落とす）--------------------
+def test_config_rejects_dangerous_values():
+    import pydantic
+    from config import Settings
+
+    # reduce_factor>1 は連敗でサイズが増える（マルチンゲール）→ 拒否
+    with pytest.raises(pydantic.ValidationError):
+        Settings(loss_streak_reduce_factor=1.5)
+    with pytest.raises(pydantic.ValidationError):
+        Settings(risk_per_trade_pct=0)       # 0 以下は不可
+    with pytest.raises(pydantic.ValidationError):
+        Settings(max_position_qty=0)         # 0 以下は不可
+    # 妥当値は通る
+    s = Settings(loss_streak_reduce_factor=0.5, risk_per_trade_pct=0.75, max_position_qty=5000)
+    assert s.loss_streak_reduce_factor == 0.5
+
+
 # ---- executor pure helpers -------------------------------------------------
 def test_client_order_id_deterministic():
     import executor
@@ -49,6 +88,28 @@ def test_classify_symbol():
     assert executor.classify_symbol("USDJPY", "fx") == "fx"
     assert executor.classify_symbol("7203", "") == "jp_stock"
     assert executor.classify_symbol("AAPL", "us_stock") == "us_stock"
+
+
+def test_realized_r_multiple():
+    import executor
+
+    assert executor.realized_r_multiple(1000.0, 500.0) == 2.0    # +2R
+    assert executor.realized_r_multiple(-500.0, 500.0) == -1.0   # -1R
+    assert executor.realized_r_multiple(1000.0, None) is None    # リスク不明
+    assert executor.realized_r_multiple(1000.0, 0.0) is None     # 0 除算回避
+
+
+def test_entry_risk_uses_entry_not_exit(fake_redis):
+    import executor
+
+    # エントリーのリスクだけを保持（決済注文のリスクで上書きしない = hsetnx）
+    executor.record_entry_risk("USDJPY", 5000.0)   # entry
+    executor.record_entry_risk("USDJPY", 9999.0)   # exit 側の値では上書きされない
+    assert executor.pop_entry_risk("USDJPY") == 5000.0
+    assert executor.pop_entry_risk("USDJPY") is None   # 決済で消える
+    # サイジング無し（intended_risk<=0）は記録しない → R は NULL 扱い
+    executor.record_entry_risk("EURUSD", 0.0)
+    assert executor.pop_entry_risk("EURUSD") is None
 
 
 # ---- risk service（状態収集をスタブして純粋エンジンの結線を検証）-------------

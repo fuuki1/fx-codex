@@ -257,6 +257,9 @@ def _handle_one(
     try:
         handler(obj)
         r().xack(stream, group, msg_id)
+        # 成功時はリトライ計数フィールドを掃除する（一度失敗して後で成功したメッセージの
+        # msg_id が attempts ハッシュに残り続けて肥大化するのを防ぐ）。無ければ no-op。
+        r().hdel(f"attempts:{stream}", msg_id)
     except Exception:
         attempts = r().hincrby(f"attempts:{stream}", msg_id, 1)
         log.exception(

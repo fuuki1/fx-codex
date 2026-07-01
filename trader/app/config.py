@@ -180,6 +180,32 @@ class Settings(BaseSettings):
             return out
         return v
 
+    @field_validator("loss_streak_reduce_factor")
+    @classmethod
+    def _check_reduce_factor(cls, v: float) -> float:
+        # (0, 1] のみ許可。1 超だと連敗ごとにサイズが増える＝マルチンゲール化して危険。
+        if not 0 < v <= 1:
+            raise ValueError(
+                f"loss_streak_reduce_factor must be in (0, 1]; got {v} "
+                "(>1 would ENLARGE size on a losing streak = martingale)"
+            )
+        return v
+
+    @field_validator("risk_per_trade_pct")
+    @classmethod
+    def _check_risk_pct(cls, v: float) -> float:
+        # 1 取引リスクは正かつ 100% 以下（例: 0.5 を 50 と誤入力する事故を起動時に落とす）。
+        if not 0 < v <= 100:
+            raise ValueError(f"risk_per_trade_pct must be in (0, 100]; got {v}")
+        return v
+
+    @field_validator("max_position_qty", "account_equity", "lot_step", "min_lot")
+    @classmethod
+    def _check_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be > 0; got {v}")
+        return v
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def ib_port(self) -> int:
