@@ -108,7 +108,7 @@ make ps
 | `RISK_BLACKOUT_FILE` | 重要指標ブラックアウト窓ファイル（→ `risk_calendar.json`） |
 | `MIN_REWARD_RISK` / `REQUIRE_TARGET_FOR_RR` | 非対称性(R:R)の下限 / 利確目標の必須化（0=無効） |
 | `REQUIRE_REASON` | 根拠(reason)の無いシグナルを却下 |
-| `MAX_DRAWDOWN_PCT` / `DRAWDOWN_LOOKBACK_DAYS` | 実現DDキル（高値からの% / 集計期間。0=無効） |
+| `MAX_DRAWDOWN_PCT` | 実現DDキル（全期間の累計実現損益の高値からの%。0=無効） |
 | `THIN_LIQUIDITY_WINDOWS` | 薄商い時間帯（UTC `HH:MM-HH:MM` 区切り）で新規抑止 |
 
 > リスクエンジンの詳細・計算式・根拠は [RISK.md](./RISK.md)。

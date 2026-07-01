@@ -110,8 +110,9 @@ class Settings(BaseSettings):
     # True で「根拠（reason/comment）」の無いシグナルを却下（理由を文章化できないなら入らない）。
     require_reason: bool = False
     # 実現損益の高値からのドローダウンが口座の何%でKillSwitch（0=無効）。Report2 §G の強制停止。
+    # 基準は「全期間の累計実現損益」の高値（HWM）。集計期間の窓は設けない（窓を切ると古い利益が
+    # 期間外へ抜けて cum が減り、損失が無くても DD が膨らむ＝誤発火するため）。
     max_drawdown_pct: float = 0.0
-    drawdown_lookback_days: int = 180        # ドローダウン基準の集計期間
     # 薄商い時間帯（UTC, "HH:MM-HH:MM" カンマ区切り）。新規を抑止。例: FX ロールオーバ "20:55-22:05"。
     thin_liquidity_windows: Annotated[list[tuple[int, int]], NoDecode] = Field(default_factory=list)
 

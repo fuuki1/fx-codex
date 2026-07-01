@@ -90,35 +90,32 @@ def _recent_pnls(limit: int) -> list[float]:
 KEY_PNL_HWM = "risk:pnl_hwm"  # 実現損益の高値（high-water mark）。ドローダウン算出に使う。
 
 
-def _cumulative_pnl(lookback_days: int) -> float:
-    rows = common.db_query(
-        "SELECT COALESCE(SUM(realized_pnl), 0) FROM fills "
-        "WHERE ts >= now() - make_interval(days => %s)",
-        (lookback_days,),
-    )
+def _cumulative_pnl() -> float:
+    """全期間の累計実現損益（ドローダウンの基準となる実現エクイティ）。"""
+    rows = common.db_query("SELECT COALESCE(SUM(realized_pnl), 0) FROM fills")
     return float(rows[0][0]) if rows else 0.0
 
 
 def _equity_drawdown() -> float:
-    """実現損益の高値（HWM）からの現在ドローダウン額（>=0）。max_drawdown_pct=0 なら 0。
+    """全期間の累計実現損益の高値（HWM）からの現在ドローダウン額（>=0）。max_drawdown_pct=0 で 0。
 
     Report2 §G の「総資金のドローダウンが一定%を超えたら停止」を実現損益ベースで近似する。
-    HWM は Redis に保持し、最高益を更新したら書き戻す。
+    HWM（ピーク）を Redis に保持し、毎回 max(HWM, 現在の累計) を書き戻して初期化・更新する。
+    cum を全期間で取る（窓を切らない）ことで、古い利益が期間外へ抜けて DD が誤って膨らむのを防ぐ。
     """
     if settings.max_drawdown_pct <= 0:
         return 0.0
-    cum = _cumulative_pnl(settings.drawdown_lookback_days)
+    cum = _cumulative_pnl()
     try:
         stored = common.r().get(KEY_PNL_HWM)
-        prev = float(stored) if stored is not None else cum
+        hwm = max(float(stored), cum) if stored is not None else cum
+        # 初回も含め常にピークを書き戻す（旧実装は初期化されず DD が常に 0 になっていた）。
+        common.r().set(KEY_PNL_HWM, hwm)
     except Exception:
-        prev = cum
-    hwm = max(prev, cum)
-    if hwm != prev:
-        try:
-            common.r().set(KEY_PNL_HWM, hwm)
-        except Exception:
-            log.exception("failed to persist pnl HWM")
+        # Redis 不通時は DD 判定を見送る（best-effort）。Redis 断は decide 冒頭の
+        # kill_switch_on() が既に fail-safe で発注を止めているため、ここは 0 で足りる。
+        log.exception("equity drawdown: redis HWM access failed -> skip DD check")
+        return 0.0
     return max(hwm - cum, 0.0)
 
 

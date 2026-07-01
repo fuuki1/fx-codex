@@ -160,6 +160,31 @@ def test_risk_handle_publishes_sized_order(risk_stub, monkeypatch):
     assert data["intended_risk"] == pytest.approx(10000.0)
 
 
+def test_equity_drawdown_tracks_all_time_hwm(fake_redis, monkeypatch):
+    import risk
+
+    monkeypatch.setattr(risk.settings, "max_drawdown_pct", 10.0)
+
+    # 初回: cum=100k -> HWM=100k を必ず永続化し、DD=0（旧実装は初期化されず常に 0 だった）
+    monkeypatch.setattr(risk, "_cumulative_pnl", lambda: 100_000.0)
+    assert risk._equity_drawdown() == 0.0
+    assert float(fake_redis.get(risk.KEY_PNL_HWM)) == 100_000.0
+
+    # 累計が 60k へ低下 -> ピーク 100k からの DD=40k（損失で下がった分を検知）
+    monkeypatch.setattr(risk, "_cumulative_pnl", lambda: 60_000.0)
+    assert risk._equity_drawdown() == 40_000.0
+
+    # 新高値 120k -> HWM 更新、DD=0
+    monkeypatch.setattr(risk, "_cumulative_pnl", lambda: 120_000.0)
+    assert risk._equity_drawdown() == 0.0
+    assert float(fake_redis.get(risk.KEY_PNL_HWM)) == 120_000.0
+
+    # 無効化なら常に 0（DB/Redis に触れない）
+    monkeypatch.setattr(risk.settings, "max_drawdown_pct", 0.0)
+    monkeypatch.setattr(risk, "_cumulative_pnl", lambda: (_ for _ in ()).throw(AssertionError("queried")))
+    assert risk._equity_drawdown() == 0.0
+
+
 # ---- strategy signal -------------------------------------------------------
 def test_ma_cross_signal_directions():
     import strategy
