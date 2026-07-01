@@ -95,6 +95,7 @@ make ps
 | `TRADING_MODE` / `ALLOW_LIVE` | paper/live と本番二重ガード |
 | `MAX_POSITION_QTY` | 1 発注あたり数量上限 |
 | `MAX_DAILY_LOSS_JPY` | 日次実現損失の上限（超過で自動 Kill switch） |
+| `RISK_DAY_TIMEZONE` | 日次/週次損失の集計境界の timezone（既定 `Asia/Tokyo`。取引日に合わせる） |
 | `MAX_ORDERS_PER_MIN` | 1 分あたり発注数の上限 |
 | `MAX_CONSECUTIVE_ERRORS` | 連続発注エラーでの自動 Kill switch 閾値 |
 | `ENFORCE_SESSION` | 取引時間帯チェックの有効化 |

@@ -221,6 +221,29 @@ def test_risk_handle_publishes_sized_order(risk_stub, monkeypatch):
     assert data["intended_risk"] == pytest.approx(10000.0)
 
 
+def test_day_week_pnl_use_configured_timezone(monkeypatch):
+    import common
+    import risk
+
+    captured: list[tuple] = []
+
+    def fake_query(sql, params=None):
+        captured.append((sql, params))
+        return [(0,)]
+
+    monkeypatch.setattr(common, "db_query", fake_query)
+    monkeypatch.setattr(risk.settings, "risk_day_timezone", "Asia/Tokyo")
+
+    risk._day_pnl()
+    sql, params = captured[-1]
+    assert "AT TIME ZONE" in sql            # UTC 固定ではなく設定 tz で境界を切る
+    assert params == ("day", "Asia/Tokyo", "Asia/Tokyo")
+
+    risk._week_pnl()
+    _, params = captured[-1]
+    assert params == ("week", "Asia/Tokyo", "Asia/Tokyo")
+
+
 def test_equity_drawdown_tracks_all_time_hwm(fake_redis, monkeypatch):
     import risk
 

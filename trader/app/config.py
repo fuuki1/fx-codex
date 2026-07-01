@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, computed_field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -90,6 +91,9 @@ class Settings(BaseSettings):
     risk_value_per_point: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
     # 週次損失上限（0 で無効）。超過で Kill switch（翌週まで新規停止／手動解除）。
     max_weekly_loss_jpy: float = 0.0
+    # 日次／週次損失の集計境界の timezone。既定は JST。ここを基準に「1日」「1週」を区切る。
+    # UTC 既定のままだと 09:00 JST でリセットし、境界跨ぎで日次上限が想定より緩くなるため。
+    risk_day_timezone: str = "Asia/Tokyo"
     # 連敗スロットル（Lipschutz: 連敗時はサイズ縮小→停止）
     loss_streak_reduce_at: int = 3           # この連敗数でサイズ縮小
     loss_streak_reduce_factor: float = 0.5   # 縮小係数（0.5＝半減）
@@ -204,6 +208,15 @@ class Settings(BaseSettings):
     def _check_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"must be > 0; got {v}")
+        return v
+
+    @field_validator("risk_day_timezone")
+    @classmethod
+    def _check_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except Exception as e:
+            raise ValueError(f"invalid risk_day_timezone: {v!r}") from e
         return v
 
     @computed_field  # type: ignore[prop-decorator]

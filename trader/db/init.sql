@@ -57,10 +57,11 @@ CREATE TABLE IF NOT EXISTS processed_orders (
     status          text NOT NULL DEFAULT 'submitting'
 );
 
--- 日次実現損益（リスク判定で使う）を速く集計するためのビュー
+-- 日次実現損益の集計ビュー（レポート用）。境界は JST（RISK_DAY_TIMEZONE と揃える）。
+-- リスク判定側 risk.py は設定 timezone で都度集計する。ここは表示用のため JST を明示。
 CREATE OR REPLACE VIEW daily_pnl AS
-SELECT date_trunc('day', ts) AS day,
-       sum(realized_pnl)     AS realized_pnl,
-       count(*)              AS fill_count
+SELECT date_trunc('day', ts AT TIME ZONE 'Asia/Tokyo') AS day_jst,
+       sum(realized_pnl)                               AS realized_pnl,
+       count(*)                                        AS fill_count
 FROM fills
 GROUP BY 1;

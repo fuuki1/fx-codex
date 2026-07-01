@@ -64,18 +64,29 @@ def build_params() -> risk_engine.RiskParams:
 # ============================================================================
 # 状態収集（DB / ファイル）。各関数は monkeypatch しやすいよう独立させる。
 # ============================================================================
-def _day_pnl() -> float:
-    rows = common.db_query(
-        "SELECT COALESCE(SUM(realized_pnl), 0) FROM fills WHERE ts >= date_trunc('day', now())"
-    )
+# 集計境界を「設定した timezone のその日/週の開始」に合わせる（既定 JST）。
+#   now() AT TIME ZONE tz         → 現在のローカル壁時計（naive）
+#   date_trunc(period, ...)       → ローカルの日/週の始点（naive）
+#   ... AT TIME ZONE tz           → その始点を絶対時刻(timestamptz)へ戻す
+# これにより UTC 境界（09:00 JST リセット）による日次上限の緩みを解消する。
+_PNL_SINCE_LOCAL = (
+    "SELECT COALESCE(SUM(realized_pnl), 0) FROM fills "
+    "WHERE ts >= date_trunc(%s, now() AT TIME ZONE %s) AT TIME ZONE %s"
+)
+
+
+def _pnl_since_local(period: str) -> float:
+    tz = settings.risk_day_timezone
+    rows = common.db_query(_PNL_SINCE_LOCAL, (period, tz, tz))
     return float(rows[0][0]) if rows else 0.0
+
+
+def _day_pnl() -> float:
+    return _pnl_since_local("day")
 
 
 def _week_pnl() -> float:
-    rows = common.db_query(
-        "SELECT COALESCE(SUM(realized_pnl), 0) FROM fills WHERE ts >= date_trunc('week', now())"
-    )
-    return float(rows[0][0]) if rows else 0.0
+    return _pnl_since_local("week")
 
 
 def _recent_pnls(limit: int) -> list[float]:

@@ -88,9 +88,12 @@ def maybe_daily_summary() -> None:
         common.r().set(KEY_SUMMARY_SENT, today, ex=90_000)
 
     try:
+        # 日次損失リミットと同じ境界（RISK_DAY_TIMEZONE, 既定 JST）で「本日」を数える。
+        tz = settings.risk_day_timezone
         rows = common.db_query(
             "SELECT COUNT(*), COALESCE(SUM(realized_pnl), 0) FROM fills "
-            "WHERE ts >= date_trunc('day', now())"
+            "WHERE ts >= date_trunc('day', now() AT TIME ZONE %s) AT TIME ZONE %s",
+            (tz, tz),
         )
         n, pnl = rows[0]
     except Exception:
