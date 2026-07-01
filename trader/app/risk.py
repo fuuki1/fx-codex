@@ -16,6 +16,7 @@ import socket
 from typing import Any
 
 import common
+import holidays
 from config import settings
 from domain import rate_limit_allow, within_session
 from logging_setup import log_extra, set_correlation_id, setup_logging
@@ -54,8 +55,10 @@ def evaluate(sig: dict[str, Any]) -> bool:
         _reject(sig, "qty_over_limit", qty=qty, limit=settings.max_position_qty)
         return False
 
-    # 3) 取引時間帯
-    if settings.enforce_session and not within_session(sig.get("asset", ""), sig.get("symbol", "")):
+    # 3) 取引時間帯（休日カレンダーは holidays.get_calendar() が I/O 側でホットリロード）
+    if settings.enforce_session and not within_session(
+        sig.get("asset", ""), sig.get("symbol", ""), holidays=holidays.get_calendar()
+    ):
         _reject(sig, "out_of_session", asset=sig.get("asset"), symbol=sig.get("symbol"))
         return False
 

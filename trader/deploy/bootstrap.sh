@@ -22,7 +22,7 @@ fi
 
 # --- launchd LaunchAgent を設置 ---
 mkdir -p "$HOME/Library/LaunchAgents"
-for label in com.trader.supervisor com.trader.backup; do
+for label in com.trader.supervisor com.trader.backup com.trader.optimize; do
   src="deploy/$label.plist"
   dst="$HOME/Library/LaunchAgents/$label.plist"
   sed "s#__TRADER_DIR__#$HERE#g" "$src" > "$dst"
@@ -51,4 +51,6 @@ cat <<EOF
        make kill-status
 
   ※ 既定は paper（IB Gateway 4002）。本番は .env で TRADING_MODE=live かつ ALLOW_LIVE=1。
+  ※ 自作戦略（STRATEGY_ENABLED=1）を使う場合、com.trader.optimize が毎週日曜 05:00 に
+    strategy_params.json を自動更新する（手動実行は make optimize）。
 EOF

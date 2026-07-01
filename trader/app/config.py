@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     max_orders_per_min: int = 10
     max_consecutive_errors: int = 5
     enforce_session: bool = True
+    # 市場休日カレンダー（venue -> ["YYYY-MM-DD", ...] の JSON）。app/ からの相対 or 絶対パス。
+    market_holidays_file: str = "market_holidays.json"
 
     # ---- 自作戦略（strategy.py）------------------------------------------
     # 既定 OFF。明示的に有効化しない限り自動シグナルは出さない（安全側）。

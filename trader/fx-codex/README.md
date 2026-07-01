@@ -3,6 +3,10 @@
 実弾判断に使える「信頼できる分析」を目的にした、先読みバイアスなし・コスト考慮・
 アウトオブサンプル(OOS)検証つきのバックテスタ。`optimize/auto_optimize.py` が依存し、
 ライブの `strategy.py` 用パラメータ（`strategy_params.json`）を OOS 検証して書き出す。
+`auto_optimize.py` は `../app/export_history.py` 経由で IB Gateway から取得した実ヒストリカル
+データを優先して使い、取得できない場合のみ本ディレクトリ同梱の `examples/sample_prices.csv`
+にフォールバックする。また `overfit_warning`/取引数不足が出た場合は `strategy_params.json` を
+更新しない（過学習パラメータをそのまま配備しない）。
 
 ## 設計上の保証（なぜ信頼できるか）
 - **先読みバイアスなし**: 指標は「そのバーまで」の情報のみ。エンジンはポジションを

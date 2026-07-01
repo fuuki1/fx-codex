@@ -131,11 +131,14 @@ def emit_if_changed(symbol: str, asset: str, target: int, stop_distance: float) 
     if target == prev_state or target == 0:
         return
     side = "BUY" if target == 1 else "SELL"
+    # 反転(-1<->1)は現在の建玉を閉じて反対方向を新規に建てる必要があるため 2 倍量を発注する。
+    # position_qty は発注後に想定される建玉サイズ（= 保護ストップの数量はこちらを使う）。
     raw = {
         "symbol": symbol,
         "asset": asset,
         "side": side,
-        "qty": settings.strategy_qty,
+        "qty": abs(target - prev_state) * settings.strategy_qty,
+        "position_qty": settings.strategy_qty,
         "type": "MARKET",
         "ts": time.time(),
         "stop_distance": stop_distance,

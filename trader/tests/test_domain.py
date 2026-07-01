@@ -81,6 +81,36 @@ def test_us_equity_hours():
     assert within_session("us_stock", "AAPL", dt(2024, 1, 4, 22)) is False  # 17:00 ET
 
 
+# ---- within_session holiday calendar ---------------------------------------
+def test_holidays_ignored_when_not_provided():
+    # 2024-01-08 10:00 JST は平日だが holidays 省略時は従来通り祝日を考慮しない
+    assert within_session("jp_stock", "7203", dt(2024, 1, 8, 1)) is True
+
+
+def test_jp_equity_closed_on_holiday():
+    holidays = {"jp_stock": {"2024-01-08"}}  # 成人の日（月曜）
+    assert within_session("jp_stock", "7203", dt(2024, 1, 8, 1), holidays=holidays) is False
+    # 前日（休日ではない）は通常営業
+    assert within_session("jp_stock", "7203", dt(2024, 1, 5, 1), holidays=holidays) is True
+
+
+def test_us_equity_closed_on_holiday():
+    holidays = {"us_stock": {"2025-01-20"}}  # MLK Day（月曜）
+    assert within_session("us_stock", "AAPL", dt(2025, 1, 20, 15), holidays=holidays) is False
+
+
+def test_fx_closed_on_holiday_even_on_weekday():
+    holidays = {"fx": {"2024-12-25"}}  # クリスマス（水曜）
+    assert within_session("fx", "USDJPY", dt(2024, 12, 25, 12), holidays=holidays) is False
+    assert within_session("fx", "USDJPY", dt(2024, 12, 24, 12), holidays=holidays) is True
+
+
+def test_holiday_calendar_is_per_venue():
+    # symbol が数字なら jp_stock 判定になるため us_stock の休日は影響しない
+    holidays = {"us_stock": {"2024-01-08"}}
+    assert within_session("jp_stock", "7203", dt(2024, 1, 8, 1), holidays=holidays) is True
+
+
 # ---- rate limit ------------------------------------------------------------
 def test_rate_limit_sliding_window(fake_redis):
     now = 1000.0

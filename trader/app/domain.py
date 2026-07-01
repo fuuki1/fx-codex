@@ -100,28 +100,44 @@ def _infer_asset(symbol: str) -> str:
 # ============================================================================
 # 取引セッション
 # ============================================================================
-def within_session(asset: str, symbol: str, now: datetime | None = None) -> bool:
+def within_session(
+    asset: str,
+    symbol: str,
+    now: datetime | None = None,
+    holidays: dict[str, Any] | None = None,
+) -> bool:
     """対象市場が取引時間内かを返す。
 
-    注意: 祝日は未考慮（拡張点）。本番では市場休日カレンダーの注入を推奨。
+    holidays: {"jp_stock": {"YYYY-MM-DD", ...}, "us_stock": {...}, "fx": {...}} を渡すと
+    その市場区分の休日を休場として扱う。省略時（None）は祝日を考慮しない（従来動作）。
+    ファイルからの読み込みは I/O なのでこの純粋関数の外（holidays.py）で行う。
     """
     now = now or datetime.now(UTC)
+    holidays = holidays or {}
     a = (asset or "").lower()
     if symbol and symbol.isdigit():
-        return _jp_equity_open(now)
+        return _jp_equity_open(now, holidays.get("jp_stock"))
     if a in ("fx", "forex", "cash", "currency"):
-        return _fx_open(now)
+        return _fx_open(now, holidays.get("fx"))
     if a in ("jp", "jp_stock", "jpstock", "stock_jp"):
-        return _jp_equity_open(now)
+        return _jp_equity_open(now, holidays.get("jp_stock"))
     if a in ("us", "us_stock", "usstock", "stock", "equity"):
-        return _us_equity_open(now)
+        return _us_equity_open(now, holidays.get("us_stock"))
     # 不明な資産は取引を止めない（明示的に塞ぎたい場合は呼び出し側で制御）
     return True
 
 
-def _fx_open(now: datetime) -> bool:
+def _is_holiday(local_now: datetime, holiday_dates: Any) -> bool:
+    if not holiday_dates:
+        return False
+    return local_now.date().isoformat() in holiday_dates
+
+
+def _fx_open(now: datetime, holiday_dates: Any = None) -> bool:
     """FX は概ね 日曜21:00UTC 〜 金曜21:00UTC（≒NYクローズ）。"""
     u = now.astimezone(UTC)
+    if _is_holiday(u, holiday_dates):
+        return False
     wd = u.weekday()  # Mon=0 .. Sun=6
     minutes = u.hour * 60 + u.minute
     close = 21 * 60
@@ -134,9 +150,11 @@ def _fx_open(now: datetime) -> bool:
     return True            # 月〜木は 24h
 
 
-def _jp_equity_open(now: datetime) -> bool:
+def _jp_equity_open(now: datetime, holiday_dates: Any = None) -> bool:
     j = now.astimezone(JST)
     if j.weekday() >= 5:
+        return False
+    if _is_holiday(j, holiday_dates):
         return False
     m = j.hour * 60 + j.minute
     morning = 9 * 60 <= m < 11 * 60 + 30
@@ -144,9 +162,11 @@ def _jp_equity_open(now: datetime) -> bool:
     return morning or afternoon
 
 
-def _us_equity_open(now: datetime) -> bool:
+def _us_equity_open(now: datetime, holiday_dates: Any = None) -> bool:
     e = now.astimezone(ET)
     if e.weekday() >= 5:
+        return False
+    if _is_holiday(e, holiday_dates):
         return False
     m = e.hour * 60 + e.minute
     return 9 * 60 + 30 <= m < 16 * 60

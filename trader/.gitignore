@@ -10,6 +10,7 @@ logs/
 *.log
 optimize_result.log
 strategy_params.json
+fx-codex/data/
 
 # Python
 __pycache__/

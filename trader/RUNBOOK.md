@@ -22,12 +22,14 @@ make kill-status
 | 停止（データ保持） | `make down` |
 | DB バックアップ | `make backup` |
 | リコンサイル手動実行 | `make reconcile` |
+| 自律最適化を手動実行 | `make optimize` |
 
 ## 3. 監視とアラート
 - `monitor` が 60 秒ごとに webhook `/health` / DB / Redis / 各サービスのハートビート鮮度を確認。
 - 異常は Discord へ通知（`common.notify` が同一内容を `NOTIFY_THROTTLE_SEC` 秒抑制してアラート嵐を防ぐ）。
 - 毎朝 7 時（JST）に日次サマリ（約定件数 / 実現損益 / Kill switch / モード）。
 - launchd `com.trader.supervisor`（120 秒ごと）が compose を up に保ち、unhealthy/exited を自動再起動。
+- launchd `com.trader.optimize`（毎週日曜 05:00）が自律最適化を実行し、更新有無を Discord へ通知。
 
 ## 4. 障害対応
 ### サービスが unhealthy / 落ちた
@@ -86,11 +88,20 @@ make ps
 | `MAX_ORDERS_PER_MIN` | 1 分あたり発注数の上限 |
 | `MAX_CONSECUTIVE_ERRORS` | 連続発注エラーでの自動 Kill switch 閾値 |
 | `ENFORCE_SESSION` | 取引時間帯チェックの有効化 |
+| `MARKET_HOLIDAYS_FILE` | 休日カレンダー JSON（既定 `app/market_holidays.json` 同梱） |
 | `STRATEGY_ENABLED` | 自作戦略のシグナル発行（既定 0=停止） |
 | `TV_ALLOWED_IPS` / `WEBHOOK_SECRET` | webhook の IP / secret 検証 |
 
 ## 9. 既知の制約（拡張ポイント）
-- セッション判定は祝日未考慮（市場休日カレンダーの注入が望ましい）。
-- 戦略のポジション管理は単純化（状態変化時に固定数量を発注）。実運用ロジックは要拡張。
+- セッション判定の祝日カレンダーは `app/market_holidays.json` に同梱のデフォルト（JP/US 2024-2027,
+  国立天文台の暦要項ベース）。年をまたいで運用する場合や取引所側の変更があった場合は、
+  `MARKET_HOLIDAYS_FILE` で指すファイルを更新するか上書きしてください（mtime を見てホットリロード）。
+- 戦略のポジション管理は依然として固定数量（`STRATEGY_QTY`）ベース。反転(-1<->1)は 2 倍量の
+  発注で正しく反対方向へ乗り換えるが、口座残高やボラティリティに応じた動的サイジングは未対応。
+- ATR ストップは strategy 由来のシグナル（`stop_distance` 付き）にのみ実発注される。TradingView
+  webhook 経由のシグナルにはストップを付けない（TradingView 側の戦略が自分でエグジットを送る想定）。
+  複数ソースが同一シンボルを同時に取引する場合の整合は取らない。
 - exactly-once は近似（claim 後クラッシュ時は重複回避を優先し、reconcile で人手確認）。
-- バックテスタ `fx_backtester`（`optimize/auto_optimize.py` が依存）は本リポジトリ範囲外。
+- バックテスタ `fx_backtester`（`optimize/auto_optimize.py` が依存）は本リポジトリに同梱
+  （`fx-codex/`）。祝日カレンダーやボラ連動スリッページのシミュレーションは未対応
+  （詳細は [fx-codex/README.md](./fx-codex/README.md) の既知の制約）。

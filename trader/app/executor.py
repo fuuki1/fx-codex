@@ -15,6 +15,7 @@ ib_async は関数内で遅延 import する（CI/テストで未接続でもモ
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 from typing import Any
@@ -30,6 +31,8 @@ GROUP = "exec"
 CONSUMER = f"{socket.gethostname()}-{os.getpid()}"
 # IBKR の異常値（PnL 非該当時の sentinel）を弾く閾値
 _PNL_SENTINEL = 1e300
+# strategy 由来の ATR ストップ発注の追跡（symbol -> {"ref": str, "stop_price": float}）
+KEY_STOP_ORDERS = "exec:stop_orders"
 
 _ib: Any = None  # ib_async.IB インスタンス（接続後に入る）
 
@@ -49,6 +52,19 @@ def classify_symbol(symbol: str, asset: str) -> str:
     if a in ("fx", "forex", "cash", "currency"):
         return "fx"
     return "us_stock"
+
+
+def stop_order_side(entry_side: str) -> str:
+    """建玉を保護するストップ注文の action（エントリと反対側）を返す。"""
+    return "SELL" if entry_side == "BUY" else "BUY"
+
+
+def compute_stop_price(entry_side: str, fill_price: float, stop_distance: float) -> float:
+    """約定価格と ATR 距離からストップ注文の発注価格(auxPrice)を計算する。"""
+    if fill_price <= 0 or stop_distance <= 0:
+        raise ValueError("fill_price and stop_distance must both be positive")
+    price = fill_price - stop_distance if entry_side == "BUY" else fill_price + stop_distance
+    return max(price, 0.01)
 
 
 # ============================================================================
@@ -186,6 +202,19 @@ def handle(sig: dict[str, Any]) -> None:
             throttle=False,
         )
         log.info("order submitted", **log_extra(idem=idem, status=status, ref=ref))
+
+        # strategy 由来の ATR ストップを実発注（webhook 等 stop_distance の無い signal は対象外）。
+        # 失敗してもエントリ自体は成功しているので、ここでは raise せず通知のみに留める。
+        if sig.get("stop_distance"):
+            try:
+                _place_protective_stop(sig, contract, coid, trade)
+            except Exception:
+                log.exception("protective stop handling failed", **log_extra(idem=idem))
+                common.notify(
+                    f"⚠️ ATRストップ発注に失敗 symbol={sig.get('symbol')}。手動で確認してください。",
+                    key=f"stop_err:{sig.get('symbol')}",
+                    throttle=False,
+                )
     except Exception as e:
         common.db_execute(
             "UPDATE processed_orders SET status = %s WHERE idem = %s", ("error", idem)
@@ -212,6 +241,70 @@ def _record_fill(sig: dict[str, Any], *, status: str, ref: str) -> None:
         common.r().set(common.KEY_CONSEC_ERRORS, 0)
     except Exception:
         pass
+
+
+def _cancel_tracked_stop(symbol: str) -> None:
+    """直前に張った保護ストップを取消（反転/再エントリで古いストップが残らないように）。
+
+    既に約定済み（ストップ到達でクローズ済み）の場合は openTrades() に現れないため無害。
+    """
+    raw = common.r().hget(KEY_STOP_ORDERS, symbol)
+    common.r().hdel(KEY_STOP_ORDERS, symbol)
+    if not raw:
+        return
+    try:
+        info = json.loads(raw)
+    except Exception:
+        return
+    try:
+        for t in _ib.openTrades():
+            if str(getattr(t.order, "orderRef", "")) == info.get("ref"):
+                _ib.cancelOrder(t.order)
+                log.info("cancelled stale protective stop", **log_extra(symbol=symbol, ref=info.get("ref")))
+    except Exception:
+        log.exception("failed to cancel existing protective stop", **log_extra(symbol=symbol))
+
+
+def _place_protective_stop(sig: dict[str, Any], contract: Any, coid: str, trade: Any) -> None:
+    """エントリ約定後に ATR ストップ（STP 注文）を実発注し、追跡情報を Redis に記録する。"""
+    from ib_async import StopOrder
+
+    stop_distance = float(sig.get("stop_distance") or 0)
+    if stop_distance <= 0:
+        return
+    fill_price = float(getattr(trade.orderStatus, "avgFillPrice", 0) or 0)
+    if fill_price <= 0:
+        log.error("protective stop skipped: no fill price", **log_extra(idem=sig.get("idem")))
+        common.notify(
+            f"⚠️ ATRストップ未設定（約定価格が取得できません）symbol={sig.get('symbol')}",
+            key=f"stop_missing:{sig.get('symbol')}",
+            throttle=False,
+        )
+        return
+
+    symbol = sig["symbol"]
+    _cancel_tracked_stop(symbol)
+
+    side = stop_order_side(sig["side"])
+    # position_qty は反転後の想定建玉サイズ（発注の qty はフリップ分を含むため使わない）
+    qty = float(sig.get("position_qty") or sig["qty"])
+    stop_price = compute_stop_price(sig["side"], fill_price, stop_distance)
+    ref = coid + "-stop"
+
+    order = StopOrder(side, qty, round(stop_price, 5))
+    order.orderRef = ref
+    order.tif = "GTC"
+    _ib.placeOrder(contract, order)
+    _ib.sleep(0.3)
+    common.r().hset(KEY_STOP_ORDERS, symbol, json.dumps({"ref": ref, "stop_price": stop_price}))
+    common.log_event(
+        "stop_order_submitted",
+        {"symbol": symbol, "side": side, "qty": qty, "stop_price": stop_price, "ref": ref},
+    )
+    log.info(
+        "protective stop placed",
+        **log_extra(symbol=symbol, side=side, qty=qty, stop_price=stop_price, ref=ref),
+    )
 
 
 def _bump_error_counter() -> None:

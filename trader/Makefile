@@ -72,6 +72,10 @@ backup: ## DB バックアップを取得
 reconcile: ## ブローカーと DB のリコンサイルを手動実行
 	$(COMPOSE) run --rm --no-deps executor python reconcile.py --once
 
+.PHONY: optimize
+optimize: ## 自律最適化を手動実行（通常は launchd com.trader.optimize が週次実行）
+	./deploy/optimize.sh
+
 .PHONY: guard-env
 guard-env:
 	@test -f .env || { echo "ERROR: .env がありません。'cp .env.example .env && chmod 600 .env' を実行してください"; exit 1; }
