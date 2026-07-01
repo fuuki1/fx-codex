@@ -44,6 +44,9 @@ R_QTY_LIMIT = "qty_over_limit"
 R_MAX_POSITIONS = "max_concurrent_positions"
 R_CURRENCY_EXPOSURE = "currency_exposure"
 
+# 撤退（フラット化）を表す intent。これらはリスク削減なので入口ゲートを課さず素通しする。
+EXIT_INTENTS = {"exit", "close", "flat"}
+
 
 # ============================================================================
 # パラメータ / 状態 / 判断の型
@@ -251,6 +254,16 @@ def evaluate(sig: dict, state: RiskState, params: RiskParams) -> RiskDecision:
         return RiskDecision(
             approved=False, reason=reason, trip_kill_switch=kill,
             loss_streak=streak, details=dict(detail),
+        )
+
+    # 0) 撤退（フラット化）はリスク削減。入口ゲート（ブラックアウト/セッション/連敗/サイジング
+    #    /数量上限/同時保有）を課さず、要求数量をそのまま通す。バックテストの「クローズ脚」
+    #    （フラット化・反転の決済）に対応し、ライブでも確実に手仕舞える。
+    #    ※ Kill switch とレート制限は risk.py 側で別途適用される。
+    if str(sig.get("intent", "")).lower() in EXIT_INTENTS and req_qty > 0:
+        return RiskDecision(
+            approved=True, sized_qty=req_qty, intended_risk=0.0, loss_streak=streak,
+            details={"intent": "exit"},
         )
 
     # 1) イベント・ブラックアウト（重要指標前後の新規を抑止）

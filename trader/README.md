@@ -31,10 +31,10 @@ monitor（死活監視・日次通知）            reconcile（起動時/定期
 ## サービス
 | サービス | 役割 |
 |---|---|
-| `webhook` | シグナル受信（IP+secret 検証・`text/plain` 対応・鮮度・正規化・冪等）。FastAPI / `/health` |
-| `strategy` | 自作戦略（MA クロス+ATR）。`strategy_params.json` をホットリロード。既定 OFF |
-| `risk` | **プロ級リスクエンジン**: リスク基準サイジング / 連敗スロットル / 日次・週次損失 / 相関・同時保有 / イベントブラックアウト / セッション / レート制限。通過分だけサイズを確定して発注へ（→ [RISK.md](./RISK.md)） |
-| `executor` | IBKR 発注（冪等・realized_pnl 更新・自動再接続）。起動時リコンサイル |
+| `webhook` | シグナル受信（IP+secret 検証・`text/plain` 対応・鮮度・正規化・冪等）。FastAPI / `/health`。本番堅牢化: `main()` 実行エントリ・XFF ホップ不足フォールバック・IP 正規化 |
+| `strategy` | 自作戦略（MA クロス+ATR）。**実建玉から目標ポジションへの差分発注**でバックテストと遷移一致（反転=クローズ+新規 / 目標0=クローズ / ストップ後再エントリー）。`strategy_params.json` をホットリロード。既定 OFF |
+| `risk` | **プロ級リスクエンジン**: リスク基準サイジング / 連敗スロットル / 日次・週次損失 / 相関・同時保有 / イベントブラックアウト / セッション / レート制限。撤退(intent=exit)は素通し。通過分だけサイズを確定して発注へ（→ [RISK.md](./RISK.md)） |
+| `executor` | IBKR 発注（冪等・自動再接続）。**エントリーに保護ストップ(STP)を付与**（バックテストの ATR ストップ）。**実約定を execDetails で fills に記録**し commissionReport で realized_pnl 更新。起動時リコンサイル |
 | `monitor` | 60 秒ごとの死活＆ハートビート監視、毎朝 7 時（JST）日次サマリ |
 | `redis` / `timescaledb` / `ib-gateway` / `ngrok` | 基盤 |
 

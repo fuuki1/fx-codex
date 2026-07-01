@@ -21,6 +21,9 @@ ET = ZoneInfo("America/New_York")
 VALID_SIDES = {"BUY", "SELL"}
 VALID_TYPES = {"MARKET", "LIMIT"}
 _SIDE_ALIASES = {"BUY": "BUY", "LONG": "BUY", "B": "BUY", "SELL": "SELL", "SHORT": "SELL", "S": "SELL"}
+# 発注の意図。exit/close/flat は「撤退（フラット化）」＝ executor が保護ストップを取消して
+# フラット化し、risk は入口ゲートを課さず素通しする。未指定/その他は entry（新規）扱い。
+_EXIT_INTENTS = {"exit", "close", "flat"}
 
 
 class SignalError(ValueError):
@@ -132,6 +135,11 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
     reason = raw.get("reason") or raw.get("comment")
     reason = str(reason).strip() if reason not in (None, "") else None
 
+    # 発注意図。TradingView からも "intent":"exit" で手仕舞い（保護ストップ取消＋素通し）を
+    # 指示できるようにする。未指定/不明は "entry"（新規）。
+    intent_raw = str(raw.get("intent", "")).strip().lower()
+    intent = intent_raw if intent_raw in _EXIT_INTENTS else "entry"
+
     # 鮮度判定用の時刻。TradingView は ``{{timenow}}``（発火時刻・ISO）を推奨。
     # 何も無ければ受信時刻（= 常に新鮮扱い）。bar 時刻 ``{{time}}`` は古くなりうるので非推奨。
     ts = parse_ts(raw.get("ts") or raw.get("timenow") or raw.get("time"))
@@ -147,6 +155,7 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
         "stop_distance": stop_distance,
         "tp_distance": tp_distance,
         "reason": reason,
+        "intent": intent,
         "ts": ts,
         "idem": compute_idem(raw),
     }

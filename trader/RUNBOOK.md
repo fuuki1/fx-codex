@@ -69,7 +69,8 @@ make ps
 **各段階で中止条件を決め、満たさなければ前段に戻る。**
 
 0. **リスクエンジンの準備**（サイジングを使う場合・→ [RISK.md](./RISK.md)）
-   - [ ] `make migrate`（既存 DB に `fills.intended_risk/stop_distance/realized_r` を追加）
+   - [ ] `make migrate`（既存 DB に `fills.intended_risk/stop_distance/realized_r` と、実約定用の
+         `fills.fill_price/exec_id` を追加。0003 は冪等）
    - [ ] `ACCOUNT_EQUITY` を実残高に、`RISK_PER_TRADE_PCT` を 0.25–0.5% に設定
    - [ ] `RISK_VALUE_PER_POINT` を取引ペアに合わせる（JPY 建て×JPY 口座以外）
    - [ ] `cp app/risk_calendar.example.json app/risk_calendar.json` し、当面の CPI/NFP/FOMC を記入
@@ -78,6 +79,11 @@ make ps
 1. **paper で安定運用**（IB Gateway 4002, `TRADING_MODE=paper`）
    - [ ] 監視・Discord 通知・日次サマリ（期待値・R 倍数・連敗を含む）が届く
    - [ ] webhook→risk→executor→fills まで events に相関 ID（idem）で追える
+   - [ ] エントリー約定に**保護ストップ(STP)**が付く（`events.kind='protective_stop'`）。撤退
+         （`intent=exit` / 自作戦略の反転・フラット化）で保護ストップが取り消される
+   - [ ] `fills` に**実約定**（`fill_price`/`exec_id`・約定数量）が記録される（発注時の想定行ではない）
+   - [ ] 自作戦略を使う場合、`STRATEGY_ENABLED=1` でシグナルが出る（既定パラメータでも履歴不足で
+         恒常 None にならない）こと、反転が「クローズ+新規」になることを paper で確認
    - [ ] Kill switch（手動・日次/週次損失自動・連敗自動・連続エラー自動）が効く
    - [ ] 連敗時にサイズが縮小→停止すること、ブラックアウト窓で新規が止まることを確認
    - [ ] 障害注入（redis/executor 停止→復旧、reconcile 差異検知、watchdog 再起動）を確認

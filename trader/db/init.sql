@@ -45,6 +45,15 @@ ALTER TABLE fills ADD COLUMN IF NOT EXISTS intended_risk double precision NOT NU
 ALTER TABLE fills ADD COLUMN IF NOT EXISTS stop_distance double precision;
 ALTER TABLE fills ADD COLUMN IF NOT EXISTS realized_r    double precision;
 
+-- 実約定（execDetails）の記録用の列。
+--   fill_price : 実際の約定価格（想定値ではない）
+--   exec_id    : IBKR の約定 ID（execDetails/commissionReport の冪等・突合キー）
+-- fills は「発注ログ」ではなく「実約定履歴」。executor は execDetails を受けて 1 約定 = 1 行を
+-- exec_id 冪等で記録し、commissionReport が exec_id 基準で realized_pnl / realized_r を更新する。
+ALTER TABLE fills ADD COLUMN IF NOT EXISTS fill_price double precision;
+ALTER TABLE fills ADD COLUMN IF NOT EXISTS exec_id    text;
+CREATE INDEX IF NOT EXISTS fills_exec_id_idx ON fills (exec_id);
+
 -- ============================================================================
 -- processed_orders : 冪等な発注の決め手（exactly-once 近似）
 --   executor は発注前にここへ idem を INSERT し、衝突したら二重発注を回避する。

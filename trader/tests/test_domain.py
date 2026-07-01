@@ -75,6 +75,14 @@ def test_normalize_no_risk_fields_are_none():
     assert sig["stop_distance"] is None
     assert sig["tp_distance"] is None
     assert sig["reason"] is None
+    assert sig["intent"] == "entry"          # 未指定は新規扱い
+
+
+def test_normalize_intent_exit_passthrough():
+    # TradingView からも intent=exit で手仕舞いを指示できる（close/flat も同義）
+    assert normalize_signal({"symbol": "USDJPY", "side": "sell", "qty": 1, "intent": "exit"})["intent"] == "exit"
+    assert normalize_signal({"symbol": "USDJPY", "side": "sell", "qty": 1, "intent": "CLOSE"})["intent"] == "close"
+    assert normalize_signal({"symbol": "USDJPY", "side": "sell", "qty": 1, "intent": "weird"})["intent"] == "entry"
 
 
 def test_normalize_limit_requires_price():

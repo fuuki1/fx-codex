@@ -18,6 +18,21 @@ from logging_setup import log_extra, setup_logging
 log = setup_logging("reconcile", settings.log_level)
 
 STALE_THRESHOLD_SEC = 300
+# executor が保護ストップの orderRef に付ける接尾辞（親 orderRef + これ）。
+# reconcile はこれを「既知の親に紐づく子注文」として扱い、孤児判定から除外する。
+STOP_REF_SUFFIX = ":stop"
+
+
+def _is_known_ref(ref: str, known: set[str]) -> bool:
+    """orderRef が processed_orders に紐づく既知の注文か。
+
+    保護ストップ（``<親ref>:stop``）は processed_orders には無いが、親が既知なら孤児ではない。
+    """
+    if ref in known:
+        return True
+    if ref.endswith(STOP_REF_SUFFIX) and ref[: -len(STOP_REF_SUFFIX)] in known:
+        return True
+    return False
 
 
 def stale_submitting(threshold_sec: int = STALE_THRESHOLD_SEC) -> list[str]:
@@ -61,7 +76,10 @@ def run_once(ib: Any | None = None) -> dict[str, Any]:
             r[0]
             for r in common.db_query("SELECT client_order_id FROM processed_orders")
         }
-        orphans = [ref for ref in broker.get("open_order_refs", []) if ref and ref not in known]
+        orphans = [
+            ref for ref in broker.get("open_order_refs", [])
+            if ref and not _is_known_ref(ref, known)
+        ]
         if orphans:
             discrepancies.append(f"DBに無いブローカー未約定注文: {orphans[:5]}")
 

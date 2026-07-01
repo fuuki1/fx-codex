@@ -75,14 +75,16 @@
 （`events.kind='risk_decision'`）で残るので、後から「なぜ入らなかったか」を検証できる。
 
 ## 同時保有・相関の扱い
-- 現在ポジションは `fills` の符号付き合計（BUY=+ / SELL=−）で近似する。フラット⇄ロング/
-  ショートに反転する戦略では正確。厳密な突合は `reconcile`（ブローカー実ポジション）に委ねる。
+- 現在ポジションは `fills`（**実約定** = execDetails 記録）の符号付き合計（BUY=+ / SELL=−）で
+  近似する。フラット⇄ロング/ショートに反転する戦略では正確。厳密な突合は `reconcile`
+  （ブローカー実ポジション）に委ねる。
 - **通貨レッグ分解**: `USDJPY` を +1000 持つ = `USD +1000 / JPY −1000`。複数ペアの
   「同方向 USD ロング」を合算して上限 `MAX_CURRENCY_EXPOSURE` で抑える。**エクスポージャを
   減らす方向（手仕舞い）の発注は、上限超過中でも許す**。
 
 ## トレード・ジャーナル（期待値で検証する）
-`fills` に `intended_risk` / `stop_distance` / `realized_r` を記録し、`journal.py` が
+`fills`（実約定）に `intended_risk` / `stop_distance` / `realized_r` を記録する。realized_pnl /
+realized_r は決済約定の commissionReport が `exec_id` 基準で更新し、`journal.py` が
 **勝率に依存しない**指標を出す: 期待値・期待値R・PF・損益比・最大/現在連敗・合計損益。
 ```bash
 make journal                 # 直近 30 日の成績

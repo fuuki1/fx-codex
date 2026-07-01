@@ -128,6 +128,41 @@ def test_xff_trusted_hop_accepted(fake_redis, monkeypatch):
     assert r.status_code == 200, r.text
 
 
+# ---- IP 正規化・ホップ不足フォールバック（本番 TradingView 連携の堅牢化, Issue 5）--
+def test_normalize_ip_strips_port_and_maps_ipv6():
+    import webhook
+
+    assert webhook._normalize_ip("52.89.214.238:443") == "52.89.214.238"
+    assert webhook._normalize_ip("::ffff:52.89.214.238") == "52.89.214.238"
+    assert webhook._normalize_ip("[::1]:8000") == "::1"
+    assert webhook._normalize_ip("  1.2.3.4  ") == "1.2.3.4"
+
+
+def test_ipv4_mapped_ipv6_matches_allowlist(fake_redis, monkeypatch):
+    import webhook
+
+    # ngrok/uvicorn が IPv4-mapped IPv6 で渡しても許可 IP(IPv4)と一致すること
+    monkeypatch.setattr(webhook.settings, "tv_allowed_ips", ["52.89.214.238"])
+    monkeypatch.setattr(webhook.settings, "tv_trusted_proxy_hops", 1)
+    client = _client(monkeypatch, fake_redis)
+    headers = {"X-Forwarded-For": "::ffff:52.89.214.238", "Content-Type": "application/json"}
+    r = client.post("/webhook", json=_body(id="v6map"), headers=headers)
+    assert r.status_code == 200, r.text
+
+
+def test_xff_fewer_hops_falls_back_to_peer_not_attacker(fake_redis, monkeypatch):
+    import webhook
+
+    # hops=2 を期待するのに XFF が 1 件だけ（偽装/直結の疑い）。攻撃者が入れた許可 IP を
+    # 信用せず、TCP ピア（TestClient=非許可）にフォールバックして 403 になること。
+    monkeypatch.setattr(webhook.settings, "tv_allowed_ips", ["52.89.214.238"])
+    monkeypatch.setattr(webhook.settings, "tv_trusted_proxy_hops", 2)
+    client = _client(monkeypatch, fake_redis)
+    headers = {"X-Forwarded-For": "52.89.214.238", "Content-Type": "application/json"}
+    r = client.post("/webhook", json=_body(id="spoof2"), headers=headers)
+    assert r.status_code == 403
+
+
 # ---- 配信失敗時の復旧（idem 解放 -> 再送可能）------------------------------
 def test_publish_failure_releases_idem(fake_redis, monkeypatch):
     import common

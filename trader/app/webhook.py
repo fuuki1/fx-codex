@@ -52,21 +52,45 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="trader-webhook", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
+def _normalize_ip(ip: str) -> str:
+    """IP を比較用に正規化する（ポート除去・IPv4-mapped IPv6 の平坦化）。
+
+    本番 TradingView 連携での取りこぼしを防ぐ:
+      - ``host:port`` / ``[::1]:port`` の付随ポートを落とす
+      - ``::ffff:52.89.214.238`` のような IPv4-mapped IPv6 を IPv4 へ（許可 IP は IPv4 で書くため）
+    """
+    ip = (ip or "").strip()
+    if not ip:
+        return ""
+    if ip.startswith("["):                    # [IPv6]:port
+        ip = ip[1:].split("]", 1)[0]
+    elif ip.count(":") == 1:                   # IPv4:port / host:port（IPv6 は複数コロン）
+        ip = ip.split(":", 1)[0]
+    if ip.lower().startswith("::ffff:") and "." in ip:   # IPv4-mapped IPv6
+        ip = ip.rsplit(":", 1)[-1]
+    return ip
+
+
 def _client_ip(request: Request) -> str:
     """信頼プロキシ段数を考慮して実クライアント IP を返す。
 
     ngrok 等のプロキシ 1 段（tv_trusted_proxy_hops=1）なら XFF の右端が実クライアント。
     クライアントが偽の XFF を先頭に足しても、プロキシが本物を右に追記するため迂回できない。
     hops=0 なら XFF を無視して TCP ピア IP を使う（プロキシ無しの直接公開時）。
+
+    ただし XFF のホップ数が想定（hops）より **少ない** 場合は、信頼プロキシが本物を
+    追記した形跡が無い＝偽装/直結の疑いがあるため XFF を採用せず、TCP ピア IP に
+    フォールバックする（旧実装は先頭要素へクランプし、攻撃者が入れた値を信じていた）。
     """
     hops = settings.tv_trusted_proxy_hops
     if hops > 0:
         xff = request.headers.get("x-forwarded-for")
         if xff:
-            parts = [p.strip() for p in xff.split(",") if p.strip()]
-            if parts:
-                return parts[max(0, len(parts) - hops)]
-    return request.client.host if request.client else ""
+            parts = [_normalize_ip(p) for p in xff.split(",") if p.strip()]
+            if len(parts) >= hops:
+                return parts[len(parts) - hops]
+            # ホップ不足（偽装/直結の疑い）→ XFF を信用しない
+    return _normalize_ip(request.client.host) if request.client else ""
 
 
 @app.get("/health")
@@ -177,3 +201,28 @@ async def webhook(request: Request) -> dict:
     ip = _client_ip(request)
     # ブロッキング処理（Redis/DB）はスレッドプールへ。イベントループを塞がない。
     return await run_in_threadpool(_process, raw, ip)
+
+
+def main() -> None:
+    """本番向けの実行エントリ（他サービスと同じく ``python webhook.py`` で起動できる）。
+
+    - ``proxy_headers=False``: XFF の解釈は ``_client_ip`` で信頼ホップ数を考慮して自前で行う。
+      uvicorn に client.host を上書きさせない（TCP ピア＝直結検知のフォールバックを保つ）。
+    - ``timeout_keep_alive``: アイドル接続を回収し、ソケット枯渇を防ぐ。
+    - 単一ワーカー: Redis/DB プールはプロセス共有前提。水平スケールは複数コンテナで行う。
+    """
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        proxy_headers=False,
+        timeout_keep_alive=30,
+        log_config=None,
+        access_log=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

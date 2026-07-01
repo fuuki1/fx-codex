@@ -69,7 +69,7 @@ services:
 
   webhook:
     <<: *app
-    command: ["uvicorn", "webhook:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["python", "webhook.py"]
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:

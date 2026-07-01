@@ -41,7 +41,10 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
     → 正規化 → 鮮度(MAX_SIGNAL_AGE_SEC) → idem 冪等(Redis nx,ex=3600) → Stream "signals"
     （publish 失敗時は idem を解放して 503＝再送で復旧、永久ロストを防ぐ）
 
-④ strategy.py（並行）: interval ごとに decide()。状態変化時のみ "signals" へ publish
+④ strategy.py（並行）: interval ごとに目標ポジション(-1/0/+1)を判定し、**ブローカー実
+        建玉から目標への差分注文**を "signals" へ publish（バックテストのポジション遷移と一致。
+        反転=クローズ+新規、目標0=クローズ、ストップ後は再エントリー。entry には stop_distance、
+        exit には intent=exit を載せる）
         ▼ Stream "signals"
 ② risk.py（Consumer Group "risk"）→ 純粋判断は risk_engine.evaluate（→ RISK.md）
   └ KillSwitch(Redis,fail-safe) → 状態収集(残高/日次・週次損益/直近損益/建玉/カレンダー/DD)
@@ -53,8 +56,11 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
         ▼ Stream "orders"
 ③ executor.py（Consumer Group "exec"）
   └ KillSwitch 再確認 → 本番二重ガード → 冪等claim(processed_orders) → IBKR 発注
-  └ fills 記録(intended_risk/stop_distance) → commissionReport で realized_pnl/realized_r 更新 → 通知
-  └ 起動時 reconcile（取りこぼし/未完了の検知）
+  └ エントリーに保護ストップ(IBKR STP, `<ref>:stop`)を付与（= バックテストの ATR ストップ）。
+     撤退(intent=exit)は先に保護ストップを取消してフラット化
+  └ **実約定を execDetails で fills に記録**（約定価格・数量・execId、冪等）→ commissionReport が
+     execId 基準で realized_pnl/realized_r を更新 → 通知
+  └ 起動時 reconcile（取りこぼし/未完了の検知。`:stop` 子注文は既知親として孤児判定から除外）
 
 ⑥ monitor.py（並行）: 60秒ごとに health + ハートビート鮮度。毎朝7時(JST)に日次サマリ
 ```
@@ -73,8 +79,12 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 
 ## DB スキーマ（TimescaleDB）
 - `events(ts, kind, payload jsonb)` — 全イベント監査（hypertable, idem 索引）
-- `fills(ts, symbol, side, qty, status, broker, ref, realized_pnl, idem, intended_risk, stop_distance, realized_r)`
-  — 約定記録。`intended_risk`（発注時の想定最大損失）/ `stop_distance` / `realized_r`（= 実現損益÷想定リスク = R 倍数）を持ち、`journal.py` の期待値・R 倍数集計の基礎にする。
+- `fills(ts, symbol, side, qty, status, broker, ref, realized_pnl, idem, intended_risk, stop_distance, realized_r, fill_price, exec_id)`
+  — **実約定履歴**（発注ログではない）。executor が IBKR の execDetails を受けて 1 約定 = 1 行を
+  `exec_id` 冪等で記録し（`fill_price`=実約定価格・`qty`=約定数量）、commissionReport が `exec_id`
+  基準で `realized_pnl`/`realized_r`（= 実現損益÷想定リスク = R 倍数）を更新する。`intended_risk`
+  （発注時の想定最大損失）/ `stop_distance` は発注文脈から載せ、`journal.py` の期待値・R 倍数集計の
+  基礎にする。列追加は `db/migrations/0003_fills_executions.sql`（`make migrate`・冪等）。
 - `processed_orders(idem PK, client_order_id, submitted_at, broker_ref, status)` — 冪等発注の決め手
 - `daily_pnl`（ビュー）— 日次実現損益の集計
 - 既存 DB への列追加は `db/migrations/0001_risk_columns.sql`（`make migrate`・冪等）。
@@ -92,7 +102,11 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 | 箇所 | 対応 |
 |---|---|
 | `within_session()` | ✅ FX 24/5・日本株・米株の取引時間を実装（祝日は拡張点） |
-| `realized_pnl` 更新 | ✅ executor が commissionReport で約定後に更新 |
+| ライブの保護ストップ | ✅ エントリー約定に IBKR STP を付与（撤退で取消）。バックテストの ATR ストップに対応 |
+| `fills` が発注ログだった | ✅ execDetails で **実約定**（約定価格・数量・execId）を冪等記録。realized_pnl は execId 基準で更新 |
+| ライブ⇄バックテストのポジション遷移 | ✅ 実建玉から目標への差分注文（反転=クローズ+新規 / 目標0=クローズ / ストップ後再エントリー） |
+| 自作戦略が既定でシグナル皆無 | ✅ 履歴取得を必要バー数から逆算（旧: 5秒足40本 < slow60+1 で恒常 None だった） |
+| Webhook の本番堅牢化 | ✅ `main()` エントリ / XFF ホップ不足のフォールバック / IP 正規化（ポート・IPv4-mapped IPv6） |
 | 自作戦略 `decide()` | ✅ ATR ストップ付き MA クロス + パラメータ自動再読込 |
 | DB 接続プール | ✅ psycopg_pool へ移行 |
 | レート制限の永続化 | ✅ Redis ZSET のスライディングウィンドウ（再起動で消えない） |
@@ -129,10 +143,16 @@ Webhook URL: `https://<NGROK_DOMAIN>/webhook`
   より古い／未来すぎる受信は 409 で拒否し、リプレイや遅延配信での誤発注を防ぐ。
   bar 時刻 `{{time}}` は上位足だと古くなり誤拒否の原因になるので使わないこと。
 - **`id`**: 冪等キー。`{{timenow}}-{{ticker}}` のように発火ごとに一意にする。
+- **`stop_distance`**（任意）: 価格距離。入れると executor がエントリー約定に保護ストップ(STP)を
+  付ける（`stop_price` と基準価格からの導出も可）。
+- **`intent`**（任意）: 手仕舞いアラートは `"intent": "exit"` を入れる。executor が保護ストップを
+  取り消してフラット化し、risk は入口ゲートを課さず素通しする（`close` / `flat` も同義）。
 - **Content-Type の注意**: TradingView は本文を `text/plain` で送る。webhook は
   Content-Type に依存せず生ボディを JSON パースするので、そのままで受理できる
   （`application/json` を期待する実装だと 422 で全弾はじかれる—対策済み）。
 - **送信元 IP**: TradingView 公式の 4 つ（`52.89.214.238 / 34.212.75.30 /
   54.218.53.128 / 52.32.178.7`）を `TV_ALLOWED_IPS` に設定。ngrok 経由では
   `X-Forwarded-For` の右端（信頼プロキシが付与した実クライアント）で照合するため、
-  偽の XFF を足しても IP 検証は迂回されない（`TV_TRUSTED_PROXY_HOPS=1`）。
+  偽の XFF を足しても IP 検証は迂回されない（`TV_TRUSTED_PROXY_HOPS=1`）。XFF のホップ数が
+  想定より少ない（＝信頼プロキシが本物を追記した形跡が無い）場合は XFF を信用せず TCP ピア IP に
+  フォールバックする。IP はポート除去・IPv4-mapped IPv6 の平坦化を施してから照合する。
