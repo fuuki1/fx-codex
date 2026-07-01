@@ -129,6 +129,23 @@ class Settings(BaseSettings):
     strategy_interval_sec: int = 15
     strategy_params_file: str = "strategy_params.json"
 
+    # ---- アドバイザリー分析（OANDA データ + ダッシュボード / analyzer + dashboard）----
+    # 実売買はしない。OANDA からリアルタイム価格を取り、MTF(下位足=タイミング / 上位足=トレンド)
+    # で「入る/入らない・損切り・R:R」を根拠つきで助言する。チャートは Web ダッシュボードに表示。
+    oanda_api_token: str = ""                       # OANDA v20 API トークン（practice/live）
+    oanda_environment: Literal["practice", "live"] = "practice"
+    oanda_instrument: str = "USD_JPY"               # OANDA 形式（アンダースコア区切り）
+    analyzer_interval_sec: int = 20                 # 分析ループ間隔（秒）
+    analyzer_fast_window: int = 20                  # 短期 SMA
+    analyzer_slow_window: int = 60                  # 長期 SMA
+    analyzer_atr_window: int = 14                   # ATR 期間
+    analyzer_atr_multiple: float = 1.5              # ストップ距離 = ATR × これ
+    analyzer_rr_target: float = 1.5                 # 利確距離 = ストップ距離 × これ（R:R）
+    analyzer_htf_granularity: str = "H1"            # 上位足（トレンド方向の判定）
+    analyzer_ltf_granularity: str = "M5"            # 下位足（エントリー・タイミング）
+    analyzer_candles: int = 200                     # 取得するローソク本数
+    dashboard_port: int = 8080                      # ダッシュボードの待受ポート
+
     # ---- 通知 -------------------------------------------------------------
     discord_webhook_url: str = ""
     notify_throttle_sec: int = 300
@@ -242,6 +259,16 @@ class Settings(BaseSettings):
     @property
     def redis_url(self) -> str:
         return f"redis://{self.redis_host}:{self.redis_port}/0"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def oanda_host(self) -> str:
+        """OANDA v20 REST のベース URL（practice / live）。"""
+        return (
+            "https://api-fxtrade.oanda.com"
+            if self.oanda_environment == "live"
+            else "https://api-fxpractice.oanda.com"
+        )
 
 
 @lru_cache(maxsize=1)

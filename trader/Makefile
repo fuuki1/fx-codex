@@ -49,6 +49,20 @@ kill-off: ## 発注を再開（Kill switch OFF）
 kill-status: ## Kill switch の現在値
 	@echo -n "kill_switch="; $(REDIS) get kill_switch
 
+# ---- アドバイザリー（分析ダッシュボード・実売買なし）------------------------
+.PHONY: advisory
+advisory: guard-env ## 分析ダッシュボードを起動（OANDA データ・http://127.0.0.1:8080）
+	$(COMPOSE) --profile advisory up -d --build dashboard
+	@echo "dashboard: http://127.0.0.1:8080  （.env の OANDA_API_TOKEN を設定すること）"
+
+.PHONY: advisory-logs
+advisory-logs: ## ダッシュボードのログを追従
+	$(COMPOSE) logs -f --tail=100 dashboard
+
+.PHONY: advisory-down
+advisory-down: ## ダッシュボードを停止
+	$(COMPOSE) --profile advisory stop dashboard
+
 # ---- 開発・検証 ------------------------------------------------------------
 .PHONY: test
 test: ## ローカルで pytest を実行

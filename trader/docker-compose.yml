@@ -153,6 +153,23 @@ services:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
 
+  # アドバイザリー分析ダッシュボード（実売買しない・profile "advisory" でのみ起動）。
+  # OANDA からリアルタイム価格を取り、MTF で売買タイミングを助言し、チャートを Web 表示する。
+  # 発注系（ib-gateway/webhook/risk/executor）に依存せず単独で 24/7 常駐できる。
+  dashboard:
+    <<: *app
+    command: ["python", "dashboard.py"]
+    profiles: ["advisory"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    mem_limit: 512m
+
 volumes:
   redis-data:
   db-data:

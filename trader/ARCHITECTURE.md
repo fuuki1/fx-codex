@@ -24,6 +24,9 @@ trader/
 │   ├── journal.py            # 期待値・R 倍数・連敗の成績分析（純粋 + CLI）
 │   ├── executor.py           # ③ 注文実行（IBKR / ib_async, 冪等, realized_pnl/R 更新）
 │   ├── reconcile.py          # ブローカー実状態 vs DB の突合
+│   ├── oanda.py              # ⑦ OANDA v20 のローソク取得（アドバイザリー分析のデータ源）
+│   ├── analysis.py           # ⑦ MTF 分析の純粋ロジック（HTF トレンド × LTF タイミング + ATR）
+│   ├── dashboard.py          # ⑦ アドバイザリー: 分析ループ + チャート Web 表示 + Discord 通知（実売買なし）
 │   ├── monitor.py            # ⑥ 死活監視・日次通知（成績サマリ含む）
 │   ├── risk_calendar.example.json # 重要指標ブラックアウト窓の雛形（→ risk_calendar.json）
 │   └── healthz.py            # コンテナ healthcheck（ハートビート鮮度）
@@ -63,6 +66,12 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
   └ 起動時 reconcile（取りこぼし/未完了の検知。`:stop` 子注文は既知親として孤児判定から除外）
 
 ⑥ monitor.py（並行）: 60秒ごとに health + ハートビート鮮度。毎朝7時(JST)に日次サマリ
+
+⑦ dashboard.py（独立・実売買なし / profile "advisory"）: 発注系に依存しないアドバイザリー。
+     oanda.py で USDJPY の下位足/上位足ローソクを定期取得 → analysis.analyze（MTF: 上位足トレンド ×
+     下位足タイミング + ATR ストップ + R:R）で助言を生成 → 分析中チャート（ローソク+MA+売買マーカー+
+     損切り/利確ライン, Lightweight Charts）を Web 表示（/・/api/state・/health）→ 好機の状態変化時のみ
+     Discord 通知。「入る/入らない・損切り・R:R」を根拠つきで提示するだけで、注文は一切出さない。
 ```
 
 ## 共通部品（common.py）
