@@ -131,3 +131,42 @@ def test_optimizer_score():
     # 高 Sharpe・高 PF・低 DD のほうが高スコアになる
     better = auto_optimize.score({"sharpe_ratio": 2.0, "profit_factor": 3.0, "max_drawdown_pct": 5})
     assert better > s
+
+
+# ---- optimizer data guard ---------------------------------------------------
+def test_optimizer_rejects_missing_data_env():
+    import auto_optimize
+
+    path, error = auto_optimize.validate_data_path(None)
+    assert path is None and "OPTIMIZE_DATA" in error
+    path, error = auto_optimize.validate_data_path("   ")
+    assert path is None
+
+
+def test_optimizer_rejects_bundled_sample(tmp_path):
+    """合成サンプルデータで最適化したパラメータの自動配備を拒否する。"""
+    import auto_optimize
+
+    sample = tmp_path / "sample_prices.csv"
+    sample.write_text("timestamp,open,high,low,close\n")
+    path, error = auto_optimize.validate_data_path(str(sample), sample=sample)
+    assert path is None
+    assert "サンプル" in error
+
+
+def test_optimizer_rejects_nonexistent_path(tmp_path):
+    import auto_optimize
+
+    path, error = auto_optimize.validate_data_path(str(tmp_path / "missing.csv"))
+    assert path is None
+    assert "存在しない" in error
+
+
+def test_optimizer_accepts_real_data_path(tmp_path):
+    import auto_optimize
+
+    real = tmp_path / "usdjpy_2020_2025.csv"
+    real.write_text("timestamp,open,high,low,close\n")
+    path, error = auto_optimize.validate_data_path(str(real))
+    assert path == real.resolve()
+    assert error == ""
