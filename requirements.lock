@@ -1,5 +1,8 @@
 # Generated from the local verified environment for reproducible CI/runtime installs.
 # Regenerate intentionally when dependency versions are upgraded.
+certifi==2026.6.17
+charset-normalizer==3.4.7
+idna==3.18
 iniconfig==2.3.0
 numpy==2.3.5
 packaging==26.2
@@ -8,6 +11,8 @@ pluggy==1.6.0
 pytest==9.0.3
 python-dateutil==2.9.0.post0
 pytz==2025.2
+requests==2.34.2
 six==1.17.0
+tradingview-ta==3.3.0
 tzdata==2025.2
-
+urllib3==2.7.0
