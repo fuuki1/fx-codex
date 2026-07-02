@@ -9,7 +9,7 @@ briefing の複合スコアの入力にする。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from collections.abc import Sequence
 
 from tradingview_ta import get_multiple_analysis
 
@@ -144,9 +144,7 @@ def fetch_pair_technicals(
     cleaned = [s.upper().replace("/", "") for s in symbols]
     qualified = [f"{exchange}:{s}" for s in cleaned]
     result = {
-        symbol: PairTechnicals(
-            symbol=symbol, fast_window=fast_window, slow_window=slow_window
-        )
+        symbol: PairTechnicals(symbol=symbol, fast_window=fast_window, slow_window=slow_window)
         for symbol in cleaned
     }
     warnings: list[str] = []

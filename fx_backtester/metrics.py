@@ -54,8 +54,10 @@ def calculate_metrics(
         win_rate = float((net > 0).mean())
         gross_profit = float(wins.sum())
         gross_loss = abs(float(losses.sum()))
-        profit_factor = float("inf") if gross_loss == 0 and gross_profit > 0 else (
-            gross_profit / gross_loss if gross_loss > 0 else 0.0
+        profit_factor = (
+            float("inf")
+            if gross_loss == 0 and gross_profit > 0
+            else (gross_profit / gross_loss if gross_loss > 0 else 0.0)
         )
         average_win = float(wins.mean()) if not wins.empty else 0.0
         average_loss = abs(float(losses.mean())) if not losses.empty else 0.0
@@ -92,7 +94,9 @@ def calculate_metrics(
         "payoff_ratio": average_win / average_loss if average_loss > 0 else 0.0,
         "sharpe_ratio": sharpe,
         "calmar_ratio": annualized_return / max_drawdown_pct if max_drawdown_pct > 0 else 0.0,
-        "recovery_factor": (final_equity - initial_cash) / max_drawdown_usd if max_drawdown_usd > 0 else 0.0,
+        "recovery_factor": (
+            (final_equity - initial_cash) / max_drawdown_usd if max_drawdown_usd > 0 else 0.0
+        ),
         "exposure_pct": exposure_pct,
     }
 

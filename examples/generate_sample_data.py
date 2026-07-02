@@ -23,7 +23,9 @@ def main() -> None:
         bar_range = np.abs(rng.normal(spec["vol"] * 1.5, spec["vol"] * 0.4, len(index)))
         high = np.maximum(open_, close) + bar_range
         low = np.minimum(open_, close) - bar_range
-        for timestamp, open_price, high_price, low_price, close_price in zip(index, open_, high, low, close):
+        for timestamp, open_price, high_price, low_price, close_price in zip(
+            index, open_, high, low, close
+        ):
             rows.append(
                 {
                     "timestamp": timestamp,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
-from typing import Callable
+from collections.abc import Callable
 
 import pandas as pd
 
@@ -116,7 +116,9 @@ class WalkForwardValidator:
 
             if best_params is None or best_train_result is None:
                 best_params = combinations[0]
-                best_train_result = self.engine_factory(self.strategy_cls(**best_params)).run(train_data)
+                best_train_result = self.engine_factory(self.strategy_cls(**best_params)).run(
+                    train_data
+                )
 
             test_result = self.engine_factory(self.strategy_cls(**best_params)).run(test_data)
             selected_test_results.append(test_result)

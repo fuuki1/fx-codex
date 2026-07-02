@@ -29,7 +29,6 @@ from fx_backtester.tradingview import TradingViewWebhookConfig, run_tradingview_
 from fx_backtester.validation import validate_backtest_inputs, validate_trade_log_contract
 from fx_backtester.walk_forward import WalkForwardConfig, WalkForwardValidator
 
-
 DEFAULT_CLI_VALUES: dict[str, Any] = {
     "initial_cash": 100_000.0,
     "risk_per_trade": 0.01,
@@ -98,7 +97,9 @@ def main(argv: list[str] | None = None) -> int:
         "--output-dir",
         help="Write production-grade run artifacts: manifest, config, QA, metrics, equity, trade_log",
     )
-    backtest_parser.add_argument("--expected-frequency", help="Expected pandas frequency for artifact QA")
+    backtest_parser.add_argument(
+        "--expected-frequency", help="Expected pandas frequency for artifact QA"
+    )
     backtest_parser.add_argument("--max-missing-pct", type=float, default=0.0005)
 
     walk_parser = _add_common_arguments(subparsers.add_parser("walk-forward"))
@@ -108,7 +109,9 @@ def main(argv: list[str] | None = None) -> int:
     walk_parser.add_argument("--purge-bars", type=int, default=DEFAULT_CLI_VALUES["purge_bars"])
     walk_parser.add_argument("--embargo-bars", type=int, default=DEFAULT_CLI_VALUES["embargo_bars"])
     walk_parser.add_argument("--max-params", type=int, default=20)
-    walk_parser.add_argument("--output-summary", help="Optional path to write walk-forward summary CSV")
+    walk_parser.add_argument(
+        "--output-summary", help="Optional path to write walk-forward summary CSV"
+    )
     walk_parser.add_argument(
         "--grid",
         action="append",
@@ -129,18 +132,26 @@ def main(argv: list[str] | None = None) -> int:
 
     qa_parser = subparsers.add_parser("qa-data")
     qa_parser.add_argument("--data", nargs="+", required=True, help="CSV file(s) with OHLC data")
-    qa_parser.add_argument("--expected-frequency", help="Expected pandas frequency, e.g. 1min, 15min, h")
+    qa_parser.add_argument(
+        "--expected-frequency", help="Expected pandas frequency, e.g. 1min, 15min, h"
+    )
     qa_parser.add_argument("--max-missing-pct", type=float, default=0.0005)
     qa_parser.add_argument("--start-date", help="Inclusive start timestamp/date for QA")
     qa_parser.add_argument("--end-date", help="Inclusive end timestamp/date for QA")
     qa_parser.add_argument("--output", help="Optional path to write QA CSV")
 
     audit_parser = subparsers.add_parser("audit-run")
-    audit_parser.add_argument("--run-dir", required=True, help="Backtest artifact directory to audit")
+    audit_parser.add_argument(
+        "--run-dir", required=True, help="Backtest artifact directory to audit"
+    )
 
     analyze_parser = subparsers.add_parser("analyze-run")
-    analyze_parser.add_argument("--run-dir", required=True, help="Backtest artifact directory to analyze")
-    analyze_parser.add_argument("--output-dir", help="Directory for analysis artifacts; defaults to run-dir")
+    analyze_parser.add_argument(
+        "--run-dir", required=True, help="Backtest artifact directory to analyze"
+    )
+    analyze_parser.add_argument(
+        "--output-dir", help="Directory for analysis artifacts; defaults to run-dir"
+    )
     analyze_parser.add_argument("--oos-ratio", type=float, default=0.30)
     analyze_parser.add_argument("--monte-carlo-paths", type=int, default=2_000)
     analyze_parser.add_argument("--monte-carlo-seed", type=int, default=42)
@@ -220,9 +231,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         help="Strategy parameter like fast_window=20",
     )
     parser.add_argument("--initial-cash", type=float, default=DEFAULT_CLI_VALUES["initial_cash"])
-    parser.add_argument("--risk-per-trade", type=float, default=DEFAULT_CLI_VALUES["risk_per_trade"])
+    parser.add_argument(
+        "--risk-per-trade", type=float, default=DEFAULT_CLI_VALUES["risk_per_trade"]
+    )
     parser.add_argument("--risk-cap", type=float, default=DEFAULT_CLI_VALUES["risk_cap"])
-    parser.add_argument("--max-daily-loss", type=float, default=DEFAULT_CLI_VALUES["max_daily_loss"])
+    parser.add_argument(
+        "--max-daily-loss", type=float, default=DEFAULT_CLI_VALUES["max_daily_loss"]
+    )
     parser.add_argument("--max-weekly-loss", type=float)
     parser.add_argument("--max-monthly-drawdown", type=float)
     parser.add_argument(
@@ -273,7 +288,9 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         default=None,
         help="Time-varying slippage multiplier like 21=2.0. Can be repeated.",
     )
-    parser.add_argument("--no-trade-before", type=int, default=DEFAULT_CLI_VALUES["no_trade_before"])
+    parser.add_argument(
+        "--no-trade-before", type=int, default=DEFAULT_CLI_VALUES["no_trade_before"]
+    )
     parser.add_argument("--no-trade-after", type=int, default=DEFAULT_CLI_VALUES["no_trade_after"])
     parser.add_argument(
         "--min-event-impact",
@@ -335,7 +352,9 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         type=float,
         default=DEFAULT_CLI_VALUES["max_spread_multiple"],
     )
-    parser.add_argument("--spread-lookback", type=int, default=DEFAULT_CLI_VALUES["spread_lookback"])
+    parser.add_argument(
+        "--spread-lookback", type=int, default=DEFAULT_CLI_VALUES["spread_lookback"]
+    )
     parser.add_argument(
         "--no-close-on-daily-stop",
         action="store_false",
@@ -480,7 +499,9 @@ def _run_audit_run(args: argparse.Namespace) -> int:
 
 
 def _run_analyze_run(args: argparse.Namespace) -> int:
-    ruin_threshold = args.ruin_threshold_pct / 100 if args.ruin_threshold_pct > 1 else args.ruin_threshold_pct
+    ruin_threshold = (
+        args.ruin_threshold_pct / 100 if args.ruin_threshold_pct > 1 else args.ruin_threshold_pct
+    )
     cost_multipliers = (
         tuple(float(value) for value in args.cost_multiplier)
         if args.cost_multiplier
@@ -567,9 +588,7 @@ def _build_config(args: argparse.Namespace) -> BacktestConfig:
         max_daily_loss_pct=_preset_value(args, "max_daily_loss"),
         max_weekly_loss_pct=_preset_value(args, "max_weekly_loss"),
         max_monthly_drawdown_pct=_preset_value(args, "max_monthly_drawdown"),
-        monthly_profit_target_pct=_optional_pct_value(
-            _preset_value(args, "monthly_profit_target")
-        ),
+        monthly_profit_target_pct=_optional_pct_value(_preset_value(args, "monthly_profit_target")),
         hard_drawdown_pct=_preset_value(args, "hard_drawdown"),
         min_stop_pips=_preset_value(args, "min_stop_pips"),
         max_leverage=_preset_value(args, "max_leverage"),
@@ -669,8 +688,7 @@ def _strategy_factory_from_args(args: argparse.Namespace) -> Any:
 def _build_strategy_params(param_items: list[str] | None) -> dict[str, Any]:
     param_items = param_items or []
     return {
-        key: _cast_value(value)
-        for key, value in (_split_key_value(item) for item in param_items)
+        key: _cast_value(value) for key, value in (_split_key_value(item) for item in param_items)
     }
 
 
@@ -741,7 +759,9 @@ def _parse_weekdays(items: list[str] | None) -> tuple[int, ...]:
                 try:
                     value = int(part)
                 except ValueError as error:
-                    raise ValueError(f"Expected weekday 0-6 or mon-sun, got {raw_part!r}") from error
+                    raise ValueError(
+                        f"Expected weekday 0-6 or mon-sun, got {raw_part!r}"
+                    ) from error
             if value < 0 or value > 6:
                 raise ValueError(f"Weekday must be 0-6, got {value}")
             weekdays.add(value)

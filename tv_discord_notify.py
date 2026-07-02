@@ -19,7 +19,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import requests
@@ -70,9 +70,7 @@ def load_strategy_windows() -> tuple[int, int]:
     return fast, slow
 
 
-def ma_cross_state(
-    indicators: dict, fast_window: int, slow_window: int
-) -> tuple[str | None, str]:
+def ma_cross_state(indicators: dict, fast_window: int, slow_window: int) -> tuple[str | None, str]:
     """TradingViewが返すSMA値から自作戦略と同じMAクロスの目線を判定する。"""
     fast = indicators.get(f"SMA{fast_window}")
     slow = indicators.get(f"SMA{slow_window}")
@@ -92,9 +90,7 @@ def agreement_line(symbol: str, recommendation: str, ma_side: str | None) -> str
     tv_side = (
         "long"
         if recommendation in ("BUY", "STRONG_BUY")
-        else "short"
-        if recommendation in ("SELL", "STRONG_SELL")
-        else None
+        else "short" if recommendation in ("SELL", "STRONG_SELL") else None
     )
     if tv_side == ma_side:
         side_ja = "ロング" if ma_side == "long" else "ショート"
@@ -102,9 +98,7 @@ def agreement_line(symbol: str, recommendation: str, ma_side: str | None) -> str
     return f"⚠️ {symbol} 1h: 自作MAクロスとTradingView({rec_ja})の見解が不一致"
 
 
-def fetch_analysis(
-    symbols: list[str], intervals: list[str]
-) -> dict[str, dict[str, object]]:
+def fetch_analysis(symbols: list[str], intervals: list[str]) -> dict[str, dict[str, object]]:
     """interval → {"EXCHANGE:SYMBOL": Analysis|None} の辞書を返す。"""
     qualified = [f"{EXCHANGE}:{s}" for s in symbols]
     results: dict[str, dict[str, object]] = {}
@@ -124,7 +118,7 @@ def build_embeds(
 ) -> tuple[list[dict], list[str]]:
     embeds: list[dict] = []
     headlines: list[str] = []
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
 
     for symbol in symbols:
         key = f"{EXCHANGE}:{symbol}"
@@ -133,9 +127,7 @@ def build_embeds(
         for interval in intervals:
             result = analysis.get(interval, {}).get(key)
             if result is None:
-                fields.append(
-                    {"name": interval, "value": "取得失敗", "inline": True}
-                )
+                fields.append({"name": interval, "value": "取得失敗", "inline": True})
                 continue
             summary = result.summary
             ind = result.indicators
@@ -158,9 +150,7 @@ def build_embeds(
                 macd_state = "上抜け" if macd > macd_signal else "下抜け"
                 lines.append(f"MACD: {macd:+.5f} ({macd_state})")
             lines.append(ma_text)
-            fields.append(
-                {"name": interval, "value": "\n".join(lines), "inline": True}
-            )
+            fields.append({"name": interval, "value": "\n".join(lines), "inline": True})
 
             if interval == "1h":
                 if rec in ("BUY", "STRONG_BUY"):
@@ -191,20 +181,14 @@ def post_to_discord(webhook_url: str, content: str, embeds: list[dict]) -> None:
     }
     response = requests.post(webhook_url, json=payload, timeout=15)
     if response.status_code >= 300:
-        raise RuntimeError(
-            f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}"
-        )
+        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="TradingViewテクニカル分析をDiscordに通知する"
-    )
+    parser = argparse.ArgumentParser(description="TradingViewテクニカル分析をDiscordに通知する")
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument("--intervals", nargs="+", default=DEFAULT_INTERVALS)
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Discordに送信せず内容を表示する"
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
@@ -216,9 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"TradingView分析の取得に失敗: {error}", file=sys.stderr)
         return 1
 
-    embeds, headlines = build_embeds(
-        symbols, args.intervals, analysis, fast_window, slow_window
-    )
+    embeds, headlines = build_embeds(symbols, args.intervals, analysis, fast_window, slow_window)
     content = "\n".join(headlines) if headlines else "TradingViewテクニカル分析"
 
     if args.dry_run:

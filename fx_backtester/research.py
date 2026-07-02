@@ -7,7 +7,6 @@ from typing import Any
 
 import pandas as pd
 
-
 RESEARCH_MAX_PRESET: dict[str, Any] = {
     "initial_cash": 100_000.0,
     "risk_per_trade": 0.005,

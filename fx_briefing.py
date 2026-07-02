@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import requests
@@ -71,9 +71,7 @@ def load_strategy_params() -> tuple[int, int, float]:
 def post_to_discord(webhook_url: str, payload: dict) -> None:
     response = requests.post(webhook_url, json=payload, timeout=15)
     if response.status_code >= 300:
-        raise RuntimeError(
-            f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}"
-        )
+        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,29 +80,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument(
-        "--hours-ahead", type=float, default=48.0,
+        "--hours-ahead",
+        type=float,
+        default=48.0,
         help="経済イベントを何時間先まで表示するか(既定48)",
     )
     parser.add_argument(
-        "--hours-back", type=float, default=24.0,
+        "--hours-back",
+        type=float,
+        default=24.0,
         help="ニュースを何時間前まで集めるか(既定24)",
     )
     parser.add_argument(
-        "--no-llm", action="store_true",
+        "--no-llm",
+        action="store_true",
         help="Claude API分析を使わず語彙ベースのみで実行",
     )
     parser.add_argument(
-        "--no-export-events", action="store_true",
+        "--no-export-events",
+        action="store_true",
         help="research_pack/upcoming_events.csv の書き出しを行わない",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Discordに送信せず内容を表示する"
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
     fast_window, slow_window, atr_multiple = load_strategy_params()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     currencies: set[str] = set()
     for symbol in symbols:
@@ -129,15 +131,11 @@ def main(argv: list[str] | None = None) -> int:
             fetch_warnings.append(f"イベントCSV書き出し失敗: {error}")
 
     # 2. ニュース収集
-    items, news_warnings = news.fetch_news_for_symbols(
-        symbols, hours_back=args.hours_back
-    )
+    items, news_warnings = news.fetch_news_for_symbols(symbols, hours_back=args.hours_back)
     fetch_warnings.extend(news_warnings)
 
     # 3. センチメント分析(Claude API → 語彙ベースの順に試行)
-    analysis = sentiment.analyze_market(
-        items, ordered_currencies, use_llm=not args.no_llm
-    )
+    analysis = sentiment.analyze_market(items, ordered_currencies, use_llm=not args.no_llm)
 
     # 4. テクニカル取得
     tech_map, tech_warnings = technicals.fetch_pair_technicals(

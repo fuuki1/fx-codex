@@ -71,7 +71,9 @@ class SimulatedExecution:
             raise ValueError(f"{symbol} slippage_pips must be positive")
         return slippage
 
-    def fill_price(self, symbol: str, mid_price: float, side: int, bar: object | None = None) -> float:
+    def fill_price(
+        self, symbol: str, mid_price: float, side: int, bar: object | None = None
+    ) -> float:
         if side not in (-1, 1):
             raise ValueError("side must be 1 for buy or -1 for sell")
         inst = instrument_for(symbol)

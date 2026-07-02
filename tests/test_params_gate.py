@@ -6,7 +6,6 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 import auto_optimize
 import params_gate
@@ -15,22 +14,23 @@ import promote_params
 REPO_ROOT = Path(params_gate.__file__).resolve().parent
 
 
-def write_price_csv(path: Path, *, periods: int, freq: str = "h",
-                    symbol: str = "EURUSD") -> Path:
+def write_price_csv(path: Path, *, periods: int, freq: str = "h", symbol: str = "EURUSD") -> Path:
     """実データと同じ形式の決定的な価格CSVを生成する（サイン波+微トレンド）。"""
     index = pd.date_range("2024-01-01 00:00:00", periods=periods, freq=freq)
     rows = []
     prev_close = 1.09
     for i, ts in enumerate(index):
         close = 1.09 + 0.02 * math.sin(i / 25) + 0.000002 * i
-        rows.append({
-            "timestamp": ts,
-            "symbol": symbol,
-            "open": round(prev_close, 6),
-            "high": round(max(prev_close, close) + 0.0005, 6),
-            "low": round(min(prev_close, close) - 0.0005, 6),
-            "close": round(close, 6),
-        })
+        rows.append(
+            {
+                "timestamp": ts,
+                "symbol": symbol,
+                "open": round(prev_close, 6),
+                "high": round(max(prev_close, close) + 0.0005, 6),
+                "low": round(min(prev_close, close) - 0.0005, 6),
+                "close": round(close, 6),
+            }
+        )
         prev_close = close
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -135,9 +135,13 @@ def test_validate_params_rejects_missing_provenance() -> None:
 def test_validate_params_rejects_legacy_active_file_shape() -> None:
     # リポジトリの旧 strategy_params.json と同じ形（provenance 無し）は拒否される
     legacy = {
-        "fast_window": 20, "slow_window": 100, "atr_window": 14,
-        "atr_multiple": 2.5, "best_symbol": "EURUSD",
-        "score": 140911.9994, "sharpe": 3.9623,
+        "fast_window": 20,
+        "slow_window": 100,
+        "atr_window": 14,
+        "atr_multiple": 2.5,
+        "best_symbol": "EURUSD",
+        "score": 140911.9994,
+        "sharpe": 3.9623,
         "updated_at": "2026-06-30T07:46:47.297995+00:00",
     }
     assert params_gate.validate_params(legacy)
@@ -190,9 +194,7 @@ def test_auto_optimize_refuses_without_data(tmp_path: Path, monkeypatch) -> None
 
 def test_auto_optimize_refuses_sample_data(tmp_path: Path) -> None:
     out = tmp_path / "candidate.json"
-    rc = auto_optimize.main(
-        ["--data", str(params_gate.BUNDLED_SAMPLE), "--output", str(out)]
-    )
+    rc = auto_optimize.main(["--data", str(params_gate.BUNDLED_SAMPLE), "--output", str(out)])
     assert rc == 1
     assert not out.exists()
 

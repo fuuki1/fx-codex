@@ -295,7 +295,11 @@ def monthly_pnl_summary(equity: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFr
         equity_values = month_equity["equity"].astype(float)
         start_equity = float(equity_values.iloc[0])
         end_equity = float(equity_values.iloc[-1])
-        net = month_trades["net_pnl"].astype(float) if not month_trades.empty else pd.Series(dtype=float)
+        net = (
+            month_trades["net_pnl"].astype(float)
+            if not month_trades.empty
+            else pd.Series(dtype=float)
+        )
         rows.append(
             {
                 "month": str(month),
@@ -788,7 +792,11 @@ def strategy_diagnosis_summary(
 
     strategy_row = _baseline_row(baseline, "strategy")
     random_row = _baseline_row(baseline, "random_direction_baseline")
-    if strategy_row and random_row and float(strategy_row["net_pnl"]) <= float(random_row["net_pnl"]):
+    if (
+        strategy_row
+        and random_row
+        and float(strategy_row["net_pnl"]) <= float(random_row["net_pnl"])
+    ):
         findings.append(
             _finding(
                 "baseline_underperformance",
@@ -926,9 +934,7 @@ def baseline_comparison_summary(
     try:
         manifest = _read_json(manifest_path)
         data_paths = [item["path"] for item in manifest["inputs"]["data"]]
-        events_path = (
-            manifest.get("inputs", {}).get("events", {}) or {}
-        ).get("path")
+        events_path = (manifest.get("inputs", {}).get("events", {}) or {}).get("path")
         data = load_price_csvs(data_paths)
         events = load_economic_events_csv(events_path)
         config = _config_from_dict(run_config)
@@ -977,7 +983,13 @@ def paper_backtest_diff_summary(
         "forward": forward_summary,
         "diff": {
             key: forward_summary[key] - backtest_summary[key]
-            for key in ("net_pnl", "expectancy_usd", "win_rate", "average_spread_pips", "average_slippage_pips")
+            for key in (
+                "net_pnl",
+                "expectancy_usd",
+                "win_rate",
+                "average_spread_pips",
+                "average_slippage_pips",
+            )
         },
     }
 
@@ -1132,7 +1144,9 @@ def commercial_readiness_summary(
     )
     target_months_missed = target_month_count - target_months_met
     worst_monthly_shortfall = (
-        float(monthly_target["shortfall_pct"].astype(float).max()) if not monthly_target.empty else 0.0
+        float(monthly_target["shortfall_pct"].astype(float).max())
+        if not monthly_target.empty
+        else 0.0
     )
     pair_count = int(len(pair_performance))
     oos_trade_count = int(oos.get("out_of_sample", {}).get("trade_count", 0))
@@ -1287,14 +1301,8 @@ def write_analysis_dashboard(
     pnl_summary = pnl["summary"]
     diagnosis_summary = diagnosis["summary"]
     target_months = int(len(monthly_target))
-    target_months_met = (
-        int(monthly_target["target_met"].astype(bool).sum()) if target_months else 0
-    )
-    target_label = (
-        f"{target_months_met}/{target_months}"
-        if target_months
-        else "0/0"
-    )
+    target_months_met = int(monthly_target["target_met"].astype(bool).sum()) if target_months else 0
+    target_label = f"{target_months_met}/{target_months}" if target_months else "0/0"
     cards = [
         (
             "Final equity",
@@ -1306,8 +1314,16 @@ def write_analysis_dashboard(
             _pct(metrics.get("total_return_pct", 0.0)),
             "Annualized: " + _pct(metrics.get("annualized_return_pct", 0.0)),
         ),
-        ("Max drawdown", _pct(metrics.get("max_drawdown_pct", 0.0)), _money(metrics.get("max_drawdown_usd", 0.0))),
-        ("Trades", str(metrics.get("trade_count", 0)), "Win rate: " + _pct(metrics.get("win_rate", 0.0))),
+        (
+            "Max drawdown",
+            _pct(metrics.get("max_drawdown_pct", 0.0)),
+            _money(metrics.get("max_drawdown_usd", 0.0)),
+        ),
+        (
+            "Trades",
+            str(metrics.get("trade_count", 0)),
+            "Win rate: " + _pct(metrics.get("win_rate", 0.0)),
+        ),
         (
             "Profit factor",
             _number(metrics.get("profit_factor", 0.0)),
@@ -1318,7 +1334,11 @@ def write_analysis_dashboard(
             _pct(monte_carlo.get("ruin_probability", 0.0)),
             f"Paths: {monte_carlo.get('paths', 0)}",
         ),
-        ("OOS trades", str(oos.get("out_of_sample", {}).get("trade_count", 0)), "Split: " + str(oos.get("split_time"))),
+        (
+            "OOS trades",
+            str(oos.get("out_of_sample", {}).get("trade_count", 0)),
+            "Split: " + str(oos.get("split_time")),
+        ),
         (
             "Monthly target",
             target_label,
@@ -1604,8 +1624,12 @@ def _enriched_pnl_trades(trades: pd.DataFrame, run_config: dict[str, Any]) -> pd
         - output["commission"]
         - output["swap"]
     )
-    output["side_label"] = output["direction"].astype(int).map({1: "long", -1: "short"}).fillna("unknown")
-    output["entry_hour"] = pd.to_datetime(output["entry_time"], errors="coerce").dt.hour.fillna(-1).astype(int)
+    output["side_label"] = (
+        output["direction"].astype(int).map({1: "long", -1: "short"}).fillna("unknown")
+    )
+    output["entry_hour"] = (
+        pd.to_datetime(output["entry_time"], errors="coerce").dt.hour.fillna(-1).astype(int)
+    )
     return output
 
 
@@ -1690,9 +1714,7 @@ def _config_from_dict(raw: dict[str, Any]) -> BacktestConfig:
                 int(key): float(value)
                 for key, value in execution.get("slippage_time_multipliers", {}).items()
             },
-            commission_per_million_usd=float(
-                execution.get("commission_per_million_usd", 30.0)
-            ),
+            commission_per_million_usd=float(execution.get("commission_per_million_usd", 30.0)),
             fixed_fee_usd=float(execution.get("fixed_fee_usd", 0.0)),
             minimum_fee_usd=float(execution.get("minimum_fee_usd", 0.0)),
         ),
@@ -1700,22 +1722,17 @@ def _config_from_dict(raw: dict[str, Any]) -> BacktestConfig:
         no_trade_minutes_after=int(raw.get("no_trade_minutes_after", 30)),
         min_event_impact=str(raw.get("min_event_impact", "medium")),
         max_open_positions=(
-            int(raw["max_open_positions"])
-            if raw.get("max_open_positions") is not None
-            else None
+            int(raw["max_open_positions"]) if raw.get("max_open_positions") is not None else None
         ),
         cooldown_bars_after_stop=int(raw.get("cooldown_bars_after_stop", 0)),
         trading_start_time=raw.get("trading_start_time"),
         trading_end_time=raw.get("trading_end_time"),
         blocked_weekdays=tuple(int(day) for day in raw.get("blocked_weekdays", [])),
         conversion_rates={
-            str(key).upper(): float(value)
-            for key, value in raw.get("conversion_rates", {}).items()
+            str(key).upper(): float(value) for key, value in raw.get("conversion_rates", {}).items()
         },
         close_positions_on_daily_stop=bool(raw.get("close_positions_on_daily_stop", True)),
-        close_positions_on_portfolio_stop=bool(
-            raw.get("close_positions_on_portfolio_stop", True)
-        ),
+        close_positions_on_portfolio_stop=bool(raw.get("close_positions_on_portfolio_stop", True)),
         force_close_on_end=bool(raw.get("force_close_on_end", True)),
     )
 
@@ -1760,14 +1777,12 @@ def _trade_summary(trades: pd.DataFrame) -> dict[str, Any]:
         "net_pnl": float(net.sum()),
         "expectancy_usd": float(net.mean()),
         "win_rate": float((net > 0).mean()),
-        "average_spread_pips": float(trades[spread_columns].astype(float).mean().mean())
-        if spread_columns
-        else 0.0,
-        "average_slippage_pips": float(
-            trades[slippage_columns].astype(float).mean().mean()
-        )
-        if slippage_columns
-        else 0.0,
+        "average_spread_pips": (
+            float(trades[spread_columns].astype(float).mean().mean()) if spread_columns else 0.0
+        ),
+        "average_slippage_pips": (
+            float(trades[slippage_columns].astype(float).mean().mean()) if slippage_columns else 0.0
+        ),
     }
 
 
@@ -1926,7 +1941,9 @@ def _trades_before(trades: pd.DataFrame, split_time: pd.Timestamp, column: str) 
     return trades[timestamps < split_time].copy()
 
 
-def _trades_at_or_after(trades: pd.DataFrame, split_time: pd.Timestamp, column: str) -> pd.DataFrame:
+def _trades_at_or_after(
+    trades: pd.DataFrame, split_time: pd.Timestamp, column: str
+) -> pd.DataFrame:
     if trades.empty or column not in trades.columns:
         return trades.iloc[0:0].copy()
     timestamps = pd.to_datetime(trades[column], errors="coerce")
@@ -2017,7 +2034,9 @@ def _walk_forward_fold_count(path: Path | None) -> int:
     return int(len(frame))
 
 
-def _cost_row(frame: pd.DataFrame, spread_multiplier: float, slippage_multiplier: float) -> dict[str, Any] | None:
+def _cost_row(
+    frame: pd.DataFrame, spread_multiplier: float, slippage_multiplier: float
+) -> dict[str, Any] | None:
     if frame.empty:
         return None
     matched = frame[
@@ -2047,7 +2066,7 @@ def _gate(
 
 def _card(title: str, value: str, subtitle: str) -> str:
     return (
-        "<div class=\"card\">"
+        '<div class="card">'
         f"<span>{html.escape(title)}</span>"
         f"<strong>{html.escape(value)}</strong>"
         f"<small>{html.escape(subtitle)}</small>"
@@ -2057,7 +2076,7 @@ def _card(title: str, value: str, subtitle: str) -> str:
 
 def _file_link(path: str, label: str) -> str:
     return (
-        f"<a class=\"file\" href=\"{html.escape(path)}\">"
+        f'<a class="file" href="{html.escape(path)}">'
         f"{html.escape(path)}<small>{html.escape(label)}</small></a>"
     )
 
@@ -2086,18 +2105,20 @@ def _findings_table(findings: list[dict[str, Any]]) -> pd.DataFrame:
 
 def _html_table(frame: pd.DataFrame, rows: int) -> str:
     if frame.empty:
-        return "<p class=\"note\">No rows.</p>"
+        return '<p class="note">No rows.</p>'
     limited = frame.head(rows).copy()
     for column in limited.columns:
         if pd.api.types.is_float_dtype(limited[column]):
             limited[column] = limited[column].map(_number)
         else:
-            limited[column] = limited[column].map(lambda value: "" if pd.isna(value) else str(value))
+            limited[column] = limited[column].map(
+                lambda value: "" if pd.isna(value) else str(value)
+            )
     table = limited.to_html(index=False, escape=True)
-    table = table.replace("<table border=\"1\" class=\"dataframe\">", "<table>")
-    table = table.replace("<td>PASS</td>", "<td class=\"good-text\">PASS</td>")
-    table = table.replace("<td>BLOCK</td>", "<td class=\"bad-text\">BLOCK</td>")
-    return f"<div class=\"table-wrap\">{table}</div>"
+    table = table.replace('<table border="1" class="dataframe">', "<table>")
+    table = table.replace("<td>PASS</td>", '<td class="good-text">PASS</td>')
+    table = table.replace("<td>BLOCK</td>", '<td class="bad-text">BLOCK</td>')
+    return f'<div class="table-wrap">{table}</div>'
 
 
 def _money(value: Any) -> str:

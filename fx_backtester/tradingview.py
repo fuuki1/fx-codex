@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -40,7 +40,7 @@ def normalize_tradingview_alert(
     raw: dict[str, Any],
     received_at_utc: str | None = None,
 ) -> dict[str, Any]:
-    timestamp = received_at_utc or datetime.now(timezone.utc).isoformat()
+    timestamp = received_at_utc or datetime.now(UTC).isoformat()
     ticker = _optional_string(raw.get("ticker") or raw.get("symbol"))
     exchange = _optional_string(raw.get("exchange"))
     symbol = _normalize_symbol(ticker)
@@ -62,9 +62,7 @@ def normalize_tradingview_alert(
         "action": action,
         "side": _side_from_action(action),
         "price": _optional_float(raw.get("price") or raw.get("close")),
-        "quantity": _optional_float(
-            raw.get("quantity") or raw.get("qty") or raw.get("contracts")
-        ),
+        "quantity": _optional_float(raw.get("quantity") or raw.get("qty") or raw.get("contracts")),
         "order_id": _optional_string(raw.get("order_id") or raw.get("id")),
         "message": _optional_string(raw.get("message")),
         "raw": raw,

@@ -14,13 +14,14 @@
 - 直接配備しない: 出力は candidate ファイルまで。strategy_params.json への昇格は
   promote_params.py での明示的な承認が必要。
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from itertools import product
 from pathlib import Path
 
@@ -39,16 +40,16 @@ CANDIDATE_OUTPUT = Path(__file__).parent / "strategy_params.candidate.json"
 # ── グリッド定義 ──────────────────────────────────────────────────────────────
 FAST_WINDOWS = [10, 15, 20, 25]
 SLOW_WINDOWS = [40, 50, 60, 80, 100]
-ATR_WINDOWS  = [14]
-ATR_MULTS    = [1.5, 2.0, 2.5]
+ATR_WINDOWS = [14]
+ATR_MULTS = [1.5, 2.0, 2.5]
 
 OOS_FRACTION = 0.3  # 末尾30%を検証専用（アウトオブサンプル）に取り分ける
 
 
 def score(metrics: dict) -> float:
     sharpe = metrics.get("sharpe_ratio", 0) or 0
-    pf     = metrics.get("profit_factor", 0) or 0
-    dd     = abs(metrics.get("max_drawdown_pct", 100) or 100)
+    pf = metrics.get("profit_factor", 0) or 0
+    dd = abs(metrics.get("max_drawdown_pct", 100) or 100)
     if dd == 0:
         return 0.0
     return sharpe * pf / (dd / 100 + 1e-9)
@@ -62,12 +63,14 @@ def load_data(data_file: Path) -> dict[str, pd.DataFrame]:
     return frames
 
 
-def run_backtest(symbol: str, df: pd.DataFrame,
-                 fast: int, slow: int, atr: int, mult: float) -> dict:
+def run_backtest(
+    symbol: str, df: pd.DataFrame, fast: int, slow: int, atr: int, mult: float
+) -> dict:
     if len(df) < slow + 10:
         return {}
-    strategy = MovingAverageCross(fast_window=fast, slow_window=slow,
-                                  atr_window=atr, stop_atr_multiple=mult)
+    strategy = MovingAverageCross(
+        fast_window=fast, slow_window=slow, atr_window=atr, stop_atr_multiple=mult
+    )
     config = BacktestConfig(
         initial_cash=100_000,
         risk=RiskConfig(
@@ -90,13 +93,14 @@ def run_backtest(symbol: str, df: pd.DataFrame,
 
 def optimize(frames: dict[str, pd.DataFrame], symbols: list[str]) -> dict:
     """前半(IS)でグリッドサーチ、後半(OOS)で検証。candidate の中身を返す。"""
-    best_score  = -1e9
+    best_score = -1e9
     best: dict = {}
-    total = (len(FAST_WINDOWS) * len(SLOW_WINDOWS) * len(ATR_WINDOWS)
-             * len(ATR_MULTS) * len(symbols))
-    done  = 0
+    total = len(FAST_WINDOWS) * len(SLOW_WINDOWS) * len(ATR_WINDOWS) * len(ATR_MULTS) * len(symbols)
+    done = 0
 
-    print(f"[optimize] グリッドサーチ開始: {total} 通り（IS {1 - OOS_FRACTION:.0%} / OOS {OOS_FRACTION:.0%}）")
+    print(
+        f"[optimize] グリッドサーチ開始: {total} 通り（IS {1 - OOS_FRACTION:.0%} / OOS {OOS_FRACTION:.0%}）"
+    )
 
     for symbol, fast, slow, atr, mult in product(
         symbols, FAST_WINDOWS, SLOW_WINDOWS, ATR_WINDOWS, ATR_MULTS
@@ -114,7 +118,10 @@ def optimize(frames: dict[str, pd.DataFrame], symbols: list[str]) -> dict:
             best_score = s
             best = {
                 "symbol": symbol,
-                "fast": fast, "slow": slow, "atr": atr, "mult": mult,
+                "fast": fast,
+                "slow": slow,
+                "atr": atr,
+                "mult": mult,
                 "is_metrics": metrics,
                 "score": s,
             }
@@ -124,19 +131,23 @@ def optimize(frames: dict[str, pd.DataFrame], symbols: list[str]) -> dict:
 
     df = frames[best["symbol"]]
     split = int(len(df) * (1 - OOS_FRACTION))
-    oos_metrics = run_backtest(best["symbol"], df.iloc[split:],
-                               best["fast"], best["slow"], best["atr"], best["mult"])
+    oos_metrics = run_backtest(
+        best["symbol"], df.iloc[split:], best["fast"], best["slow"], best["atr"], best["mult"]
+    )
     best["oos_metrics"] = oos_metrics
-    print(f"[optimize] 完了: score={best_score:.4f} "
-          f"IS sharpe={best['is_metrics'].get('sharpe_ratio')} "
-          f"OOS sharpe={oos_metrics.get('sharpe_ratio', 'n/a')}")
+    print(
+        f"[optimize] 完了: score={best_score:.4f} "
+        f"IS sharpe={best['is_metrics'].get('sharpe_ratio')} "
+        f"OOS sharpe={oos_metrics.get('sharpe_ratio', 'n/a')}"
+    )
     return best
 
 
-def build_candidate(best: dict, data_path: Path, frames: dict[str, pd.DataFrame],
-                    min_trades: int) -> dict:
+def build_candidate(
+    best: dict, data_path: Path, frames: dict[str, pd.DataFrame], min_trades: int
+) -> dict:
     is_m, oos_m = best["is_metrics"], best["oos_metrics"]
-    is_sharpe  = is_m.get("sharpe_ratio", 0) or 0
+    is_sharpe = is_m.get("sharpe_ratio", 0) or 0
     oos_sharpe = oos_m.get("sharpe_ratio", 0) or 0
     trade_count = int(is_m.get("trade_count", 0) or 0) + int(oos_m.get("trade_count", 0) or 0)
 
@@ -154,25 +165,23 @@ def build_candidate(best: dict, data_path: Path, frames: dict[str, pd.DataFrame]
 
     all_rows = sum(len(f) for f in frames.values())
     start = min(f.index.min() for f in frames.values())
-    end   = max(f.index.max() for f in frames.values())
+    end = max(f.index.max() for f in frames.values())
 
     return {
-        "fast_window":  best["fast"],
-        "slow_window":  best["slow"],
-        "atr_window":   best["atr"],
+        "fast_window": best["fast"],
+        "slow_window": best["slow"],
+        "atr_window": best["atr"],
         "atr_multiple": best["mult"],
-        "best_symbol":  best["symbol"],
-        "score":            round(best["score"], 4),
-        "sharpe":           round(is_sharpe, 4),
-        "profit_factor":    round(is_m.get("profit_factor", 0) or 0, 4),
+        "best_symbol": best["symbol"],
+        "score": round(best["score"], 4),
+        "sharpe": round(is_sharpe, 4),
+        "profit_factor": round(is_m.get("profit_factor", 0) or 0, 4),
         "max_drawdown_pct": round(is_m.get("max_drawdown_pct", 0) or 0, 4),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
         "provenance": {
             "schema": params_gate.SCHEMA_VERSION,
             "generated_by": "auto_optimize.py",
-            "data": params_gate.data_provenance(
-                data_path, all_rows, str(start), str(end)
-            ),
+            "data": params_gate.data_provenance(data_path, all_rows, str(start), str(end)),
             "grid": {
                 "fast_window": FAST_WINDOWS,
                 "slow_window": SLOW_WINDOWS,
@@ -194,19 +203,26 @@ def build_candidate(best: dict, data_path: Path, frames: dict[str, pd.DataFrame]
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--data", default=os.environ.get("OPTIMIZE_DATA"),
+        "--data",
+        default=os.environ.get("OPTIMIZE_DATA"),
         help="実データ CSV のパス（必須。環境変数 OPTIMIZE_DATA でも指定可）",
     )
     parser.add_argument(
-        "--output", type=Path, default=CANDIDATE_OUTPUT,
+        "--output",
+        type=Path,
+        default=CANDIDATE_OUTPUT,
         help=f"candidate の出力先（既定: {CANDIDATE_OUTPUT.name}）",
     )
     parser.add_argument(
-        "--symbols", nargs="*", default=None,
+        "--symbols",
+        nargs="*",
+        default=None,
         help="対象シンボル（既定: データ内の全シンボル）",
     )
     parser.add_argument(
-        "--min-trades", type=int, default=params_gate.MIN_TRADE_COUNT,
+        "--min-trades",
+        type=int,
+        default=params_gate.MIN_TRADE_COUNT,
         help="取引数の下限（未満は警告が付き、promote が既定で拒否する）",
     )
     args = parser.parse_args(argv)

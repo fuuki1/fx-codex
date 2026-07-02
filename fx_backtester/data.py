@@ -50,7 +50,9 @@ def _symbol_from_path(path: str | Path) -> str:
     )
 
 
-def load_price_csv(path: str | Path, symbol: str | None = None, timezone: str | None = None) -> dict[str, pd.DataFrame]:
+def load_price_csv(
+    path: str | Path, symbol: str | None = None, timezone: str | None = None
+) -> dict[str, pd.DataFrame]:
     """Load OHLC price data.
 
     Accepted columns: timestamp, symbol (optional), open, high, low, close,
@@ -145,7 +147,9 @@ def load_economic_events_csv(path: str | Path | None) -> pd.DataFrame:
 
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False)
     frame["currency"] = frame["currency"].astype(str).str.upper().str.strip()
-    frame["symbol"] = frame["symbol"].astype(str).str.upper().str.replace("/", "", regex=False).str.strip()
+    frame["symbol"] = (
+        frame["symbol"].astype(str).str.upper().str.replace("/", "", regex=False).str.strip()
+    )
     frame["impact"] = frame["impact"].astype(str).str.lower().str.strip().replace("", "high")
     return frame[EVENT_COLUMNS].sort_values("timestamp").set_index("timestamp")
 
@@ -193,7 +197,10 @@ def build_no_trade_mask(
         event_symbol = str(event.get("symbol", "")).strip().upper().replace("/", "")
         event_currency = str(event.get("currency", "")).strip().upper()
         applies_to_symbol = event_symbol in ("", "NAN") or event_symbol == inst.symbol
-        applies_to_currency = event_currency in ("", "NAN") or event_currency in {inst.base, inst.quote}
+        applies_to_currency = event_currency in ("", "NAN") or event_currency in {
+            inst.base,
+            inst.quote,
+        }
         if not (applies_to_symbol and applies_to_currency):
             continue
 

@@ -13,8 +13,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Mapping, Sequence
+from datetime import datetime, timedelta, timezone, UTC
+from collections.abc import Mapping, Sequence
 
 from .calendar import (
     EconomicEvent,
@@ -154,7 +154,7 @@ def build_trade_plan(
     risk_pct: float = DEFAULT_RISK_PCT,
 ) -> TradePlan:
     """1ペア分のトレードプランを組み立てる。"""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     base, quote = symbol_currencies(symbol)
 
     tech_score, ma_note = _tech_score(tech)
@@ -326,18 +326,16 @@ def build_discord_payload(
     now: datetime | None = None,
 ) -> dict:
     """Discord Webhook用のペイロードを組み立てる。"""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     now_iso = now.isoformat()
 
     headline_parts = [
-        f"{plan.emoji} {plan.symbol} {plan.direction_ja}({plan.conviction})"
-        for plan in plans
+        f"{plan.emoji} {plan.symbol} {plan.direction_ja}({plan.conviction})" for plan in plans
     ]
     engine_ja = "Claude分析" if analysis.engine == "claude" else "語彙分析"
     content = (
         f"📊 **FXデスクブリーフィング** {now.astimezone(JST):%m/%d %H:%M} JST"
-        f" | 地合い: {analysis.regime_ja} ({engine_ja})\n"
-        + " / ".join(headline_parts)
+        f" | 地合い: {analysis.regime_ja} ({engine_ja})\n" + " / ".join(headline_parts)
     )
 
     macro_fields = [
@@ -353,9 +351,7 @@ def build_discord_payload(
         },
     ]
     if analysis.summary:
-        macro_fields.insert(
-            0, {"name": "市況要約", "value": analysis.summary, "inline": False}
-        )
+        macro_fields.insert(0, {"name": "市況要約", "value": analysis.summary, "inline": False})
     if fetch_warnings:
         macro_fields.append(
             {
@@ -370,9 +366,7 @@ def build_discord_payload(
             "title": "マクロ・センチメント概況",
             "color": COLOR_NEUTRAL,
             "fields": macro_fields,
-            "footer": {
-                "text": f"fx-codex fx_briefing | MA({fast_window}/{slow_window}) | OANDA"
-            },
+            "footer": {"text": f"fx-codex fx_briefing | MA({fast_window}/{slow_window}) | OANDA"},
             "timestamp": now_iso,
         }
     ]

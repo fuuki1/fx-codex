@@ -78,7 +78,9 @@ class BacktestEngine:
         self.economic_events = economic_events if economic_events is not None else pd.DataFrame()
 
     def run(self, data: dict[str, pd.DataFrame]) -> BacktestResult:
-        prepared = {normalize_symbol(symbol): frame.sort_index().copy() for symbol, frame in data.items()}
+        prepared = {
+            normalize_symbol(symbol): frame.sort_index().copy() for symbol, frame in data.items()
+        }
         signals = {
             symbol: self._validate_signal_output(
                 symbol,
@@ -99,7 +101,9 @@ class BacktestEngine:
             for symbol, frame in prepared.items()
         }
 
-        all_times = pd.DatetimeIndex(sorted(set().union(*(frame.index for frame in prepared.values()))))
+        all_times = pd.DatetimeIndex(
+            sorted(set().union(*(frame.index for frame in prepared.values())))
+        )
         if all_times.empty:
             raise ValueError("No bars available")
 
@@ -217,7 +221,9 @@ class BacktestEngine:
                     "entry_allowed",
                     default=True,
                 )
-                no_trade_window = bool(no_trade_masks[symbol].at[timestamp]) or not signal_entry_allowed
+                no_trade_window = (
+                    bool(no_trade_masks[symbol].at[timestamp]) or not signal_entry_allowed
+                )
                 if not self.risk.can_open(timestamp, equity, no_trade_window):
                     continue
 
@@ -289,7 +295,9 @@ class BacktestEngine:
             )
 
         equity_curve = pd.DataFrame(equity_rows).set_index("timestamp")
-        trades_frame = pd.DataFrame([trade.to_dict() for trade in trades], columns=TRADE_LOG_COLUMNS)
+        trades_frame = pd.DataFrame(
+            [trade.to_dict() for trade in trades], columns=TRADE_LOG_COLUMNS
+        )
         metrics = calculate_metrics(equity_curve, trades_frame, self.config.initial_cash)
         return BacktestResult(equity_curve=equity_curve, trades=trades_frame, metrics=metrics)
 
@@ -556,9 +564,8 @@ class BacktestEngine:
             position = positions.get(symbol)
             if not position:
                 continue
-            stop_hit = (
-                (position.direction == 1 and float(row["low"]) <= position.stop_price)
-                or (position.direction == -1 and float(row["high"]) >= position.stop_price)
+            stop_hit = (position.direction == 1 and float(row["low"]) <= position.stop_price) or (
+                position.direction == -1 and float(row["high"]) >= position.stop_price
             )
             take_profit_hit = self._take_profit_confirmed(position, row)
             # Conservative intrabar assumption: if both levels are touched, stop loss wins.
@@ -604,9 +611,8 @@ class BacktestEngine:
         if position.take_profit_price is None:
             return False
         inst = self.execution
-        buffer = (
-            inst.spread_pips(position.symbol, row) / 2
-            + inst.slippage_pips(position.symbol, row)
+        buffer = inst.spread_pips(position.symbol, row) / 2 + inst.slippage_pips(
+            position.symbol, row
         )
         pip_size = instrument_for(position.symbol).pip_size
         price_buffer = buffer * pip_size

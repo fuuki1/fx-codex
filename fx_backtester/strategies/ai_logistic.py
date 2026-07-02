@@ -37,9 +37,11 @@ class AILogisticStrategy(Strategy):
     def generate(self, symbol: str, data: pd.DataFrame) -> pd.DataFrame:
         self._validate_params()
         features = self._features(data)
-        forward_return = data["close"].astype(float).shift(-self.prediction_horizon) / data[
-            "close"
-        ].astype(float) - 1
+        forward_return = (
+            data["close"].astype(float).shift(-self.prediction_horizon)
+            / data["close"].astype(float)
+            - 1
+        )
         labels = (forward_return > self.min_abs_forward_return).astype(float)
         valid_train = features.notna().all(axis=1) & forward_return.notna()
 

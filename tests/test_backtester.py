@@ -241,8 +241,7 @@ def test_package_version_matches_pyproject() -> None:
 def test_load_price_csv_with_symbol_column(tmp_path) -> None:
     path = tmp_path / "prices.csv"
     path.write_text(
-        "timestamp,symbol,open,high,low,close\n"
-        "2024-01-01 00:00:00,EUR/USD,1.1,1.2,1.0,1.15\n",
+        "timestamp,symbol,open,high,low,close\n" "2024-01-01 00:00:00,EUR/USD,1.1,1.2,1.0,1.15\n",
         encoding="utf-8",
     )
 
@@ -275,8 +274,7 @@ def test_filter_price_data_by_date_includes_full_end_date() -> None:
 def test_economic_event_mask_blocks_relevant_currency(tmp_path) -> None:
     path = tmp_path / "events.csv"
     path.write_text(
-        "timestamp,currency,impact,name\n"
-        "2024-01-01 01:00:00,USD,high,FOMC\n",
+        "timestamp,currency,impact,name\n" "2024-01-01 01:00:00,USD,high,FOMC\n",
         encoding="utf-8",
     )
     events = load_economic_events_csv(path)
@@ -327,7 +325,15 @@ def test_no_trade_window_blocks_new_entries() -> None:
         )
     }
     events = pd.DataFrame(
-        [{"timestamp": index[0], "currency": "USD", "symbol": "", "impact": "high", "name": "event"}]
+        [
+            {
+                "timestamp": index[0],
+                "currency": "USD",
+                "symbol": "",
+                "impact": "high",
+                "name": "event",
+            }
+        ]
     ).set_index("timestamp")
     config = BacktestConfig(
         initial_cash=100_000,
@@ -825,7 +831,9 @@ def test_stop_loss_gap_fills_at_worse_open_not_stop_price() -> None:
         ),
     )
 
-    result = BacktestEngine(TakeProfitStrategy(stop_distance=0.05, take_profit_distance=0.5), config).run(data)
+    result = BacktestEngine(
+        TakeProfitStrategy(stop_distance=0.05, take_profit_distance=0.5), config
+    ).run(data)
     trade = result.trades.iloc[0]
 
     assert trade["exit_reason"] == "stop_loss"
@@ -1238,13 +1246,9 @@ def test_analyze_run_writes_commercial_validation_pack(tmp_path) -> None:
     readiness = json.loads((output_dir / "commercial_readiness.json").read_text(encoding="utf-8"))
     assert readiness["commercial_ready"] is False
     assert any(
-        gate["name"] == "forward_test" and gate["passed"] is False
-        for gate in readiness["gates"]
+        gate["name"] == "forward_test" and gate["passed"] is False for gate in readiness["gates"]
     )
-    assert any(
-        gate["name"] == "monthly_return_target"
-        for gate in readiness["gates"]
-    )
+    assert any(gate["name"] == "monthly_return_target" for gate in readiness["gates"])
     assert not pd.read_csv(output_dir / "pair_performance.csv").empty
     pnl = json.loads((output_dir / "pnl_breakdown_summary.json").read_text(encoding="utf-8"))
     reconstructed = (

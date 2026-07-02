@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 import pytest
 
@@ -27,7 +27,7 @@ from fx_intel.sentiment import (
 )
 from fx_intel.technicals import PairTechnicals, build_interval_view
 
-UTC = timezone.utc
+UTC = UTC
 NOW = datetime(2026, 7, 2, 8, 0, tzinfo=UTC)
 
 
@@ -75,9 +75,7 @@ def test_upcoming_events_filters_currency_horizon_and_impact() -> None:
         EconomicEvent("対象外通貨", "AUD", NOW + timedelta(hours=6), "high"),
         EconomicEvent("低影響", "USD", NOW + timedelta(hours=6), "low"),
     ]
-    selected = upcoming_events(
-        events, {"USD", "JPY"}, NOW, hours_ahead=48, min_impact="high"
-    )
+    selected = upcoming_events(events, {"USD", "JPY"}, NOW, hours_ahead=48, min_impact="high")
     assert [e.title for e in selected] == ["NFP"]
 
 
@@ -101,9 +99,7 @@ def test_risk_windows_and_active_next() -> None:
 
 
 def test_export_events_csv_is_loadable_by_backtester(tmp_path) -> None:
-    events = [
-        EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")
-    ]
+    events = [EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")]
     path = export_events_csv(events, tmp_path / "upcoming.csv")
 
     from fx_backtester.data import load_economic_events_csv
@@ -192,9 +188,7 @@ def test_fetch_calendar_falls_back_to_stale_cache(tmp_path) -> None:
 
 
 def test_fetch_calendar_no_cache_no_network_returns_empty(tmp_path) -> None:
-    events, warnings = fetch_calendar(
-        session=_FailingSession(), cache_path=tmp_path / "none.json"
-    )
+    events, warnings = fetch_calendar(session=_FailingSession(), cache_path=tmp_path / "none.json")
     assert events == []
     assert len(warnings) == 2
 
@@ -372,9 +366,7 @@ def test_build_trade_plan_standby_in_event_window() -> None:
         "USD": CurrencySentiment("USD", score=0.8),
         "JPY": CurrencySentiment("JPY", score=-0.8),
     }
-    plan = briefing.build_trade_plan(
-        "USDJPY", bullish_tech(), currencies, windows, [], now=NOW
-    )
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, windows, [], now=NOW)
     assert plan.direction == "standby"
     assert plan.conviction <= briefing.STANDBY_CONVICTION_CAP
     assert plan.stop is None
@@ -406,8 +398,14 @@ def test_build_discord_payload_structure() -> None:
     )
     events = [EconomicEvent("NFP", "USD", NOW + timedelta(hours=30), "high", "110K")]
     payload = briefing.build_discord_payload(
-        [plan], analysis, events, ["JPY", "USD"], 20, 100,
-        fetch_warnings=["テスト警告"], now=NOW,
+        [plan],
+        analysis,
+        events,
+        ["JPY", "USD"],
+        20,
+        100,
+        fetch_warnings=["テスト警告"],
+        now=NOW,
     )
     assert "FXデスクブリーフィング" in payload["content"]
     assert "リスクオン" in payload["content"]

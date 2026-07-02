@@ -16,7 +16,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import requests
 
@@ -28,35 +28,87 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
 
 # タグ付けされた通貨に対して強気(通貨高)方向の語彙
 POSITIVE_TERMS = (
-    "hawkish", "rate hike", "rate hikes", "raise rates", "raises rates",
-    "higher rates", "rates higher", "head higher", "tightening", "tighten",
-    "strong", "strengthens", "strengthen", "beats", "beat expectations",
-    "better than expected", "above expectations", "upbeat", "bullish",
-    "resilient", "hot inflation", "hotter than expected", "surge in hiring",
+    "hawkish",
+    "rate hike",
+    "rate hikes",
+    "raise rates",
+    "raises rates",
+    "higher rates",
+    "rates higher",
+    "head higher",
+    "tightening",
+    "tighten",
+    "strong",
+    "strengthens",
+    "strengthen",
+    "beats",
+    "beat expectations",
+    "better than expected",
+    "above expectations",
+    "upbeat",
+    "bullish",
+    "resilient",
+    "hot inflation",
+    "hotter than expected",
+    "surge in hiring",
 )
 
 # タグ付けされた通貨に対して弱気(通貨安)方向の語彙
 NEGATIVE_TERMS = (
-    "dovish", "rate cut", "rate cuts", "cut rates", "cuts rates",
-    "lower rates", "rates lower", "easing", "loosen", "weak", "weakens",
-    "weaken", "misses", "miss expectations", "worse than expected",
-    "below expectations", "downbeat", "bearish", "recession", "slowdown",
-    "cooling", "softer than expected",
+    "dovish",
+    "rate cut",
+    "rate cuts",
+    "cut rates",
+    "cuts rates",
+    "lower rates",
+    "rates lower",
+    "easing",
+    "loosen",
+    "weak",
+    "weakens",
+    "weaken",
+    "misses",
+    "miss expectations",
+    "worse than expected",
+    "below expectations",
+    "downbeat",
+    "bearish",
+    "recession",
+    "slowdown",
+    "cooling",
+    "softer than expected",
 )
 
 # 「PAIRが上昇/下落」の構文: ベース通貨に+、クオート通貨に−(下落なら逆)
 _UP_VERBS = (
-    "rises", "rise", "gains", "climbs", "jumps", "rallies", "advances",
-    "extends gains", "hits high", "strengthens", "recovers",
+    "rises",
+    "rise",
+    "gains",
+    "climbs",
+    "jumps",
+    "rallies",
+    "advances",
+    "extends gains",
+    "hits high",
+    "strengthens",
+    "recovers",
 )
 _DOWN_VERBS = (
-    "falls", "fall", "drops", "slides", "declines", "slips", "plunges",
-    "tumbles", "extends losses", "hits low", "weakens", "retreats",
+    "falls",
+    "fall",
+    "drops",
+    "slides",
+    "declines",
+    "slips",
+    "plunges",
+    "tumbles",
+    "extends losses",
+    "hits low",
+    "weakens",
+    "retreats",
 )
 
-_PAIR_MOVE_RE = re.compile(
-    r"\b([A-Z]{3})\s*/\s*([A-Z]{3})\b|\b([A-Z]{6})\b"
-)
+_PAIR_MOVE_RE = re.compile(r"\b([A-Z]{3})\s*/\s*([A-Z]{3})\b|\b([A-Z]{6})\b")
 
 
 @dataclass
@@ -163,9 +215,7 @@ def score_headlines_lexicon(
     for sentiment in result.values():
         total = sentiment.positives + sentiment.negatives
         if total > 0:
-            sentiment.score = round(
-                (sentiment.positives - sentiment.negatives) / total, 3
-            )
+            sentiment.score = round((sentiment.positives - sentiment.negatives) / total, 3)
     return result
 
 
@@ -252,9 +302,7 @@ def analyze_with_claude(
     }
     http = session or requests
     try:
-        response = http.post(
-            ANTHROPIC_API_URL, json=payload, headers=headers, timeout=timeout
-        )
+        response = http.post(ANTHROPIC_API_URL, json=payload, headers=headers, timeout=timeout)
         response.raise_for_status()
         body = response.json()
         text = "".join(
@@ -317,9 +365,7 @@ def analyze_market(
     )
 
 
-def pair_bias(
-    base: str, quote: str, currencies: Mapping[str, CurrencySentiment]
-) -> float:
+def pair_bias(base: str, quote: str, currencies: Mapping[str, CurrencySentiment]) -> float:
     """ペアの方向バイアス = (ベース通貨スコア − クオート通貨スコア) / 2。"""
     base_score = currencies.get(base, CurrencySentiment(base)).score
     quote_score = currencies.get(quote, CurrencySentiment(quote)).score

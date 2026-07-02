@@ -23,10 +23,18 @@ class DonchianBreakout(Strategy):
         if self.exit_window >= self.entry_window:
             raise ValueError("exit_window should be smaller than entry_window")
 
-        upper_entry = data["high"].shift(1).rolling(self.entry_window, min_periods=self.entry_window).max()
-        lower_entry = data["low"].shift(1).rolling(self.entry_window, min_periods=self.entry_window).min()
-        upper_exit = data["high"].shift(1).rolling(self.exit_window, min_periods=self.exit_window).max()
-        lower_exit = data["low"].shift(1).rolling(self.exit_window, min_periods=self.exit_window).min()
+        upper_entry = (
+            data["high"].shift(1).rolling(self.entry_window, min_periods=self.entry_window).max()
+        )
+        lower_entry = (
+            data["low"].shift(1).rolling(self.entry_window, min_periods=self.entry_window).min()
+        )
+        upper_exit = (
+            data["high"].shift(1).rolling(self.exit_window, min_periods=self.exit_window).max()
+        )
+        lower_exit = (
+            data["low"].shift(1).rolling(self.exit_window, min_periods=self.exit_window).min()
+        )
 
         target_values: list[int] = []
         current = 0

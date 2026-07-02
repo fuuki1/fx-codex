@@ -39,7 +39,9 @@ def validate_price_data(
         inferred_frequency = pd.infer_freq(prepared.index) if len(prepared.index) >= 3 else None
         frequency = settings.expected_frequency or inferred_frequency
         if frequency and not prepared.empty:
-            expected_index = pd.date_range(prepared.index.min(), prepared.index.max(), freq=frequency)
+            expected_index = pd.date_range(
+                prepared.index.min(), prepared.index.max(), freq=frequency
+            )
             expected_bars = len(expected_index)
             missing_bars = int(len(expected_index.difference(prepared.index)))
             missing_pct = missing_bars / expected_bars if expected_bars else 0.0

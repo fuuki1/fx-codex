@@ -12,6 +12,7 @@
 
 Mac mini へは rsync でこのファイルごと同期される前提のため、依存は標準ライブラリのみ。
 """
+
 from __future__ import annotations
 
 import csv
@@ -212,9 +213,7 @@ def validate_params(
                 errors.append(f"provenance.data.{key} が無い")
         sha = data.get("sha256")
         if isinstance(sha, str) and sha in synthetic_hashes():
-            errors.append(
-                "合成サンプルデータで最適化されたパラメータ。配備禁止"
-            )
+            errors.append("合成サンプルデータで最適化されたパラメータ。配備禁止")
 
     trade_count = provenance.get("trade_count")
     if not isinstance(trade_count, int) or isinstance(trade_count, bool):

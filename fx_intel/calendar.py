@@ -13,9 +13,9 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import requests
 
@@ -65,7 +65,7 @@ class RiskWindow:
 
 
 def symbol_currencies(symbol: str) -> tuple[str, str]:
-    """"USDJPY" → ("USD", "JPY")。"""
+    """ "USDJPY" → ("USD", "JPY")。"""
     cleaned = symbol.upper().replace("/", "").strip()
     if len(cleaned) != 6:
         raise ValueError(f"通貨ペア名を解釈できません: {symbol}")
@@ -84,12 +84,12 @@ def parse_calendar_json(raw: Iterable[dict]) -> list[EconomicEvent]:
         except ValueError:
             continue
         if when.tzinfo is None:
-            when = when.replace(tzinfo=timezone.utc)
+            when = when.replace(tzinfo=UTC)
         events.append(
             EconomicEvent(
                 title=str(item.get("title", "")).strip(),
                 currency=str(item.get("country", "")).strip().upper(),
-                when=when.astimezone(timezone.utc),
+                when=when.astimezone(UTC),
                 impact=str(item.get("impact", "")).strip().lower(),
                 forecast=str(item.get("forecast", "")).strip(),
                 previous=str(item.get("previous", "")).strip(),
@@ -146,7 +146,7 @@ def fetch_calendar(
     """
     cache_file = Path(cache_path) if cache_path else None
     cache = _load_cache(cache_file)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if cache is not None and _cache_age_minutes(cache, now) <= cache_max_age_minutes:
         return _merge_weeks(cache["weeks"]), []
 

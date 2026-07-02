@@ -5,7 +5,7 @@ import json
 import platform
 import sys
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,7 @@ def write_backtest_run_artifacts(
 
     manifest = {
         "schema_version": 1,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": datetime.now(UTC).isoformat(),
         "package": {
             "name": "fx_backtester",
             "version": fx_backtester.__version__,
@@ -86,9 +86,7 @@ def write_backtest_run_artifacts(
             "qa_passed": bool(qa_report["passed"].all()) if not qa_report.empty else False,
             "required_trade_log_columns": list(REQUIRED_TRADE_LOG_COLUMNS),
             "trade_log_columns_present": [
-                column
-                for column in REQUIRED_TRADE_LOG_COLUMNS
-                if column in result.trades.columns
+                column for column in REQUIRED_TRADE_LOG_COLUMNS if column in result.trades.columns
             ],
         },
         "metrics": _json_safe(result.metrics),

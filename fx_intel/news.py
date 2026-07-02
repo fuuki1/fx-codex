@@ -9,18 +9,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from email.utils import parsedate_to_datetime
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from urllib.parse import quote
 from xml.etree import ElementTree
 
 import requests
 
 FXSTREET_RSS_URL = "https://www.fxstreet.com/rss/news"
-GOOGLE_NEWS_RSS_URL = (
-    "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-)
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
 USER_AGENT = "fx-codex-intel/1.0 (+https://github.com/fuuki1)"
 
@@ -29,20 +27,50 @@ KNOWN_CURRENCIES = {"USD", "JPY", "EUR", "GBP", "AUD", "NZD", "CAD", "CHF"}
 # 通貨ごとの関連キーワード(小文字で照合)
 CURRENCY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "USD": (
-        r"\busd\b", "dollar", "greenback", r"\bfed\b", "fomc", "powell",
-        "nonfarm", "payrolls", r"u\.s\.", "united states", "treasur",
+        r"\busd\b",
+        "dollar",
+        "greenback",
+        r"\bfed\b",
+        "fomc",
+        "powell",
+        "nonfarm",
+        "payrolls",
+        r"u\.s\.",
+        "united states",
+        "treasur",
     ),
     "JPY": (
-        r"\bjpy\b", r"\byen\b", r"\bboj\b", "bank of japan", "ueda",
-        "japan", "tankan", "tokyo cpi",
+        r"\bjpy\b",
+        r"\byen\b",
+        r"\bboj\b",
+        "bank of japan",
+        "ueda",
+        "japan",
+        "tankan",
+        "tokyo cpi",
     ),
     "EUR": (
-        r"\beur\b", r"\beuro\b", r"\becb\b", "lagarde", "eurozone",
-        "euro zone", "germany", "german", r"\bbund\b",
+        r"\beur\b",
+        r"\beuro\b",
+        r"\becb\b",
+        "lagarde",
+        "eurozone",
+        "euro zone",
+        "germany",
+        "german",
+        r"\bbund\b",
     ),
     "GBP": (
-        r"\bgbp\b", "pound", "sterling", r"\bboe\b", "bank of england",
-        r"\buk\b", "britain", "british", r"\bcable\b", "gilt",
+        r"\bgbp\b",
+        "pound",
+        "sterling",
+        r"\bboe\b",
+        "bank of england",
+        r"\buk\b",
+        "britain",
+        "british",
+        r"\bcable\b",
+        "gilt",
     ),
     "AUD": (r"\baud\b", "aussie", r"\brba\b", "australia"),
     "NZD": (r"\bnzd\b", r"\bkiwi\b", "rbnz", "new zealand"),
@@ -103,8 +131,8 @@ def _parse_pubdate(text: str) -> datetime | None:
         except ValueError:
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _clean_html(text: str) -> str:
@@ -202,12 +230,10 @@ def fetch_news_for_symbols(
         queried.add(cleaned)
         query = f'"{cleaned[:3]}/{cleaned[3:]}" OR "{cleaned}"'
         try:
-            collected.extend(
-                fetch_google_news(query, timeout=timeout, session=session)
-            )
+            collected.extend(fetch_google_news(query, timeout=timeout, session=session))
         except Exception as error:  # noqa: BLE001 - 外部フィード起因
             warnings.append(f"Google News({cleaned})取得失敗: {error}")
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    cutoff = datetime.now(UTC) - timedelta(hours=hours_back)
     fresh = [item for item in dedupe_and_sort(collected) if item.published >= cutoff]
     return fresh[:max_items], warnings

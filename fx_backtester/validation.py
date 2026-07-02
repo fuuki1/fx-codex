@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from collections.abc import Iterable
 
 import pandas as pd
 
 from fx_backtester.engine import BacktestConfig
 from fx_backtester.models import ACCOUNT_CURRENCY, TRADE_LOG_COLUMNS, instrument_for
-
 
 REQUIRED_TRADE_LOG_COLUMNS = TRADE_LOG_COLUMNS
 
@@ -119,7 +118,9 @@ def validate_backtest_inputs(
             elif configured_spread <= 0:
                 errors.append(f"{inst.symbol} configured spread_pips must be positive")
             else:
-                warnings.append(f"{inst.symbol} uses configured spread_pips; no per-bar spread column")
+                warnings.append(
+                    f"{inst.symbol} uses configured spread_pips; no per-bar spread column"
+                )
 
         configured_slippage = config.execution.slippage_pips.get(inst.symbol)
         if configured_slippage is None:
