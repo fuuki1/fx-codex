@@ -50,6 +50,40 @@ def test_normalize_limit_requires_price():
     assert sig["price"] == 150.0
 
 
+def test_normalize_stop_fields():
+    sig = normalize_signal(
+        {"symbol": "USDJPY", "side": "buy", "qty": 1, "price": 150, "stop_distance": 0.5}
+    )
+    assert sig["stop_distance"] == 0.5
+    assert sig["stop_price"] is None
+    assert sig["close"] is False
+
+    sig = normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "stop_price": 148.2})
+    assert sig["stop_price"] == 148.2
+
+    sig = normalize_signal({"symbol": "USDJPY", "side": "sell", "qty": 1, "close": True})
+    assert sig["close"] is True
+
+
+def test_normalize_stop_distance_requires_price():
+    with pytest.raises(SignalError):
+        normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "stop_distance": 0.5})
+
+
+def test_normalize_stop_distance_must_be_below_price_for_buy():
+    with pytest.raises(SignalError):
+        normalize_signal(
+            {"symbol": "USDJPY", "side": "buy", "qty": 1, "price": 150, "stop_distance": 151}
+        )
+
+
+def test_normalize_invalid_stop_values():
+    with pytest.raises(SignalError):
+        normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "stop_price": -1})
+    with pytest.raises(SignalError):
+        normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "stop_price": "abc"})
+
+
 def test_idem_deterministic_and_content_based():
     a = normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "type": "market"})
     b = normalize_signal({"symbol": "USDJPY", "side": "buy", "qty": 1, "type": "market"})
