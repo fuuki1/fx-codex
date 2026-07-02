@@ -5,8 +5,12 @@
   POST /webhook : TradingView 等からのシグナル受信
 
 セキュリティ 2 重チェック:
-  1. 送信元 IP を TV_ALLOWED_IPS と照合（ngrok 経由は X-Forwarded-For を見る）
+  1. 送信元 IP を TV_ALLOWED_IPS と照合（ngrok 経由は X-Forwarded-For の「末尾」を見る。
+     先頭はクライアントが自由に偽装できるため信頼しない）
   2. ペイロードの secret を WEBHOOK_SECRET と定時間比較（hmac.compare_digest）
+
+DoS 対策: Content-Length が MAX_BODY_BYTES を超えるリクエストは 413 で拒否
+（uvicorn はボディサイズを制限しないため、アプリ側で上限を設ける）。
 
 冪等: idem を Redis に nx,ex=3600 で記録。60 分以内の重複は黙って捨てる。
 ハンドラは同期 def（FastAPI がスレッドプールで実行）なので同期 Redis でも
@@ -38,11 +42,32 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="trader-webhook", docs_url=None, redoc_url=None, lifespan=lifespan)
 
+# TradingView のアラートは数百バイト程度。これを大きく超えるボディは攻撃とみなす。
+MAX_BODY_BYTES = 64 * 1024
+
+
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):  # type: ignore[no-untyped-def]
+    try:
+        length = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+    if length > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "request body too large"}, status_code=413)
+    return await call_next(request)
+
 
 def _client_ip(request: Request) -> str:
+    """信頼できる送信元 IP を返す。
+
+    X-Forwarded-For はクライアントが任意の値を先頭に付けられ、経路上のプロキシが
+    実際の接続元を「右端に追記」する仕様。信頼できるのは末尾（= 直近の信頼プロキシ
+    ngrok が追記した実接続元）だけ。先頭を採用すると許可 IP を偽装した
+    allowlist バイパスが可能になる。
+    """
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
+        return xff.split(",")[-1].strip()
     return request.client.host if request.client else ""
 
 
