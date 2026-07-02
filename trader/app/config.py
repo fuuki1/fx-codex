@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     max_orders_per_min: int = 10
     max_consecutive_errors: int = 5
     enforce_session: bool = True
+    # 新規建てシグナルに stop_price / stop_distance を必須にする（安全側の既定 ON）。
+    # 決済シグナルは "close": true で免除。
+    require_stop_loss: bool = True
 
     # ---- 自作戦略（strategy.py）------------------------------------------
     # 既定 OFF。明示的に有効化しない限り自動シグナルは出さない（安全側）。

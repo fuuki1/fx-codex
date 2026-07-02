@@ -102,6 +102,13 @@ Webhook URL: `https://<NGROK_DOMAIN>/webhook`
   "side":   "{{strategy.order.action}}",
   "qty":    1000,
   "type":   "market",
+  "price":  {{close}},
+  "stop_distance": 0.30,
   "id":     "{{timenow}}-{{ticker}}"
 }
 ```
+- **ストップロスは必須**（`REQUIRE_STOP_LOSS=1` 既定）。`stop_price`（絶対価格）か
+  `stop_distance`（`price` からの距離。`price` 必須）のどちらかを入れる。
+  executor が親注文＋逆指値をブラケットで一括送信する。
+- 決済（ポジションを閉じる）シグナルは `"close": true` を付ければストップ不要。
+  この場合は単発注文として送信される。

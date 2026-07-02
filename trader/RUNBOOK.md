@@ -86,6 +86,7 @@ make ps
 | `MAX_ORDERS_PER_MIN` | 1 分あたり発注数の上限 |
 | `MAX_CONSECUTIVE_ERRORS` | 連続発注エラーでの自動 Kill switch 閾値 |
 | `ENFORCE_SESSION` | 取引時間帯チェックの有効化 |
+| `REQUIRE_STOP_LOSS` | 新規建てシグナルに stop_price/stop_distance を必須化（決済は `"close": true` で免除） |
 | `STRATEGY_ENABLED` | 自作戦略のシグナル発行（既定 0=停止） |
 | `TV_ALLOWED_IPS` / `WEBHOOK_SECRET` | webhook の IP / secret 検証 |
 

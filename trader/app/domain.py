@@ -74,6 +74,19 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
     if otype == "LIMIT" and not (price and price > 0):
         raise SignalError("LIMIT order requires a positive price")
 
+    # ストップロス指定（stop_price=絶対価格 / stop_distance=参照価格からの距離）。
+    # stop_distance は基準となる price（TradingView なら {{close}}）が無いと解決できない。
+    stop_price = _optional_positive(raw.get("stop_price"), "stop_price")
+    stop_distance = _optional_positive(raw.get("stop_distance"), "stop_distance")
+    close = bool(raw.get("close", False))
+    if stop_distance is not None and stop_price is None:
+        if price is None:
+            raise SignalError("stop_distance requires a reference price")
+        if side == "BUY" and stop_distance >= price:
+            raise SignalError(
+                f"stop_distance {stop_distance} must be smaller than price {price}"
+            )
+
     asset = str(raw.get("asset", "")).strip().lower() or _infer_asset(symbol)
 
     return {
@@ -84,9 +97,24 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
         "qty": qty,
         "type": otype,
         "price": price,
+        "stop_price": stop_price,
+        "stop_distance": stop_distance,
+        "close": close,
         "ts": float(raw.get("ts") or time.time()),
         "idem": compute_idem(raw),
     }
+
+
+def _optional_positive(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise SignalError(f"invalid {name}: {value!r}") from None
+    if number <= 0:
+        raise SignalError(f"{name} must be > 0: {number}")
+    return number
 
 
 def _infer_asset(symbol: str) -> str:

@@ -52,7 +52,16 @@ def test_classify_symbol():
 
 # ---- risk.evaluate ---------------------------------------------------------
 def _sig(**over):
-    base = {"idem": "i", "symbol": "USDJPY", "asset": "fx", "side": "BUY", "qty": 1000, "type": "MARKET"}
+    base = {
+        "idem": "i",
+        "symbol": "USDJPY",
+        "asset": "fx",
+        "side": "BUY",
+        "qty": 1000,
+        "type": "MARKET",
+        "price": 150.0,
+        "stop_distance": 0.5,
+    }
     base.update(over)
     return base
 
@@ -96,6 +105,34 @@ def test_risk_approve(fake_redis, monkeypatch):
     assert risk.evaluate(_sig(idem="i3")) is True
 
 
+def test_risk_stop_loss_required(fake_redis, monkeypatch):
+    """REQUIRE_STOP_LOSS（既定 ON）: ストップ情報の無い新規建てシグナルは却下。"""
+    import common
+    import risk
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    assert risk.evaluate(_sig(idem="i5", stop_distance=None, stop_price=None)) is False
+
+
+def test_risk_stop_price_accepted(fake_redis, monkeypatch):
+    import common
+    import risk
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_today_realized_pnl", lambda: 0.0)
+    assert risk.evaluate(_sig(idem="i6", stop_distance=None, stop_price=148.0)) is True
+
+
+def test_risk_close_exempt_from_stop(fake_redis, monkeypatch):
+    """決済シグナル（close=true）はストップ不要で通る。"""
+    import common
+    import risk
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_today_realized_pnl", lambda: 0.0)
+    assert risk.evaluate(_sig(idem="i7", stop_distance=None, stop_price=None, close=True)) is True
+
+
 # ---- strategy signal -------------------------------------------------------
 def test_ma_cross_signal_directions():
     import strategy
@@ -114,12 +151,22 @@ def test_strategy_emit_only_on_change(fake_redis, monkeypatch):
 
     monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
     # 初回 flat->long は発行
-    strategy.emit_if_changed("USDJPY", "fx", 1, 0.01)
+    strategy.emit_if_changed("USDJPY", "fx", 1, 0.01, 150.0)
     assert fake_redis.hget("strategy:state", "USDJPY") == "1"
     assert fake_redis.xlen("signals") == 1
     # 同じ状態なら発行しない
-    strategy.emit_if_changed("USDJPY", "fx", 1, 0.01)
+    strategy.emit_if_changed("USDJPY", "fx", 1, 0.01, 150.0)
     assert fake_redis.xlen("signals") == 1
+
+
+def test_strategy_skip_without_valid_stop(fake_redis, monkeypatch):
+    """ATR が計算できない（stop_distance=0）状態ではシグナルを出さない。"""
+    import common
+    import strategy
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    strategy.emit_if_changed("EURUSD", "fx", 1, 0.0, 1.09)
+    assert fake_redis.xlen("signals") == 0
 
 
 # ---- optimizer score -------------------------------------------------------

@@ -125,10 +125,19 @@ def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFr
 # ============================================================================
 # シグナル発行（状態変化時のみ）
 # ============================================================================
-def emit_if_changed(symbol: str, asset: str, target: int, stop_distance: float) -> None:
+def emit_if_changed(
+    symbol: str, asset: str, target: int, stop_distance: float, price: float
+) -> None:
     prev = common.r().hget(STATE_KEY, symbol)
     prev_state = int(prev) if prev is not None else 0
     if target == prev_state or target == 0:
+        return
+    if stop_distance <= 0 or price <= 0:
+        # ATR が計算できない（データ不足等）状態でストップ無し発注はしない
+        log.warning(
+            "no valid stop -> skip signal",
+            **log_extra(symbol=symbol, stop_distance=stop_distance, price=price),
+        )
         return
     side = "BUY" if target == 1 else "SELL"
     raw = {
@@ -138,6 +147,7 @@ def emit_if_changed(symbol: str, asset: str, target: int, stop_distance: float) 
         "qty": settings.strategy_qty,
         "type": "MARKET",
         "ts": time.time(),
+        "price": price,
         "stop_distance": stop_distance,
     }
     sig = {
@@ -185,6 +195,7 @@ def main() -> None:
                             settings.strategy_asset,
                             sig["target"],
                             sig["stop_distance"],
+                            float(df["close"].iloc[-1]),
                         )
                 ib.sleep(0.2)
         except Exception:
