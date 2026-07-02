@@ -38,7 +38,8 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 ④ strategy.py（並行）: interval ごとに decide()。状態変化時のみ "signals" へ publish
         ▼ Stream "signals"
 ② risk.py（Consumer Group "risk"）
-  └ KillSwitch → 数量上限 → 取引時間帯 → 日次損失(超過で自動KillSwitch) → 発注レート
+  └ KillSwitch → 数量上限 → 銘柄許可リスト → 純建玉上限 → 取引時間帯
+    → 日次損失(超過で自動KillSwitch) → 発注レート
   └ 通過 → Stream "orders"
         ▼ Stream "orders"
 ③ executor.py（Consumer Group "exec"）

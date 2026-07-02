@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     # 新規建てシグナルに stop_price / stop_distance を必須にする（安全側の既定 ON）。
     # 決済シグナルは "close": true で免除。
     require_stop_loss: bool = True
+    # 取引を許可する銘柄（カンマ区切り、大文字化して照合）。
+    # 空 = 制限なし（後方互換のため許容するが、本番では必ず設定すること）。
+    symbol_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # シンボル毎の純建玉（ネットポジション）上限。建玉を「増やす」発注のみ制限し、
+    # 減らす方向（決済）は常に通す。MAX_POSITION_QTY は 1 注文の上限、
+    # こちらは累積の上限（同方向シグナル連打による積み上がりを止める）。
+    max_net_position_qty: float = 10_000
 
     # ---- 自作戦略（strategy.py）------------------------------------------
     # 既定 OFF。明示的に有効化しない限り自動シグナルは出さない（安全側）。
@@ -81,6 +88,14 @@ class Settings(BaseSettings):
         """カンマ区切り文字列を list に変換（空要素は除去）。"""
         if isinstance(v, str):
             return [p.strip() for p in v.split(",") if p.strip()]
+        return v
+
+    @field_validator("symbol_allowlist", mode="before")
+    @classmethod
+    def _split_symbols(cls, v: object) -> object:
+        """カンマ区切り文字列を大文字の list に変換（空要素は除去）。"""
+        if isinstance(v, str):
+            return [p.strip().upper() for p in v.split(",") if p.strip()]
         return v
 
     @computed_field  # type: ignore[prop-decorator]
