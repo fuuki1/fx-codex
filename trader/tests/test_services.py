@@ -91,6 +91,7 @@ def test_risk_daily_loss_auto_kill(fake_redis, monkeypatch):
     monkeypatch.setattr(common, "notify", lambda *a, **k: None)
     killed: list[bool] = []
     monkeypatch.setattr(common, "set_kill_switch", lambda on, **k: killed.append(on))
+    monkeypatch.setattr(risk, "_net_position", lambda symbol: 0.0)
     monkeypatch.setattr(risk, "_today_realized_pnl", lambda: -1_000_000.0)
     assert risk.evaluate(_sig(idem="i4")) is False
     assert killed == [True]
@@ -101,6 +102,7 @@ def test_risk_approve(fake_redis, monkeypatch):
     import risk
 
     monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_net_position", lambda symbol: 0.0)
     monkeypatch.setattr(risk, "_today_realized_pnl", lambda: 0.0)
     assert risk.evaluate(_sig(idem="i3")) is True
 
@@ -119,6 +121,7 @@ def test_risk_stop_price_accepted(fake_redis, monkeypatch):
     import risk
 
     monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_net_position", lambda symbol: 0.0)
     monkeypatch.setattr(risk, "_today_realized_pnl", lambda: 0.0)
     assert risk.evaluate(_sig(idem="i6", stop_distance=None, stop_price=148.0)) is True
 
@@ -129,8 +132,53 @@ def test_risk_close_exempt_from_stop(fake_redis, monkeypatch):
     import risk
 
     monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_net_position", lambda symbol: 0.0)
     monkeypatch.setattr(risk, "_today_realized_pnl", lambda: 0.0)
     assert risk.evaluate(_sig(idem="i7", stop_distance=None, stop_price=None, close=True)) is True
+
+
+# ---- 銘柄許可リスト / 純建玉上限 --------------------------------------------
+def _patch_risk_io(monkeypatch, *, net: float = 0.0, pnl: float = 0.0):
+    import common
+    import risk
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(common, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(risk, "_net_position", lambda symbol: net)
+    monkeypatch.setattr(risk, "_today_realized_pnl", lambda: pnl)
+    return risk
+
+
+def test_risk_symbol_not_in_allowlist_rejected(fake_redis, monkeypatch):
+    risk = _patch_risk_io(monkeypatch)
+    monkeypatch.setattr(risk.settings, "symbol_allowlist", ["USDJPY"])
+    assert risk.evaluate(_sig(idem="a1", symbol="EURUSD")) is False
+    assert risk.evaluate(_sig(idem="a2", symbol="USDJPY")) is True
+
+
+def test_risk_empty_allowlist_allows_all(fake_redis, monkeypatch):
+    risk = _patch_risk_io(monkeypatch)
+    monkeypatch.setattr(risk.settings, "symbol_allowlist", [])
+    assert risk.evaluate(_sig(idem="a3", symbol="EURUSD")) is True
+
+
+def test_risk_net_position_blocks_accumulation(fake_redis, monkeypatch):
+    """既に上限近くまで買い持ち → さらに BUY は却下（積み上がり防止）。"""
+    risk = _patch_risk_io(monkeypatch, net=9_500.0)
+    assert risk.evaluate(_sig(idem="n1", side="BUY", qty=1000)) is False
+
+
+def test_risk_net_position_allows_reducing(fake_redis, monkeypatch):
+    """上限超の建玉でも、減らす方向（決済）は通す。"""
+    risk = _patch_risk_io(monkeypatch, net=12_000.0)
+    assert risk.evaluate(_sig(idem="n2", side="SELL", qty=1000)) is True
+
+
+def test_risk_net_position_short_side(fake_redis, monkeypatch):
+    """売り持ちの積み上がりも同様に制限する。"""
+    risk = _patch_risk_io(monkeypatch, net=-9_500.0)
+    assert risk.evaluate(_sig(idem="n3", side="SELL", qty=1000)) is False
+    assert risk.evaluate(_sig(idem="n4", side="BUY", qty=1000)) is True
 
 
 # ---- strategy signal -------------------------------------------------------
