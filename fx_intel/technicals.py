@@ -8,6 +8,7 @@ briefing の複合スコアの入力にする。
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from collections.abc import Sequence
 
@@ -16,6 +17,10 @@ from tradingview_ta import get_multiple_analysis
 DEFAULT_EXCHANGE = "OANDA"
 DEFAULT_SCREENER = "forex"
 DEFAULT_INTERVALS = ("15m", "1h", "4h", "1d")
+
+# スキャナーAPIは一時的に失敗することがあるため時間足ごとに再試行する
+FETCH_ATTEMPTS = 2
+FETCH_RETRY_WAIT_SECONDS = 1.0
 
 # 上位足ほど重い(合計1.0)
 INTERVAL_WEIGHTS = {"15m": 0.15, "1h": 0.30, "4h": 0.30, "1d": 0.25}
@@ -80,6 +85,20 @@ class PairTechnicals:
         if total_weight == 0:
             return 0.0
         return round(total / total_weight, 3)
+
+    def coverage(self, intervals: Sequence[str] = DEFAULT_INTERVALS) -> float:
+        """取得できた時間足の重み合計 / 期待する重み合計(0.0〜1.0)。
+
+        briefing のデータ品質判定に使う。1.0なら全時間足が揃っている。
+        """
+        expected = sum(INTERVAL_WEIGHTS.get(i, 0.1) for i in intervals)
+        if expected == 0:
+            return 0.0
+        got = sum(INTERVAL_WEIGHTS.get(i, 0.1) for i in intervals if i in self.views)
+        return round(got / expected, 3)
+
+    def missing_intervals(self, intervals: Sequence[str] = DEFAULT_INTERVALS) -> list[str]:
+        return [i for i in intervals if i not in self.views]
 
     def ma_side(self, interval: str = "1h") -> str | None:
         """自作MAクロス戦略と同じ目線判定(long/short/None)。"""
@@ -150,12 +169,22 @@ def fetch_pair_technicals(
     warnings: list[str] = []
 
     for interval in intervals:
-        try:
-            analysis = get_multiple_analysis(
-                screener=screener, interval=interval, symbols=qualified
+        analysis = None
+        last_error: Exception | None = None
+        for attempt in range(FETCH_ATTEMPTS):
+            try:
+                analysis = get_multiple_analysis(
+                    screener=screener, interval=interval, symbols=qualified
+                )
+                break
+            except Exception as error:  # noqa: BLE001 - 外部API起因
+                last_error = error
+                if attempt + 1 < FETCH_ATTEMPTS:
+                    time.sleep(FETCH_RETRY_WAIT_SECONDS)
+        if analysis is None:
+            warnings.append(
+                f"TradingView {interval} 取得失敗(再試行{FETCH_ATTEMPTS}回): {last_error}"
             )
-        except Exception as error:  # noqa: BLE001 - 外部API起因
-            warnings.append(f"TradingView {interval} 取得失敗: {error}")
             continue
         for symbol in cleaned:
             entry = analysis.get(f"{exchange}:{symbol}")

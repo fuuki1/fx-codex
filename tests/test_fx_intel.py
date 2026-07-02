@@ -18,10 +18,17 @@ from fx_intel.calendar import (
     upcoming_events,
 )
 from fx_intel.news import NewsItem, dedupe_and_sort, parse_rss, tag_currencies
+from fx_intel.journal import (
+    DirectionalStats,
+    append_plans,
+    evaluate_directional_accuracy,
+    format_stats_ja,
+)
 from fx_intel.sentiment import (
     CurrencySentiment,
     _extract_json_block,
     analyze_market,
+    build_analysis_from_claude_json,
     pair_bias,
     score_headlines_lexicon,
 )
@@ -293,6 +300,50 @@ def test_extract_json_block() -> None:
     assert _extract_json_block("JSONなし") is None
 
 
+def test_lexicon_single_headline_is_shrunk() -> None:
+    """記事1件では±1.0に振り切らない(過大評価の防止)。"""
+    items = [make_news("USD/JPY rises above 160 on dollar strength")]
+    scores = score_headlines_lexicon(items, ["USD", "JPY"])
+    assert 0 < scores["USD"].score <= 0.34  # shrink = 1/(1+2)
+    assert -0.34 <= scores["JPY"].score < 0
+
+
+def test_lexicon_more_headlines_increase_magnitude() -> None:
+    one = score_headlines_lexicon([make_news("BOJ hawkish rate hike")], ["JPY"])
+    many = score_headlines_lexicon(
+        [make_news(f"BOJ hawkish rate hike {i}", hours_ago=i) for i in range(4)],
+        ["JPY"],
+    )
+    assert many["JPY"].score > one["JPY"].score > 0
+
+
+def test_claude_json_bias_scaled_by_confidence() -> None:
+    parsed = {
+        "currencies": {
+            "USD": {"bias": 0.8, "confidence": 0.5, "themes": ["雇用"], "comment": "強い"},
+            "JPY": {"bias": -1.0},  # confidence欠落 → 0.5扱い
+        },
+        "market_regime": "risk_on",
+        "summary": "要約",
+    }
+    analysis = build_analysis_from_claude_json(parsed, ["JPY", "USD"])
+    assert analysis is not None and analysis.engine == "claude"
+    assert analysis.currencies["USD"].score == pytest.approx(0.4)  # 0.8 × 0.5
+    assert analysis.currencies["USD"].confidence == 0.5
+    assert analysis.currencies["JPY"].score == pytest.approx(-0.5)
+    assert analysis.regime == "risk_on"
+
+
+def test_claude_json_invalid_payloads_rejected() -> None:
+    assert build_analysis_from_claude_json(None, ["USD"]) is None
+    assert build_analysis_from_claude_json({"summary": "通貨なし"}, ["USD"]) is None
+    # 壊れた値は0扱い・範囲外はクリップ
+    parsed = {"currencies": {"USD": {"bias": "abc", "confidence": 5.0}}}
+    analysis = build_analysis_from_claude_json(parsed, ["USD"])
+    assert analysis is not None
+    assert analysis.currencies["USD"].score == 0.0
+
+
 # -------------------------------------------------------------- technicals
 
 
@@ -328,6 +379,22 @@ def test_ma_side_short_and_missing() -> None:
     tech.views = {"1h": make_view("1h", "SELL", sma_fast=148.0, sma_slow=149.0)}
     assert tech.ma_side() == "short"
     assert PairTechnicals(symbol="EURUSD").ma_side() is None
+
+
+def test_coverage_and_missing_intervals() -> None:
+    tech = PairTechnicals(symbol="USDJPY")
+    assert tech.coverage() == 0.0
+    tech.views = {"1h": make_view("1h", "BUY")}
+    assert tech.coverage() == pytest.approx(0.30)
+    assert tech.missing_intervals() == ["15m", "4h", "1d"]
+    tech.views = {
+        "15m": make_view("15m", "BUY"),
+        "1h": make_view("1h", "BUY"),
+        "4h": make_view("4h", "BUY"),
+        "1d": make_view("1d", "BUY"),
+    }
+    assert tech.coverage() == 1.0
+    assert tech.missing_intervals() == []
 
 
 # ---------------------------------------------------------------- briefing
@@ -385,6 +452,120 @@ def test_build_trade_plan_neutral_when_signals_conflict() -> None:
     assert plan.stop is None
 
 
+def test_trade_plan_quality_penalizes_missing_news() -> None:
+    """関連ニュースが無い場合は品質70%扱いになり確信度が減衰する。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    assert plan.data_quality == pytest.approx(0.7)
+    assert plan.conviction == round(abs(plan.composite) * 100 * 0.7)
+    assert any("関連ニュース0件" in w for w in plan.warnings)
+
+
+def test_trade_plan_no_technicals_forces_neutral() -> None:
+    """テクニカルが全滅したらニュースが強くても方向判断を出さない。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.9),
+        "JPY": CurrencySentiment("JPY", score=-0.9),
+    }
+    tech = PairTechnicals(symbol="USDJPY")  # views空 = 全時間足取得失敗
+    news = [make_news(f"USD/JPY rises session {i}", hours_ago=i + 1) for i in range(5)]
+    plan = briefing.build_trade_plan("USDJPY", tech, currencies, [], news, now=NOW)
+    assert plan.direction == "neutral"
+    assert any("テクニカル全時間足" in w for w in plan.warnings)
+    assert any("方向判断を見送り" in w for w in plan.warnings)
+
+
+def test_trade_plan_partial_technicals_warns() -> None:
+    currencies = {"USD": CurrencySentiment("USD"), "JPY": CurrencySentiment("JPY")}
+    tech = PairTechnicals(symbol="USDJPY")
+    tech.views = {"1h": make_view("1h", "BUY")}
+    plan = briefing.build_trade_plan("USDJPY", tech, currencies, [], [], now=NOW)
+    assert any("テクニカル欠損" in w and "15m" in w for w in plan.warnings)
+
+
+def test_trade_plan_calendar_unavailable_caps_conviction() -> None:
+    """カレンダー取得不能=イベントリスク未確認なら確信度に上限。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.8),
+        "JPY": CurrencySentiment("JPY", score=-0.8),
+    }
+    news = [make_news(f"USD/JPY rallies session {i}", hours_ago=i + 1) for i in range(5)]
+    plan = briefing.build_trade_plan(
+        "USDJPY", bullish_tech(), currencies, [], news, now=NOW, calendar_ok=False
+    )
+    assert plan.direction == "long"
+    assert plan.conviction <= briefing.CALENDAR_UNKNOWN_CONVICTION_CAP
+    assert any("イベントリスク未確認" in w for w in plan.warnings)
+
+
+def test_trade_plan_conflict_between_tech_and_news_warns() -> None:
+    """テクニカルとニュースが強く対立したら警告して確信度を減衰。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=-0.5),  # ニュースはドル売り
+        "JPY": CurrencySentiment("JPY", score=0.5),
+    }
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    assert any("対立" in w for w in plan.warnings)
+    undamped = round(round(abs(plan.composite) * 100 * plan.data_quality))
+    assert plan.conviction == round(undamped * briefing.CONFLICT_CONVICTION_FACTOR)
+
+
+# ----------------------------------------------------------------- journal
+
+
+def test_journal_append_and_evaluate(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    recorded_at = NOW - timedelta(hours=8)
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=recorded_at)
+    assert plan.direction == "long" and plan.close == 150.0
+    append_plans(path, [plan], now=recorded_at)
+    path.open("a", encoding="utf-8").write("壊れた行 not json\n")  # 耐性確認
+
+    # 記録時150.0 → 現値151.0: ロング的中
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 151.0}, now=NOW)
+    assert stats.evaluated == 1 and stats.hits == 1
+    # 現値149.0: 不的中
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 149.0}, now=NOW)
+    assert stats.evaluated == 1 and stats.hits == 0
+    # 記録から最低経過時間に満たなければ評価対象外
+    stats = evaluate_directional_accuracy(
+        path, {"USDJPY": 151.0}, now=recorded_at + timedelta(hours=1)
+    )
+    assert stats.evaluated == 0
+    # 存在しないファイルは空集計
+    stats = evaluate_directional_accuracy(tmp_path / "none.jsonl", {}, now=NOW)
+    assert stats.evaluated == 0
+
+
+def test_journal_skips_non_directional_entries(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    neutral = briefing.TradePlan(
+        symbol="EURUSD",
+        direction="neutral",
+        conviction=0,
+        composite=0.0,
+        tech_score=0.0,
+        news_score=0.0,
+        close=1.1,
+    )
+    append_plans(path, [neutral], now=NOW - timedelta(hours=8))
+    stats = evaluate_directional_accuracy(path, {"EURUSD": 1.2}, now=NOW)
+    assert stats.evaluated == 0
+
+
+def test_format_stats_ja() -> None:
+    assert "4件中 3件的中" in format_stats_ja(DirectionalStats(evaluated=4, hits=3))
+    assert "的中率 75%" in format_stats_ja(DirectionalStats(evaluated=4, hits=3))
+    assert format_stats_ja(DirectionalStats()) == ""
+
+
 def test_build_discord_payload_structure() -> None:
     from fx_intel.sentiment import MarketAnalysis
 
@@ -405,6 +586,7 @@ def test_build_discord_payload_structure() -> None:
         20,
         100,
         fetch_warnings=["テスト警告"],
+        journal_note="直近48h内の方向判断 4件中 3件的中 — 的中率 75%",
         now=NOW,
     )
     assert "FXデスクブリーフィング" in payload["content"]
@@ -415,6 +597,7 @@ def test_build_discord_payload_structure() -> None:
     assert "通貨センチメント" in field_names
     assert "今後48時間の重要イベント" in field_names
     assert "データ取得の注意" in field_names
+    assert "判断の検証(自己採点)" in field_names
     pair_embed = payload["embeds"][1]
     assert pair_embed["title"].startswith("USDJPY")
     assert any("プライスプラン" in f["name"] for f in pair_embed["fields"])

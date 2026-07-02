@@ -8,6 +8,9 @@
 3. センチメント分析 — 語彙ベース(常時) + Claude API(ANTHROPIC_API_KEYがあれば)
 4. TradingViewマルチタイムフレームテクニカル(15m/1h/4h/1d)
 5. 複合スコア → ペアごとのトレードプラン(方向・確信度・ATRベースSL/TP)
+   確信度はデータ品質(テクニカル取得率・関連ニュース量・カレンダー可用性)で減衰
+6. 判断ジャーナル(logs/briefing_journal.jsonl) — 過去の方向判断の的中率を
+   毎回検証してブリーフィングに表示(--no-journal で無効化)
 
 使い方:
     .venv/bin/python fx_briefing.py                  # Discordへ送信
@@ -31,11 +34,12 @@ from pathlib import Path
 
 import requests
 
-from fx_intel import briefing, calendar, news, sentiment, technicals
+from fx_intel import briefing, calendar, journal, news, sentiment, technicals
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
 DEFAULT_EVENTS_CSV = PROJECT_ROOT / "research_pack" / "upcoming_events.csv"
+DEFAULT_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_journal.jsonl"
 
 
 def load_webhook_url() -> str | None:
@@ -101,6 +105,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="research_pack/upcoming_events.csv の書き出しを行わない",
     )
+    parser.add_argument(
+        "--no-journal",
+        action="store_true",
+        help="判断ジャーナル(logs/briefing_journal.jsonl)の記録・検証を行わない",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
 
@@ -121,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         cache_path=PROJECT_ROOT / "logs" / "calendar_cache.json"
     )
     fetch_warnings.extend(calendar_warnings)
+    # イベントが1件も取れていない=警戒窓判定が機能しない状態。判断側で安全側に倒す
+    calendar_ok = bool(events)
     events_48h = calendar.upcoming_events(
         events, currencies, now, hours_ahead=args.hours_ahead, min_impact="high"
     )
@@ -157,8 +168,21 @@ def main(argv: list[str] | None = None) -> int:
                 items,
                 now=now,
                 atr_multiple=atr_multiple,
+                calendar_ok=calendar_ok,
             )
         )
+
+    # 6. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
+    journal_note = ""
+    if not args.no_journal:
+        closes = {symbol: tech_map[symbol].close() for symbol in symbols}
+        stats = journal.evaluate_directional_accuracy(DEFAULT_JOURNAL_PATH, closes, now=now)
+        journal_note = journal.format_stats_ja(stats)
+        if not args.dry_run:
+            try:
+                journal.append_plans(DEFAULT_JOURNAL_PATH, plans, now=now)
+            except OSError as error:
+                fetch_warnings.append(f"判断ジャーナル書き込み失敗: {error}")
 
     payload = briefing.build_discord_payload(
         plans,
@@ -168,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         fast_window,
         slow_window,
         fetch_warnings=fetch_warnings,
+        journal_note=journal_note,
         now=now,
     )
 
