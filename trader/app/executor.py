@@ -292,16 +292,54 @@ def _bump_error_counter() -> None:
         )
 
 
+def _claim_exec_report(exec_id: str) -> bool:
+    """この execId の commission report を初めて処理するなら True。
+
+    IB は再接続時などに commission report を再送しうるため、execId で重複加算を防ぐ。
+    Redis 不通時は True（処理する）を返す: まれな再送での二重計上より、
+    実現損失のカウント漏れ（日次損失ガードの空振り）のほうが危険。
+    """
+    if not exec_id:
+        return True
+    try:
+        return bool(common.r().set(f"exec_report:{exec_id}", "1", nx=True, ex=7 * 86400))
+    except Exception:
+        log.exception("exec report dedupe failed -> processing anyway")
+        return True
+
+
 def _on_commission(trade: Any, _fill: Any, report: Any) -> None:
-    """約定後の commissionReport から realized_pnl を更新（ギャップ解消）。"""
+    """約定後の commissionReport から realized_pnl を更新（ギャップ解消）。
+
+    - 部分約定は複数回届くので「加算」する（上書きすると過少計上になる）。
+    - execId で重複加算を防ぐ（再送対策）。
+    - ref の fills 行が無い場合（子ストップ注文・手動注文など）は行を新規作成する。
+      ストップロスの損失こそ日次損失ガードに乗せる必要がある。
+    """
     pnl = getattr(report, "realizedPNL", None)
     if pnl is None or abs(pnl) >= _PNL_SENTINEL:
         return
     ref = str(getattr(trade.order, "orderRef", "") or "")
     if not ref:
         return
+    if not _claim_exec_report(str(getattr(report, "execId", "") or "")):
+        return
     try:
-        common.db_execute("UPDATE fills SET realized_pnl = %s WHERE ref = %s", (float(pnl), ref))
+        rows = common.db_query(
+            "UPDATE fills SET realized_pnl = realized_pnl + %s WHERE ref = %s RETURNING 1",
+            (float(pnl), ref),
+        )
+        if not rows:
+            symbol = str(
+                getattr(trade.contract, "localSymbol", "") or getattr(trade.contract, "symbol", "")
+            )
+            side = str(getattr(trade.order, "action", "") or "")
+            qty = float(getattr(trade.order, "totalQuantity", 0) or 0)
+            common.db_execute(
+                "INSERT INTO fills (ts, symbol, side, qty, status, broker, ref, realized_pnl, idem) "
+                "VALUES (now(), %s, %s, %s, %s, %s, %s, %s, NULL)",
+                (symbol, side, qty, "ChildFill", "IBKR", ref, float(pnl)),
+            )
         log.info("realized pnl updated", **log_extra(ref=ref, pnl=pnl))
     except Exception:
         log.exception("failed to update realized pnl", **log_extra(ref=ref))
