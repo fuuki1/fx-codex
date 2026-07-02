@@ -84,7 +84,7 @@ make ps
 | `MAX_POSITION_QTY` | 1 発注あたり数量上限 |
 | `SYMBOL_ALLOWLIST` | 取引を許可する銘柄（空 = 制限なし。本番は必ず設定） |
 | `MAX_NET_POSITION_QTY` | シンボル毎の純建玉上限（決済方向は制限しない） |
-| `MAX_DAILY_LOSS_JPY` | 日次実現損失の上限（超過で自動 Kill switch） |
+| `MAX_DAILY_LOSS_JPY` | 日次（JST 0 時区切り）実現損失の上限（超過で自動 Kill switch） |
 | `MAX_ORDERS_PER_MIN` | 1 分あたり発注数の上限 |
 | `MAX_CONSECUTIVE_ERRORS` | 連続発注エラーでの自動 Kill switch 閾値 |
 | `ENFORCE_SESSION` | 取引時間帯チェックの有効化 |

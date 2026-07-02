@@ -88,9 +88,10 @@ def maybe_daily_summary() -> None:
         common.r().set(KEY_SUMMARY_SENT, today, ex=90_000)
 
     try:
+        # risk._today_realized_pnl と同じ JST 日界で集計する（UTC のままだと 9 時 JST リセット）
         rows = common.db_query(
             "SELECT COUNT(*), COALESCE(SUM(realized_pnl), 0) FROM fills "
-            "WHERE ts >= date_trunc('day', now())"
+            "WHERE ts >= date_trunc('day', now() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo'"
         )
         n, pnl = rows[0]
     except Exception:
