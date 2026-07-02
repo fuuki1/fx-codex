@@ -1,0 +1,13 @@
+# Generated from the local verified environment for reproducible CI/runtime installs.
+# Regenerate intentionally when dependency versions are upgraded.
+iniconfig==2.3.0
+numpy==2.3.5
+packaging==26.2
+pandas==2.3.3
+pluggy==1.6.0
+pytest==9.0.3
+python-dateutil==2.9.0.post0
+pytz==2025.2
+six==1.17.0
+tzdata==2025.2
+
