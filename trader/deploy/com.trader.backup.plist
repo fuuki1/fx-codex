@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  毎日 06:00 に DB バックアップ（pg_dump）を取得する LaunchAgent。
+  __TRADER_DIR__ は bootstrap.sh が実パスに置換する。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.trader.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__TRADER_DIR__/deploy/backup.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__TRADER_DIR__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__TRADER_DIR__/logs/backup.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__TRADER_DIR__/logs/backup.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>

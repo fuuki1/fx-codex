@@ -31,10 +31,13 @@ testpaths = ["tests"]
 [tool.black]
 line-length = 100
 target-version = ["py311"]
+# trader/（Mac mini稼働スタック）は独自ツールチェーンで検証する（ci.ymlのtraderジョブ参照）
+extend-exclude = "^/trader/"
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["trader"]
 
 [tool.ruff.lint]
 select = ["E", "F", "UP"]

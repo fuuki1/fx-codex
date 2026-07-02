@@ -30,3 +30,35 @@ jobs:
         run: black --check .
       - name: Tests
         run: pytest
+
+  # trader/（Mac mini稼働スタック）は独自のツールチェーンで検証する（旧CIのジョブを踏襲）
+  trader-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: trader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: trader/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check app tests fx-codex/fx_backtester fx-codex/tests
+      - name: Unit tests (pytest)
+        run: pytest
+      - name: Validate docker-compose
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null
+          echo "compose config OK"
+
+  trader-build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app image
+        run: docker build -f trader/app/Dockerfile -t trader-app:ci trader
