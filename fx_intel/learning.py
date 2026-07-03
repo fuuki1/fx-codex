@@ -592,12 +592,17 @@ def derive_profile(
     calls: Sequence[EvaluatedCall],
     now: datetime | None = None,
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
+    horizon_label: str = "約24時間後",
 ) -> LearnedProfile:
     """採点済みの判断一覧から学習プロファイルを導く。
 
     記録間隔がどれだけ短くても(5分間隔運用など)、同一ペアの判断は
     thin_gap_hours に1件へ間引いてから数える。各種サンプル数ガードが
     「ほぼ同じ判断の重複」ではなく実効サンプルに対して機能するようにするため。
+
+    horizon_label は学習メモに載せる採点ホライズンの表記(既定「約24時間後」)。
+    時間足別学習(tf_learning)はここに「約1時間後」等を渡す。融合1判断は
+    既定のままで従来の表示と一致する。
     """
     now = now or datetime.now(UTC)
     if thin_gap_hours > 0:
@@ -689,20 +694,24 @@ def derive_profile(
         condition_stats=condition_stats,
         condition_factors=condition_factors,
     )
-    profile.notes_ja = _build_notes_ja(profile, weights_adjusted, tech_n, news_n)
+    profile.notes_ja = _build_notes_ja(profile, weights_adjusted, tech_n, news_n, horizon_label)
     profile.notes_ja.extend(reflection_report_ja(scored))
     return profile
 
 
 def _build_notes_ja(
-    profile: LearnedProfile, weights_adjusted: bool, tech_n: int, news_n: int
+    profile: LearnedProfile,
+    weights_adjusted: bool,
+    tech_n: int,
+    news_n: int,
+    horizon_label: str = "約24時間後",
 ) -> list[str]:
     if profile.evaluated == 0 and profile.flat == 0:
         return []
     notes: list[str] = []
     if profile.evaluated:
         line = (
-            f"過去の方向判断{profile.evaluated}件を約24時間後の値動きで採点"
+            f"過去の方向判断{profile.evaluated}件を{horizon_label}の値動きで採点"
             f" — 的中率 {profile.hit_rate:.0%}"
         )
         if profile.flat:
