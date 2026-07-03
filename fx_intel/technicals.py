@@ -8,6 +8,7 @@ briefing の複合スコアの入力にする。
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from collections.abc import Sequence
 
@@ -16,6 +17,14 @@ from tradingview_ta import get_multiple_analysis
 DEFAULT_EXCHANGE = "OANDA"
 DEFAULT_SCREENER = "forex"
 DEFAULT_INTERVALS = ("15m", "1h", "4h", "1d")
+
+# スキャナーAPIは一時的に失敗することがあるため時間足ごとに再試行する
+FETCH_ATTEMPTS = 2
+FETCH_RETRY_WAIT_SECONDS = 1.0
+
+# tradingview_ta の既定91指標にATRは含まれないため、明示的に追加リクエストする。
+# ATRが無いとSL/TP計算・学習の小動き除外・ATR換算期待値がすべて機能しない
+ADDITIONAL_INDICATORS = ("ATR",)
 
 # 上位足ほど重い(合計1.0)
 INTERVAL_WEIGHTS = {"15m": 0.15, "1h": 0.30, "4h": 0.30, "1d": 0.25}
@@ -80,6 +89,40 @@ class PairTechnicals:
         if total_weight == 0:
             return 0.0
         return round(total / total_weight, 3)
+
+    def coverage(self, intervals: Sequence[str] = DEFAULT_INTERVALS) -> float:
+        """取得できた時間足の重み合計 / 期待する重み合計(0.0〜1.0)。
+
+        briefing のデータ品質判定に使う。1.0なら全時間足が揃っている。
+        """
+        expected = sum(INTERVAL_WEIGHTS.get(i, 0.1) for i in intervals)
+        if expected == 0:
+            return 0.0
+        got = sum(INTERVAL_WEIGHTS.get(i, 0.1) for i in intervals if i in self.views)
+        return round(got / expected, 3)
+
+    def missing_intervals(self, intervals: Sequence[str] = DEFAULT_INTERVALS) -> list[str]:
+        return [i for i in intervals if i not in self.views]
+
+    def agreement_ratio(self) -> float | None:
+        """時間足レーティングの向きがどれだけ揃っているか(0.0〜1.0)。
+
+        重み付き平均(alignment_score)と同符号のレーティングを出している
+        時間足の割合。中立(スコア0)の時間足は「揃っていない」側に数える。
+        全体が中立(平均0)や未取得なら判定不能でNone。
+        学習ジャーナルの特徴量「tf_agreement」に使う。
+        """
+        if not self.views:
+            return None
+        overall = self.alignment_score()
+        if overall == 0:
+            return None
+        agree = sum(
+            1
+            for view in self.views.values()
+            if view.score != 0 and (view.score > 0) == (overall > 0)
+        )
+        return round(agree / len(self.views), 3)
 
     def ma_side(self, interval: str = "1h") -> str | None:
         """自作MAクロス戦略と同じ目線判定(long/short/None)。"""
@@ -150,12 +193,25 @@ def fetch_pair_technicals(
     warnings: list[str] = []
 
     for interval in intervals:
-        try:
-            analysis = get_multiple_analysis(
-                screener=screener, interval=interval, symbols=qualified
+        analysis = None
+        last_error: Exception | None = None
+        for attempt in range(FETCH_ATTEMPTS):
+            try:
+                analysis = get_multiple_analysis(
+                    screener=screener,
+                    interval=interval,
+                    symbols=qualified,
+                    additional_indicators=list(ADDITIONAL_INDICATORS),
+                )
+                break
+            except Exception as error:  # noqa: BLE001 - 外部API起因
+                last_error = error
+                if attempt + 1 < FETCH_ATTEMPTS:
+                    time.sleep(FETCH_RETRY_WAIT_SECONDS)
+        if analysis is None:
+            warnings.append(
+                f"TradingView {interval} 取得失敗(再試行{FETCH_ATTEMPTS}回): {last_error}"
             )
-        except Exception as error:  # noqa: BLE001 - 外部API起因
-            warnings.append(f"TradingView {interval} 取得失敗: {error}")
             continue
         for symbol in cleaned:
             entry = analysis.get(f"{exchange}:{symbol}")

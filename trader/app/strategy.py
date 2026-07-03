@@ -12,21 +12,43 @@
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any
 
 import common
 import pandas as pd
-from config import settings
+from config import IB_BAR_SIZE_STR, settings
 from domain import compute_idem
 from logging_setup import log_extra, setup_logging
+from params_gate import load_validated_params
 
 log = setup_logging("strategy", settings.log_level)
 
 DEFAULT_PARAMS = {"fast_window": 20, "slow_window": 60, "atr_window": 14, "atr_multiple": 2.0}
 STATE_KEY = "strategy:state"  # hash: symbol -> -1/0/1
+# 取得本数の余裕。ma_cross_signal は slow+1 本、compute_atr は末尾 atr_window 本を
+# 使うため、必要本数は slow + atr_window。加えて欠損バーやウォームアップの取りこぼしに
+# 備えて係数と定数の下駄を履かせる（取り過ぎ側は安全、取り不足はシグナル沈黙になる）。
+_FETCH_HEADROOM_FACTOR = 1.5
+_FETCH_HEADROOM_CONST = 20
+# IB reqHistoricalData は 1 リクエストの期間に上限がある。バー間隔ごとの目安（秒）。
+# ここを超える期間は要求せず頭打ちにする（過大要求でのタイムアウト/pacing 違反を避ける）。
+# slow_window 上限までは、いずれのバー間隔でもこの上限内に必要本数が収まる。
+_IB_MAX_DURATION_SEC = {
+    5: 7_200,      # 5 secs: ~2h
+    10: 14_400,
+    15: 14_400,
+    30: 28_800,
+    60: 86_400,    # 1 min: 1D
+    300: 604_800,  # 5 mins: 1W
+    900: 2_592_000,
+    1800: 2_592_000,
+    3600: 2_592_000,  # 1 hour: ~1M
+}
+# ファイル欠落を表すセンチネル mtime（実 mtime とは衝突しない負値）。
+# 削除が続く間、欠落イベントを一度だけ記録するために _notified_mtime に載せる。
+_MISSING_MTIME = -1.0
 
 
 # ============================================================================
@@ -72,34 +94,149 @@ def ma_cross_signal(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any] 
 # パラメータのホットリロード
 # ============================================================================
 class ParamStore:
+    """strategy_params.json を監視し、params_gate を通過した値だけをホットリロードする。
+
+    検証（provenance・境界値・取引数など）に落ちたファイル、および削除された
+    ファイルは適用しない。挙動は「直近に一度でも合格した値があるか」で分岐する:
+
+    - 合格値がある: 汚染更新が来ても直近の合格値を維持する（params_rejected を記録）。
+      合格後にファイルが削除された場合も直近合格値を維持する（params_missing を記録）。
+    - 合格値が一度も無い: get() は None を返す（params_unavailable を記録）。
+      呼び出し側はシグナルを出してはならない。検証されていないパラメータでの
+      新規発注、および「一度も検証を通っていない状態での DEFAULT 発注」を防ぐ。
+
+    いずれの異常も無音では継続しない（イベントを記録する）。DEFAULT_PARAMS は
+    合格値のスキーマ欠落キーを穴埋めする下地としてのみ使い、フォールバックの
+    発注根拠にはしない。拒否/欠落/削除の警告は同じ状態につき一度だけ。
+    """
+
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self._mtime: float = 0.0
-        self.params: dict[str, Any] = dict(DEFAULT_PARAMS)
+        self._notified_mtime: float | None = None
+        # None = 検証済みパラメータが一度も無い（= 発注不可）。
+        self.params: dict[str, Any] | None = None
 
-    def get(self) -> dict[str, Any]:
+    def get(self) -> dict[str, Any] | None:
+        """有効な検証済みパラメータを返す。無ければ None（呼び出し側は発注しない）。"""
         try:
             mtime = self.path.stat().st_mtime
-            if mtime != self._mtime:
-                self.params = {**DEFAULT_PARAMS, **json.loads(self.path.read_text())}
-                self._mtime = mtime
-                log.info("params reloaded", **log_extra(params=self.params))
         except FileNotFoundError:
-            pass
+            # ファイルが無い。削除が続く限り一度だけ記録する（センチネル mtime を使う）。
+            if self.params is not None:
+                # 一度合格した後に削除された → 直近合格値を維持しつつ params_missing を記録。
+                self._notify_once(
+                    _MISSING_MTIME,
+                    "params_missing",
+                    "params file missing after a valid load; keeping previous validated params",
+                    ["パラメータファイルが存在しない"],
+                )
+            else:
+                # 合格値が一度も無い → 発注不可のまま params_unavailable を記録。
+                self._notify_once(
+                    _MISSING_MTIME,
+                    "params_unavailable",
+                    "no validated params available; strategy will not emit signals",
+                    ["パラメータファイルが存在しない"],
+                )
+            return self.params
         except Exception:
-            log.exception("failed to load params; keeping previous")
+            log.exception("failed to stat params file; keeping previous")
+            return self.params
+
+        if mtime == self._mtime:
+            return self.params
+
+        params, errors = load_validated_params(self.path)
+        if errors or params is None:
+            # 拒否/読み込み不能。再検証を毎ループ走らせないよう mtime は進める（指摘5）。
+            self._mtime = mtime
+            if self.params is not None:
+                # 直近合格値がある → それを維持（params_rejected）。
+                self._notify_once(
+                    mtime,
+                    "params_rejected",
+                    "params rejected by gate; keeping previous validated params",
+                    errors,
+                )
+            else:
+                # 合格値が一度も無い → 発注不可のまま（params_unavailable）。
+                self._notify_once(
+                    mtime,
+                    "params_unavailable",
+                    "no validated params available; strategy will not emit signals",
+                    errors,
+                )
+            return self.params
+
+        # 合格: 反映。DEFAULT_PARAMS はスキーマ外キー欠落時の保険として下地に敷く。
+        self.params = {**DEFAULT_PARAMS, **params}
+        self._mtime = mtime
+        self._notified_mtime = None
+        log.info("params reloaded (gate passed)", **log_extra(params=self.params))
         return self.params
+
+    def _notify_once(self, mtime: float, kind: str, message: str, errors: list[str]) -> None:
+        if self._notified_mtime == mtime:
+            return
+        log.warning(message, **log_extra(errors=errors, active_params=self.params))
+        common.log_event(
+            kind, {"path": str(self.path), "errors": errors, "active_params": self.params}
+        )
+        self._notified_mtime = mtime
 
 
 # ============================================================================
 # 価格取得（IB historical bars, 取得失敗時は None）
 # ============================================================================
-def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFrame | None:
+def required_bars(slow_window: int, atr_window: int) -> int:
+    """シグナル生成に必要な最小バー数に余裕を加えた取得本数。
+
+    ma_cross_signal は slow+1 本、compute_atr は末尾 atr_window 本を使う。
+    欠損バー等に備えて係数・定数の下駄を履かせる。**ゲート受理範囲**（PARAM_BOUNDS）の
+    上限 slow_window でもデータ不足でシグナルが沈黙しないことを保証するのが目的。
+    """
+    need = slow_window + atr_window
+    return int(need * _FETCH_HEADROOM_FACTOR) + _FETCH_HEADROOM_CONST
+
+
+def duration_str(bars: int, bar_size_sec: int) -> str:
+    """必要バー数とバー間隔から IB reqHistoricalData の durationStr を組み立てる。
+
+    バー間隔ごとの 1 リクエスト上限（_IB_MAX_DURATION_SEC）で頭打ちにし、
+    秒 → 日 → 週へ単位を繰り上げる（IB は "N S"/"N D"/"N W" を受理する）。
+    IB の実バーは営業時間により歯抜けになるため、期間は必要秒数の 2 倍を要求して
+    余裕を持たせる（過大要求は上限でクリップされる）。
+    """
+    span_sec = bars * bar_size_sec * 2
+    cap = _IB_MAX_DURATION_SEC.get(bar_size_sec, 86_400)
+    span_sec = min(span_sec, cap)
+    if span_sec <= 86_400:
+        return f"{max(span_sec, 60)} S"
+    days = -(-span_sec // 86_400)  # ceil
+    if days <= 7:
+        return f"{days} D"
+    weeks = -(-days // 7)  # ceil
+    return f"{weeks} W"
+
+
+def fetch_prices(
+    ib: Any,
+    symbol: str,
+    asset: str,
+    *,
+    slow_window: int,
+    atr_window: int,
+    bar_size_sec: int | None = None,
+) -> pd.DataFrame | None:
+    bar_size_sec = bar_size_sec if bar_size_sec is not None else settings.strategy_bar_size_sec
+    bar_size_str = IB_BAR_SIZE_STR[bar_size_sec]
+    bars = required_bars(slow_window, atr_window)
     try:
         if asset.lower() in ("fx", "forex"):
             from ib_async import Forex
 
-            contract = Forex(symbol)
+            contract: Any = Forex(symbol)
         else:
             from ib_async import Stock
 
@@ -107,16 +244,24 @@ def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFr
         data = ib.reqHistoricalData(
             contract,
             endDateTime="",
-            durationStr=f"{max(bars, 60)} S",
-            barSizeSetting="5 secs",
+            durationStr=duration_str(bars, bar_size_sec),
+            barSizeSetting=bar_size_str,
             whatToShow="MIDPOINT",
             useRTH=False,
         )
         if not data:
             return None
-        return pd.DataFrame(
-            [{"high": b.high, "low": b.low, "close": b.close} for b in data]
-        )
+        df = pd.DataFrame([{"high": b.high, "low": b.low, "close": b.close} for b in data])
+        # ゲート受理範囲でも履歴が足りなければ沈黙する前に検知する（無音の沈黙を防ぐ）。
+        if len(df) < slow_window + 1:
+            log.warning(
+                "insufficient bars for slow_window; signal will be silent",
+                **log_extra(
+                    got=len(df), need=slow_window + 1, slow_window=slow_window,
+                    bar_size_sec=bar_size_sec,
+                ),
+            )
+        return df
     except Exception:
         log.exception("fetch_prices failed")
         return None
@@ -128,7 +273,7 @@ def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFr
 def emit_if_changed(
     symbol: str, asset: str, target: int, stop_distance: float, price: float
 ) -> None:
-    prev = common.r().hget(STATE_KEY, symbol)
+    prev: str | None = common.sync(common.r().hget(STATE_KEY, symbol))
     prev_state = int(prev) if prev is not None else 0
     if target == prev_state or target == 0:
         return
@@ -157,7 +302,8 @@ def emit_if_changed(
     }
     common.log_event("signal_received", sig)
     common.publish(common.STREAM_SIGNALS, sig)
-    common.r().hset(STATE_KEY, symbol, target)
+    # redis は値を文字列化して保存する。hget 側は int(prev) で読み戻す（str で明示）。
+    common.r().hset(STATE_KEY, symbol, str(target))
     log.info("strategy signal", **log_extra(symbol=symbol, side=side, target=target))
 
 
@@ -185,10 +331,19 @@ def main() -> None:
     while not stop.is_set():
         common.heartbeat("strategy")
         try:
-            if ib is not None and ib.isConnected():
-                df = fetch_prices(ib, settings.strategy_symbol, settings.strategy_asset)
+            active_params = params.get()
+            # 検証済みパラメータが無い間はシグナルを出さない（未検証パラメータや
+            # 一度も検証を通っていない DEFAULT での新規発注を防ぐ）。価格取得もしない。
+            if active_params is not None and ib is not None and ib.isConnected():
+                df = fetch_prices(
+                    ib,
+                    settings.strategy_symbol,
+                    settings.strategy_asset,
+                    slow_window=int(active_params["slow_window"]),
+                    atr_window=int(active_params["atr_window"]),
+                )
                 if df is not None:
-                    sig = ma_cross_signal(df, params.get())
+                    sig = ma_cross_signal(df, active_params)
                     if sig is not None:
                         emit_if_changed(
                             settings.strategy_symbol,

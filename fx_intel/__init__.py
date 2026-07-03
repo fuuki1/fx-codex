@@ -1,15 +1,39 @@
-"""fx_intel — ニュース・経済指標・テクニカルを統合するFX分析パッケージ。
+"""fx_intel — ニュース・経済指標・テクニカル・マクロを統合するFX分析パッケージ。
 
-機関投資家のデスクが毎朝行う分析プロセスを自動化する:
+機関投資家のデスクの投資委員会を模した役割分担で分析を自動化する:
 
-1. calendar    — 経済指標カレンダー取得とイベントリスク窓の判定
-2. news        — ニュースヘッドラインの収集と通貨タグ付け
-3. sentiment   — 語彙ベース + Claude API(任意)による通貨センチメント
-4. technicals  — TradingViewマルチタイムフレームのテクニカル集約
-5. briefing    — 上記を融合したトレードプラン生成とDiscord配信
+1.  calendar    — 経済指標カレンダー取得とイベントリスク窓の判定
+2.  news        — ニュースヘッドラインの収集と通貨タグ付け
+3.  analyst     — 自前分析エンジン(否定・強調・鮮度減衰・テーマ抽出を備えた
+                   決定論的センチメント。Claude API非依存の既定経路)
+4.  sentiment   — センチメント統合(Claude API 任意 → analyst の序列)
+5.  technicals  — TradingViewマルチタイムフレームのテクニカル集約
+6.  macro       — OHLC・米金利・DXY・VIX・CFTC COTの取得とリスクレジーム判定
+7.  gbm         — 依存ゼロの勾配ブースティング決定木(確率モデルの基盤)
+8.  ml          — ジャーナルからGBDT確率モデルを学習する時系列パイプライン
+9.  committee   — tech/news/macro/MLの委員会オーケストレータ
+10. promotion   — 委員の shadow→paper→live 昇格ゲート
+11. briefing    — 上記を融合したトレードプラン生成とDiscord配信
+12. journal     — 判断の記録と方向的中率の自己検証
+13. learning    — 履歴の相互採点による重み・確信度の自己調整
 
 tv_discord_notify.py と同じく fx_backtester 非依存で単体動作する
-(必要な外部パッケージは requests と tradingview_ta のみ)。
+(必要な外部パッケージは requests と tradingview_ta のみ。gbm/ml/promotion は
+標準ライブラリのみで動作し、ネイティブ拡張の重い依存を持ち込まない)。
 """
 
-__all__ = ["calendar", "news", "sentiment", "technicals", "briefing"]
+__all__ = [
+    "analyst",
+    "briefing",
+    "calendar",
+    "committee",
+    "gbm",
+    "journal",
+    "learning",
+    "macro",
+    "ml",
+    "news",
+    "promotion",
+    "sentiment",
+    "technicals",
+]

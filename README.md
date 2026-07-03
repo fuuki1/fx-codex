@@ -29,6 +29,9 @@ fx_intel/
   sentiment.py              # 語彙ベース+Claude API(任意)のセンチメント分析
   technicals.py             # TradingViewマルチタイムフレーム集約
   briefing.py               # 複合スコア→トレードプラン→Discord embed生成
+  journal.py                # 判断ジャーナル記録と24時間後の的中率検証
+  learning.py               # ジャーナル履歴から重み・確信度を自己学習
+  market.py                 # FX週末クローズ判定・市場オープン時間換算
 examples/
   generate_sample_data.py
 tests/
@@ -48,6 +51,22 @@ tests/
   `ANTHROPIC_API_KEY` があれば自動で有効化、失敗時は語彙ベースへフォールバック)
 - **複合スコア**: テクニカル55% + ニュース45% → ペアごとに方向・確信度(0-100)・
   ATRベースのSL/TP(strategy_params.jsonのatr_multiple使用)を提示
+- **自己学習ループ**: 毎回の判断を `logs/briefing_journal.jsonl` に記録し、
+  実行のたびに履歴全体を約24時間後(市場オープン時間換算)の値動きで相互採点。
+  テクニカル/ニュースそれぞれの的中率から複合重みを再推定(シュリンク付き、
+  テクニカル35〜70%にクランプ)し、確信度帯別の的中率キャリブレーションと
+  的中率が低いペアの確信度減衰(×0.6〜1.0)を `logs/briefing_learning.json` に
+  導出して、当日の分析に自動反映。結果は通知の「🧠 学習メモ」欄に表示されます。
+  サンプル不足の間は既定値で安全に動作します(`--no-learning` で無効化)
+- **チャート状態×方向別の学習**: 判断時のチャート状態(RSI・MA乖離のATR換算・
+  ボラティリティ・時間足一致度・関連ニュース量・ADX)を特徴量として
+  ジャーナルに記録し、「売られすぎ圏」「全時間足一致」などの固定バケットを
+  さらにロング/ショート別に分けて的中率を集計。同じ状態でも向きで成績は
+  非対称になる(例: RSI買われすぎ圏はロングでは外しやすいがショートは当たる)
+  ため、状態×方向のセル単位で学習します。過去に外しやすかったセル
+  (方向別に12件以上かつ的中率45%未満)にいまの判断が該当するときは、
+  確信度を×0.7〜1.0に減衰して理由を明示。当たりやすい/苦手な状態は
+  方向付きで学習メモに一覧表示されます
 
 ```bash
 .venv/bin/python fx_briefing.py --dry-run        # 送信せず内容確認
@@ -56,9 +75,13 @@ tests/
 ./fx_briefing_loop.sh &                          # 毎時10分に自動送信
 ```
 
-副産物として `research_pack/upcoming_events.csv` を書き出します。これは
+副産物として `research_pack/upcoming_events.csv`(最新スナップショット、毎回上書き)と
+`research_pack/event_history.csv`(追記アーカイブ)を書き出します。いずれも
 `fx_backtester` の `--events` にそのまま渡せる形式で、ライブのイベント回避と
-バックテストのイベント回避が同じデータを共有します。
+バックテストのイベント回避が同じデータを共有します。event_history.csv は実行のたびに
+未観測のイベント・改定分だけを `recorded_at` 付きで蓄積する簡易 point-in-time 記録で、
+運用を続けるほど過去期間のイベント回避を実カレンダーで再生できるようになります
+(`--no-event-archive` で無効化)。
 
 注意: これは意思決定支援であり、収益を保証する予測ではありません。イベント
 回避・リスク管理・複数ソースの突き合わせという「プロセス」を自動化するものです。
@@ -479,6 +502,19 @@ CLIはJSONで以下を出力します。
 - ウォークフォワードの組み合わせ数は `max_parameter_combinations` で制限し、CLIでは `--max-params` の既定値を20にしています。
 - 学習区間で選んだパラメータを、隣接する未使用のテスト区間だけに適用します。
 - 勝率だけを目的関数にせず、Sharpe、期待R、Profit Factor、DDを組み合わせた簡易スコアを使います。
+- 試行ログ (`fx_backtester/trial_log.py`): `auto_optimize.py` はグリッドサーチの全試行
+  (パラメータ・指標・リターン系列)を `runs/trial_logs/<run_id>/` に記録します
+  (trials.jsonl / returns_matrix.csv / run.json)。`WalkForwardValidator` にも
+  `trial_logger=` で同じロガーを渡せます。探索履歴の監査証跡であり、下記検定の入力です。
+- 過剰最適化の統計検定 (`fx_backtester/overfitting.py`、scipy非依存):
+  - PBO (CSCV; Bailey et al. 2015) — 時系列をブロック分割した全組み合わせで
+    「ISで最良の試行がOOSで中央値未満に沈む確率」を測ります。0.5でIS順位に予測力ゼロ。
+  - Deflated Sharpe Ratio (Bailey & López de Prado 2014) — 探索回数Nのまぐれで
+    達成しうる期待最大Sharpeを控除した上で、観測Sharpeが本物である確率を
+    歪度・尖度込みで出します。
+  - `auto_optimize.py` は両方を自動計算して `provenance.overfitting` に埋め込み、
+    PBO >= 0.5 / DSR < 0.95 は警告になります(警告付き candidate は
+    `promote_params.py` が `--force` 無しで昇格を拒否)。
 
 ## ネット上のFX履歴データを使う際の前提
 

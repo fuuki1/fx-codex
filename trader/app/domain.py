@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import market_calendar
+
 JST = ZoneInfo("Asia/Tokyo")
 ET = ZoneInfo("America/New_York")
 
@@ -58,10 +60,11 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
     if otype not in VALID_TYPES:
         raise SignalError(f"invalid type: {raw.get('type')!r}")
 
+    qty_raw = raw.get("qty")
     try:
-        qty = float(raw.get("qty"))
+        qty = float(qty_raw)  # type: ignore[arg-type]  # None/不正は下の except で SignalError 化
     except (TypeError, ValueError):
-        raise SignalError(f"invalid qty: {raw.get('qty')!r}") from None
+        raise SignalError(f"invalid qty: {qty_raw!r}") from None
     if qty <= 0:
         raise SignalError(f"qty must be > 0: {qty}")
 
@@ -131,7 +134,8 @@ def _infer_asset(symbol: str) -> str:
 def within_session(asset: str, symbol: str, now: datetime | None = None) -> bool:
     """対象市場が取引時間内かを返す。
 
-    注意: 祝日は未考慮（拡張点）。本番では市場休日カレンダーの注入を推奨。
+    週末/時間帯に加え、market_calendar の祝日・半日取引を考慮する。祝日テーブルの
+    収録レンジ外の日付はフェイルセーフに「祝日でない」扱い（週末/時間帯判定に委ねる）。
     """
     now = now or datetime.now(UTC)
     a = (asset or "").lower()
@@ -148,8 +152,10 @@ def within_session(asset: str, symbol: str, now: datetime | None = None) -> bool
 
 
 def _fx_open(now: datetime) -> bool:
-    """FX は概ね 日曜21:00UTC 〜 金曜21:00UTC（≒NYクローズ）。"""
+    """FX は概ね 日曜21:00UTC 〜 金曜21:00UTC（≒NYクローズ）。元日/クリスマスは停止。"""
     u = now.astimezone(UTC)
+    if market_calendar.is_fx_holiday(u.date()):
+        return False
     wd = u.weekday()  # Mon=0 .. Sun=6
     minutes = u.hour * 60 + u.minute
     close = 21 * 60
@@ -164,7 +170,7 @@ def _fx_open(now: datetime) -> bool:
 
 def _jp_equity_open(now: datetime) -> bool:
     j = now.astimezone(JST)
-    if j.weekday() >= 5:
+    if j.weekday() >= 5 or market_calendar.is_jp_equity_holiday(j.date()):
         return False
     m = j.hour * 60 + j.minute
     morning = 9 * 60 <= m < 11 * 60 + 30
@@ -174,10 +180,12 @@ def _jp_equity_open(now: datetime) -> bool:
 
 def _us_equity_open(now: datetime) -> bool:
     e = now.astimezone(ET)
-    if e.weekday() >= 5:
+    if e.weekday() >= 5 or market_calendar.is_us_equity_holiday(e.date()):
         return False
     m = e.hour * 60 + e.minute
-    return 9 * 60 + 30 <= m < 16 * 60
+    # 早終い（13:00 ET クローズ）の日は通常より早くクローズ
+    close = market_calendar.us_equity_early_close_minute(e.date()) or 16 * 60
+    return 9 * 60 + 30 <= m < close
 
 
 # ============================================================================

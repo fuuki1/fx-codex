@@ -177,7 +177,7 @@ def _file_fingerprint(path: str | None) -> dict[str, Any] | None:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _to_jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(key): _to_jsonable(item) for key, item in value.items()}
