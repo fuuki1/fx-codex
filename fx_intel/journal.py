@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 
 from .briefing import TradePlan
 from .market import open_hours_between
+from .timeframe import TimeframePlan
 
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
@@ -80,6 +81,57 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                         # チャート状態の特徴量(learning.pyの状態別学習に使う)
                         "features": plan.features,
                         # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
+                        "components": plan.components,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+def append_timeframe_plans(
+    path: str | Path, plans: Sequence[TimeframePlan], now: datetime | None = None
+) -> None:
+    """時間足別の判断をJSONLへ追記する(1プラン1行)。
+
+    append_plans(融合1判断)と同じスキーマに timeframe と horizon_hours を
+    加える。この2フィールドで learning.py が「どの時間足の・どの主ホライズンの
+    判断か」を区別し、symbol×timeframe のセル単位で採点・学習する。
+
+    close はその時間足自身の終値。後続の実行で同じ (symbol, timeframe) の
+    エントリが追記されるので、その close 列が「過去判断から見た将来価格」に
+    なる(price_history.build_close_series が (symbol, timeframe) 別に組む)。
+    """
+    now = now or datetime.now(UTC)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        for plan in plans:
+            handle.write(
+                json.dumps(
+                    {
+                        "ts": now.isoformat(),
+                        "symbol": plan.symbol,
+                        # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
+                        # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
+                        "timeframe": plan.timeframe,
+                        "horizon_hours": plan.horizon_hours,
+                        "direction": plan.direction,
+                        "conviction": plan.conviction,
+                        "composite": plan.composite,
+                        # 融合版の tech_score に相当(時間足単体の方向スコア)。
+                        # learning._signal_hit_rate が読むキー名に合わせる
+                        "tech_score": plan.tf_score,
+                        "news_score": plan.news_score,
+                        "close": plan.close,
+                        "atr": plan.atr,
+                        "rsi": plan.rsi,
+                        "adx": plan.adx,
+                        "stop": plan.stop,
+                        "target1": plan.target1,
+                        "target2": plan.target2,
+                        "data_quality": plan.data_quality,
+                        "features": plan.features,
                         "components": plan.components,
                     },
                     ensure_ascii=False,
