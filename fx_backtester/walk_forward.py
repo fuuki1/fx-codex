@@ -8,6 +8,12 @@ import pandas as pd
 
 from fx_backtester.engine import BacktestEngine, BacktestResult
 from fx_backtester.strategies.base import Strategy
+from fx_backtester.trial_log import TrialLogger
+
+
+def _wf_trial_id(fold: int, params: dict[str, object]) -> str:
+    label = "-".join(f"{key}={params[key]}" for key in sorted(params))
+    return f"fold{fold}-{label}"
 
 
 @dataclass
@@ -68,11 +74,14 @@ class WalkForwardValidator:
         parameter_grid: dict[str, list[object]],
         engine_factory: Callable[[Strategy], BacktestEngine],
         config: WalkForwardConfig | None = None,
+        trial_logger: TrialLogger | None = None,
     ) -> None:
         self.strategy_cls = strategy_cls
         self.parameter_grid = parameter_grid
         self.engine_factory = engine_factory
         self.config = config or WalkForwardConfig()
+        # 渡すと fold ごとの全学習試行と採択テストを記録する(PBO/DSR・監査の入力)
+        self.trial_logger = trial_logger
 
     def run(self, data: dict[str, pd.DataFrame]) -> WalkForwardResult:
         combinations = self._parameter_combinations()
@@ -109,6 +118,21 @@ class WalkForwardValidator:
                 score = self._score(result.metrics)
                 if result.metrics["trade_count"] < self.config.min_train_trades:
                     score = float("-inf")
+                if self.trial_logger is not None:
+                    self.trial_logger.log(
+                        _wf_trial_id(fold_number, params),
+                        params=params,
+                        phase="wf_train",
+                        metrics=result.metrics,
+                        score=score,
+                        window={
+                            "kind": "train",
+                            "fold": fold_number,
+                            "start": train_index[0],
+                            "end": train_index[-1],
+                        },
+                        returns=result.equity_curve["equity"].pct_change().dropna(),
+                    )
                 if score > best_score:
                     best_score = score
                     best_params = params
@@ -121,6 +145,20 @@ class WalkForwardValidator:
                 )
 
             test_result = self.engine_factory(self.strategy_cls(**best_params)).run(test_data)
+            if self.trial_logger is not None:
+                self.trial_logger.log(
+                    f"fold{fold_number}-selected-test",
+                    params=best_params,
+                    phase="wf_test",
+                    metrics=test_result.metrics,
+                    window={
+                        "kind": "test",
+                        "fold": fold_number,
+                        "start": test_index[0],
+                        "end": test_index[-1],
+                    },
+                    selected=True,
+                )
             selected_test_results.append(test_result)
             folds.append(
                 WalkForwardFold(

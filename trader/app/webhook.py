@@ -25,9 +25,10 @@ from contextlib import asynccontextmanager
 import common
 from config import settings
 from domain import SignalError, normalize_signal
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from logging_setup import log_extra, set_correlation_id, setup_logging
+from starlette.middleware.base import RequestResponseEndpoint
 
 log = setup_logging("webhook", settings.log_level)
 
@@ -47,7 +48,7 @@ MAX_BODY_BYTES = 64 * 1024
 
 
 @app.middleware("http")
-async def _limit_body_size(request: Request, call_next):  # type: ignore[no-untyped-def]
+async def _limit_body_size(request: Request, call_next: RequestResponseEndpoint) -> Response:
     try:
         length = int(request.headers.get("content-length") or 0)
     except ValueError:

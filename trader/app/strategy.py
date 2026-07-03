@@ -18,7 +18,7 @@ from typing import Any
 
 import common
 import pandas as pd
-from config import settings
+from config import IB_BAR_SIZE_STR, settings
 from domain import compute_idem
 from logging_setup import log_extra, setup_logging
 from params_gate import load_validated_params
@@ -27,6 +27,25 @@ log = setup_logging("strategy", settings.log_level)
 
 DEFAULT_PARAMS = {"fast_window": 20, "slow_window": 60, "atr_window": 14, "atr_multiple": 2.0}
 STATE_KEY = "strategy:state"  # hash: symbol -> -1/0/1
+# 取得本数の余裕。ma_cross_signal は slow+1 本、compute_atr は末尾 atr_window 本を
+# 使うため、必要本数は slow + atr_window。加えて欠損バーやウォームアップの取りこぼしに
+# 備えて係数と定数の下駄を履かせる（取り過ぎ側は安全、取り不足はシグナル沈黙になる）。
+_FETCH_HEADROOM_FACTOR = 1.5
+_FETCH_HEADROOM_CONST = 20
+# IB reqHistoricalData は 1 リクエストの期間に上限がある。バー間隔ごとの目安（秒）。
+# ここを超える期間は要求せず頭打ちにする（過大要求でのタイムアウト/pacing 違反を避ける）。
+# slow_window 上限までは、いずれのバー間隔でもこの上限内に必要本数が収まる。
+_IB_MAX_DURATION_SEC = {
+    5: 7_200,      # 5 secs: ~2h
+    10: 14_400,
+    15: 14_400,
+    30: 28_800,
+    60: 86_400,    # 1 min: 1D
+    300: 604_800,  # 5 mins: 1W
+    900: 2_592_000,
+    1800: 2_592_000,
+    3600: 2_592_000,  # 1 hour: ~1M
+}
 # ファイル欠落を表すセンチネル mtime（実 mtime とは衝突しない負値）。
 # 削除が続く間、欠落イベントを一度だけ記録するために _notified_mtime に載せる。
 _MISSING_MTIME = -1.0
@@ -170,12 +189,54 @@ class ParamStore:
 # ============================================================================
 # 価格取得（IB historical bars, 取得失敗時は None）
 # ============================================================================
-def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFrame | None:
+def required_bars(slow_window: int, atr_window: int) -> int:
+    """シグナル生成に必要な最小バー数に余裕を加えた取得本数。
+
+    ma_cross_signal は slow+1 本、compute_atr は末尾 atr_window 本を使う。
+    欠損バー等に備えて係数・定数の下駄を履かせる。**ゲート受理範囲**（PARAM_BOUNDS）の
+    上限 slow_window でもデータ不足でシグナルが沈黙しないことを保証するのが目的。
+    """
+    need = slow_window + atr_window
+    return int(need * _FETCH_HEADROOM_FACTOR) + _FETCH_HEADROOM_CONST
+
+
+def duration_str(bars: int, bar_size_sec: int) -> str:
+    """必要バー数とバー間隔から IB reqHistoricalData の durationStr を組み立てる。
+
+    バー間隔ごとの 1 リクエスト上限（_IB_MAX_DURATION_SEC）で頭打ちにし、
+    秒 → 日 → 週へ単位を繰り上げる（IB は "N S"/"N D"/"N W" を受理する）。
+    IB の実バーは営業時間により歯抜けになるため、期間は必要秒数の 2 倍を要求して
+    余裕を持たせる（過大要求は上限でクリップされる）。
+    """
+    span_sec = bars * bar_size_sec * 2
+    cap = _IB_MAX_DURATION_SEC.get(bar_size_sec, 86_400)
+    span_sec = min(span_sec, cap)
+    if span_sec <= 86_400:
+        return f"{max(span_sec, 60)} S"
+    days = -(-span_sec // 86_400)  # ceil
+    if days <= 7:
+        return f"{days} D"
+    weeks = -(-days // 7)  # ceil
+    return f"{weeks} W"
+
+
+def fetch_prices(
+    ib: Any,
+    symbol: str,
+    asset: str,
+    *,
+    slow_window: int,
+    atr_window: int,
+    bar_size_sec: int | None = None,
+) -> pd.DataFrame | None:
+    bar_size_sec = bar_size_sec if bar_size_sec is not None else settings.strategy_bar_size_sec
+    bar_size_str = IB_BAR_SIZE_STR[bar_size_sec]
+    bars = required_bars(slow_window, atr_window)
     try:
         if asset.lower() in ("fx", "forex"):
             from ib_async import Forex
 
-            contract = Forex(symbol)
+            contract: Any = Forex(symbol)
         else:
             from ib_async import Stock
 
@@ -183,16 +244,24 @@ def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFr
         data = ib.reqHistoricalData(
             contract,
             endDateTime="",
-            durationStr=f"{max(bars, 60)} S",
-            barSizeSetting="5 secs",
+            durationStr=duration_str(bars, bar_size_sec),
+            barSizeSetting=bar_size_str,
             whatToShow="MIDPOINT",
             useRTH=False,
         )
         if not data:
             return None
-        return pd.DataFrame(
-            [{"high": b.high, "low": b.low, "close": b.close} for b in data]
-        )
+        df = pd.DataFrame([{"high": b.high, "low": b.low, "close": b.close} for b in data])
+        # ゲート受理範囲でも履歴が足りなければ沈黙する前に検知する（無音の沈黙を防ぐ）。
+        if len(df) < slow_window + 1:
+            log.warning(
+                "insufficient bars for slow_window; signal will be silent",
+                **log_extra(
+                    got=len(df), need=slow_window + 1, slow_window=slow_window,
+                    bar_size_sec=bar_size_sec,
+                ),
+            )
+        return df
     except Exception:
         log.exception("fetch_prices failed")
         return None
@@ -204,7 +273,7 @@ def fetch_prices(ib: Any, symbol: str, asset: str, bars: int = 200) -> pd.DataFr
 def emit_if_changed(
     symbol: str, asset: str, target: int, stop_distance: float, price: float
 ) -> None:
-    prev = common.r().hget(STATE_KEY, symbol)
+    prev: str | None = common.sync(common.r().hget(STATE_KEY, symbol))
     prev_state = int(prev) if prev is not None else 0
     if target == prev_state or target == 0:
         return
@@ -233,7 +302,8 @@ def emit_if_changed(
     }
     common.log_event("signal_received", sig)
     common.publish(common.STREAM_SIGNALS, sig)
-    common.r().hset(STATE_KEY, symbol, target)
+    # redis は値を文字列化して保存する。hget 側は int(prev) で読み戻す（str で明示）。
+    common.r().hset(STATE_KEY, symbol, str(target))
     log.info("strategy signal", **log_extra(symbol=symbol, side=side, target=target))
 
 
@@ -265,7 +335,13 @@ def main() -> None:
             # 検証済みパラメータが無い間はシグナルを出さない（未検証パラメータや
             # 一度も検証を通っていない DEFAULT での新規発注を防ぐ）。価格取得もしない。
             if active_params is not None and ib is not None and ib.isConnected():
-                df = fetch_prices(ib, settings.strategy_symbol, settings.strategy_asset)
+                df = fetch_prices(
+                    ib,
+                    settings.strategy_symbol,
+                    settings.strategy_asset,
+                    slow_window=int(active_params["slow_window"]),
+                    atr_window=int(active_params["atr_window"]),
+                )
                 if df is not None:
                     sig = ma_cross_signal(df, active_params)
                     if sig is not None:

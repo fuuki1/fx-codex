@@ -202,20 +202,50 @@ def test_auto_optimize_refuses_sample_data(tmp_path: Path) -> None:
 def test_auto_optimize_writes_candidate_with_provenance(tmp_path: Path, monkeypatch) -> None:
     csv = write_price_csv(tmp_path / "real.csv", periods=4500)
     out = tmp_path / "candidate.json"
-    monkeypatch.setattr(auto_optimize, "FAST_WINDOWS", [10])
+    trial_logs = tmp_path / "trial_logs"
+    monkeypatch.setattr(auto_optimize, "FAST_WINDOWS", [10, 15])
     monkeypatch.setattr(auto_optimize, "SLOW_WINDOWS", [40])
     monkeypatch.setattr(auto_optimize, "ATR_MULTS", [2.0])
 
-    assert auto_optimize.main(["--data", str(csv), "--output", str(out)]) == 0
+    args = ["--data", str(csv), "--output", str(out), "--trial-log-dir", str(trial_logs)]
+    assert auto_optimize.main(args) == 0
 
     candidate = json.loads(out.read_text())
-    assert candidate["fast_window"] == 10
+    assert candidate["fast_window"] in (10, 15)
     assert candidate["slow_window"] == 40
     prov = candidate["provenance"]
     assert prov["data"]["sha256"] == params_gate.sha256_file(csv)
     assert prov["data"]["rows"] == 4500
     assert isinstance(prov["trade_count"], int)
     assert "oos" in prov and "warnings" in prov
+
+    # 試行ログ: 全試行(IS 2通り + 採択のOOS 1件)が記録され、candidateから参照できる
+    trials_info = prov["trials"]
+    assert trials_info["count"] == 3
+    run_dir = Path(trials_info["log_dir"])
+    assert run_dir.parent == trial_logs
+    trials = [
+        json.loads(line)
+        for line in (run_dir / "trials.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(t["phase"] == "is_grid" for t in trials) == 2
+    assert sum(t["phase"] == "oos" for t in trials) == 1
+    assert sum(t["selected"] for t in trials) == 1
+    assert (run_dir / "returns_matrix.csv").exists()
+    assert (run_dir / "run.json").exists()
+
+    # 過剰最適化検定: PBO/DSR が計算され provenance に記録される
+    # (このデータ量・試行数なら両方とも計算可能なはず)
+    over = prov["overfitting"]
+    assert 0.0 <= over["pbo"]["pbo"] <= 1.0
+    assert over["pbo"]["n_trials"] == 2
+    assert 0.0 <= over["dsr"]["dsr"] <= 1.0
+    assert over["dsr"]["n_trials"] == 2
+    # 警告閾値を跨いだ場合は既存のwarning機構(promoteが既定拒否)に乗る
+    if over["pbo"]["pbo"] >= auto_optimize.PBO_WARN_THRESHOLD:
+        assert any("PBO警告" in w for w in prov["warnings"])
+    if over["dsr"]["dsr"] < auto_optimize.DSR_WARN_THRESHOLD:
+        assert any("DSR警告" in w for w in prov["warnings"])
 
 
 # ── promote_params ───────────────────────────────────────────────────────────

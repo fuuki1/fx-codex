@@ -4,22 +4,40 @@
 
 ---
 
-## [最優先・次PR] slow_window が大きいと検証済みパラメータでもシグナルが沈黙する
+## [解決済み] slow_window が大きいと検証済みパラメータでもシグナルが沈黙する
 
 **深刻度**: 高（正規パラメータでも発注が止まる沈黙障害）
+**状態**: 解決（branch `feature/fx-intel-reliability`）
 
 `params_gate` は `slow_window` を最大 500 まで受理する（`params_gate.py` の
-`PARAM_BOUNDS`）。一方 `trader/app/strategy.py` の `fetch_prices` は
-`durationStr=f"{max(bars, 60)} S"` × `barSizeSetting="5 secs"` で最大 200 本しか
-取得しない。`ma_cross_signal` は `len(df) < slow + 1` でデータ不足時に None を返すため、
-検証を**通過した正規パラメータ**でも `slow_window ≳ 200` だとシグナルが一切出なくなる。
+`PARAM_BOUNDS`）。一方 `trader/app/strategy.py` の旧 `fetch_prices` は
+`durationStr=f"{max(bars, 60)} S"` × `barSizeSetting="5 secs"` で最大 40 本しか
+取得できず（200 S ÷ 5 secs）、`ma_cross_signal` は `len(df) < slow + 1` で None を
+返すため、検証を**通過した正規パラメータ**（現行 active の `slow_window=100` を含む）で
+シグナルが一切出なくなっていた。
+
+**対応（実装済み）**:
+- `fetch_prices` は取得本数を `required_bars(slow_window, atr_window)` で逆算し、
+  `duration_str()` で IB の `N S`/`N D`/`N W` に単位を繰り上げて要求する。
+- バー間隔は `STRATEGY_BAR_SIZE_SEC`（既定 5、config でバリデーション）で設定可能に。
+- 取得後 `len(df) < slow+1` を検知したら warning を出す（無音の沈黙を防ぐ）。
+- `tests/test_strategy_params.py` に「gate 受理範囲（PARAM_BOUNDS の全 slow_window）× 全
+  バー間隔で必要本数が満たされる」ことを突き合わせる回帰テストを追加。
+
+---
+
+## [残課題・別PR] バー時間軸と backtest 時間軸の不一致
+
+**深刻度**: 中（沈黙は解消したが、戦略の意味論が backtest と一致しない可能性）
+
+`auto_optimize.py` は時間足（hourly 形状）データで `slow_window` を最適化するが、
+既定の `STRATEGY_BAR_SIZE_SEC=5`（5 秒足）では同じ `slow_window=100` でも MA が
+約 8 分しか張らず、backtest とは別物の戦略になる。上記修正で沈黙は解消したが、
+「配備 params の時間軸」と「live のバー間隔」を突き合わせる仕組みは未整備。
 
 **対応案**:
-- `fetch_prices` の取得本数を `slow_window` から必要数を逆算して決める、または
-- バー間隔（5 secs）を戦略の時間軸に合わせて広げる、または
-- `PARAM_BOUNDS` の `slow_window` 上限を取得可能本数と整合させる。
-
-いずれにせよ「gate 受理範囲」と「実際に取得できるバー数」を突き合わせるテストを追加する。
+- `provenance` に最適化データのバー間隔を記録し、`STRATEGY_BAR_SIZE_SEC` と一致
+  しなければ warning／拒否する（params_gate 拡張）。
 
 ---
 

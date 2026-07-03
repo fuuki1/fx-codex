@@ -12,6 +12,8 @@
 - 確信度はデータ品質で減衰し、品質が閾値未満なら方向判断そのものを見送る
 - テクニカルとニュースが強く対立する場合は警告して確信度を減衰
 - 経済指標カレンダーが取得不能(=イベントリスク未確認)なら確信度に上限
+- FX市場の休場中(週末)はスキャナーが金曜クローズの価格を返し続けるため、
+  stale価格での判断を防ぐべく方向判断を「休場」に固定する
 
 このモジュールはネットワークアクセスを持たない純粋ロジックで、
 テストから直接検証できる。
@@ -21,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, UTC
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from .calendar import (
     EconomicEvent,
@@ -29,6 +31,7 @@ from .calendar import (
     active_and_next_window,
     symbol_currencies,
 )
+from .market import is_market_open
 from .news import NewsItem
 from .sentiment import CurrencySentiment, MarketAnalysis, pair_bias
 from .technicals import PairTechnicals
@@ -61,10 +64,26 @@ COLOR_NEUTRAL = 0x95A5A6
 COLOR_STANDBY = 0xF39C12
 
 DIRECTION_JA = {
-    "long": "ロング",
-    "short": "ショート",
-    "neutral": "中立(見送り)",
-    "standby": "様子見(イベント警戒)",
+    "long": "ロング(買い)",
+    "short": "ショート(売り)",
+    "neutral": "見送り(取引しない)",
+    "standby": "様子見(重要指標の前後)",
+    "closed": "休場(週末クローズ)",
+}
+
+# 初心者向けに「この判断が何を意味するか」を一文で言い換える
+DIRECTION_HINT_JA = {
+    "long": "値上がりを見込んで「買い」が優勢という判断です。",
+    "short": "値下がりを見込んで「売り」が優勢という判断です。",
+    "neutral": "買い・売りどちらの根拠も弱いため、今回は取引しないのが無難です。",
+    "standby": "重要な経済指標の発表が近く、価格が急に動きやすいので新規の取引は控えます。",
+    "closed": "FX市場は週末のためお休み中です。表示されている価格は金曜の最終値のままです。",
+}
+
+REGIME_HINT_JA = {
+    "risk_on": "リスクオン(投資家が強気。株や高金利の通貨が買われやすい)",
+    "risk_off": "リスクオフ(投資家が慎重。円・ドルなど安全とされる通貨が買われやすい)",
+    "neutral": "中立(相場全体の方向感が出にくい)",
 }
 
 DIRECTION_EMOJI = {
@@ -72,7 +91,25 @@ DIRECTION_EMOJI = {
     "short": "🔴",
     "neutral": "⚪",
     "standby": "🟠",
+    "closed": "💤",
 }
+
+
+@dataclass(frozen=True)
+class ScoreComponent:
+    """複合スコアに参加する追加委員1人ぶんの意見(committee.pyが組み立てる)。
+
+    tech/newsの2委員はbuild_trade_planの固有引数のまま残し(後方互換と
+    学習ループのスキーマ安定のため)、マクロ・MLなど新しい委員はこの形で
+    extra_componentsに渡す。weightはtech+news=1.0に対する相対値で、
+    合成時に全体で正規化される。
+    """
+
+    key: str  # "macro" / "ml" など(ジャーナルの特徴量キーにも使う)
+    label_ja: str
+    score: float  # -1.0〜+1.0
+    weight: float
+    detail: str = ""  # 根拠の一言(注意点・内訳表示に使う)
 
 
 @dataclass
@@ -90,6 +127,15 @@ class TradePlan:
     target2: float | None = None
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0  # 0.0〜1.0。判断の根拠データがどれだけ揃っていたか
+    tech_weight: float = TECH_WEIGHT  # 実際に使った複合重み(学習調整で変わりうる)
+    news_weight: float = NEWS_WEIGHT
+    # 判断時点のチャート状態(RSI/MA乖離/ボラ/時間足一致度/ニュース量など)。
+    # ジャーナルに残し、learning.pyが「どんな状態で当たりやすいか」を学習する
+    features: dict[str, float] = field(default_factory=dict)
+    # 複合スコアの内訳(tech/news+追加委員)。表示とジャーナル記録用
+    components: list[dict] = field(default_factory=list)
+    # 委員会の見解メモ(shadow検証中の委員の意見も含む。判断根拠の可視化)
+    committee_notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     headlines: list[NewsItem] = field(default_factory=list)
     interval_summary: str = ""
@@ -122,12 +168,57 @@ def _tech_score(tech: PairTechnicals) -> tuple[float, str]:
     alignment = tech.alignment_score()
     ma_side = tech.ma_side()
     if ma_side == "long":
-        ma_dir, ma_note = 1.0, f"MA({tech.fast_window}/{tech.slow_window}): ゴールデン(ロング目線)"
+        ma_dir = 1.0
+        ma_note = (
+            f"移動平均線MA({tech.fast_window}/{tech.slow_window}): "
+            "ゴールデンクロス(買いが優勢のサイン)"
+        )
     elif ma_side == "short":
-        ma_dir, ma_note = -1.0, f"MA({tech.fast_window}/{tech.slow_window}): デッド(ショート目線)"
+        ma_dir = -1.0
+        ma_note = (
+            f"移動平均線MA({tech.fast_window}/{tech.slow_window}): "
+            "デッドクロス(売りが優勢のサイン)"
+        )
     else:
-        ma_dir, ma_note = 0.0, f"MA({tech.fast_window}/{tech.slow_window}): 判定不能"
+        ma_dir, ma_note = 0.0, f"移動平均線MA({tech.fast_window}/{tech.slow_window}): 判定不能"
     return _clip(alignment + MA_AGREEMENT_BONUS * ma_dir), ma_note
+
+
+def _extract_features(tech: PairTechnicals, news_count: int) -> dict[str, float]:
+    """判断時点のチャート状態を学習用の特徴量にする(取得できたものだけ)。
+
+    - rsi_1h / adx_1h: 1時間足のRSIとADX(トレンド強度)
+    - ma_gap_atr: MA(fast/slow)の乖離をATR何個分かで正規化した値(符号=向き)
+    - atr_pct: ATR(1h)÷終値の百分率。ボラティリティレジームの指標
+    - tf_agreement: 時間足レーティングの向きの一致度(0.0〜1.0)
+    - rating_4h / rating_1d: 上位足レーティング(-1.0〜+1.0)。
+      学習側が「上位足逆行の判断は当たるか」を方向別に採点するのに使う
+    - news_count: 関連ニュース件数
+    """
+    features: dict[str, float] = {"news_count": float(news_count)}
+    for interval in ("4h", "1d"):
+        higher = tech.views.get(interval)
+        if higher is not None:
+            features[f"rating_{interval}"] = higher.score
+    view = tech.views.get("1h")
+    if view is not None:
+        if view.rsi is not None:
+            features["rsi_1h"] = round(view.rsi, 2)
+        if view.adx is not None:
+            features["adx_1h"] = round(view.adx, 2)
+        if (
+            view.sma_fast is not None
+            and view.sma_slow is not None
+            and view.atr is not None
+            and view.atr > 0
+        ):
+            features["ma_gap_atr"] = round((view.sma_fast - view.sma_slow) / view.atr, 3)
+        if view.atr is not None and view.close:
+            features["atr_pct"] = round(view.atr / view.close * 100, 4)
+    agreement = tech.agreement_ratio()
+    if agreement is not None:
+        features["tf_agreement"] = agreement
+    return features
 
 
 def _interval_summary(tech: PairTechnicals) -> str:
@@ -150,12 +241,12 @@ def _event_warnings(
         warnings.append(
             f"⚠️ イベント警戒中: {event.currency}「{event.title}」"
             f"({event.when.astimezone(JST):%m/%d %H:%M} JST, 影響度{event.impact_ja})"
-            f" — 窓終了 {active.end.astimezone(JST):%H:%M} JST"
+            f" — {active.end.astimezone(JST):%H:%M} JSTまでは値動きが荒れやすく、新規取引は控える時間帯"
         )
     if upcoming is not None and upcoming.start <= now + timedelta(hours=lookahead_hours):
         event = upcoming.event
         warnings.append(
-            f"⏳ 次のイベント: {event.currency}「{event.title}」"
+            f"⏳ 次の重要イベント: {event.currency}「{event.title}」"
             f" {event.when.astimezone(JST):%m/%d %H:%M} JST (影響度{event.impact_ja})"
         )
     return active is not None, warnings
@@ -171,18 +262,74 @@ def build_trade_plan(
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    tech_weight: float = TECH_WEIGHT,
+    news_weight: float = NEWS_WEIGHT,
+    conviction_factor: float = 1.0,
+    condition_adjuster: Callable[[Mapping[str, float], str], tuple[float, str]] | None = None,
+    extra_components: Sequence[ScoreComponent] = (),
+    extra_features: Mapping[str, float] | None = None,
+    committee_notes: Sequence[str] = (),
 ) -> TradePlan:
     """1ペア分のトレードプランを組み立てる。
 
     calendar_ok=False は経済指標カレンダーが取得できず、イベントリスクを
     確認できていない状態。警戒窓判定が機能しないため確信度に上限を掛ける。
+
+    now がFX市場の休場中(週末クローズ)の場合、テクニカルの価格は最終取引
+    時点のstale値なので、方向判断を出さず direction="closed" に固定する。
+
+    tech_weight/news_weight/conviction_factor は学習プロファイル
+    (fx_intel.learning)による自動調整の注入点。conviction_factor<1.0は
+    「過去の的中率が低いペアなので確信度を減衰する」の意味で、
+    方向判断そのものは変えず確信度だけを下げる。
+
+    condition_adjuster は「現在のチャート状態(特徴量)×判断方向が過去に
+    外しやすかった組み合わせか」を判定するフック。(特徴量, "long"/"short")を
+    受けて(減衰係数, 理由文)を返し、係数<1.0なら確信度を減衰して理由を
+    注意点に載せる。方向が決まった後(long/shortのときだけ)呼ばれ、
+    方向判断そのものは変えない。
+
+    extra_components はマクロ・MLなど追加委員の意見(committee.py参照)。
+    複合スコアは全委員の重み付き平均になり、重みは全体で正規化するため
+    追加委員が無ければ従来のtech/news合成と完全に一致する。
+    extra_features は特徴量への追記(委員のスコアをジャーナルに残し、
+    shadow段階の委員でも成績を後から採点できるようにする)。
     """
     now = now or datetime.now(UTC)
     base, quote = symbol_currencies(symbol)
 
     tech_score, ma_note = _tech_score(tech)
     news_score = pair_bias(base, quote, currency_scores)
-    composite = round(TECH_WEIGHT * tech_score + NEWS_WEIGHT * news_score, 3)
+    weighted_sum = tech_weight * tech_score + news_weight * news_score
+    total_weight = tech_weight + news_weight
+    for component in extra_components:
+        weighted_sum += component.weight * _clip(component.score)
+        total_weight += component.weight
+    composite = round(weighted_sum / total_weight, 3) if total_weight > 0 else 0.0
+
+    components_record = [
+        {
+            "key": "tech",
+            "label_ja": "テクニカル",
+            "score": round(tech_score, 3),
+            "weight": round(tech_weight / total_weight, 3),
+        },
+        {
+            "key": "news",
+            "label_ja": "ニュース",
+            "score": news_score,
+            "weight": round(news_weight / total_weight, 3),
+        },
+    ] + [
+        {
+            "key": component.key,
+            "label_ja": component.label_ja,
+            "score": round(_clip(component.score), 3),
+            "weight": round(component.weight / total_weight, 3),
+            "detail": component.detail,
+        }
+        for component in extra_components
+    ]
 
     # 両通貨に言及する記事(ペア固有ニュース)を優先し、片方のみは補完扱い
     def _relevance(item: NewsItem) -> int:
@@ -193,6 +340,14 @@ def build_trade_plan(
         relevant_items,
         key=lambda item: (-_relevance(item), -item.published.timestamp()),
     )[:3]
+
+    # 判断時点のチャート状態を記録(learning.pyの状態別学習の入力)。
+    # 追加委員のスコア(macro_score等)もここに合流させてジャーナルに残す
+    features = _extract_features(tech, len(relevant_items))
+    if extra_features:
+        for key, value in extra_features.items():
+            if isinstance(value, (int, float)):
+                features[str(key)] = round(float(value), 4)
 
     # データ品質: 根拠データの揃い具合。確信度の減衰と方向判断の見送りに使う
     tech_cov = tech.coverage()
@@ -207,11 +362,20 @@ def build_trade_plan(
 
     in_event_window, warnings = _event_warnings(windows, now)
 
+    # 学習調整: 直近の的中率が低いペアは確信度を減衰(方向判断は変えない)
+    conviction_factor = max(0.0, min(1.0, conviction_factor))
+    if conviction_factor < 1.0:
+        conviction = round(conviction * conviction_factor)
+        warnings.append(
+            f"📉 学習調整: このペアは過去の方向判断の的中率が低めのため"
+            f"確信度を×{conviction_factor:.2f}に減衰"
+        )
+
     if tech_cov <= 0:
         warnings.append("⚠️ テクニカル全時間足の取得に失敗 — テクニカル根拠なし")
     elif tech_cov < 1.0:
         missing = ", ".join(tech.missing_intervals())
-        warnings.append(f"テクニカル欠損: {missing} 未取得(カバレッジ{tech_cov:.0%})")
+        warnings.append(f"テクニカル欠損: {missing} 未取得(取得率{tech_cov:.0%})")
     if not relevant_items:
         warnings.append("関連ニュース0件 — ニュース根拠なし")
     if not calendar_ok:
@@ -226,11 +390,19 @@ def build_trade_plan(
     )
     if conflict:
         warnings.append(
-            f"テクニカル({tech_score:+.2f})とニュース({news_score:+.2f})が対立 — 確信度を減衰"
+            f"テクニカル({tech_score:+.2f})とニュース({news_score:+.2f})が反対方向を示しており、"
+            "方向感が定まらないため確信度を下げて評価"
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if in_event_window:
+    if not is_market_open(now):
+        direction = "closed"
+        conviction = 0
+        warnings.append(
+            "💤 FX市場休場中(週末クローズ) — 表示価格は最終取引時点のもの。"
+            "方向判断は市場再開後に実施"
+        )
+    elif in_event_window:
         direction = "standby"
         conviction = min(conviction, STANDBY_CONVICTION_CAP)
     elif tech_cov <= 0 or quality < MIN_QUALITY_FOR_DIRECTION:
@@ -244,9 +416,23 @@ def build_trade_plan(
     else:
         direction = "neutral"
 
+    # 学習調整: いまのチャート状態×方向が過去に外しやすかった状態なら確信度を減衰
+    if condition_adjuster is not None and direction in ("long", "short"):
+        condition_factor, condition_reason = condition_adjuster(features, direction)
+        condition_factor = max(0.0, min(1.0, condition_factor))
+        if condition_factor < 1.0 and condition_reason:
+            conviction = round(conviction * condition_factor)
+            warnings.append(f"📉 学習調整: {condition_reason}")
+
     close = tech.close()
     atr = tech.atr()
     stop = target1 = target2 = None
+    if direction in ("long", "short") and (atr is None or atr <= 0):
+        # ATRが無い方向判断は、SL/TPを提示できないだけでなく学習側の
+        # 小動き除外・ATR換算期待値も無効になる(ジャーナルに残る欠陥データ)
+        warnings.append(
+            "⚠️ ATR(1h)取得失敗 — SL/TPを算出できず、学習の小動き判定・期待値計算も無効"
+        )
     if close is not None and atr is not None and atr > 0 and direction in ("long", "short"):
         risk_distance = atr * atr_multiple
         sign = 1.0 if direction == "long" else -1.0
@@ -268,6 +454,11 @@ def build_trade_plan(
         target2=target2,
         risk_pct=risk_pct,
         data_quality=quality,
+        tech_weight=tech_weight,
+        news_weight=news_weight,
+        features=features,
+        components=components_record,
+        committee_notes=list(committee_notes),
         warnings=warnings,
         headlines=related,
         interval_summary=_interval_summary(tech),
@@ -309,14 +500,15 @@ def _events_lines(events: Sequence[EconomicEvent], limit: int = 8) -> str:
         )
         extras = []
         if event.forecast:
-            extras.append(f"予:{event.forecast}")
+            extras.append(f"予想 {event.forecast}")
         if event.previous:
-            extras.append(f"前:{event.previous}")
+            extras.append(f"前回 {event.previous}")
         if extras:
-            line += f" ({' '.join(extras)})"
+            line += f" ({' / '.join(extras)})"
         lines.append(line)
     if len(events) > limit:
         lines.append(f"…ほか{len(events) - limit}件")
+    lines.append("※発表の前後は価格が急に動きやすいので新規の取引は控えるのが安全")
     return "\n".join(lines)
 
 
@@ -327,50 +519,73 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
         "standby": COLOR_STANDBY,
     }.get(plan.direction, COLOR_NEUTRAL)
 
+    hint = DIRECTION_HINT_JA.get(plan.direction, "")
+    if plan.components:
+        parts = " + ".join(
+            f"{c['label_ja']} {c['score']:+.2f}({c['weight']:.0%})" for c in plan.components
+        )
+    else:
+        parts = (
+            f"テクニカル {plan.tech_score:+.2f}({plan.tech_weight:.0%})"
+            f" + ニュース {plan.news_score:+.2f}({plan.news_weight:.0%})"
+        )
     breakdown = (
-        f"複合 **{plan.composite:+.2f}**"
-        f" = テクニカル {plan.tech_score:+.2f}×{TECH_WEIGHT:.0%}"
-        f" + ニュース {plan.news_score:+.2f}×{NEWS_WEIGHT:.0%}"
+        f"根拠の内訳: {parts}"
+        f" = 複合 **{plan.composite:+.2f}**"
         f" | データ品質 {plan.data_quality:.0%}"
     )
     fields = [
         {
             "name": "判断",
             "value": (
-                f"{plan.emoji} **{plan.direction_ja}** 確信度 {plan.conviction}/100\n"
+                f"{plan.emoji} **{plan.direction_ja}** — 確信度 {plan.conviction}/100"
+                "(根拠のそろい具合)\n"
+                f"{hint}\n"
                 f"{breakdown}\n{plan.ma_note}"
             ),
             "inline": False,
         },
         {
-            "name": "時間足レーティング",
-            "value": plan.interval_summary,
+            "name": "時間足ごとの見立て",
+            "value": (
+                f"{plan.interval_summary}\n"
+                "※15m=15分足 / 1h=1時間足 / 4h=4時間足 / 1d=日足。"
+                "短いほど直近の動きを反映"
+            ),
             "inline": False,
         },
     ]
     if plan.direction in ("long", "short") and plan.stop is not None:
         fields.append(
             {
-                "name": "プライスプラン (ATRベース)",
+                "name": "売買プラン(価格の目安)",
                 "value": (
-                    f"現値 {format_price(plan.symbol, plan.close)}"
-                    f" / SL {format_price(plan.symbol, plan.stop)}\n"
-                    f"T1 {format_price(plan.symbol, plan.target1)} (1R)"
-                    f" / T2 {format_price(plan.symbol, plan.target2)} (2R)\n"
-                    f"ATR(1h) {format_price(plan.symbol, plan.atr)}"
-                    f" / 推奨リスク {plan.risk_pct:.2g}%"
+                    f"いまの価格: {format_price(plan.symbol, plan.close)}\n"
+                    f"損切り(SL): {format_price(plan.symbol, plan.stop)}"
+                    " ← 予想と逆に動いたらここで撤退\n"
+                    f"利確の目標: 第1目標(T1) {format_price(plan.symbol, plan.target1)}"
+                    f" / 第2目標(T2) {format_price(plan.symbol, plan.target2)}\n"
+                    f"1回の取引で許容する損失: 資金の{plan.risk_pct:.2g}%まで\n"
+                    f"※直近の平均的な値動き幅 ATR(1h) {format_price(plan.symbol, plan.atr)}"
+                    " をもとに算出"
                 ),
                 "inline": False,
             }
         )
-    if plan.warnings:
+    if plan.committee_notes:
         fields.append(
-            {"name": "イベントリスク", "value": "\n".join(plan.warnings), "inline": False}
+            {
+                "name": "🧩 委員会の見解(役割別AI)",
+                "value": "\n".join(plan.committee_notes)[:1024],
+                "inline": False,
+            }
         )
+    if plan.warnings:
+        fields.append({"name": "⚠️ 注意点", "value": "\n".join(plan.warnings), "inline": False})
     if plan.headlines:
         fields.append(
             {
-                "name": "関連ヘッドライン",
+                "name": "関連ニュース",
                 "value": "\n".join(
                     f"・[{item.source}] {item.title[:90]}" for item in plan.headlines
                 ),
@@ -393,6 +608,8 @@ def build_discord_payload(
     slow_window: int,
     fetch_warnings: Sequence[str] = (),
     journal_note: str = "",
+    learning_note: str = "",
+    promotion_note: str = "",
     now: datetime | None = None,
 ) -> dict:
     """Discord Webhook用のペイロードを組み立てる。"""
@@ -400,18 +617,26 @@ def build_discord_payload(
     now_iso = now.isoformat()
 
     headline_parts = [
-        f"{plan.emoji} {plan.symbol} {plan.direction_ja}({plan.conviction})" for plan in plans
+        f"{plan.emoji} {plan.symbol} {plan.direction_ja} 確信度{plan.conviction}" for plan in plans
     ]
-    engine_ja = "Claude分析" if analysis.engine == "claude" else "語彙分析"
+    engine_ja = {
+        "claude": "Claude分析",
+        "analyst": "自前分析エンジン",
+        "lexicon": "語彙分析",
+    }.get(analysis.engine, analysis.engine)
+    regime_ja = REGIME_HINT_JA.get(analysis.regime, analysis.regime_ja)
     content = (
-        f"📊 **FXデスクブリーフィング** {now.astimezone(JST):%m/%d %H:%M} JST"
-        f" | 地合い: {analysis.regime_ja} ({engine_ja})\n" + " / ".join(headline_parts)
+        f"📊 **FXデスクブリーフィング** {now.astimezone(JST):%m/%d %H:%M} JST ({engine_ja})\n"
+        f"相場のムード: {regime_ja}\n" + " / ".join(headline_parts)
     )
 
+    sentiment_value = _sentiment_lines(analysis, currencies)
+    if sentiment_value != "データなし":
+        sentiment_value += "\n※ニュースから測った通貨の強さ。+1.0に近いほど買われやすい"
     macro_fields = [
         {
             "name": "通貨センチメント",
-            "value": _sentiment_lines(analysis, currencies),
+            "value": sentiment_value,
             "inline": False,
         },
         {
@@ -426,6 +651,22 @@ def build_discord_payload(
         macro_fields.append(
             {"name": "判断の検証(自己採点)", "value": journal_note, "inline": False}
         )
+    if learning_note:
+        macro_fields.append(
+            {
+                "name": "🧠 学習メモ(過去の判断からの自動調整)",
+                "value": learning_note[:1024],  # Discordのフィールド上限
+                "inline": False,
+            }
+        )
+    if promotion_note:
+        macro_fields.append(
+            {
+                "name": "🎖️ 委員の運用段階(shadow→paper→live)",
+                "value": promotion_note[:1024],
+                "inline": False,
+            }
+        )
     if fetch_warnings:
         macro_fields.append(
             {
@@ -434,6 +675,19 @@ def build_discord_payload(
                 "inline": False,
             }
         )
+    macro_fields.append(
+        {
+            "name": "📘 用語ミニ解説(FX初心者向け)",
+            "value": (
+                "・**ロング/ショート**: 値上がりを狙う「買い」/値下がりを狙う「売り」\n"
+                "・**確信度**: 分析根拠のそろい具合(0〜100)。低いときは見送りが無難\n"
+                "・**損切り(SL)**: 予想が外れたとき、損失を小さく確定して撤退する価格\n"
+                "・**利確(T1/T2)**: 利益を確定する目安の価格。T2の方が遠い目標\n"
+                "・**ATR**: 直近の平均的な値動きの幅。損切り・利確までの距離の物差し"
+            ),
+            "inline": False,
+        }
+    )
 
     embeds = [
         {

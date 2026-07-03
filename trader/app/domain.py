@@ -60,10 +60,11 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
     if otype not in VALID_TYPES:
         raise SignalError(f"invalid type: {raw.get('type')!r}")
 
+    qty_raw = raw.get("qty")
     try:
-        qty = float(raw.get("qty"))
+        qty = float(qty_raw)  # type: ignore[arg-type]  # None/不正は下の except で SignalError 化
     except (TypeError, ValueError):
-        raise SignalError(f"invalid qty: {raw.get('qty')!r}") from None
+        raise SignalError(f"invalid qty: {qty_raw!r}") from None
     if qty <= 0:
         raise SignalError(f"qty must be > 0: {qty}")
 

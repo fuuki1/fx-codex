@@ -48,9 +48,14 @@ jobs:
           cache: pip
           cache-dependency-path: trader/requirements-dev.txt
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: |
+          pip install -r requirements-dev.txt
+          # 品質ゲートの再現性のため mypy を固定（flat 側 CI と同版）
+          pip install mypy==2.1.0
       - name: Lint (ruff)
         run: ruff check app tests fx-codex/fx_backtester fx-codex/tests
+      - name: Types (mypy) — 稼働スタック app/ を型ゲート
+        run: mypy app
       - name: Unit tests (pytest)
         run: pytest
       - name: Validate docker-compose

@@ -10,7 +10,14 @@ import os
 from pathlib import Path
 
 import params_gate
-from strategy import ParamStore
+import pytest
+from config import IB_BAR_SIZE_STR
+from strategy import (
+    ParamStore,
+    duration_str,
+    fetch_prices,
+    required_bars,
+)
 
 
 def _valid_params(**overrides) -> dict:
@@ -222,3 +229,109 @@ def test_deleted_then_restored_reloads(tmp_path: Path) -> None:
     st = path.stat()
     os.utime(path, (st.st_atime, st.st_mtime + 10))
     assert store.get()["fast_window"] == 21  # 復活後は新しい合格値を反映
+
+
+# ── ゲート受理範囲 vs 実際に取得できるバー数（docs/ISSUES.md 最優先項目）────────
+#
+# params_gate は slow_window を最大 500 まで受理する。fetch_prices が取得本数を
+# slow_window から逆算せず固定値だと、正規パラメータでもシグナルが沈黙する（旧バグ）。
+# 「ゲート受理範囲」と「実際に取得できるバー数」を突き合わせて回帰を防ぐ。
+
+
+def _bars_from_duration(duration: str, bar_size_sec: int) -> int:
+    """durationStr が表す期間から、そのバー間隔で得られる最大バー数を求める。"""
+    n_str, unit = duration.split()
+    n = int(n_str)
+    seconds = {"S": 1, "D": 86_400, "W": 604_800}[unit]
+    return (n * seconds) // bar_size_sec
+
+
+def _slow_bounds() -> tuple[int, int]:
+    lo, hi = params_gate.PARAM_BOUNDS["slow_window"]
+    return int(lo), int(hi)
+
+
+def test_required_bars_covers_signal_need() -> None:
+    """required_bars は常に slow+1（MA）と atr_window（ATR）を満たす。"""
+    _, hi = _slow_bounds()
+    for slow in (5, 60, 100, 250, hi):
+        atr = 14
+        need = required_bars(slow, atr)
+        assert need >= slow + 1
+        assert need >= atr
+
+
+def test_duration_covers_gate_accepted_slow_window() -> None:
+    """全バー間隔 × ゲート受理範囲の全 slow_window で、要求 duration から得られる
+    バー数が必要本数（slow+1）以上になる（＝データ不足の沈黙が起きない）。"""
+    lo, hi = _slow_bounds()
+    atr_hi = int(params_gate.PARAM_BOUNDS["atr_window"][1])
+    for bar_size_sec in IB_BAR_SIZE_STR:
+        for slow in (lo, 60, 100, 250, hi):
+            need = required_bars(slow, atr_hi)
+            duration = duration_str(need, bar_size_sec)
+            available = _bars_from_duration(duration, bar_size_sec)
+            assert available >= slow + 1, (
+                f"bar_size={bar_size_sec}s slow={slow}: "
+                f"duration={duration!r} → {available} bars < {slow + 1}"
+            )
+
+
+def test_duration_str_units_grow_with_span() -> None:
+    """duration は必要秒数に応じて秒→日→週へ単位が繰り上がり、IB 受理形式になる。"""
+    assert duration_str(10, 5).endswith(" S")            # 小さい → 秒
+    # 1 日超・1 週以内 → 日単位（3600s バー × 400 本 × 2 = 800h ≒ 33日 だが 1M 上限で頭打ち）
+    assert duration_str(500, 3600).endswith((" D", " W"))  # 大きい → 日/週
+    for bar_size_sec in IB_BAR_SIZE_STR:
+        d = duration_str(required_bars(500, 100), bar_size_sec)
+        n_str, unit = d.split()
+        assert unit in {"S", "D", "W"}
+        assert int(n_str) >= 1
+
+
+class _FakeBar:
+    def __init__(self, close: float) -> None:
+        self.high = close + 0.001
+        self.low = close - 0.001
+        self.close = close
+
+
+class _FakeIB:
+    """reqHistoricalData の呼び出しを記録し、指定本数のバーを返すスタブ。"""
+
+    def __init__(self, n_bars: int) -> None:
+        self.n_bars = n_bars
+        self.calls: list[dict] = []
+
+    def reqHistoricalData(self, contract, **kw):  # noqa: N802 (IB API 名に合わせる)
+        self.calls.append(kw)
+        return [_FakeBar(1.10 + i * 1e-5) for i in range(self.n_bars)]
+
+
+def test_fetch_prices_requests_bars_scaled_to_slow_window() -> None:
+    """fetch_prices は slow_window に応じた duration を要求し、
+    十分なバーが返れば ma_cross_signal が沈黙しない。"""
+    import strategy
+
+    _, hi = _slow_bounds()
+    ib = _FakeIB(n_bars=required_bars(hi, 100))
+
+    df = fetch_prices(
+        ib, "EURUSD", "fx", slow_window=hi, atr_window=14, bar_size_sec=60
+    )
+    assert df is not None
+    assert len(df) >= hi + 1  # slow=500 でも沈黙しない本数が返る
+    # 5 secs 固定ではなく、設定したバー間隔で要求している
+    assert ib.calls[0]["barSizeSetting"] == IB_BAR_SIZE_STR[60]
+    # ma_cross_signal がデータ不足で None を返さない
+    sig = strategy.ma_cross_signal(
+        df, {"fast_window": 20, "slow_window": hi, "atr_window": 14, "atr_multiple": 2.0}
+    )
+    assert sig is not None
+
+
+def test_fetch_prices_rejects_unknown_bar_size() -> None:
+    ib = _FakeIB(n_bars=10)
+    with pytest.raises(KeyError):
+        fetch_prices(ib, "EURUSD", "fx", slow_window=60, atr_window=14, bar_size_sec=7)
+    assert ib.calls == []  # 未対応間隔は API を呼ぶ前に弾かれる

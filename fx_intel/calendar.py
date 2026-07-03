@@ -242,8 +242,41 @@ def active_and_next_window(
     return active, upcoming
 
 
+# research_pack/major_fx_events.csv と同じ列構成（fx_backtester の --events が読む形式）
+EVENT_CSV_COLUMNS = [
+    "timestamp",
+    "currency",
+    "symbol",
+    "impact",
+    "name",
+    "category",
+    "source_url",
+    "notes",
+]
+# 追記アーカイブは「いつ観測したか」を持つ。fx_backtester 側は未知の列を無視するので互換
+ARCHIVE_COLUMNS = [*EVENT_CSV_COLUMNS, "recorded_at"]
+
+
+def _event_csv_row(event: EconomicEvent) -> dict[str, str]:
+    return {
+        "timestamp": event.when.strftime("%Y-%m-%d %H:%M:%S"),
+        "currency": event.currency,
+        "symbol": "",
+        "impact": event.impact,
+        "name": event.title,
+        "category": "economic_calendar",
+        "source_url": "https://www.forexfactory.com/calendar",
+        "notes": f"forecast={event.forecast} previous={event.previous}".strip(),
+    }
+
+
+def _archive_key(row: Mapping[str, str | None]) -> tuple[str, str, str, str, str]:
+    """内容ベースの重複判定キー。時刻改定や forecast/previous の更新は別内容として扱う。"""
+    return tuple(str(row.get(field) or "").strip() for field in ("timestamp", "currency", "name", "impact", "notes"))  # type: ignore[return-value]
+
+
 def export_events_csv(events: Iterable[EconomicEvent], path: str | Path) -> Path:
-    """fx_backtesterの --events で読める形式でCSVに書き出す。
+    """fx_backtesterの --events で読める形式でCSVに書き出す（毎回上書きのスナップショット）。
 
     research_pack/major_fx_events.csv と同じ列構成にして、
     バックテストとライブ運用が同じイベントデータを共有できるようにする。
@@ -251,30 +284,51 @@ def export_events_csv(events: Iterable[EconomicEvent], path: str | Path) -> Path
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "timestamp",
-                "currency",
-                "symbol",
-                "impact",
-                "name",
-                "category",
-                "source_url",
-                "notes",
-            ]
-        )
+        writer = csv.DictWriter(handle, fieldnames=EVENT_CSV_COLUMNS)
+        writer.writeheader()
         for event in events:
-            writer.writerow(
-                [
-                    event.when.strftime("%Y-%m-%d %H:%M:%S"),
-                    event.currency,
-                    "",
-                    event.impact,
-                    event.title,
-                    "economic_calendar",
-                    "https://www.forexfactory.com/calendar",
-                    f"forecast={event.forecast} previous={event.previous}".strip(),
-                ]
-            )
+            writer.writerow(_event_csv_row(event))
     return target
+
+
+def append_events_archive(
+    events: Iterable[EconomicEvent],
+    path: str | Path,
+    now: datetime | None = None,
+) -> tuple[Path, int]:
+    """イベントを重複排除つきで追記し、カレンダー履歴を蓄積する。(path, 追記件数) を返す。
+
+    upcoming_events.csv（毎回上書きのスナップショット）と違い、実行のたびに
+    未観測のイベントだけが recorded_at 付きで追記される point-in-time 記録。
+    同一イベントでも時刻・impact・forecast/previous が改定されたら別行として残し、
+    「いつ・どの内容で観測したか」を再構成できるようにする。
+
+    fx_backtester の --events はこのファイルをそのまま読める
+    （recorded_at 列は無視され、同一イベントの改定行はマスク上同じ窓に畳まれる）。
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    recorded_at = (now or datetime.now(UTC)).strftime("%Y-%m-%d %H:%M:%S")
+
+    seen: set[tuple[str, str, str, str, str]] = set()
+    has_header = target.exists() and target.stat().st_size > 0
+    if has_header:
+        with target.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                seen.add(_archive_key(row))
+
+    appended = 0
+    with target.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ARCHIVE_COLUMNS)
+        if not has_header:
+            writer.writeheader()
+        for event in events:
+            row = _event_csv_row(event)
+            key = _archive_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            row["recorded_at"] = recorded_at
+            writer.writerow(row)
+            appended += 1
+    return target, appended

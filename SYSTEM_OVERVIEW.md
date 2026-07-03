@@ -255,8 +255,9 @@ fx_intel/calendar.py       (実績で委員を段階昇格)
 1. 開発機: python3 auto_optimize.py --data <実データ.csv> → strategy_params.candidate.json
 2. 開発機: python3 promote_params.py で検証+承認 → strategy_params.json（旧値は.prevへ退避）
 3. rsync: ~/Desktop/fx-codex/ → Mac mini ~/trader/fx-codex/
-4. Mac mini: strategy.py が strategy_params.json のmtime変更を検知 → 自動反映（再起動不要）
-   ※読み込み側ゲート（params_gate.load_validated_params）の統合は未実施、2-1章参照
+4. Mac mini: strategy.py が strategy_params.json のmtime変更を検知 → 検証後に自動反映（再起動不要）
+   ※反映は必ず読み込み側ゲート（params_gate.load_validated_params）を通す。
+     来歴なし/境界外/合成データ由来は拒否し、直近の合格値を維持する（2-1章参照）。
 5. 必要なら: ssh fuuki@192.168.11.15 "cd ~/trader && docker compose restart strategy"
 ```
 

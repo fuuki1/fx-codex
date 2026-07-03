@@ -16,6 +16,22 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 IB_PORT_PAPER = 4002
 IB_PORT_LIVE = 4001
 
+# IB reqHistoricalData がサポートするバー間隔（秒 → barSizeSetting 文字列）。
+# strategy.fetch_prices が取得本数を slow_window から逆算する際の基準になる。
+# ここに無い間隔は設定バリデーションで弾く（黙って別間隔で動くのを防ぐ）。
+IB_BAR_SIZE_STR = {
+    5: "5 secs",
+    10: "10 secs",
+    15: "15 secs",
+    30: "30 secs",
+    60: "1 min",
+    300: "5 mins",
+    900: "15 mins",
+    1800: "30 mins",
+    3600: "1 hour",
+}
+_IB_BAR_SIZES = frozenset(IB_BAR_SIZE_STR)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -74,6 +90,21 @@ class Settings(BaseSettings):
     strategy_qty: float = 1000
     strategy_interval_sec: int = 15
     strategy_params_file: str = "strategy_params.json"
+    # 価格バーの間隔（秒）。IB reqHistoricalData の barSizeSetting に対応。
+    # slow_window が大きいほど必要な履歴が延びるため、取得本数は slow_window から
+    # 逆算する（fetch_prices）。ここは 1 バーの時間軸だけを決める。
+    # 対応値: 5/10/15/30 秒, 60(=1分)/300(5分)/900(15分)/1800(30分)/3600(1時間)。
+    strategy_bar_size_sec: int = 5
+
+    @field_validator("strategy_bar_size_sec")
+    @classmethod
+    def _validate_bar_size(cls, v: int) -> int:
+        if v not in _IB_BAR_SIZES:
+            raise ValueError(
+                f"strategy_bar_size_sec={v} は IB がサポートするバー間隔でない。"
+                f"許容値: {sorted(_IB_BAR_SIZES)}"
+            )
+        return v
 
     # ---- 通知 -------------------------------------------------------------
     discord_webhook_url: str = ""
