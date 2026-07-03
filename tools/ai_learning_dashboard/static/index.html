@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FX Intel AI Learning</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">fx_intel learning monitor</p>
+          <h1>Mac mini AI 学習ダッシュボード</h1>
+        </div>
+        <div class="toolbar">
+          <input id="logDir" aria-label="ログディレクトリ" />
+          <button id="refreshBtn" type="button" title="最新状態を読み込む">更新</button>
+        </div>
+      </header>
+
+      <section id="realityPanel" class="reality-panel is-waiting" aria-label="現在の学習判定">
+        <div>
+          <span id="realityBadge" class="badge amber">monitor</span>
+          <h2 id="realityTitle">学習状態を確認中</h2>
+          <p id="realityBody" class="note">ログを読み込んでいます。</p>
+        </div>
+        <ul id="realityReasons" class="reason-list"></ul>
+      </section>
+
+      <section class="status-grid" aria-label="学習概要">
+        <article class="metric">
+          <span class="metric-label">判断ログ</span>
+          <strong id="journalTotal">0</strong>
+          <small id="journalLatest">未記録</small>
+        </article>
+        <article class="metric">
+          <span class="metric-label">採点済み</span>
+          <strong id="evaluatedTotal">0</strong>
+          <small id="pendingTotal">24h待ち 0</small>
+        </article>
+        <article class="metric">
+          <span class="metric-label">方向的中率</span>
+          <strong id="hitRate">--</strong>
+          <small id="hitCount">0 / 0</small>
+        </article>
+        <article class="metric">
+          <span class="metric-label">MLモデル</span>
+          <strong id="mlStatus">未学習</strong>
+          <small id="mlRows">学習0 / 検証0</small>
+        </article>
+      </section>
+
+      <section class="flow-panel" aria-label="学習サイクル">
+        <div class="flow-step" id="flowJournal">
+          <span>1</span>
+          <strong>記録</strong>
+          <small>判断・価格・特徴量</small>
+        </div>
+        <div class="flow-step" id="flowMature">
+          <span>2</span>
+          <strong>成熟</strong>
+          <small>約24時間後に比較</small>
+        </div>
+        <div class="flow-step" id="flowProfile">
+          <span>3</span>
+          <strong>重み調整</strong>
+          <small>tech / news / 条件</small>
+        </div>
+        <div class="flow-step" id="flowMl">
+          <span>4</span>
+          <strong>ML</strong>
+          <small>GBDT + 較正</small>
+        </div>
+        <div class="flow-step" id="flowPromotion">
+          <span>5</span>
+          <strong>昇格</strong>
+          <small>shadow / paper / live</small>
+        </div>
+      </section>
+
+      <section class="main-grid">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>学習重み</h2>
+            <span id="learningGenerated" class="subtle">未生成</span>
+          </div>
+          <div class="weight-row">
+            <div>
+              <span>テクニカル</span>
+              <strong id="techWeight">55%</strong>
+            </div>
+            <div class="bar-track"><div id="techWeightBar" class="bar-fill green"></div></div>
+          </div>
+          <div class="weight-row">
+            <div>
+              <span>ニュース</span>
+              <strong id="newsWeight">45%</strong>
+            </div>
+            <div class="bar-track"><div id="newsWeightBar" class="bar-fill amber"></div></div>
+          </div>
+          <div class="split-kpis">
+            <div><span>Tech的中</span><strong id="techHit">--</strong></div>
+            <div><span>News的中</span><strong id="newsHit">--</strong></div>
+            <div><span>Brier</span><strong id="brierScore">--</strong></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>委員の運用段階</h2>
+            <span id="promotionUpdated" class="subtle">未保存</span>
+          </div>
+          <div id="stageList" class="stage-list"></div>
+          <div id="promotionHistory" class="timeline"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>ペア別の学習成績</h2>
+            <span class="subtle">採点済み判断</span>
+          </div>
+          <div id="symbolBars" class="bars"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>確信度キャリブレーション</h2>
+            <span class="subtle">conviction bins</span>
+          </div>
+          <div id="binBars" class="bars compact"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>MLモデル</h2>
+            <span id="mlTrainedAt" class="subtle">未学習</span>
+          </div>
+          <div class="split-kpis">
+            <div><span>usable</span><strong id="mlUsable">false</strong></div>
+            <div><span>Brier</span><strong id="mlBrier">--</strong></div>
+            <div><span>基準</span><strong id="mlBaseBrier">--</strong></div>
+          </div>
+          <div id="importanceBars" class="bars compact"></div>
+          <p id="mlReasons" class="note"></p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>苦手条件</h2>
+            <span class="subtle">減衰候補</span>
+          </div>
+          <div id="conditionList" class="condition-list"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>ファイル状態</h2>
+            <span id="readOnlyBadge" class="badge">read only</span>
+          </div>
+          <div id="fileList" class="file-list"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>最近の判断ログ</h2>
+            <span class="subtle">最新30件</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>時刻</th>
+                  <th>ペア</th>
+                  <th>方向</th>
+                  <th>確信度</th>
+                  <th>品質</th>
+                  <th>終値</th>
+                </tr>
+              </thead>
+              <tbody id="recentRows"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
