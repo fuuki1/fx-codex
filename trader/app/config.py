@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     # NoDecode: env のカンマ区切り文字列を JSON 解釈せず、下の validator に生のまま渡す
     tv_allowed_ips: Annotated[list[str], NoDecode] = Field(default_factory=list)
     webhook_secret: str = ""
+    # 信頼するリバースプロキシ段数。ngrok 経由は 1（= X-Forwarded-For の右端が実クライアント）。
+    # 0 にすると XFF を無視し TCP ピア IP を使う（プロキシ無しの直接公開時）。
+    # 右端を採用することで、クライアントが偽の XFF を足して IP 検証を迂回するのを防ぐ。
+    tv_trusted_proxy_hops: int = 1
+    # 受信ボディの最大バイト数（これを超える POST は 413 で拒否。安価な DoS 対策）。
+    max_webhook_body_bytes: int = 65_536
+    # シグナルの最大許容齢（秒）。alert に時刻（{{timenow}}）が含まれる場合のみ有効。
+    # これより古い／未来すぎるシグナルは 409 で拒否（リプレイ・遅延配信の発注を防ぐ）。
+    # 0 で無効。時刻フィールドが無いシグナルは受信時刻扱いなので影響しない。
+    max_signal_age_sec: int = 120
 
     # ---- リスク上限 -------------------------------------------------------
     max_position_qty: float = 10_000

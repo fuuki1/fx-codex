@@ -5,30 +5,41 @@
   POST /webhook : TradingView 等からのシグナル受信
 
 セキュリティ 2 重チェック:
-  1. 送信元 IP を TV_ALLOWED_IPS と照合（ngrok 経由は X-Forwarded-For の「末尾」を見る。
-     先頭はクライアントが自由に偽装できるため信頼しない）
+  1. 送信元 IP を TV_ALLOWED_IPS と照合（ngrok 経由は X-Forwarded-For の
+     「右端＝信頼プロキシが付与した実クライアント」を見る。偽の XFF で迂回されない）
   2. ペイロードの secret を WEBHOOK_SECRET と定時間比較（hmac.compare_digest）
 
-DoS 対策: Content-Length が MAX_BODY_BYTES を超えるリクエストは 413 で拒否
+ボディ解釈:
+  TradingView の Webhook は本文を ``Content-Type: text/plain`` で送る。
+  FastAPI の ``Body(dict)`` は application/json 以外を受け付けず 422 になるため、
+  ここでは Content-Type に依存せず生ボディを自前で JSON パースする。
+
+冪等・鮮度・取りこぼし防止:
+  - idem を Redis に nx,ex=3600 で記録。60 分以内の重複は黙って捨てる。
+  - {{timenow}} 付きの古い／未来すぎるシグナルは 409（リプレイ・遅延配信の発注を防ぐ）。
+  - Stream への publish に失敗したら idem を解放し 503 を返す（再送で復旧でき、
+    「dedup に食われて永久ロスト」を防ぐ）。
+
+DoS 対策: Content-Length が max_webhook_body_bytes を超える POST は 413 で拒否
 （uvicorn はボディサイズを制限しないため、アプリ側で上限を設ける）。
 
-冪等: idem を Redis に nx,ex=3600 で記録。60 分以内の重複は黙って捨てる。
-ハンドラは同期 def（FastAPI がスレッドプールで実行）なので同期 Redis でも
-イベントループを塞がない。
+ブロッキング I/O（Redis/DB）はスレッドプールへ退避し、イベントループを塞がない。
 """
 from __future__ import annotations
 
 import hmac
+import json
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import common
 from config import settings
-from domain import SignalError, normalize_signal
-from fastapi import Body, FastAPI, HTTPException, Request, Response
+from domain import SignalError, normalize_signal, signal_is_stale
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from logging_setup import log_extra, set_correlation_id, setup_logging
-from starlette.middleware.base import RequestResponseEndpoint
 
 log = setup_logging("webhook", settings.log_level)
 
@@ -43,32 +54,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="trader-webhook", docs_url=None, redoc_url=None, lifespan=lifespan)
 
-# TradingView のアラートは数百バイト程度。これを大きく超えるボディは攻撃とみなす。
-MAX_BODY_BYTES = 64 * 1024
-
-
-@app.middleware("http")
-async def _limit_body_size(request: Request, call_next: RequestResponseEndpoint) -> Response:
-    try:
-        length = int(request.headers.get("content-length") or 0)
-    except ValueError:
-        return JSONResponse({"detail": "invalid content-length"}, status_code=400)
-    if length > MAX_BODY_BYTES:
-        return JSONResponse({"detail": "request body too large"}, status_code=413)
-    return await call_next(request)
-
 
 def _client_ip(request: Request) -> str:
-    """信頼できる送信元 IP を返す。
+    """信頼プロキシ段数を考慮して実クライアント IP を返す。
 
-    X-Forwarded-For はクライアントが任意の値を先頭に付けられ、経路上のプロキシが
-    実際の接続元を「右端に追記」する仕様。信頼できるのは末尾（= 直近の信頼プロキシ
-    ngrok が追記した実接続元）だけ。先頭を採用すると許可 IP を偽装した
-    allowlist バイパスが可能になる。
+    ngrok 等のプロキシ 1 段（tv_trusted_proxy_hops=1）なら XFF の右端が実クライアント。
+    クライアントが偽の XFF を先頭に足しても、プロキシが本物を右に追記するため迂回できない。
+    hops=0 なら XFF を無視して TCP ピア IP を使う（プロキシ無しの直接公開時）。
     """
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[-1].strip()
+    hops = settings.tv_trusted_proxy_hops
+    if hops > 0:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[max(0, len(parts) - hops)]
     return request.client.host if request.client else ""
 
 
@@ -89,16 +89,27 @@ def health() -> JSONResponse:
     )
 
 
-@app.post("/webhook")
-def webhook(request: Request, payload: dict = Body(...)) -> dict:
-    ip = _client_ip(request)
+def _process(raw: bytes, ip: str) -> dict:
+    """同期パイプライン（IP→JSON→secret→正規化→鮮度→冪等→配信）。
 
+    ブロッキングする Redis/DB を含むためスレッドプールで実行される。
+    拒否は HTTPException で表現し、FastAPI が適切な HTTP ステータスへ変換する。
+    """
     # 1) IP 検証
     if settings.tv_allowed_ips and ip not in settings.tv_allowed_ips:
         log.warning("rejected by ip", **log_extra(ip=ip))
         raise HTTPException(status_code=403, detail="forbidden")
 
-    # 2) secret 検証（未設定は受信拒否＝安全側）
+    # 2) JSON パース（Content-Type 非依存。TradingView は text/plain で送るため）
+    try:
+        payload = json.loads(raw or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log.warning("invalid json body", **log_extra(ip=ip, error=str(e)))
+        raise HTTPException(status_code=400, detail="invalid json") from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="json object required")
+
+    # 3) secret 検証（未設定は受信拒否＝安全側）
     if not settings.webhook_secret:
         log.error("WEBHOOK_SECRET not configured -> refusing signals")
         raise HTTPException(status_code=503, detail="server not configured")
@@ -107,7 +118,7 @@ def webhook(request: Request, payload: dict = Body(...)) -> dict:
         log.warning("rejected by secret", **log_extra(ip=ip))
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    # 3) 正規化
+    # 4) 正規化
     try:
         sig = normalize_signal(payload, source="tradingview")
     except SignalError as e:
@@ -116,13 +127,56 @@ def webhook(request: Request, payload: dict = Body(...)) -> dict:
 
     set_correlation_id(sig["idem"])
 
-    # 4) 冪等（60 分以内の重複を排除）
-    if not common.r().set(f"idem:{sig['idem']}", "1", nx=True, ex=3600):
+    # 5) 鮮度（リプレイ・遅延配信の発注を防ぐ。時刻フィールドが無ければ受信時刻で常に新鮮）
+    if signal_is_stale(sig["ts"], time.time(), settings.max_signal_age_sec):
+        log.warning(
+            "rejected stale signal",
+            **log_extra(idem=sig["idem"], ts=sig["ts"], max_age=settings.max_signal_age_sec),
+        )
+        common.log_event("signal_stale", sig)
+        raise HTTPException(status_code=409, detail="stale signal")
+
+    # 6) 冪等（60 分以内の重複を排除）
+    idem_key = f"idem:{sig['idem']}"
+    try:
+        fresh = common.r().set(idem_key, "1", nx=True, ex=3600)
+    except Exception as e:
+        # Redis 不通では冪等保証も配信もできない。受け付けず 503（TV 側/手動で再送可能に）。
+        log.exception("redis unavailable on dedup", **log_extra(idem=sig["idem"]))
+        raise HTTPException(status_code=503, detail="queue unavailable") from e
+    if not fresh:
         log.info("duplicate ignored", **log_extra(idem=sig["idem"]))
         return {"status": "duplicate_ignored", "idem": sig["idem"]}
 
-    # 5) 記録 + 配信
+    # 7) 記録 + 配信。失敗したら idem を解放して 503（再送で復旧でき、永久ロストを防ぐ）。
     common.log_event("signal_received", sig)
-    msg_id = common.publish(common.STREAM_SIGNALS, sig)
+    try:
+        msg_id = common.publish(common.STREAM_SIGNALS, sig)
+    except Exception as e:
+        try:
+            common.r().delete(idem_key)
+        except Exception:
+            log.exception("failed to release idem after publish error")
+        common.notify(
+            f"⚠️ シグナル配信失敗（Redis publish）idem={sig['idem']}。再送が必要。",
+            key="publish_fail",
+        )
+        log.exception("publish failed -> released idem", **log_extra(idem=sig["idem"]))
+        raise HTTPException(status_code=503, detail="enqueue failed") from e
+
     log.info("signal accepted", **log_extra(idem=sig["idem"], symbol=sig["symbol"], msg_id=msg_id))
     return {"status": "accepted", "idem": sig["idem"]}
+
+
+@app.post("/webhook")
+async def webhook(request: Request) -> dict:
+    # ボディサイズ上限（安価な DoS 対策）。Content-Length で早期に弾き、読み切り後も再確認。
+    clen = request.headers.get("content-length")
+    if clen and clen.isdigit() and int(clen) > settings.max_webhook_body_bytes:
+        raise HTTPException(status_code=413, detail="payload too large")
+    raw = await request.body()
+    if len(raw) > settings.max_webhook_body_bytes:
+        raise HTTPException(status_code=413, detail="payload too large")
+    ip = _client_ip(request)
+    # ブロッキング処理（Redis/DB）はスレッドプールへ。イベントループを塞がない。
+    return await run_in_threadpool(_process, raw, ip)
