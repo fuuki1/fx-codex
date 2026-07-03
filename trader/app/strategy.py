@@ -12,7 +12,6 @@
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any
@@ -22,11 +21,15 @@ import pandas as pd
 from config import settings
 from domain import compute_idem
 from logging_setup import log_extra, setup_logging
+from params_gate import load_validated_params
 
 log = setup_logging("strategy", settings.log_level)
 
 DEFAULT_PARAMS = {"fast_window": 20, "slow_window": 60, "atr_window": 14, "atr_multiple": 2.0}
 STATE_KEY = "strategy:state"  # hash: symbol -> -1/0/1
+# ファイル欠落を表すセンチネル mtime（実 mtime とは衝突しない負値）。
+# 削除が続く間、欠落イベントを一度だけ記録するために _notified_mtime に載せる。
+_MISSING_MTIME = -1.0
 
 
 # ============================================================================
@@ -72,23 +75,96 @@ def ma_cross_signal(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any] 
 # パラメータのホットリロード
 # ============================================================================
 class ParamStore:
+    """strategy_params.json を監視し、params_gate を通過した値だけをホットリロードする。
+
+    検証（provenance・境界値・取引数など）に落ちたファイル、および削除された
+    ファイルは適用しない。挙動は「直近に一度でも合格した値があるか」で分岐する:
+
+    - 合格値がある: 汚染更新が来ても直近の合格値を維持する（params_rejected を記録）。
+      合格後にファイルが削除された場合も直近合格値を維持する（params_missing を記録）。
+    - 合格値が一度も無い: get() は None を返す（params_unavailable を記録）。
+      呼び出し側はシグナルを出してはならない。検証されていないパラメータでの
+      新規発注、および「一度も検証を通っていない状態での DEFAULT 発注」を防ぐ。
+
+    いずれの異常も無音では継続しない（イベントを記録する）。DEFAULT_PARAMS は
+    合格値のスキーマ欠落キーを穴埋めする下地としてのみ使い、フォールバックの
+    発注根拠にはしない。拒否/欠落/削除の警告は同じ状態につき一度だけ。
+    """
+
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self._mtime: float = 0.0
-        self.params: dict[str, Any] = dict(DEFAULT_PARAMS)
+        self._notified_mtime: float | None = None
+        # None = 検証済みパラメータが一度も無い（= 発注不可）。
+        self.params: dict[str, Any] | None = None
 
-    def get(self) -> dict[str, Any]:
+    def get(self) -> dict[str, Any] | None:
+        """有効な検証済みパラメータを返す。無ければ None（呼び出し側は発注しない）。"""
         try:
             mtime = self.path.stat().st_mtime
-            if mtime != self._mtime:
-                self.params = {**DEFAULT_PARAMS, **json.loads(self.path.read_text())}
-                self._mtime = mtime
-                log.info("params reloaded", **log_extra(params=self.params))
         except FileNotFoundError:
-            pass
+            # ファイルが無い。削除が続く限り一度だけ記録する（センチネル mtime を使う）。
+            if self.params is not None:
+                # 一度合格した後に削除された → 直近合格値を維持しつつ params_missing を記録。
+                self._notify_once(
+                    _MISSING_MTIME,
+                    "params_missing",
+                    "params file missing after a valid load; keeping previous validated params",
+                    ["パラメータファイルが存在しない"],
+                )
+            else:
+                # 合格値が一度も無い → 発注不可のまま params_unavailable を記録。
+                self._notify_once(
+                    _MISSING_MTIME,
+                    "params_unavailable",
+                    "no validated params available; strategy will not emit signals",
+                    ["パラメータファイルが存在しない"],
+                )
+            return self.params
         except Exception:
-            log.exception("failed to load params; keeping previous")
+            log.exception("failed to stat params file; keeping previous")
+            return self.params
+
+        if mtime == self._mtime:
+            return self.params
+
+        params, errors = load_validated_params(self.path)
+        if errors or params is None:
+            # 拒否/読み込み不能。再検証を毎ループ走らせないよう mtime は進める（指摘5）。
+            self._mtime = mtime
+            if self.params is not None:
+                # 直近合格値がある → それを維持（params_rejected）。
+                self._notify_once(
+                    mtime,
+                    "params_rejected",
+                    "params rejected by gate; keeping previous validated params",
+                    errors,
+                )
+            else:
+                # 合格値が一度も無い → 発注不可のまま（params_unavailable）。
+                self._notify_once(
+                    mtime,
+                    "params_unavailable",
+                    "no validated params available; strategy will not emit signals",
+                    errors,
+                )
+            return self.params
+
+        # 合格: 反映。DEFAULT_PARAMS はスキーマ外キー欠落時の保険として下地に敷く。
+        self.params = {**DEFAULT_PARAMS, **params}
+        self._mtime = mtime
+        self._notified_mtime = None
+        log.info("params reloaded (gate passed)", **log_extra(params=self.params))
         return self.params
+
+    def _notify_once(self, mtime: float, kind: str, message: str, errors: list[str]) -> None:
+        if self._notified_mtime == mtime:
+            return
+        log.warning(message, **log_extra(errors=errors, active_params=self.params))
+        common.log_event(
+            kind, {"path": str(self.path), "errors": errors, "active_params": self.params}
+        )
+        self._notified_mtime = mtime
 
 
 # ============================================================================
@@ -185,10 +261,13 @@ def main() -> None:
     while not stop.is_set():
         common.heartbeat("strategy")
         try:
-            if ib is not None and ib.isConnected():
+            active_params = params.get()
+            # 検証済みパラメータが無い間はシグナルを出さない（未検証パラメータや
+            # 一度も検証を通っていない DEFAULT での新規発注を防ぐ）。価格取得もしない。
+            if active_params is not None and ib is not None and ib.isConnected():
                 df = fetch_prices(ib, settings.strategy_symbol, settings.strategy_asset)
                 if df is not None:
-                    sig = ma_cross_signal(df, params.get())
+                    sig = ma_cross_signal(df, active_params)
                     if sig is not None:
                         emit_if_changed(
                             settings.strategy_symbol,

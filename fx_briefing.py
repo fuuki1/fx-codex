@@ -8,17 +8,53 @@
 3. センチメント分析 — 語彙ベース(常時) + Claude API(ANTHROPIC_API_KEYがあれば)
 4. TradingViewマルチタイムフレームテクニカル(15m/1h/4h/1d)
 5. 複合スコア → ペアごとのトレードプラン(方向・確信度・ATRベースSL/TP)
-   確信度はデータ品質(テクニカル取得率・関連ニュース量・カレンダー可用性)で減衰
-6. 判断ジャーナル(logs/briefing_journal.jsonl) — 過去の方向判断の的中率を
-   毎回検証してブリーフィングに表示(--no-journal で無効化)
+   確信度はデータ品質(テクニカル取得率・関連ニュース量・カレンダー可用性)で減衰。
+   FX市場の休場中(週末)はstale価格での判断を防ぐため方向判断を「休場」に固定
+6. 判断ジャーナル(logs/briefing_journal.jsonl) — 記録から約24時間
+   (市場オープン時間換算、週末除外)経過した方向判断を毎回検証して
+   的中率をブリーフィングに表示。記録時ATRの10%未満の値動きは
+   「小動き」として判定から除外(--no-journal で無効化)
+7. 学習ループ(logs/briefing_learning.json) — ジャーナル履歴の全成熟判断を
+   相互採点し、テクニカル/ニュース複合重みの再推定・確信度帯別
+   キャリブレーション・不調ペアの確信度減衰を毎回導出して、
+   今回の分析にそのまま反映する。さらに判断時のチャート状態
+   (RSI・MA乖離・ボラティリティ・時間足一致度・ニュース量・ADX)を
+   特徴量としてジャーナルに残し、「どんな状態のどちら向きが当たりやすい/
+   外しやすいか」を状態バケット×ロング/ショート別に学習。同じ状態でも
+   向きで成績は非対称になるため方向別に数え、いまの判断が過去に
+   外しやすかった状態×方向に該当するときだけ確信度を自動減衰して
+   理由を表示する。
+   さらに学習サンプルは記録間隔非依存の間引き(同一ペア1時間1件)後に数え、
+   確信度Brier(確率予測としての精度)・ホライズン別(4h/24h/72h)的中率・
+   反省レポート(上位足逆行/RSI極端圏追随などの失敗理由テンプレート別成績)を
+   学習メモとして表示する。
+   分析を重ねるほど自分の当たり外れから学習して調整が効いてくる
+   (--no-learning で無効化)
+
+8. 複数AI委員会(fx_intel/committee.py) — テクニカル/ニュース/マクロ/MLの
+   4委員が意見を出し、複合スコアを重み付き平均で合成。リスクオフィサー
+   (build_trade_planの決定論ゲート)が常に拒否権を持つ。
+9. マクロデータ層(fx_intel/macro.py) — COT・米金利・VIX・ドル指数を
+   TTLキャッシュ+staleness品質ゲート付きで取得。リスクレジームを実データ判定。
+10. ML確率モデル(fx_intel/gbm.py + ml.py) — 依存ゼロのGBDTでジャーナルから
+    P(hit|状態,方向)を学習。自己相関間引き・時系列split+エンバーゴ・較正・
+    スキルゲート付き。--train-ml で強制再学習。モデルが無い/7日以上古い場合は
+    自動再学習(サンプル不足ならゲートが弾くだけで安全)。
+11. 昇格ゲート(fx_intel/promotion.py) — 委員を実績で shadow→paper→live へ
+    段階昇格。live昇格のみ --promote-live の人間承認が必須。
 
 使い方:
     .venv/bin/python fx_briefing.py                  # Discordへ送信
     .venv/bin/python fx_briefing.py --dry-run        # 送信せず内容を表示
     .venv/bin/python fx_briefing.py --symbols USDJPY GBPJPY --no-llm
+    .venv/bin/python fx_briefing.py --train-ml       # ML確率モデルを再学習して保存
+    .venv/bin/python fx_briefing.py --promote-live ml # 条件を満たせばML委員をliveへ承認
 
-副産物として research_pack/upcoming_events.csv を書き出す
-(fx_backtester の --events でそのまま使える形式)。
+副産物として以下を書き出す(いずれも fx_backtester の --events でそのまま使える形式):
+- research_pack/upcoming_events.csv — 最新スナップショット(毎回上書き)
+- research_pack/event_history.csv — 追記アーカイブ。実行のたびに未観測のイベント・
+  改定分だけを recorded_at 付きで蓄積し、過去期間のイベント回避再生に使う
+  (--no-event-archive で無効化)
 
 Webhook URLは環境変数 DISCORD_WEBHOOK_URL か .env から読み込む。
 Claude分析は ANTHROPIC_API_KEY が設定されている場合のみ有効。
@@ -29,17 +65,55 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 import requests
 
-from fx_intel import briefing, calendar, journal, news, sentiment, technicals
+import params_gate
+from fx_intel import (
+    briefing,
+    calendar,
+    committee,
+    journal,
+    learning,
+    macro,
+    ml,
+    news,
+    promotion,
+    sentiment,
+    technicals,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
 DEFAULT_EVENTS_CSV = PROJECT_ROOT / "research_pack" / "upcoming_events.csv"
+DEFAULT_EVENTS_ARCHIVE = PROJECT_ROOT / "research_pack" / "event_history.csv"
 DEFAULT_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_journal.jsonl"
+DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
+DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
+DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
+DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
+
+# MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
+# 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
+# ガードが早期returnするため、データが足りないうちは実質ノーコスト)
+ML_RETRAIN_DAYS = 7.0
+
+
+def ml_needs_retrain(
+    artifact: ml.MLArtifact, now: datetime, max_age_days: float = ML_RETRAIN_DAYS
+) -> bool:
+    """保存済みMLモデルが再学習を要する状態か(モデル無し/日付不明/stale)。"""
+    if artifact.model is None:
+        return True
+    try:
+        trained = datetime.fromisoformat(artifact.trained_at)
+    except (TypeError, ValueError):
+        return True
+    if trained.tzinfo is None:
+        trained = trained.replace(tzinfo=UTC)
+    return (now - trained) >= timedelta(days=max_age_days)
 
 
 def load_webhook_url() -> str | None:
@@ -57,19 +131,32 @@ def load_webhook_url() -> str | None:
     return None
 
 
-def load_strategy_params() -> tuple[int, int, float]:
-    """strategy_params.json から (fast, slow, atr_multiple) を読む。"""
+def load_strategy_params() -> tuple[int, int, float, str | None]:
+    """strategy_params.json から (fast, slow, atr_multiple, warning) を読む。
+
+    params_gate を通し、来歴の無い/過剰適合の疑いがあるパラメータは採用しない。
+    ライブ戦略（trader/app/strategy.py）と同じゲートを共有し、検証されていない
+    パラメータに基づくブリーフィングを出さないようにする。ゲートに落ちた場合は
+    保守的な既定値で継続し、warning を返して通知本文にも明示する。
+    """
     params_path = PROJECT_ROOT / "strategy_params.json"
     fast, slow, atr_multiple = 20, 100, briefing.DEFAULT_ATR_MULTIPLE
-    if params_path.exists():
-        try:
-            params = json.loads(params_path.read_text(encoding="utf-8"))
-            fast = int(params.get("fast_window", fast))
-            slow = int(params.get("slow_window", slow))
-            atr_multiple = float(params.get("atr_multiple", atr_multiple))
-        except (ValueError, json.JSONDecodeError):
-            pass
-    return fast, slow, atr_multiple
+    if not params_path.exists():
+        return fast, slow, atr_multiple, None
+
+    params, errors = params_gate.load_validated_params(params_path)
+    if errors or params is None:
+        warning = (
+            "strategy_params.json が検証ゲートに不合格のため既定値"
+            f"(MA {fast}/{slow}, ATR×{atr_multiple})で継続: " + "; ".join(errors)
+        )
+        print(f"[warn] {warning}", file=sys.stderr)
+        return fast, slow, atr_multiple, warning
+
+    fast = int(params.get("fast_window", fast))
+    slow = int(params.get("slow_window", slow))
+    atr_multiple = float(params.get("atr_multiple", atr_multiple))
+    return fast, slow, atr_multiple, None
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
@@ -106,15 +193,47 @@ def main(argv: list[str] | None = None) -> int:
         help="research_pack/upcoming_events.csv の書き出しを行わない",
     )
     parser.add_argument(
+        "--no-event-archive",
+        action="store_true",
+        help="research_pack/event_history.csv への追記アーカイブを行わない",
+    )
+    parser.add_argument(
         "--no-journal",
         action="store_true",
         help="判断ジャーナル(logs/briefing_journal.jsonl)の記録・検証を行わない",
+    )
+    parser.add_argument(
+        "--no-learning",
+        action="store_true",
+        help="学習プロファイルによる重み・確信度の自動調整を行わない(既定重みで実行)",
+    )
+    parser.add_argument(
+        "--no-macro",
+        action="store_true",
+        help="マクロデータ(COT・金利・VIX・ドル指数)の取得と委員を使わない",
+    )
+    parser.add_argument(
+        "--no-ml",
+        action="store_true",
+        help="ML確率モデル委員を使わない(学習・予測をスキップ)",
+    )
+    parser.add_argument(
+        "--train-ml",
+        action="store_true",
+        help="今回の実行でジャーナルからML確率モデルを再学習して保存する",
+    )
+    parser.add_argument(
+        "--promote-live",
+        nargs="*",
+        default=None,
+        metavar="MEMBER",
+        help="指定した委員(macro/ml)を条件を満たせばliveへ昇格承認する(人間の明示承認)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
-    fast_window, slow_window, atr_multiple = load_strategy_params()
+    fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
     now = datetime.now(UTC)
 
     currencies: set[str] = set()
@@ -124,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
     ordered_currencies = sorted(currencies)
 
     fetch_warnings: list[str] = []
+    if params_warning:
+        fetch_warnings.append(params_warning)
 
     # 1. 経済指標カレンダー(レート制限対策にローカルキャッシュ併用)
     events, calendar_warnings = calendar.fetch_calendar(
@@ -140,27 +261,94 @@ def main(argv: list[str] | None = None) -> int:
             calendar.export_events_csv(events, DEFAULT_EVENTS_CSV)
         except OSError as error:
             fetch_warnings.append(f"イベントCSV書き出し失敗: {error}")
+    if not args.no_event_archive and events:
+        try:
+            calendar.append_events_archive(events, DEFAULT_EVENTS_ARCHIVE, now=now)
+        except OSError as error:
+            fetch_warnings.append(f"イベント履歴アーカイブ追記失敗: {error}")
 
     # 2. ニュース収集
     items, news_warnings = news.fetch_news_for_symbols(symbols, hours_back=args.hours_back)
     fetch_warnings.extend(news_warnings)
 
-    # 3. センチメント分析(Claude API → 語彙ベースの順に試行)
-    analysis = sentiment.analyze_market(items, ordered_currencies, use_llm=not args.no_llm)
+    # 3. マクロデータ(COT・金利・VIX・ドル指数)。レジーム判定とマクロ委員に使う
+    macro_snapshot = None
+    if not args.no_macro:
+        macro_snapshot = macro.fetch_macro_snapshot(DEFAULT_MACRO_CACHE, now=now)
+        fetch_warnings.extend(macro_snapshot.warnings)
 
-    # 4. テクニカル取得
+    # 4. センチメント分析(Claude API → 自前分析エンジン。レジームはマクロ実データ優先)
+    analysis = sentiment.analyze_market(
+        items, ordered_currencies, use_llm=not args.no_llm, macro=macro_snapshot, now=now
+    )
+
+    # 5. テクニカル取得
     tech_map, tech_warnings = technicals.fetch_pair_technicals(
         symbols, fast_window=fast_window, slow_window=slow_window
     )
     fetch_warnings.extend(tech_warnings)
 
-    # 5. ペアごとのトレードプラン
+    # 6. 学習ループ: ジャーナル履歴を相互採点し、重み・確信度の調整を導出
+    profile = learning.LearnedProfile()
+    learning_note = ""
+    calls: list[learning.EvaluatedCall] = []
+    journal_entries = list(journal.read_entries(DEFAULT_JOURNAL_PATH))
+    if not args.no_learning:
+        calls = learning.evaluate_history(journal_entries)
+        profile = learning.derive_profile(calls, now=now)
+        learning_note = profile.summary_ja()
+        # ホライズン別(4h/24h/72h)の的中率観測。学習は24hのみを使う
+        horizon_line = learning.horizon_report_ja(journal_entries)
+        if horizon_line:
+            learning_note = (learning_note + "\n" + horizon_line).strip()
+        if not args.dry_run:
+            try:
+                learning.save_profile(profile, DEFAULT_LEARNING_PATH)
+            except OSError as error:
+                fetch_warnings.append(f"学習プロファイル保存失敗: {error}")
+
+    # 7. ML確率モデル: --train-mlで強制再学習。それ以外も保存済みモデルが
+    #    無い/staleなら自動再学習する(スキルゲートは train_artifact 内)
+    ml_artifact = ml.MLArtifact()
+    if not args.no_ml:
+        if not args.train_ml:
+            ml_artifact = ml.load_artifact(DEFAULT_ML_MODEL_PATH)
+        if args.train_ml or ml_needs_retrain(ml_artifact, now):
+            train_calls = calls or learning.evaluate_history(journal_entries)
+            ml_artifact = ml.train_artifact(train_calls, now=now)
+            # モデル本体ができたときだけ保存する(データ不足の空アーティファクトで
+            # 毎回上書きしても意味がなく、--train-ml時は結果を必ず残す)
+            if not args.dry_run and (args.train_ml or ml_artifact.model is not None):
+                try:
+                    ml.save_artifact(ml_artifact, DEFAULT_ML_MODEL_PATH)
+                except OSError as error:
+                    fetch_warnings.append(f"MLモデル保存失敗: {error}")
+
+    # 8. 昇格ゲート: 委員(macro/ml)の実績をジャーナルから採点し段階を更新
+    promotion_state = promotion.load_state(DEFAULT_PROMOTION_STATE)
+    require_live_ack = args.promote_live if args.promote_live is not None else []
+    promotion_state, _member_perf = promotion.evaluate_and_update(
+        journal_entries, promotion_state, now=now, require_live_ack=require_live_ack
+    )
+    stages = promotion_state.as_stage_map()
+    if args.no_macro:
+        stages["macro"] = "shadow"
+    if args.no_ml or not ml_artifact.usable:
+        stages["ml"] = "shadow"
+    promotion_note = promotion.summary_ja(promotion_state)
+    if not args.dry_run:
+        try:
+            promotion.save_state(promotion_state, DEFAULT_PROMOTION_STATE)
+        except OSError as error:
+            fetch_warnings.append(f"昇格状態の保存失敗: {error}")
+
+    # 9. ペアごとの委員会審議(tech/news/macro/ML、学習済み重み・段階ゲート反映)
     plans: list[briefing.TradePlan] = []
     for symbol in symbols:
         base, quote = calendar.symbol_currencies(symbol)
         windows = calendar.risk_windows(events, {base, quote})
         plans.append(
-            briefing.build_trade_plan(
+            committee.deliberate(
                 symbol,
                 tech_map[symbol],
                 analysis.currencies,
@@ -169,10 +357,17 @@ def main(argv: list[str] | None = None) -> int:
                 now=now,
                 atr_multiple=atr_multiple,
                 calendar_ok=calendar_ok,
+                tech_weight=profile.tech_weight,
+                news_weight=profile.news_weight,
+                conviction_factor=profile.conviction_factor(symbol),
+                condition_adjuster=profile.condition_adjustment,
+                macro_snapshot=macro_snapshot,
+                ml_artifact=ml_artifact if not args.no_ml else None,
+                stages=stages,
             )
         )
 
-    # 6. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
+    # 10. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
     journal_note = ""
     if not args.no_journal:
         closes = {symbol: tech_map[symbol].close() for symbol in symbols}
@@ -184,6 +379,9 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as error:
                 fetch_warnings.append(f"判断ジャーナル書き込み失敗: {error}")
 
+    if ml_artifact.model is not None:
+        learning_note = (learning_note + "\n" + ml_artifact.summary_ja()).strip()
+
     payload = briefing.build_discord_payload(
         plans,
         analysis,
@@ -193,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
         slow_window,
         fetch_warnings=fetch_warnings,
         journal_note=journal_note,
+        learning_note=learning_note,
+        promotion_note=promotion_note,
         now=now,
     )
 

@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 import requests
 
@@ -191,6 +192,10 @@ def _pair_move_scores(text: str) -> dict[str, float]:
     return scores
 
 
+# analyst.py(自前分析エンジン)も同じ構文解析を使う公開エイリアス
+pair_move_scores = _pair_move_scores
+
+
 def score_headlines_lexicon(
     items: Iterable[NewsItem], currencies: Sequence[str] | None = None
 ) -> dict[str, CurrencySentiment]:
@@ -344,7 +349,7 @@ def analyze_with_claude(
         "次のJSONだけを出力してください(前後に文章を付けない):\n"
         + json.dumps(schema_example, ensure_ascii=False)
     )
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "max_tokens": 2000,
         "messages": [{"role": "user", "content": prompt}],
@@ -379,8 +384,16 @@ def analyze_market(
     use_llm: bool = True,
     api_key: str | None = None,
     model: str | None = None,
+    macro=None,  # macro.MacroSnapshot | None(循環import回避のため型は緩め)
+    now=None,  # datetime | None。自前エンジンの鮮度減衰の基準時刻(テスト注入用)
 ) -> MarketAnalysis:
-    """LLM分析を試み、使えなければ語彙ベースで返す。"""
+    """エンジン序列: Claude API(任意) → 自前分析エンジン(既定)。
+
+    Claude APIはANTHROPIC_API_KEYがある場合の上乗せオプション。
+    失敗・キー無しの既定経路は analyst.py の自前エンジンで、否定・強調・
+    鮮度減衰・テーマ抽出を備え、決定論的に同じ入力から同じ判断を返す。
+    旧来の単純語彙カウント(score_headlines_lexicon)は比較・検証用に残す。
+    """
     if use_llm:
         key = api_key or load_api_key()
         if key:
@@ -392,10 +405,10 @@ def analyze_market(
                     if ccy in counts:
                         sentiment.headline_count = counts[ccy].headline_count
                 return analysis
-    return MarketAnalysis(
-        currencies=score_headlines_lexicon(items, currencies),
-        engine="lexicon",
-    )
+    # 遅延import: analyst は本モジュールのデータクラスを使うため循環になる
+    from .analyst import analyze_headlines
+
+    return analyze_headlines(items, currencies, now=now, macro=macro)
 
 
 def pair_bias(base: str, quote: str, currencies: Mapping[str, CurrencySentiment]) -> float:
