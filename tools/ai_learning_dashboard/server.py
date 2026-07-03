@@ -28,6 +28,9 @@ JOURNAL_FILE = "briefing_journal.jsonl"
 LEARNING_FILE = "briefing_learning.json"
 ML_FILE = "ml_model.json"
 PROMOTION_FILE = "promotion_state.json"
+# 時間足別モード(fx_briefing --per-timeframe)の記録
+TF_JOURNAL_FILE = "briefing_tf_journal.jsonl"
+TF_LEARNING_FILE = "briefing_tf_learning.json"
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -109,23 +112,47 @@ def _future_close(
     return best[1] if best is not None else None
 
 
+# 時間足別ジャーナルの主ホライズン(時間)と採点許容誤差(±時間)。
+# fx_intel.timeframe と同じ値。dashboard は fx_intel に依存しない方針なので
+# ここに独立して持つ(ズレたら表示だけの問題で、採点の正は fx_intel 側)。
+_HORIZON_TOLERANCE = {
+    0.25: 0.1,
+    0.5: 0.15,
+    1.0: 0.25,
+    4.0: 1.0,
+    8.0: 1.5,
+    12.0: 2.0,
+    24.0: 2.0,
+    48.0: 4.0,
+    72.0: 6.0,
+}
+
+
+def _tolerance_for(horizon_hours: float) -> float:
+    return _HORIZON_TOLERANCE.get(horizon_hours, 2.0)
+
+
 def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    prices: dict[str, list[tuple[datetime, float]]] = {}
+    # 価格系列は (symbol, timeframe) 別に持つ。timeframe を持たない旧スキーマ行は
+    # timeframe="" のキー(融合1判断)に入り、従来どおり24h採点される。
+    prices: dict[tuple[str, str], list[tuple[datetime, float]]] = {}
     parsed: list[tuple[datetime, dict[str, Any]]] = []
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
         close = _number(entry.get("close"))
         symbol = str(entry.get("symbol") or "")
+        timeframe = str(entry.get("timeframe") or "")
         if ts is None:
             continue
         parsed.append((ts, entry))
         if close is not None and symbol:
-            prices.setdefault(symbol, []).append((ts, close))
+            prices.setdefault((symbol, timeframe), []).append((ts, close))
     for series in prices.values():
         series.sort(key=lambda row: row[0])
 
     evaluated = hits = flat = pending = directional = 0
     by_symbol: dict[str, dict[str, int]] = {}
+    by_timeframe: dict[str, dict[str, int]] = {}
     outcomes: list[dict[str, Any]] = []
     for ts, entry in parsed:
         direction = str(entry.get("direction") or "")
@@ -133,12 +160,20 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         directional += 1
         symbol = str(entry.get("symbol") or "")
+        timeframe = str(entry.get("timeframe") or "")
         close = _number(entry.get("close"))
         atr = _number(entry.get("atr"))
         if close is None or not symbol:
             pending += 1
             continue
-        future = _future_close(prices.get(symbol, []), ts)
+        # その足の主ホライズンで採点(旧スキーマ行=24h)
+        horizon = _number(entry.get("horizon_hours")) or 24.0
+        future = _future_close(
+            prices.get((symbol, timeframe), []),
+            ts,
+            horizon_hours=horizon,
+            tolerance_hours=_tolerance_for(horizon),
+        )
         if future is None:
             pending += 1
             continue
@@ -155,11 +190,18 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             stat = by_symbol.setdefault(symbol, {"evaluated": 0, "hits": 0, "flat": 0})
             stat["evaluated"] += 1
             stat["hits"] += int(hit)
+            if timeframe:
+                tf_stat = by_timeframe.setdefault(
+                    timeframe, {"evaluated": 0, "hits": 0, "flat": 0}
+                )
+                tf_stat["evaluated"] += 1
+                tf_stat["hits"] += int(hit)
             outcome = "hit" if hit else "miss"
         outcomes.append(
             {
                 "ts": ts.isoformat(),
                 "symbol": symbol,
+                "timeframe": timeframe,
                 "direction": direction,
                 "outcome": outcome,
                 "move": round(move, 6),
@@ -173,6 +215,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "pending": pending,
         "hit_rate": hits / evaluated if evaluated else None,
         "by_symbol": by_symbol,
+        "by_timeframe": by_timeframe,
         "recent_outcomes": outcomes[-20:],
     }
 
@@ -305,12 +348,17 @@ def build_state(log_dir: Path) -> dict[str, Any]:
     learning_path = log_dir / LEARNING_FILE
     ml_path = log_dir / ML_FILE
     promotion_path = log_dir / PROMOTION_FILE
+    tf_journal_path = log_dir / TF_JOURNAL_FILE
+    tf_learning_path = log_dir / TF_LEARNING_FILE
 
     entries = _read_journal(journal_path)
+    tf_entries = _read_journal(tf_journal_path)
     learning = _load_json(learning_path)
     ml = _load_json(ml_path)
     promotion = _load_json(promotion_path)
-    evaluated = _evaluate_journal(entries)
+    # 融合1判断行(24h)と時間足別行(各主ホライズン)を同じ採点器で評価する。
+    # _evaluate_journal は行ごとに timeframe/horizon_hours を見て採点する。
+    evaluated = _evaluate_journal(entries + tf_entries)
 
     evaluated_count = int(learning.get("evaluated", 0) or evaluated["evaluated"])
     hits = int(learning.get("hits", 0) or evaluated["hits"])
@@ -324,8 +372,10 @@ def build_state(log_dir: Path) -> dict[str, Any]:
             LEARNING_FILE: _file_status(learning_path),
             ML_FILE: _file_status(ml_path),
             PROMOTION_FILE: _file_status(promotion_path),
+            TF_JOURNAL_FILE: _file_status(tf_journal_path),
+            TF_LEARNING_FILE: _file_status(tf_learning_path),
         },
-        "journal": _journal_summary(entries),
+        "journal": _journal_summary(entries + tf_entries),
         "evaluation": evaluated,
         "learning": {
             "generated_at": learning.get("generated_at"),

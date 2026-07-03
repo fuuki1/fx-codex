@@ -83,6 +83,9 @@ from fx_intel import (
     promotion,
     sentiment,
     technicals,
+    tf_briefing,
+    tf_learning,
+    timeframe,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -91,6 +94,10 @@ DEFAULT_EVENTS_CSV = PROJECT_ROOT / "research_pack" / "upcoming_events.csv"
 DEFAULT_EVENTS_ARCHIVE = PROJECT_ROOT / "research_pack" / "event_history.csv"
 DEFAULT_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_journal.jsonl"
 DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
+# 時間足別モード(--per-timeframe)専用の記録。融合1判断モードと混ざらないよう
+# ジャーナルを分ける(採点ホライズンもスキーマも異なるため)
+DEFAULT_TF_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_tf_journal.jsonl"
+DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
@@ -165,6 +172,108 @@ def post_to_discord(webhook_url: str, payload: dict) -> None:
         raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
 
 
+def _run_per_timeframe(
+    *,
+    args,
+    symbols,
+    tech_map,
+    analysis,
+    events,
+    events_48h,
+    ordered_currencies,
+    calendar_ok,
+    atr_multiple,
+    fetch_warnings,
+    items,
+    now,
+) -> int:
+    """時間足別モードの本体(main から分岐)。
+
+    各時間足を独立に判断し、専用ジャーナルへ記録、時間足別の主ホライズンで
+    自己採点・学習して次回の確信度に反映する。融合1判断モードとは
+    ジャーナル・学習ファイルを分ける(スキーマも採点ホライズンも異なるため)。
+    """
+    journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
+
+    # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
+    tf_learn = tf_learning.TimeframeLearning()
+    learning_note = ""
+    if not args.no_learning:
+        tf_learn = tf_learning.derive_timeframe_learning(journal_entries, now=now)
+        learning_note = tf_learn.summary_ja()
+        if not args.dry_run:
+            try:
+                tf_learning.save_timeframe_learning(tf_learn, DEFAULT_TF_LEARNING_PATH)
+            except OSError as error:
+                fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
+
+    profile_lookup = tf_learn.profile_lookup if not args.no_learning else None
+
+    # 各ペア・各時間足の独立判断
+    plans_by_symbol: dict[str, list[timeframe.TimeframePlan]] = {}
+    for symbol in symbols:
+        base, quote = calendar.symbol_currencies(symbol)
+        windows = calendar.risk_windows(events, {base, quote})
+        plans_by_symbol[symbol] = timeframe.build_timeframe_plans(
+            symbol,
+            tech_map[symbol],
+            analysis.currencies,
+            windows,
+            items,
+            now=now,
+            atr_multiple=atr_multiple,
+            calendar_ok=calendar_ok,
+            profile_lookup=profile_lookup,
+        )
+
+    # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意
+    aux_reports_by_symbol: dict[str, dict[str, str]] = {}
+    if not args.no_learning and journal_entries:
+        for tf in timeframe.DEFAULT_TIMEFRAMES:
+            line = tf_learning.auxiliary_horizon_report_ja(journal_entries, tf)
+            if line:
+                aux_reports_by_symbol.setdefault("_shared", {})[tf] = line
+
+    # ジャーナル: 今回の時間足別判断を専用ジャーナルへ追記
+    if not args.no_journal and not args.dry_run:
+        all_plans = [plan for plans in plans_by_symbol.values() for plan in plans]
+        try:
+            journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
+        except OSError as error:
+            fetch_warnings.append(f"時間足別ジャーナル書き込み失敗: {error}")
+
+    payload = tf_briefing.build_timeframe_discord_payload(
+        plans_by_symbol,
+        analysis,
+        events_48h,
+        ordered_currencies,
+        fetch_warnings=fetch_warnings,
+        learning_note=learning_note,
+        aux_reports_by_symbol={s: aux_reports_by_symbol.get("_shared", {}) for s in symbols},
+        now=now,
+    )
+
+    if args.dry_run:
+        print(payload["content"])
+        print(json.dumps(payload["embeds"], ensure_ascii=False, indent=2))
+        return 0
+
+    webhook_url = load_webhook_url()
+    if not webhook_url:
+        print(
+            "DISCORD_WEBHOOK_URL が未設定です。環境変数か .env に設定してください。",
+            file=sys.stderr,
+        )
+        return 1
+
+    post_to_discord(webhook_url, payload)
+    print(
+        f"時間足別ブリーフィングを送信しました ({', '.join(symbols)} | "
+        f"ニュース{len(items)}件 | イベント{len(events_48h)}件 | {analysis.engine})"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="ニュース×経済指標×テクニカル統合ブリーフィングをDiscordへ送る"
@@ -229,6 +338,12 @@ def main(argv: list[str] | None = None) -> int:
         metavar="MEMBER",
         help="指定した委員(macro/ml)を条件を満たせばliveへ昇格承認する(人間の明示承認)",
     )
+    parser.add_argument(
+        "--per-timeframe",
+        action="store_true",
+        help="時間足別モード: 15m/1h/4h/1d を独立に判断し、時間足ごとの主ホライズン"
+        "(15m→15分後/1h→1h/4h→4h/1d→24h)で自己採点・学習する",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
 
@@ -287,6 +402,24 @@ def main(argv: list[str] | None = None) -> int:
         symbols, fast_window=fast_window, slow_window=slow_window
     )
     fetch_warnings.extend(tech_warnings)
+
+    # 時間足別モード: ここで専用パスへ分岐して早期return(融合1判断の
+    # 委員会・ML・昇格は使わず、時間足別の判断・採点・学習だけを回す)
+    if args.per_timeframe:
+        return _run_per_timeframe(
+            args=args,
+            symbols=symbols,
+            tech_map=tech_map,
+            analysis=analysis,
+            events=events,
+            events_48h=events_48h,
+            ordered_currencies=ordered_currencies,
+            calendar_ok=calendar_ok,
+            atr_multiple=atr_multiple,
+            fetch_warnings=fetch_warnings,
+            items=items,
+            now=now,
+        )
 
     # 6. 学習ループ: ジャーナル履歴を相互採点し、重み・確信度の調整を導出
     profile = learning.LearnedProfile()

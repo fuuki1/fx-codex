@@ -17,6 +17,13 @@
 12. journal     — 判断の記録と方向的中率の自己検証
 13. learning    — 履歴の相互採点による重み・確信度の自己調整
 
+時間足別モード(fx_briefing --per-timeframe)の追加レイヤ:
+
+14. timeframe    — 15m/1h/4h/1d を独立に判断(各足に主ホライズンを紐付け)
+15. price_history — 採点用の将来価格調達(ジャーナル後続行 + 外部OHLC注入口)
+16. tf_learning  — (symbol×timeframe) セル別の主ホライズン採点・学習
+17. tf_briefing  — 時間足別のDiscordペイロード生成
+
 tv_discord_notify.py と同じく fx_backtester 非依存で単体動作する
 (必要な外部パッケージは requests と tradingview_ta のみ。gbm/ml/promotion は
 標準ライブラリのみで動作し、ネイティブ拡張の重い依存を持ち込まない)。
@@ -33,7 +40,11 @@ __all__ = [
     "macro",
     "ml",
     "news",
+    "price_history",
     "promotion",
     "sentiment",
     "technicals",
+    "tf_briefing",
+    "tf_learning",
+    "timeframe",
 ]
