@@ -69,8 +69,10 @@ def test_direction_features_sign_flip() -> None:
     chart = {"rsi_1h": 70.0, "ma_gap_atr": 1.0, "adx_1h": 25.0}
     long_f = direction_features("long", 0.5, 0.3, chart)
     short_f = direction_features("short", 0.5, 0.3, chart)
-    assert long_f["dir_tech"] == -short_f["dir_tech"]
-    assert long_f["dir_rsi"] == -short_f["dir_rsi"]
+    for key in ("dir_tech", "dir_rsi"):
+        long_v, short_v = long_f[key], short_f[key]
+        assert long_v is not None and short_v is not None
+        assert long_v == -short_v  # ロングとショートで符号が反転する
 
 
 def test_direction_features_htf_rating() -> None:
@@ -93,7 +95,7 @@ def test_thin_calls_enforces_gap() -> None:
 
 
 def test_vectorize_imputes_missing_with_median() -> None:
-    rows = [{"adx_1h": 20.0}, {"adx_1h": 30.0}, {"adx_1h": None}]
+    rows: list[dict[str, float | None]] = [{"adx_1h": 20.0}, {"adx_1h": 30.0}, {"adx_1h": None}]
     medians = compute_medians(rows)
     vec = vectorize({"adx_1h": None}, medians)
     idx = FEATURE_NAMES.index("adx_1h")
