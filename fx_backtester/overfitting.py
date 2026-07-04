@@ -1,4 +1,4 @@
-"""過剰最適化の統計検定: PBO(CSCV) と Deflated Sharpe Ratio。
+"""過剰最適化の統計検定: PBO(CSCV)・Deflated Sharpe Ratio・SPA検定。
 
 試行ログ(trial_log.py)が記録した「探索した全試行」を入力に、
 選ばれたパラメータが「本物のエッジ」か「多重検定の当たりくじ」かを推定する。
@@ -11,6 +11,10 @@
 - DSR: Bailey & López de Prado (2014) "The Deflated Sharpe Ratio"。
   N回の探索でまぐれ当たりが達成しうる期待最大Sharpe(SR*)を差し引いた上で、
   観測Sharpeが偶然を上回る確率を歪度・尖度込みで返す。
+- SPA: Hansen (2005) "A Test for Superior Predictive Ability"。
+  多数の戦略を跨いで「最良戦略の優位はデータマイニングの産物か、真の予測力か」を
+  定常ブートストラップで検定する。帰無仮説「どの戦略もベンチマーク超の期待性能を
+  持たない」を、最良戦略の平均超過性能の分布から棄却できるか(p値)で判断する。
 
 依存は numpy/pandas のみ(scipy 非依存。正規分布の逆CDFは Acklam 近似を実装)。
 Sharpe は全試行が同じ足種であれば年率化不要(順位・比較はスケール不変)のため、
@@ -259,4 +263,91 @@ def probability_of_backtest_overfitting(
         "prob_oos_loss": float(np.mean(selected_oos < 0.0)),
         "degradation_slope": float(slope),
         "degradation_intercept": float(intercept),
+    }
+
+
+def _stationary_bootstrap_indices(
+    n_obs: int, avg_block: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Politis-Romano の定常ブートストラップで長さ n_obs のインデックス列を作る。
+
+    各ステップで確率 1/avg_block で新しい開始点へ跳び、それ以外は連続で進む
+    (幾何分布のブロック長)。時系列の自己相関を保ったまま再標本化するため、
+    SPA検定の帰無分布に i.i.d. ブートストラップより適する。
+    """
+    p = 1.0 / max(avg_block, 1.0)
+    indices = np.empty(n_obs, dtype=int)
+    current = int(rng.integers(0, n_obs))
+    for i in range(n_obs):
+        indices[i] = current
+        if rng.random() < p:
+            current = int(rng.integers(0, n_obs))
+        else:
+            current = (current + 1) % n_obs
+    return indices
+
+
+def superior_predictive_ability(
+    performance: pd.DataFrame,
+    *,
+    n_bootstrap: int = 1000,
+    avg_block: float = 10.0,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Hansen (2005) の SPA検定。多数戦略の中の最良の優位が本物かを検定する。
+
+    performance: 時刻×戦略の「超過性能」行列(各セル = 戦略のリターン − ベンチマーク。
+                 ベンチマークが0=無リスクなら戦略リターンそのもの)。列=戦略、行=期間。
+
+    帰無仮説 H0:「どの戦略もベンチマークを上回る期待性能を持たない」。
+    各戦略の平均超過性能 d̄_k を標準化した統計量の最大値 T = max_k √n·d̄_k/ω_k を
+    観測し、定常ブートストラップで H0 下(平均を中心化)の分布と比べて p値を出す。
+    p値が小さいほど「最良戦略の優位はデータマイニングでは説明できない=真の予測力」。
+
+    戻り値: spa_pvalue(小さいほど有意)、best_strategy(列名)、test_statistic、
+    n_strategies、n_observations。scipy 非依存(乱数は numpy Generator)。
+    """
+    if performance is None or performance.empty:
+        raise ValueError("performance 行列が空")
+    values = performance.to_numpy(dtype=float)
+    values = np.where(np.isfinite(values), values, np.nan)
+    # 全 NaN 行/列を落とし、残る NaN は 0(その期間ポジション無し)扱い
+    values = np.where(np.isnan(values), 0.0, values)
+    n_obs, n_strategies = values.shape
+    if n_strategies < 1:
+        raise ValueError("戦略が1つも無い")
+    if n_obs < 3:
+        raise ValueError(f"観測数が不足({n_obs}件)。SPAには3件以上が必要")
+
+    means = values.mean(axis=0)  # d̄_k
+    # 各戦略の分散(標準化用 ω_k)。分散0は比較不能として大きな値で無効化する
+    std = values.std(axis=0, ddof=1)
+    omega = np.where(std > _MIN_STD, std, np.inf)
+    studentized = np.sqrt(n_obs) * means / omega
+    test_statistic = float(np.nanmax(studentized))
+    best_idx = int(np.nanargmax(studentized))
+
+    rng = np.random.default_rng(seed)
+    # H0 下の中心化: 各戦略から自身の平均を引き「優位ゼロ」の世界を作る
+    centered = values - means
+    exceed = 0
+    for _ in range(n_bootstrap):
+        idx = _stationary_bootstrap_indices(n_obs, avg_block, rng)
+        sample = centered[idx]
+        boot_means = sample.mean(axis=0)
+        boot_std = sample.std(axis=0, ddof=1)
+        boot_omega = np.where(boot_std > _MIN_STD, boot_std, np.inf)
+        boot_stat = float(np.nanmax(np.sqrt(n_obs) * boot_means / boot_omega))
+        if boot_stat >= test_statistic:
+            exceed += 1
+
+    p_value = (exceed + 1) / (n_bootstrap + 1)  # +1 で 0 を避ける保守的推定
+    return {
+        "spa_pvalue": float(p_value),
+        "best_strategy": performance.columns[best_idx],
+        "best_mean_excess": float(means[best_idx]),
+        "test_statistic": test_statistic,
+        "n_strategies": int(n_strategies),
+        "n_observations": int(n_obs),
+        "n_bootstrap": int(n_bootstrap),
     }

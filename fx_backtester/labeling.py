@@ -20,6 +20,11 @@
    「その方向に張って当たるか否か(=張る/見送る)」を学習する。二次ラベルは
    「一次の方向がトリプルバリアで利確に届いたか」。F1改善とサイズ判断に効く。
 
+4. cusum_filter — CUSUMフィルターによるイベントサンプリング。全バーを機械的に
+   学習点にすると自己相関で実効サンプルを過大評価する。累積偏差が閾値hを超えた
+   「意味のある変化が起きた点」だけをイベントとして抽出し、そこにトリプルバリアを
+   張る。López de Prado の定石(CUSUMでサンプリング→トリプルバリアでラベル付け)。
+
 すべてネットワーク非依存の純粋関数で、fixtureのSeries/DataFrameからテストできる。
 """
 
@@ -96,6 +101,64 @@ def min_ffd_order(
         if autocorr is not None and not np.isnan(autocorr) and abs(autocorr) < 0.5:
             return d
     return None
+
+
+# ---------------------------------------------------------------- CUSUM イベント抽出
+
+
+def cusum_filter(
+    close: pd.Series,
+    threshold: float | pd.Series,
+    *,
+    use_log_returns: bool = True,
+) -> pd.DatetimeIndex:
+    """対称CUSUMフィルターで「意味のある変化が起きた点」だけをイベント抽出する。
+
+    各バーのリターン(既定は対数リターン)を上振れ累積 S+ と下振れ累積 S- に積み、
+    どちらかが threshold を超えた時点をイベントとして記録し、その累積をリセットする。
+    こうして得た点だけにトリプルバリアを張ると、全バーを学習点にする場合の
+    自己相関(実効サンプルの過大評価)を避けられる(López de Prado の定石)。
+
+    threshold は固定値(float)か、各時点で異なる閾値(pd.Series。ボラ連動の
+    σ×係数を渡す運用)。閾値<=0 の点は「変化を拾わない」としてスキップする。
+    戻り値はイベント時刻の DatetimeIndex(元の close の index 部分集合)。
+    """
+    prices = close.astype(float)
+    if use_log_returns:
+        diff = np.log(prices).diff()
+    else:
+        diff = prices.pct_change()
+
+    # 閾値をSeriesに正規化する。float指定は全時点一定のSeriesに広げておくと、
+    # ループ内で分岐せず get() で引ける(型も pd.Series に固定できる)。
+    if isinstance(threshold, pd.Series):
+        threshold_series = threshold
+    else:
+        if threshold <= 0:
+            raise ValueError("threshold(float)は正であること")
+        threshold_series = pd.Series(float(threshold), index=diff.index)
+
+    events: list = []
+    s_pos = 0.0
+    s_neg = 0.0
+    for ts, value in diff.items():
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            continue
+        h = float(threshold_series.get(ts, np.nan))
+        if not np.isfinite(h) or h <= 0:
+            # 閾値が無い/非正の点は累積だけ進めて判定はしない(ボラ欠損時の保護)
+            s_pos = max(0.0, s_pos + float(value))
+            s_neg = min(0.0, s_neg + float(value))
+            continue
+        s_pos = max(0.0, s_pos + float(value))
+        s_neg = min(0.0, s_neg + float(value))
+        if s_pos >= h:
+            s_pos = 0.0
+            events.append(ts)
+        elif s_neg <= -h:
+            s_neg = 0.0
+            events.append(ts)
+    return pd.DatetimeIndex(events, name=close.index.name)
 
 
 # ---------------------------------------------------------------- トリプルバリア

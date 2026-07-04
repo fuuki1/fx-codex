@@ -18,6 +18,7 @@
 11. briefing    — 上記を融合したトレードプラン生成とDiscord配信
 12. journal     — 判断の記録と方向的中率の自己検証
 13. learning    — 履歴の相互採点による重み・確信度の自己調整
+13b. drift      — ADWIN適応窓によるコンセプトドリフト検出(再学習トリガー)
 
 時間足別モード(fx_briefing --per-timeframe)の追加レイヤ:
 
@@ -36,6 +37,7 @@ __all__ = [
     "briefing",
     "calendar",
     "committee",
+    "drift",
     "dukascopy",
     "gbm",
     "journal",

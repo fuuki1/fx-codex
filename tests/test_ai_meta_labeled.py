@@ -84,6 +84,28 @@ def test_entry_only_when_meta_gate_passes() -> None:
         assert signals.loc[ts, "meta_probability"] >= 0.55
 
 
+def test_cusum_events_reduce_entry_candidates() -> None:
+    """CUSUM ON は「一次方向が出た全バー」よりイベントを絞る(自己相関の間引き)。"""
+    data = _price_frame()
+    default_signals = _fast_strategy().generate("EURUSD", data)
+    cusum_signals = _fast_strategy(use_cusum_events=True, cusum_multiple=1.0).generate(
+        "EURUSD", data
+    )
+    # どちらも有効な出力(-1/0/1)で、CUSUMは学習に使うイベントを機械的に増やさない。
+    assert set(cusum_signals["target_position"].unique()).issubset({-1, 0, 1})
+    # CUSUM ON のトレーニング標本(成熟イベント)は default 以下になる(絞り込み)
+    assert int(cusum_signals["meta_train_rows"].max()) <= int(
+        default_signals["meta_train_rows"].max()
+    )
+
+
+def test_cusum_multiple_must_be_positive_when_enabled() -> None:
+    with pytest.raises(ValueError):
+        AIMetaLabeledStrategy(use_cusum_events=True, cusum_multiple=0.0).generate(
+            "EURUSD", _price_frame(60)
+        )
+
+
 def test_no_lookahead_future_change_does_not_alter_past_signals() -> None:
     data = _price_frame(220)
     modified = data.copy()

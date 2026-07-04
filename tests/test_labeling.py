@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from fx_backtester.labeling import (
+    cusum_filter,
     frac_diff_ffd,
     frac_diff_weights,
     meta_labels,
@@ -67,6 +68,55 @@ def test_min_ffd_order_returns_low_d_for_trending_series() -> None:
     d = min_ffd_order(series)
     assert d is not None
     assert 0.0 < d <= 1.0
+
+
+# ---------------------------------------------------------------- CUSUM
+
+
+def test_cusum_filter_flags_large_moves_only() -> None:
+    # 前半は微動(閾値未満)、途中で+5%の急騰 → その1点だけイベント
+    prices = [100.0] * 10 + [105.0] + [105.0] * 9
+    close = pd.Series(prices, index=_index(20))
+    events = cusum_filter(close, threshold=0.03, use_log_returns=True)
+    assert len(events) == 1
+    assert events[0] == close.index[10]  # 急騰した点
+
+
+def test_cusum_filter_resets_after_event() -> None:
+    # 2回の急騰は2イベント(1回目でリセットされ、2回目も拾える)
+    prices = [100.0] * 5 + [104.0] * 5 + [108.0] * 5
+    close = pd.Series(prices, index=_index(15))
+    events = cusum_filter(close, threshold=0.03)
+    assert len(events) == 2
+
+
+def test_cusum_filter_catches_downside() -> None:
+    prices = [100.0] * 5 + [95.0] * 10  # -5%の急落
+    close = pd.Series(prices, index=_index(15))
+    events = cusum_filter(close, threshold=0.03)
+    assert len(events) == 1
+    assert events[0] == close.index[5]
+
+
+def test_cusum_filter_series_threshold() -> None:
+    # 閾値をSeriesで渡す(ボラ連動運用)。緩い閾値なら拾い、厳しいと拾わない
+    prices = [100.0] * 5 + [102.0] * 10  # +2%
+    close = pd.Series(prices, index=_index(15))
+    loose = pd.Series(0.01, index=close.index)  # 1%閾値 → 拾う
+    strict = pd.Series(0.05, index=close.index)  # 5%閾値 → 拾わない
+    assert len(cusum_filter(close, loose)) == 1
+    assert len(cusum_filter(close, strict)) == 0
+
+
+def test_cusum_filter_rejects_nonpositive_float_threshold() -> None:
+    close = pd.Series([100.0, 101.0], index=_index(2))
+    with pytest.raises(ValueError):
+        cusum_filter(close, threshold=0.0)
+
+
+def test_cusum_filter_no_events_when_flat() -> None:
+    close = pd.Series([100.0] * 20, index=_index(20))
+    assert len(cusum_filter(close, threshold=0.01)) == 0
 
 
 # ---------------------------------------------------------------- トリプルバリア

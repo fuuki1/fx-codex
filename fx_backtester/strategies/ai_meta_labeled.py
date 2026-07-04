@@ -28,6 +28,7 @@ import pandas as pd
 
 from fx_backtester.indicators import average_true_range, rsi, sma
 from fx_backtester.labeling import (
+    cusum_filter,
     frac_diff_ffd,
     meta_labels,
     triple_barrier_labels,
@@ -55,6 +56,11 @@ class AIMetaLabeledStrategy(Strategy):
     upper_multiple: float = 2.0  # 上バリア = σ × これ(利確)
     lower_multiple: float = 2.0  # 下バリア = σ × これ(損切)
     vertical_bars: int = 24  # 垂直バリア(時間切れ)までの足数
+    # CUSUMイベントサンプリング(既定OFF)。ONだと「一次方向が出た全バー」ではなく
+    # 「累積変化がσ×cusum_multipleを超えた点」だけをエントリ候補にし、自己相関で
+    # 実効サンプルを過大評価するのを避ける(López de Prado の定石)。
+    use_cusum_events: bool = False
+    cusum_multiple: float = 1.0  # CUSUM閾値 = σ(volatility_window) × これ
     volatility_window: int = 20
     rsi_window: int = 14
     atr_window: int = 14
@@ -81,7 +87,16 @@ class AIMetaLabeledStrategy(Strategy):
         volatility = close.pct_change().rolling(
             self.volatility_window, min_periods=self.volatility_window
         ).std()
-        event_index = side.index[side != 0]
+        # イベント点: 既定は「一次方向が出た全バー」。CUSUM ON なら累積変化が
+        # σ×cusum_multiple を超えた点だけに絞り(自己相関の間引き)、さらに一次方向が
+        # 出ている点との積を取る(方向の無い点にはトリプルバリアを張れないため)。
+        directional = side.index[side != 0]
+        if self.use_cusum_events:
+            cusum_threshold = (volatility * self.cusum_multiple).dropna()
+            cusum_events = cusum_filter(close, cusum_threshold)
+            event_index = cusum_events.intersection(directional)
+        else:
+            event_index = directional
         barriers = triple_barrier_labels(
             close,
             events_index=event_index,
@@ -219,6 +234,8 @@ class AIMetaLabeledStrategy(Strategy):
             raise ValueError("barrier multiples must be positive")
         if self.vertical_bars <= 1:
             raise ValueError("vertical_bars must be > 1")
+        if self.use_cusum_events and self.cusum_multiple <= 0:
+            raise ValueError("cusum_multiple must be positive when use_cusum_events is on")
         if self.min_train_bars <= 20:
             raise ValueError("min_train_bars must be > 20")
         if self.retrain_interval <= 0:

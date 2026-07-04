@@ -13,6 +13,7 @@ from fx_backtester.overfitting import (
     norm_ppf,
     per_period_sharpe,
     probability_of_backtest_overfitting,
+    superior_predictive_ability,
 )
 
 # ---------------------------------------------------------------- 正規分布近似
@@ -145,3 +146,49 @@ def test_pbo_rejects_invalid_inputs() -> None:
         probability_of_backtest_overfitting(matrix.iloc[:6], n_blocks=4)
     with pytest.raises(ValueError):  # 空行列
         probability_of_backtest_overfitting(pd.DataFrame(), n_blocks=4)
+
+
+# ---------------------------------------------------------------- SPA検定
+
+
+def test_spa_low_pvalue_for_genuine_edge() -> None:
+    # 1戦略だけ一貫して正の超過性能 → 帰無「優位ゼロ」を棄却(p値小)
+    rng = np.random.default_rng(11)
+    index = pd.date_range("2024-01-01", periods=300, freq="h")
+    data = {f"noise_{k}": rng.normal(0.0, 0.01, 300) for k in range(9)}
+    data["skilled"] = rng.normal(0.004, 0.01, 300)  # 明確な正のエッジ
+    perf = pd.DataFrame(data, index=index)
+    result = superior_predictive_ability(perf, n_bootstrap=500, seed=1)
+    assert result["best_strategy"] == "skilled"
+    assert result["spa_pvalue"] < 0.05  # 有意
+
+
+def test_spa_high_pvalue_for_pure_noise() -> None:
+    # 全戦略が平均ゼロのノイズ → 最良の優位はデータマイニングの産物(p値大)
+    rng = np.random.default_rng(12)
+    index = pd.date_range("2024-01-01", periods=300, freq="h")
+    perf = pd.DataFrame(
+        {f"noise_{k}": rng.normal(0.0, 0.01, 300) for k in range(10)}, index=index
+    )
+    result = superior_predictive_ability(perf, n_bootstrap=500, seed=2)
+    assert result["spa_pvalue"] > 0.10  # 有意でない
+
+
+def test_spa_is_deterministic_with_seed() -> None:
+    rng = np.random.default_rng(13)
+    perf = pd.DataFrame(
+        {f"s_{k}": rng.normal(0.001, 0.01, 200) for k in range(5)},
+        index=pd.date_range("2024-01-01", periods=200, freq="h"),
+    )
+    a = superior_predictive_ability(perf, n_bootstrap=300, seed=42)
+    b = superior_predictive_ability(perf, n_bootstrap=300, seed=42)
+    assert a["spa_pvalue"] == b["spa_pvalue"]
+    assert a["test_statistic"] == b["test_statistic"]
+
+
+def test_spa_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError):
+        superior_predictive_ability(pd.DataFrame())
+    tiny = pd.DataFrame({"s": [0.01, 0.02]}, index=pd.date_range("2024-01-01", periods=2, freq="h"))
+    with pytest.raises(ValueError):
+        superior_predictive_ability(tiny)  # 観測不足
