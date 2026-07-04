@@ -192,3 +192,26 @@ def test_spa_rejects_invalid_inputs() -> None:
     tiny = pd.DataFrame({"s": [0.01, 0.02]}, index=pd.date_range("2024-01-01", periods=2, freq="h"))
     with pytest.raises(ValueError):
         superior_predictive_ability(tiny)  # 観測不足
+
+
+def test_pbo_handles_degenerate_returns_without_crashing() -> None:
+    # ほぼ定数リターン(分散≈0)でも LinAlgError/LAPACK 警告を出さず PBO を返す。
+    # 実データの縮退fold(ほぼ無取引)で pipeline がクラッシュしたのを回帰テスト化。
+    import warnings
+
+    index = pd.date_range("2024-01-01", periods=128, freq="h")
+    matrix = pd.DataFrame({f"t{i}": [0.0] * 128 for i in range(6)}, index=index)
+    matrix.iloc[0, 0] = 1e-9  # わずかな非ゼロ(全ゼロ列の縮退回避)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # LAPACK等の警告漏れも失敗にする
+        result = probability_of_backtest_overfitting(matrix, n_blocks=4)
+    assert 0.0 <= result["pbo"] <= 1.0
+    slope = result["degradation_slope"]
+    assert np.isnan(slope) or np.isfinite(slope)  # 退化でクラッシュしないことが要件
+
+
+def test_safe_linfit_returns_nan_on_constant_x() -> None:
+    from fx_backtester.overfitting import _safe_linfit
+
+    slope, intercept = _safe_linfit(np.array([1.0, 1.0, 1.0]), np.array([1.0, 2.0, 3.0]))
+    assert np.isnan(slope) and np.isnan(intercept)  # x が定数 → 傾き定義不能

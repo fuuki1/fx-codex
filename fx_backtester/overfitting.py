@@ -191,6 +191,21 @@ def _sharpe_from_moments(sums: np.ndarray, squares: np.ndarray, counts: np.ndarr
     return sharpe
 
 
+def _safe_linfit(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """1次回帰(傾き, 切片)。退化データ(定数・非有限)では polyfit が LinAlgError や
+    LAPACK 警告を出すため、事前に有限性・分散を確認し、不能なら (NaN, NaN) を返す。
+    """
+    finite = np.isfinite(x) & np.isfinite(y)
+    xf, yf = x[finite], y[finite]
+    if len(xf) < 2 or float(np.std(xf)) <= _MIN_STD:
+        return float("nan"), float("nan")
+    try:
+        slope, intercept = np.polyfit(xf, yf, 1)
+    except (np.linalg.LinAlgError, ValueError):
+        return float("nan"), float("nan")
+    return float(slope), float(intercept)
+
+
 def probability_of_backtest_overfitting(
     matrix: pd.DataFrame,
     n_blocks: int = 16,
@@ -252,7 +267,9 @@ def probability_of_backtest_overfitting(
     omega = rank / (n_trials + 1.0)
     lam = np.log(omega / (1.0 - omega))
 
-    slope, intercept = np.polyfit(selected_is, selected_oos, 1)
+    # 劣化度回帰(診断用)。定数系列など退化ケースで polyfit は LinAlgError を投げ
+    # LAPACK 警告も漏らすため、失敗時は slope/intercept を NaN にして PBO 本体は返す。
+    slope, intercept = _safe_linfit(selected_is, selected_oos)
     return {
         "pbo": float(np.mean(lam < 0.0) + 0.5 * np.mean(lam == 0.0)),
         "n_trials": int(n_trials),

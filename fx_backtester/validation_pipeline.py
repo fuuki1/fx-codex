@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from fx_intel.drift import scan_for_drift
@@ -40,6 +41,10 @@ from fx_backtester.overfitting import (
 )
 from fx_backtester.trial_log import TrialLogger
 from fx_backtester.walk_forward import WalkForwardResult, WalkForwardValidator
+
+# ゲート計算が退化データで投げうる数値エラー(polyfit のLinAlgError等)。
+# ValueError と併せて「計算不能」の理由に降格し、パイプライン全体は落とさない。
+_GATE_ERRORS = (ValueError, np.linalg.LinAlgError)
 
 
 @dataclass
@@ -140,7 +145,7 @@ def evaluate_deploy_gate(
                 reasons.append(
                     f"DSR {dsr_value:.3f} < {config.dsr_min:.2f}(コスト込みSharpeが有意でない)"
                 )
-        except ValueError as error:
+        except _GATE_ERRORS as error:
             reasons.append(f"DSRを計算できない({error})")
     else:
         reasons.append(f"DSRの標本不足(OOS {n_oos}件 / 試行{len(trial_sharpes)}件)")
@@ -156,7 +161,7 @@ def evaluate_deploy_gate(
                 reasons.append(
                     f"PBO {pbo_value:.3f} ≥ {config.pbo_max:.2f}(IS順位にOOS予測力なし)"
                 )
-        except ValueError as error:
+        except _GATE_ERRORS as error:
             reasons.append(f"PBOを計算できない({error})")
     else:
         reasons.append("PBOの試行不足(リターン行列が2列未満)")
@@ -176,7 +181,7 @@ def evaluate_deploy_gate(
                 reasons.append(
                     f"SPA p値 {spa_value:.3f} ≥ {config.spa_max:.2f}(最良の優位が有意でない)"
                 )
-        except ValueError as error:
+        except _GATE_ERRORS as error:
             reasons.append(f"SPAを計算できない({error})")
     else:
         reasons.append("SPAの標本不足")
