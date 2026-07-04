@@ -53,6 +53,10 @@ class BacktestConfig:
     close_positions_on_daily_stop: bool = True
     close_positions_on_portfolio_stop: bool = True
     force_close_on_end: bool = True
+    # 別枠VaR: 実現equityリターンをこの本数まで遡って分位点を測る(0=無制限)。
+    var_lookback_bars: int = 500
+    # var_limit_pct が未設定でもVaRを計算し続けたい場合に True(監視のみ・ロックしない)。
+    var_always_monitor: bool = False
 
 
 @dataclass
@@ -115,6 +119,10 @@ class BacktestEngine:
         pending_orders: list[PendingOrder] = []
         entry_cooldowns: dict[str, int] = {}
         self.risk.reset()
+        # 別枠VaR用の直近equityリターン列(方向モデルと独立に実現分布から測る)。
+        # var_limit_pct が None のときは監視のみで update_var は呼ばない(コスト回避)。
+        equity_returns: list[float] = []
+        prev_equity: float | None = None
 
         for timestamp in all_times:
             self._advance_cooldowns(entry_cooldowns)
@@ -136,6 +144,15 @@ class BacktestEngine:
 
             equity = self._equity(cash, positions, last_prices)
             self.risk.on_bar(timestamp, equity)
+
+            # 別枠VaRの更新(有効時のみ)。equityの1バーリターンを貯めて分位点で測る。
+            if prev_equity is not None and prev_equity > 0:
+                equity_returns.append(equity / prev_equity - 1.0)
+            prev_equity = equity
+            if self.config.var_lookback_bars > 0:
+                del equity_returns[: max(0, len(equity_returns) - self.config.var_lookback_bars)]
+            if self.risk.config.var_limit_pct is not None or self.config.var_always_monitor:
+                self.risk.update_var(equity_returns)
 
             stopped_symbols, cash = self._apply_price_exits(
                 timestamp,
@@ -717,6 +734,9 @@ class BacktestEngine:
             exit_reason=reason,
         )
         trades.append(trade)
+        # トレードが1件確定するたびに、実現R倍数からケリーのリスク予算を更新する
+        # (use_fractional_kelly=False のときは内部で固定値を返す no-op)。
+        self.risk.update_risk_budget([t.r_multiple for t in trades])
         positions.pop(position.symbol, None)
         cash_delta = gross_pnl - fill.fee
         return cash + cash_delta

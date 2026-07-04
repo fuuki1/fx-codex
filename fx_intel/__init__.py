@@ -9,6 +9,8 @@
 4.  sentiment   — センチメント統合(Claude API 任意 → analyst の序列)
 5.  technicals  — TradingViewマルチタイムフレームのテクニカル集約
 6.  macro       — OHLC・米金利・DXY・VIX・CFTC COTの取得とリスクレジーム判定
+6b. dukascopy   — 実ティック(.bi5)の取得・バー集約・CSV出力・将来価格供給
+                   (fetch_dukascopy.py の実装本体。源B FuturePriceProvider を提供)
 7.  gbm         — 依存ゼロの勾配ブースティング決定木(確率モデルの基盤)
 8.  ml          — ジャーナルからGBDT確率モデルを学習する時系列パイプライン
 9.  committee   — tech/news/macro/MLの委員会オーケストレータ
@@ -34,6 +36,7 @@ __all__ = [
     "briefing",
     "calendar",
     "committee",
+    "dukascopy",
     "gbm",
     "journal",
     "learning",

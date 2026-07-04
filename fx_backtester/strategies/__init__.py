@@ -1,11 +1,13 @@
 from fx_backtester.strategies.base import Strategy
 from fx_backtester.strategies.ai_logistic import AILogisticStrategy
+from fx_backtester.strategies.ai_meta_labeled import AIMetaLabeledStrategy
 from fx_backtester.strategies.donchian_breakout import DonchianBreakout
 from fx_backtester.strategies.moving_average_cross import MovingAverageCross
 from fx_backtester.strategies.rsi_mean_reversion import RSIMeanReversion
 
 STRATEGY_REGISTRY = {
     "ai_logistic": AILogisticStrategy,
+    "ai_meta_labeled": AIMetaLabeledStrategy,
     "ma_cross": MovingAverageCross,
     "donchian": DonchianBreakout,
     "rsi_mean_reversion": RSIMeanReversion,
@@ -18,6 +20,12 @@ DEFAULT_PARAM_GRIDS: dict[str, dict[str, list[object]]] = {
         "short_threshold": [0.46, 0.42],
         "stop_atr_multiple": [1.5],
         "epochs": [120],
+    },
+    "ai_meta_labeled": {
+        "frac_diff_d": [0.3, 0.5],
+        "meta_threshold": [0.55, 0.6],
+        "vertical_bars": [24],
+        "stop_atr_multiple": [1.5, 2.0],
     },
     "ma_cross": {
         "fast_window": [10, 20],
@@ -39,6 +47,7 @@ DEFAULT_PARAM_GRIDS: dict[str, dict[str, list[object]]] = {
 
 __all__ = [
     "AILogisticStrategy",
+    "AIMetaLabeledStrategy",
     "DEFAULT_PARAM_GRIDS",
     "DonchianBreakout",
     "MovingAverageCross",

@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 
+from fx_backtester.kelly import (
+    KellyEstimate,
+    VaREstimate,
+    fractional_kelly_risk_pct,
+    historical_var,
+    kelly_fraction_from_r_multiples,
+    var_breached,
+)
 from fx_backtester.models import instrument_for, notional_usd, price_distance_to_usd_per_unit
 
 
@@ -22,6 +31,16 @@ class RiskConfig:
     max_currency_exposure_pct: float | None = None
     max_position_units: float | None = None
     allow_fractional_units: bool = False
+    # --- フラクショナル・ケリー(既定OFF。ON時のみ実現R倍数から動的サイジング) ---
+    use_fractional_kelly: bool = False
+    kelly_fraction: float = 0.25  # 0.25=クォーター, 0.5=ハーフ(レポート推奨帯)
+    kelly_min_trades: int = 50  # これ未満は固定フラクショナルへフォールバック
+    kelly_full_confidence_trades: int = 100  # ここで完全にケリーへ移行
+    kelly_max_risk_pct: float = 0.02  # ケリー採用時の1トレードリスク上限(安全弁)
+    # --- VaR(別枠監視。既定OFF。方向モデルと独立に実現分布から計算) ---
+    var_limit_pct: float | None = None  # 1期間VaRがこれを超えたら新規建て停止
+    var_confidence: float = 0.95
+    var_min_samples: int = 30
 
 
 class RiskManager:
@@ -42,6 +61,11 @@ class RiskManager:
         self._monthly_locked = False
         self._monthly_profit_locked = False
         self._hard_locked = False
+        # ケリー/VaR の現在推定(サイジングとゲートに使う。既定は固定フラクショナル)
+        self._effective_risk_pct: float = self.config.risk_per_trade_pct
+        self._kelly_estimate: KellyEstimate | None = None
+        self._var_estimate: VaREstimate | None = None
+        self._var_locked = False
 
     @property
     def daily_locked(self) -> bool:
@@ -64,6 +88,10 @@ class RiskManager:
         return self._hard_locked
 
     @property
+    def var_locked(self) -> bool:
+        return self._var_locked
+
+    @property
     def risk_locked(self) -> bool:
         return (
             self._daily_locked
@@ -71,7 +99,21 @@ class RiskManager:
             or self._monthly_locked
             or self._monthly_profit_locked
             or self._hard_locked
+            or self._var_locked
         )
+
+    @property
+    def effective_risk_pct(self) -> float:
+        """現在の1トレードあたりリスク%(ケリーONなら動的、OFFなら固定値)。"""
+        return self._effective_risk_pct
+
+    @property
+    def kelly_estimate(self) -> KellyEstimate | None:
+        return self._kelly_estimate
+
+    @property
+    def var_estimate(self) -> VaREstimate | None:
+        return self._var_estimate
 
     def reset(self) -> None:
         self._current_day = None
@@ -87,6 +129,51 @@ class RiskManager:
         self._monthly_locked = False
         self._monthly_profit_locked = False
         self._hard_locked = False
+        self._effective_risk_pct = self.config.risk_per_trade_pct
+        self._kelly_estimate = None
+        self._var_estimate = None
+        self._var_locked = False
+
+    def update_risk_budget(self, realized_r_multiples: Sequence[float]) -> float:
+        """実現R倍数列からケリーで1トレードリスク%を更新し、採用値を返す。
+
+        use_fractional_kelly=False のときは何もせず固定値(risk_per_trade_pct)を返す。
+        ONのときは kelly_fraction_from_r_multiples → fractional_kelly_risk_pct で
+        動的に決め、_effective_risk_pct に反映する。engine はトレードが1件確定する
+        たびにこれを呼ぶ想定(まだ標本が薄い間は自動でフォールバックする)。
+        """
+        if not self.config.use_fractional_kelly:
+            self._effective_risk_pct = self.config.risk_per_trade_pct
+            return self._effective_risk_pct
+        estimate = kelly_fraction_from_r_multiples(
+            realized_r_multiples, min_trades=self.config.kelly_min_trades
+        )
+        self._kelly_estimate = estimate
+        risk_pct, _note = fractional_kelly_risk_pct(
+            estimate,
+            baseline_pct=self.config.risk_per_trade_pct,
+            fraction=self.config.kelly_fraction,
+            max_risk_pct=self.config.kelly_max_risk_pct,
+            full_confidence_trades=self.config.kelly_full_confidence_trades,
+        )
+        self._effective_risk_pct = risk_pct
+        return risk_pct
+
+    def update_var(self, equity_returns: Sequence[float]) -> VaREstimate:
+        """実現equityリターン分布から別枠VaRを更新し、上限超過ならロックする。
+
+        var_limit_pct が None なら監視のみ(ロックしない)。方向モデルとは独立に、
+        実現リターンそのものからテールを測る(レポートの「VaR別枠」)。
+        """
+        estimate = historical_var(
+            equity_returns,
+            confidence=self.config.var_confidence,
+            min_samples=self.config.var_min_samples,
+        )
+        self._var_estimate = estimate
+        if self.config.var_limit_pct is not None:
+            self._var_locked = var_breached(estimate, self.config.var_limit_pct)
+        return estimate
 
     def on_bar(self, timestamp: Any, equity: float) -> None:
         normalized = pd.Timestamp(timestamp)
@@ -201,7 +288,16 @@ class RiskManager:
             return 0.0, adjusted_stop_distance, 0.0
 
         fixed_risk = max(float(extra_risk_usd), 0.0)
-        risk_budget = equity * min(self.config.risk_per_trade_pct, self.config.risk_cap_pct)
+        # ケリーONなら _effective_risk_pct(動的)、OFFなら risk_per_trade_pct(固定)。
+        # ハードキャップは、ケリーONのときは kelly_max_risk_pct(ケリー用の安全上限)、
+        # OFFのときは従来どおり risk_cap_pct。これで固定運用の1%キャップは不変のまま、
+        # ケリー運用だけが上限を kelly_max_risk_pct まで許容する。
+        if self.config.use_fractional_kelly:
+            hard_cap = self.config.kelly_max_risk_pct
+            effective_pct = min(self._effective_risk_pct, hard_cap)
+        else:
+            effective_pct = min(self.config.risk_per_trade_pct, self.config.risk_cap_pct)
+        risk_budget = equity * effective_pct
         if risk_budget <= fixed_risk:
             return 0.0, adjusted_stop_distance, 0.0
         units = (risk_budget - fixed_risk) / total_risk_per_unit

@@ -43,6 +43,14 @@ DEFAULT_CLI_VALUES: dict[str, Any] = {
     "max_currency_exposure": None,
     "max_position_units": None,
     "allow_fractional_units": False,
+    "use_fractional_kelly": False,
+    "kelly_fraction": 0.25,
+    "kelly_min_trades": 50,
+    "kelly_full_confidence_trades": 100,
+    "kelly_max_risk": 0.02,
+    "var_limit": None,
+    "var_confidence": 0.95,
+    "var_min_samples": 30,
     "max_open_positions": None,
     "cooldown_bars_after_stop": 0,
     "commission_per_million": 30.0,
@@ -251,6 +259,41 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentP
     parser.add_argument("--max-currency-exposure", type=float)
     parser.add_argument("--max-position-units", type=float)
     parser.add_argument("--allow-fractional-units", action="store_true")
+    # フラクショナル・ケリー(既定OFF。実現R倍数からリスク%を動的に決める)
+    parser.add_argument(
+        "--use-fractional-kelly",
+        action="store_true",
+        help="実現トレードのW/Rからケリーでリスク%を動的調整(既定は固定フラクショナル)",
+    )
+    parser.add_argument(
+        "--kelly-fraction",
+        type=float,
+        default=DEFAULT_CLI_VALUES["kelly_fraction"],
+        help="ケリー比率の掛け目(0.25=クォーター, 0.5=ハーフ。フルは非推奨)",
+    )
+    parser.add_argument(
+        "--kelly-min-trades", type=int, default=DEFAULT_CLI_VALUES["kelly_min_trades"]
+    )
+    parser.add_argument(
+        "--kelly-full-confidence-trades",
+        type=int,
+        default=DEFAULT_CLI_VALUES["kelly_full_confidence_trades"],
+    )
+    parser.add_argument(
+        "--kelly-max-risk", type=float, default=DEFAULT_CLI_VALUES["kelly_max_risk"]
+    )
+    # 別枠VaR(方向モデルと独立に実現分布から計算。上限超過で新規建て停止)
+    parser.add_argument(
+        "--var-limit",
+        type=float,
+        help="1期間VaR(損失側)がこの割合を超えたら新規建てを停止(例: 0.05=5%)",
+    )
+    parser.add_argument(
+        "--var-confidence", type=float, default=DEFAULT_CLI_VALUES["var_confidence"]
+    )
+    parser.add_argument(
+        "--var-min-samples", type=int, default=DEFAULT_CLI_VALUES["var_min_samples"]
+    )
     parser.add_argument("--max-open-positions", type=int)
     parser.add_argument(
         "--cooldown-bars-after-stop",
@@ -595,6 +638,14 @@ def _build_config(args: argparse.Namespace) -> BacktestConfig:
         max_currency_exposure_pct=_preset_value(args, "max_currency_exposure"),
         max_position_units=_preset_value(args, "max_position_units"),
         allow_fractional_units=_preset_value(args, "allow_fractional_units"),
+        use_fractional_kelly=_preset_value(args, "use_fractional_kelly"),
+        kelly_fraction=_preset_value(args, "kelly_fraction"),
+        kelly_min_trades=_preset_value(args, "kelly_min_trades"),
+        kelly_full_confidence_trades=_preset_value(args, "kelly_full_confidence_trades"),
+        kelly_max_risk_pct=_preset_value(args, "kelly_max_risk"),
+        var_limit_pct=_preset_value(args, "var_limit"),
+        var_confidence=_preset_value(args, "var_confidence"),
+        var_min_samples=_preset_value(args, "var_min_samples"),
     )
     return BacktestConfig(
         initial_cash=_preset_value(args, "initial_cash"),
