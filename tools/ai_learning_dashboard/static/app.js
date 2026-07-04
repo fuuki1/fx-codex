@@ -169,7 +169,10 @@ function renderMetrics(data) {
   setText("journalTotal", String(data.journal.total));
   setText("journalLatest", shortDate(data.journal.latest_ts));
   setText("evaluatedTotal", String(data.learning.evaluated || 0));
-  setText("pendingTotal", `24h待ち ${data.evaluation.pending || 0} / 小動き ${data.learning.flat || 0}`);
+  setText(
+    "pendingTotal",
+    `採点待ち ${data.evaluation.pending || 0} / 小動き ${data.learning.flat || 0}`,
+  );
   setText("hitRate", pct(data.learning.hit_rate));
   setText("hitCount", `${data.learning.hits || 0} / ${data.learning.evaluated || 0}`);
   setText("mlStatus", data.ml.has_model ? (data.ml.usable ? "有効" : "無効") : "未学習");
@@ -235,6 +238,42 @@ function renderSymbolBars(data) {
         row.hit_rate || 0,
         `${pct(row.hit_rate)} (${row.hits}/${row.evaluated}) 係数×${Number(row.factor || 1).toFixed(2)}`,
         row.hit_rate >= 0.5 ? "green" : "red",
+      ),
+    );
+  });
+}
+
+const TIMEFRAME_ORDER = ["15m", "1h", "4h", "1d"];
+const TIMEFRAME_LABEL = { "15m": "15分足", "1h": "1時間足", "4h": "4時間足", "1d": "日足" };
+const TIMEFRAME_HORIZON = { "15m": "15分後", "1h": "1時間後", "4h": "4時間後", "1d": "24時間後" };
+
+function renderTimeframeBars(data) {
+  const target = $("timeframeBars");
+  if (!target) return;
+  target.replaceChildren();
+  const byTf = data.evaluation?.by_timeframe || {};
+  const timeframes = Object.keys(byTf).sort(
+    (a, b) => TIMEFRAME_ORDER.indexOf(a) - TIMEFRAME_ORDER.indexOf(b),
+  );
+  if (!timeframes.length) {
+    target.appendChild(
+      empty("時間足別に採点できる判断がまだありません(--per-timeframe で記録)"),
+    );
+    return;
+  }
+  timeframes.forEach((tf) => {
+    const stat = byTf[tf] || {};
+    const evaluated = Number(stat.evaluated || 0);
+    const hits = Number(stat.hits || 0);
+    const rate = evaluated ? hits / evaluated : null;
+    const label = TIMEFRAME_LABEL[tf] || tf;
+    const horizon = TIMEFRAME_HORIZON[tf] || "";
+    target.appendChild(
+      barRow(
+        `${label}${horizon ? ` (${horizon})` : ""}`,
+        rate || 0,
+        `${pct(rate)} (${hits}/${evaluated})`,
+        rate >= 0.5 ? "green" : "red",
       ),
     );
   });
@@ -364,6 +403,7 @@ function render(data) {
   renderWeights(data);
   renderStages(data);
   renderSymbolBars(data);
+  renderTimeframeBars(data);
   renderBins(data);
   renderMl(data);
   renderConditions(data);

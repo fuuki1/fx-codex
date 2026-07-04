@@ -236,8 +236,9 @@ fx_intel/calendar.py       (実績で委員を段階昇格)
 - `event_history.csv`は実行のたびに未観測のイベント・改定分（時刻変更やforecast確定）だけを`recorded_at`付きで追記する簡易point-in-time記録。運用を続けるほど過去期間の実カレンダーが蓄積され、バックテストでのイベント回避再生に使えるようになる（`--no-event-archive`で無効化）。
 - 定期実行: `fx_briefing_loop.sh`（毎時10分。`tv_notify_loop.sh`の毎時5分と5分ずらして負荷分散）。
 - **ML学習・昇格の運用**: `--train-ml`でジャーナルからGBDTを再学習(週次程度で十分)。委員の昇格はブリーフィング実行のたびに自動採点され、`--promote-live macro ml`を付けたときだけ条件を満たす委員をliveへ昇格承認する。`--no-macro`/`--no-ml`で個別の委員を無効化できる。追加ファイル: `logs/macro_cache.json`(マクロTTLキャッシュ)、`logs/ml_model.json`(学習済みモデル+来歴)、`logs/promotion_state.json`(委員の段階)。
-- **依存の据え置き**: 新モジュール(analyst/macro/gbm/ml/committee/promotion)は追加のサードパーティ依存を一切増やさない。macro.pyの取得はrequestsのみ、GBDT・学習・昇格・分析エンジンは標準ライブラリだけで動く。Mac miniの軽量venvへrsyncするだけで移設できる。
-- テスト(`tests/test_fx_intel.py`ほか`test_analyst`/`test_macro`/`test_gbm`/`test_ml`/`test_committee`/`test_promotion`)はネットワーク不要で完結する設計（マクロ取得はキャッシュ事前投入でオフライン検証）。
+- **時間足別モード** (`--per-timeframe`、`fx_intel/timeframe.py` + `price_history.py` + `tf_learning.py` + `tf_briefing.py`): 融合1判断の代わりに15m/1h/4h/1dを**独立したアナリスト**として判断し、**時間足別の主ホライズン**で自己採点する（15m→15分後 / 1h→1時間後 / 4h→4時間後 / 1d→24時間後。補助ホライズンは観測専用で学習には不使用）。将来価格は専用ジャーナル`logs/briefing_tf_journal.jsonl`の後続エントリの終値を使う（TradingViewスキャナーは現在値しか返せないため。外部履歴OHLCを差し込む注入口も用意）。学習は融合モードと同じコア（重み再推定・キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier）を`(通貨ペア × 時間足)`セル単位で適用し、`logs/briefing_tf_learning.json`へ保存。融合モードとはジャーナル・学習ファイルを分離しているので両モードは干渉しない。読み取り専用ダッシュボード(`tools/ai_learning_dashboard`)は両ジャーナルを各主ホライズンで採点し、時間足別の的中率も表示する。
+- **依存の据え置き**: 新モジュール(analyst/macro/gbm/ml/committee/promotion/timeframe/price_history/tf_learning/tf_briefing)は追加のサードパーティ依存を一切増やさない。macro.pyの取得はrequestsのみ、GBDT・学習・昇格・分析エンジン・時間足別レイヤは標準ライブラリだけで動く。Mac miniの軽量venvへrsyncするだけで移設できる。
+- テスト(`tests/test_fx_intel.py`ほか`test_analyst`/`test_macro`/`test_gbm`/`test_ml`/`test_committee`/`test_promotion`、時間足別は`test_timeframe`/`test_price_history`/`test_tf_learning`/`test_tf_briefing`/`test_fx_briefing_per_timeframe`/`test_dashboard_timeframe`)はネットワーク不要で完結する設計（マクロ取得はキャッシュ事前投入でオフライン検証、将来価格取得は注入モックで検証）。
 
 ### 使い分け
 
