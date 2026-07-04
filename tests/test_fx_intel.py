@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
+from typing import cast
 
 import pytest
+import requests
 
 from fx_intel import briefing
 from fx_intel.calendar import (
@@ -213,7 +215,7 @@ def test_fetch_calendar_uses_fresh_cache_without_network(tmp_path) -> None:
     )
     session = _FailingSession()
     events, warnings = fetch_calendar(
-        session=session, cache_path=cache_path, cache_max_age_minutes=45
+        session=cast(requests.Session, session), cache_path=cache_path, cache_max_age_minutes=45
     )
     assert session.calls == 0  # 新鮮なキャッシュがあればネットワークを叩かない
     assert len(events) == 1 and events[0].title == "NFP"
@@ -243,14 +245,18 @@ def test_fetch_calendar_falls_back_to_stale_cache(tmp_path) -> None:
         )
     )
     session = _FailingSession()
-    events, warnings = fetch_calendar(session=session, cache_path=cache_path)
+    events, warnings = fetch_calendar(
+        session=cast(requests.Session, session), cache_path=cache_path
+    )
     assert session.calls == 2  # thisweek/nextweek両方失敗
     assert len(events) == 1 and events[0].title == "CPI"
     assert any("キャッシュを使用" in w for w in warnings)
 
 
 def test_fetch_calendar_no_cache_no_network_returns_empty(tmp_path) -> None:
-    events, warnings = fetch_calendar(session=_FailingSession(), cache_path=tmp_path / "none.json")
+    events, warnings = fetch_calendar(
+        session=cast(requests.Session, _FailingSession()), cache_path=tmp_path / "none.json"
+    )
     assert events == []
     assert len(warnings) == 2
 

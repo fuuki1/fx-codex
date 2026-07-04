@@ -73,7 +73,7 @@ def test_build_close_series_legacy_rows_use_empty_timeframe() -> None:
 
 
 def test_build_close_series_skips_non_numeric_and_bool_close() -> None:
-    entries = [
+    entries: list[dict] = [
         {"ts": T0.isoformat(), "symbol": "USDJPY", "timeframe": "1h", "close": None},
         {"ts": T0.isoformat(), "symbol": "USDJPY", "timeframe": "1h", "close": True},
         {"ts": "bad-ts", "symbol": "USDJPY", "timeframe": "1h", "close": 156.0},

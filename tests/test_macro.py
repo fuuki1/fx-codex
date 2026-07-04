@@ -164,7 +164,9 @@ def test_fetch_uses_fresh_cache_without_network(tmp_path) -> None:
 
     snap = fetch_macro_snapshot(cache_path, now=NOW, include_cot=True)
     assert "vix" in snap.series
-    assert snap.series["vix"].last().value == 19.0
+    vix_last = snap.series["vix"].last()
+    assert vix_last is not None
+    assert vix_last.value == 19.0
 
 
 def test_coverage_reflects_fresh_data() -> None:

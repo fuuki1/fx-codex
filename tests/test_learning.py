@@ -20,6 +20,13 @@ DAY = timedelta(hours=24)
 _CALL_SEQ = count()
 
 
+def _label(spec: learning.FeatureSpec, value: float) -> str:
+    """bucket_for が値をバケットに割り当てられることを確かめてラベルを返す。"""
+    bucket = learning.bucket_for(spec, value)
+    assert bucket is not None, f"{spec.key}={value} がどのバケットにも入らない"
+    return bucket.label_ja
+
+
 def entry(
     ts: datetime,
     symbol: str = "USDJPY",
@@ -119,7 +126,7 @@ def test_evaluate_history_counts_open_hours_across_weekend() -> None:
 
 
 def test_evaluate_history_skips_malformed_entries() -> None:
-    entries = [
+    entries: list[dict] = [
         {"ts": "not-a-date", "symbol": "USDJPY", "direction": "long", "close": 100.0},
         {"ts": NOW.isoformat(), "symbol": "USDJPY", "direction": "long", "close": None},
         entry(NOW + DAY, direction="neutral", close=101.0),
@@ -362,6 +369,7 @@ def test_conviction_brier_rewards_informative_conviction() -> None:
     ]
     profile = learning.derive_profile(calls, now=NOW)
     assert profile.conviction_brier == pytest.approx(0.04)
+    assert profile.conviction_brier is not None
     assert profile.conviction_brier_base is not None
     assert profile.conviction_brier < profile.conviction_brier_base
     assert any("Brier" in n and "情報を持っている" in n for n in profile.notes_ja)
@@ -373,6 +381,8 @@ def test_conviction_brier_flags_miscalibration() -> None:
         call(conviction=10, outcome="hit") for _ in range(15)
     ]
     profile = learning.derive_profile(calls, now=NOW)
+    assert profile.conviction_brier is not None
+    assert profile.conviction_brier_base is not None
     assert profile.conviction_brier > profile.conviction_brier_base
     assert any("乖離" in n for n in profile.notes_ja)
 
@@ -389,12 +399,12 @@ def test_conviction_brier_hidden_when_samples_scarce() -> None:
 
 def test_bucket_for_maps_values_to_named_states() -> None:
     specs = {spec.key: spec for spec in learning.FEATURE_SPECS}
-    assert learning.bucket_for(specs["rsi_1h"], 20.0).label_ja == "売られすぎ圏(35未満)"
-    assert learning.bucket_for(specs["rsi_1h"], 50.0).label_ja == "中立圏(35-65)"
-    assert learning.bucket_for(specs["rsi_1h"], 80.0).label_ja == "買われすぎ圏(65超)"
+    assert _label(specs["rsi_1h"], 20.0) == "売られすぎ圏(35未満)"
+    assert _label(specs["rsi_1h"], 50.0) == "中立圏(35-65)"
+    assert _label(specs["rsi_1h"], 80.0) == "買われすぎ圏(65超)"
     # MA乖離は符号(向き)を無視して大きさで分類する
-    assert learning.bucket_for(specs["ma_gap_atr"], -3.0).label_ja == "大(2以上)"
-    assert learning.bucket_for(specs["tf_agreement"], 1.0).label_ja == "全時間足一致"
+    assert _label(specs["ma_gap_atr"], -3.0) == "大(2以上)"
+    assert _label(specs["tf_agreement"], 1.0) == "全時間足一致"
     assert learning.bucket_for(specs["tf_agreement"], -0.1) is None
 
 
@@ -629,9 +639,9 @@ def test_build_trade_plan_records_chart_features() -> None:
 
 def test_bucket_for_maps_htf_ratings() -> None:
     specs = {spec.key: spec for spec in learning.FEATURE_SPECS}
-    assert learning.bucket_for(specs["rating_4h"], -0.5).label_ja == "売り寄り(-0.25未満)"
-    assert learning.bucket_for(specs["rating_4h"], 0.0).label_ja == "中立(±0.25)"
-    assert learning.bucket_for(specs["rating_1d"], 1.0).label_ja == "買い寄り(+0.25以上)"
+    assert _label(specs["rating_4h"], -0.5) == "売り寄り(-0.25未満)"
+    assert _label(specs["rating_4h"], 0.0) == "中立(±0.25)"
+    assert _label(specs["rating_1d"], 1.0) == "買い寄り(+0.25以上)"
 
 
 def test_build_trade_plan_warns_when_atr_missing() -> None:

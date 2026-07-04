@@ -296,9 +296,8 @@ def _symbol_rows(learning: dict[str, Any], evaluated: dict[str, Any]) -> list[di
     if not isinstance(raw_stats, dict):
         raw_stats = evaluated.get("by_symbol", {})
     rows: list[dict[str, Any]] = []
-    factors = (
-        learning.get("symbol_factors") if isinstance(learning.get("symbol_factors"), dict) else {}
-    )
+    raw_factors = learning.get("symbol_factors")
+    factors: dict[str, Any] = raw_factors if isinstance(raw_factors, dict) else {}
     for symbol, stat in raw_stats.items():
         if not isinstance(stat, dict):
             continue
@@ -363,12 +362,12 @@ def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
     importance = payload.get("importance_by_name")
     if not isinstance(importance, dict):
         importance = {}
-    importance_rows = [
+    importance_rows: list[dict[str, Any]] = [
         {"name": str(name), "value": float(value)}
         for name, value in importance.items()
         if isinstance(value, (int, float))
     ]
-    importance_rows.sort(key=lambda row: row["value"], reverse=True)
+    importance_rows.sort(key=lambda row: float(row["value"]), reverse=True)
     return {
         "trained_at": payload.get("trained_at"),
         "usable": bool(payload.get("usable", False)),
@@ -383,8 +382,10 @@ def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _promotion_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    stages = payload.get("stages") if isinstance(payload.get("stages"), dict) else {}
-    history = payload.get("history") if isinstance(payload.get("history"), list) else []
+    raw_stages = payload.get("stages")
+    stages: dict[str, Any] = raw_stages if isinstance(raw_stages, dict) else {}
+    raw_history = payload.get("history")
+    history: list[Any] = raw_history if isinstance(raw_history, list) else []
     return {
         "stages": {"macro": stages.get("macro", "shadow"), "ml": stages.get("ml", "shadow")},
         "updated_at": payload.get("updated_at"),
