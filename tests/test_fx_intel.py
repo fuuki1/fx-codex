@@ -10,6 +10,7 @@ from fx_intel import briefing
 from fx_intel.calendar import (
     EconomicEvent,
     active_and_next_window,
+    append_events_archive,
     export_events_csv,
     fetch_calendar,
     parse_calendar_json,
@@ -17,11 +18,19 @@ from fx_intel.calendar import (
     symbol_currencies,
     upcoming_events,
 )
+from fx_intel.market import is_market_open, open_hours_between
 from fx_intel.news import NewsItem, dedupe_and_sort, parse_rss, tag_currencies
+from fx_intel.journal import (
+    DirectionalStats,
+    append_plans,
+    evaluate_directional_accuracy,
+    format_stats_ja,
+)
 from fx_intel.sentiment import (
     CurrencySentiment,
     _extract_json_block,
     analyze_market,
+    build_analysis_from_claude_json,
     pair_bias,
     score_headlines_lexicon,
 )
@@ -105,6 +114,59 @@ def test_export_events_csv_is_loadable_by_backtester(tmp_path) -> None:
     from fx_backtester.data import load_economic_events_csv
 
     frame = load_economic_events_csv(path)
+    assert len(frame) == 1
+    row = frame.iloc[0]
+    assert row["currency"] == "USD"
+    assert row["impact"] == "high"
+    assert row["name"] == "NFP"
+
+
+def test_append_events_archive_accumulates_without_duplicates(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    nfp = EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")
+    cpi = EconomicEvent("CPI y/y", "JPY", NOW + timedelta(hours=6), "medium")
+
+    _, appended = append_events_archive([nfp], archive, now=NOW)
+    assert appended == 1
+    # 同一内容の再実行では増えない(毎時実行しても膨張しない)
+    _, appended = append_events_archive([nfp], archive, now=NOW + timedelta(hours=1))
+    assert appended == 0
+    # 新イベントは追記され、既存行は残る
+    _, appended = append_events_archive([nfp, cpi], archive, now=NOW + timedelta(hours=2))
+    assert appended == 1
+
+    lines = archive.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 3  # header + 2行
+
+
+def test_append_events_archive_keeps_revisions_as_new_rows(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    draft = EconomicEvent("NFP", "USD", NOW, "high", forecast="", previous="139K")
+    revised = EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")
+
+    append_events_archive([draft], archive, now=NOW)
+    _, appended = append_events_archive([revised], archive, now=NOW + timedelta(days=1))
+    assert appended == 1  # forecast確定は別内容として履歴に残る(point-in-time記録)
+
+    import csv as csvlib
+
+    with archive.open(encoding="utf-8", newline="") as handle:
+        rows = list(csvlib.DictReader(handle))
+    assert len(rows) == 2
+    assert rows[0]["recorded_at"] != rows[1]["recorded_at"]
+
+
+def test_append_events_archive_is_loadable_by_backtester(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    append_events_archive(
+        [EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")],
+        archive,
+        now=NOW,
+    )
+
+    from fx_backtester.data import load_economic_events_csv
+
+    frame = load_economic_events_csv(archive)
     assert len(frame) == 1
     row = frame.iloc[0]
     assert row["currency"] == "USD"
@@ -280,10 +342,11 @@ def test_pair_bias_difference() -> None:
     assert pair_bias("JPY", "USD", currencies) == -0.5
 
 
-def test_analyze_market_lexicon_fallback() -> None:
+def test_analyze_market_falls_back_to_local_analyst() -> None:
+    """APIキー無しの既定経路は自前分析エンジン(analyst)になる。"""
     items = [make_news("Fed dovish shift: rate cut expected")]
-    analysis = analyze_market(items, ["USD", "JPY"], use_llm=False)
-    assert analysis.engine == "lexicon"
+    analysis = analyze_market(items, ["USD", "JPY"], use_llm=False, now=NOW)
+    assert analysis.engine == "analyst"
     assert analysis.currencies["USD"].score < 0
 
 
@@ -291,6 +354,50 @@ def test_extract_json_block() -> None:
     text = '前置き {"a": 1, "b": {"c": 2}} 後書き'
     assert _extract_json_block(text) == {"a": 1, "b": {"c": 2}}
     assert _extract_json_block("JSONなし") is None
+
+
+def test_lexicon_single_headline_is_shrunk() -> None:
+    """記事1件では±1.0に振り切らない(過大評価の防止)。"""
+    items = [make_news("USD/JPY rises above 160 on dollar strength")]
+    scores = score_headlines_lexicon(items, ["USD", "JPY"])
+    assert 0 < scores["USD"].score <= 0.34  # shrink = 1/(1+2)
+    assert -0.34 <= scores["JPY"].score < 0
+
+
+def test_lexicon_more_headlines_increase_magnitude() -> None:
+    one = score_headlines_lexicon([make_news("BOJ hawkish rate hike")], ["JPY"])
+    many = score_headlines_lexicon(
+        [make_news(f"BOJ hawkish rate hike {i}", hours_ago=i) for i in range(4)],
+        ["JPY"],
+    )
+    assert many["JPY"].score > one["JPY"].score > 0
+
+
+def test_claude_json_bias_scaled_by_confidence() -> None:
+    parsed = {
+        "currencies": {
+            "USD": {"bias": 0.8, "confidence": 0.5, "themes": ["雇用"], "comment": "強い"},
+            "JPY": {"bias": -1.0},  # confidence欠落 → 0.5扱い
+        },
+        "market_regime": "risk_on",
+        "summary": "要約",
+    }
+    analysis = build_analysis_from_claude_json(parsed, ["JPY", "USD"])
+    assert analysis is not None and analysis.engine == "claude"
+    assert analysis.currencies["USD"].score == pytest.approx(0.4)  # 0.8 × 0.5
+    assert analysis.currencies["USD"].confidence == 0.5
+    assert analysis.currencies["JPY"].score == pytest.approx(-0.5)
+    assert analysis.regime == "risk_on"
+
+
+def test_claude_json_invalid_payloads_rejected() -> None:
+    assert build_analysis_from_claude_json(None, ["USD"]) is None
+    assert build_analysis_from_claude_json({"summary": "通貨なし"}, ["USD"]) is None
+    # 壊れた値は0扱い・範囲外はクリップ
+    parsed = {"currencies": {"USD": {"bias": "abc", "confidence": 5.0}}}
+    analysis = build_analysis_from_claude_json(parsed, ["USD"])
+    assert analysis is not None
+    assert analysis.currencies["USD"].score == 0.0
 
 
 # -------------------------------------------------------------- technicals
@@ -330,6 +437,22 @@ def test_ma_side_short_and_missing() -> None:
     assert PairTechnicals(symbol="EURUSD").ma_side() is None
 
 
+def test_coverage_and_missing_intervals() -> None:
+    tech = PairTechnicals(symbol="USDJPY")
+    assert tech.coverage() == 0.0
+    tech.views = {"1h": make_view("1h", "BUY")}
+    assert tech.coverage() == pytest.approx(0.30)
+    assert tech.missing_intervals() == ["15m", "4h", "1d"]
+    tech.views = {
+        "15m": make_view("15m", "BUY"),
+        "1h": make_view("1h", "BUY"),
+        "4h": make_view("4h", "BUY"),
+        "1d": make_view("1d", "BUY"),
+    }
+    assert tech.coverage() == 1.0
+    assert tech.missing_intervals() == []
+
+
 # ---------------------------------------------------------------- briefing
 
 
@@ -359,6 +482,20 @@ def test_build_trade_plan_long_with_levels() -> None:
     assert plan.target2 == pytest.approx(150.0 + 0.5 * 5.0)
 
 
+def test_build_trade_plan_closed_on_weekend() -> None:
+    """市場休場中はどれだけシグナルが強くても方向判断を出さない(stale価格ガード)。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.8),
+        "JPY": CurrencySentiment("JPY", score=-0.8),
+    }
+    saturday = datetime(2026, 7, 4, 8, 0, tzinfo=UTC)
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=saturday)
+    assert plan.direction == "closed"
+    assert plan.conviction == 0
+    assert plan.stop is None
+    assert any("休場" in w for w in plan.warnings)
+
+
 def test_build_trade_plan_standby_in_event_window() -> None:
     events = [EconomicEvent("FOMC", "USD", NOW + timedelta(minutes=30), "high")]
     windows = risk_windows(events, {"USD", "JPY"})
@@ -385,6 +522,204 @@ def test_build_trade_plan_neutral_when_signals_conflict() -> None:
     assert plan.stop is None
 
 
+def test_trade_plan_quality_penalizes_missing_news() -> None:
+    """関連ニュースが無い場合は品質70%扱いになり確信度が減衰する。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    assert plan.data_quality == pytest.approx(0.7)
+    assert plan.conviction == round(abs(plan.composite) * 100 * 0.7)
+    assert any("関連ニュース0件" in w for w in plan.warnings)
+
+
+def test_trade_plan_no_technicals_forces_neutral() -> None:
+    """テクニカルが全滅したらニュースが強くても方向判断を出さない。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.9),
+        "JPY": CurrencySentiment("JPY", score=-0.9),
+    }
+    tech = PairTechnicals(symbol="USDJPY")  # views空 = 全時間足取得失敗
+    news = [make_news(f"USD/JPY rises session {i}", hours_ago=i + 1) for i in range(5)]
+    plan = briefing.build_trade_plan("USDJPY", tech, currencies, [], news, now=NOW)
+    assert plan.direction == "neutral"
+    assert any("テクニカル全時間足" in w for w in plan.warnings)
+    assert any("方向判断を見送り" in w for w in plan.warnings)
+
+
+def test_trade_plan_partial_technicals_warns() -> None:
+    currencies = {"USD": CurrencySentiment("USD"), "JPY": CurrencySentiment("JPY")}
+    tech = PairTechnicals(symbol="USDJPY")
+    tech.views = {"1h": make_view("1h", "BUY")}
+    plan = briefing.build_trade_plan("USDJPY", tech, currencies, [], [], now=NOW)
+    assert any("テクニカル欠損" in w and "15m" in w for w in plan.warnings)
+
+
+def test_trade_plan_calendar_unavailable_caps_conviction() -> None:
+    """カレンダー取得不能=イベントリスク未確認なら確信度に上限。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.8),
+        "JPY": CurrencySentiment("JPY", score=-0.8),
+    }
+    news = [make_news(f"USD/JPY rallies session {i}", hours_ago=i + 1) for i in range(5)]
+    plan = briefing.build_trade_plan(
+        "USDJPY", bullish_tech(), currencies, [], news, now=NOW, calendar_ok=False
+    )
+    assert plan.direction == "long"
+    assert plan.conviction <= briefing.CALENDAR_UNKNOWN_CONVICTION_CAP
+    assert any("イベントリスク未確認" in w for w in plan.warnings)
+
+
+def test_trade_plan_conflict_between_tech_and_news_warns() -> None:
+    """テクニカルとニュースが強く対立したら警告して確信度を減衰。"""
+    currencies = {
+        "USD": CurrencySentiment("USD", score=-0.5),  # ニュースはドル売り
+        "JPY": CurrencySentiment("JPY", score=0.5),
+    }
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    assert any("反対方向" in w for w in plan.warnings)
+    undamped = round(round(abs(plan.composite) * 100 * plan.data_quality))
+    assert plan.conviction == round(undamped * briefing.CONFLICT_CONVICTION_FACTOR)
+
+
+# ------------------------------------------------------------------ market
+
+
+def test_is_market_open_weekend_closure() -> None:
+    assert is_market_open(datetime(2026, 7, 2, 8, 0, tzinfo=UTC))  # 木曜
+    assert is_market_open(datetime(2026, 7, 3, 20, 59, tzinfo=UTC))  # 金曜クローズ直前
+    assert not is_market_open(datetime(2026, 7, 3, 21, 0, tzinfo=UTC))  # 金曜21:00 UTC
+    assert not is_market_open(datetime(2026, 7, 4, 12, 0, tzinfo=UTC))  # 土曜
+    assert not is_market_open(datetime(2026, 7, 5, 21, 59, tzinfo=UTC))  # 日曜再開直前
+    assert is_market_open(datetime(2026, 7, 5, 22, 0, tzinfo=UTC))  # 日曜22:00 UTC
+    assert is_market_open(datetime(2026, 7, 6, 8, 0, tzinfo=UTC))  # 月曜
+
+
+def test_open_hours_between() -> None:
+    wed = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
+    thu = datetime(2026, 7, 2, 8, 0, tzinfo=UTC)
+    assert open_hours_between(wed, thu) == pytest.approx(24.0)  # 平日は壁時計と同じ
+    assert open_hours_between(thu, wed) == 0.0  # 逆転は0
+
+    friday = datetime(2026, 7, 3, 18, 0, tzinfo=UTC)
+    saturday = friday + timedelta(hours=24)
+    monday = datetime(2026, 7, 6, 19, 0, tzinfo=UTC)
+    assert open_hours_between(friday, saturday) == pytest.approx(3.0)  # 金18時→21時のみ
+    assert open_hours_between(friday, monday) == pytest.approx(24.0)  # 週末49hを除外
+
+    # 2週末を跨ぐ場合は49h×2を除外
+    next_monday = datetime(2026, 7, 13, 18, 0, tzinfo=UTC)
+    assert open_hours_between(friday, next_monday) == pytest.approx(240.0 - 98.0)
+
+
+# ----------------------------------------------------------------- journal
+
+
+def test_journal_append_and_evaluate(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    recorded_at = NOW - timedelta(hours=24)  # 固定ホライズン(24±2h)に収まる経過時間
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=recorded_at)
+    assert plan.direction == "long" and plan.close == 150.0
+    append_plans(path, [plan], now=recorded_at)
+    path.open("a", encoding="utf-8").write("壊れた行 not json\n")  # 耐性確認
+
+    # 記録時150.0 → 現値151.0: ロング的中(ATR0.5×10%=0.05を超える動き)
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 151.0}, now=NOW)
+    assert stats.evaluated == 1 and stats.hits == 1
+    # 現値149.0: 不的中
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 149.0}, now=NOW)
+    assert stats.evaluated == 1 and stats.hits == 0
+    # ATR閾値未満の小動きは的中/不的中のどちらにも数えない
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 150.02}, now=NOW)
+    assert stats.evaluated == 0 and stats.flat == 1
+    # ホライズン前(1h)は評価対象外
+    stats = evaluate_directional_accuracy(
+        path, {"USDJPY": 151.0}, now=recorded_at + timedelta(hours=1)
+    )
+    assert stats.evaluated == 0
+    # ホライズン超過(40h)も評価対象外(広い窓での多重評価を防ぐ)
+    stats = evaluate_directional_accuracy(
+        path, {"USDJPY": 151.0}, now=recorded_at + timedelta(hours=40)
+    )
+    assert stats.evaluated == 0
+    # 存在しないファイルは空集計
+    stats = evaluate_directional_accuracy(tmp_path / "none.jsonl", {}, now=NOW)
+    assert stats.evaluated == 0
+
+
+def test_journal_weekend_gap_uses_market_open_hours(tmp_path) -> None:
+    """週末を跨いだ判断は「市場オープン時間」が24hに達してから評価する。"""
+    path = tmp_path / "journal.jsonl"
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    friday = datetime(2026, 7, 3, 18, 0, tzinfo=UTC)  # 金曜クローズ3時間前
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=friday)
+    assert plan.direction == "long"
+    append_plans(path, [plan], now=friday)
+
+    # 土曜18時: 壁時計では24hだが市場は3hしか開いていない → 評価しない
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 151.0}, now=friday + timedelta(hours=24))
+    assert stats.evaluated == 0 and stats.flat == 0
+    # 月曜19時: オープン時間換算で24h → 評価する
+    monday = datetime(2026, 7, 6, 19, 0, tzinfo=UTC)
+    stats = evaluate_directional_accuracy(path, {"USDJPY": 151.0}, now=monday)
+    assert stats.evaluated == 1 and stats.hits == 1
+
+
+def test_journal_records_score_breakdown_and_levels(tmp_path) -> None:
+    """スコア内訳とSL/TPが記録され、後からキャリブレーション分析に使える。"""
+    import json as jsonlib
+
+    path = tmp_path / "journal.jsonl"
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    append_plans(path, [plan], now=NOW)
+
+    entry = jsonlib.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["tech_score"] == plan.tech_score
+    assert entry["news_score"] == plan.news_score
+    assert entry["atr"] == 0.5
+    assert entry["stop"] == plan.stop
+    assert entry["target1"] == plan.target1
+    assert entry["target2"] == plan.target2
+
+
+def test_journal_skips_non_directional_entries(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    neutral = briefing.TradePlan(
+        symbol="EURUSD",
+        direction="neutral",
+        conviction=0,
+        composite=0.0,
+        tech_score=0.0,
+        news_score=0.0,
+        close=1.1,
+    )
+    append_plans(path, [neutral], now=NOW - timedelta(hours=24))
+    stats = evaluate_directional_accuracy(path, {"EURUSD": 1.2}, now=NOW)
+    assert stats.evaluated == 0
+
+
+def test_format_stats_ja() -> None:
+    line = format_stats_ja(DirectionalStats(evaluated=4, hits=3))
+    assert "4件中 3件的中" in line
+    assert "的中率 75%" in line
+    assert "約24時間前" in line
+    assert format_stats_ja(DirectionalStats()) == ""
+    assert "小動き" in format_stats_ja(DirectionalStats(flat=2))
+    assert "ほか1件は小動き" in format_stats_ja(DirectionalStats(evaluated=4, hits=3, flat=1))
+
+
 def test_build_discord_payload_structure() -> None:
     from fx_intel.sentiment import MarketAnalysis
 
@@ -405,6 +740,7 @@ def test_build_discord_payload_structure() -> None:
         20,
         100,
         fetch_warnings=["テスト警告"],
+        journal_note="直近48h内の方向判断 4件中 3件的中 — 的中率 75%",
         now=NOW,
     )
     assert "FXデスクブリーフィング" in payload["content"]
@@ -415,9 +751,13 @@ def test_build_discord_payload_structure() -> None:
     assert "通貨センチメント" in field_names
     assert "今後48時間の重要イベント" in field_names
     assert "データ取得の注意" in field_names
+    assert "判断の検証(自己採点)" in field_names
     pair_embed = payload["embeds"][1]
     assert pair_embed["title"].startswith("USDJPY")
-    assert any("プライスプラン" in f["name"] for f in pair_embed["fields"])
+    assert any("売買プラン" in f["name"] for f in pair_embed["fields"])
+    plan_field = next(f for f in pair_embed["fields"] if f["name"] == "判断")
+    assert "買い" in plan_field["value"]  # 初心者向けの言い換えが入る
+    assert any("用語ミニ解説" in f["name"] for f in macro["fields"])
 
 
 def test_price_formatting_by_symbol() -> None:

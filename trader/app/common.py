@@ -17,8 +17,8 @@ import logging
 import signal
 import threading
 import time
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
 
 import httpx
 import redis
@@ -26,6 +26,7 @@ from config import settings
 from logging_setup import log_extra
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
+from redis.typing import FieldT
 
 log = logging.getLogger("common")
 
@@ -56,6 +57,15 @@ def r() -> redis.Redis:
             retry_on_timeout=True,
         )
     return _redis
+
+
+def sync[T](value: Awaitable[T] | T) -> T:
+    """redis-py の型スタブは同期/非同期共用で戻り値を Awaitable との Union にする。
+    本プロジェクトは同期クライアント確定（r() は decode_responses=True の同期 Redis）
+    なので、実行時は常に非 Awaitable 側。ここで Union を同期の実型へ絞る。
+    他サービスからも common.sync(...) で使える。
+    """
+    return cast(T, value)
 
 
 # ============================================================================
@@ -164,7 +174,8 @@ def heartbeat(service: str) -> None:
 
 def read_heartbeats() -> dict[str, float]:
     try:
-        return {k: float(v) for k, v in r().hgetall(KEY_HEARTBEATS).items()}
+        hb: dict[str, str] = sync(r().hgetall(KEY_HEARTBEATS))
+        return {k: float(v) for k, v in hb.items()}
     except Exception:
         return {}
 
@@ -182,7 +193,7 @@ def ensure_group(stream: str, group: str) -> None:
 
 def publish(stream: str, obj: dict[str, Any]) -> str:
     """Stream へ 1 メッセージ追加（payload は JSON 文字列で格納）。"""
-    return r().xadd(stream, {"data": json.dumps(obj, default=str)})
+    return sync(r().xadd(stream, {"data": json.dumps(obj, default=str)}))
 
 
 def _parse(fields: dict[str, str]) -> dict[str, Any]:
@@ -215,14 +226,16 @@ def consume(
         try:
             heartbeat(service)
             # 1) 宙づり pending を回収（前回クラッシュ分や他コンシューマの取りこぼし）
-            _, claimed, _ = r().xautoclaim(
-                stream, group, consumer, min_idle_time=idle_reclaim_ms, start_id="0-0", count=10
+            _, claimed, _ = sync(
+                r().xautoclaim(
+                    stream, group, consumer, min_idle_time=idle_reclaim_ms, start_id="0-0", count=10
+                )
             )
             for msg_id, fields in claimed:
                 _handle_one(stream, group, msg_id, fields, handler)
 
             # 2) 新規メッセージ
-            resp = r().xreadgroup(group, consumer, {stream: ">"}, count=10, block=block_ms)
+            resp = sync(r().xreadgroup(group, consumer, {stream: ">"}, count=10, block=block_ms))
             for _stream, messages in resp or []:
                 for msg_id, fields in messages:
                     _handle_one(stream, group, msg_id, fields, handler)
@@ -250,7 +263,12 @@ def _handle_one(
     except Exception:
         # パース不能（壊れたメッセージ）は即 dead-letter
         log.exception("undecodable message -> dead-letter", **log_extra(msg_id=msg_id))
-        r().xadd(stream + DEAD_SUFFIX, {**fields, "_reason": "decode_error", "_src": msg_id})
+        # xadd の fields は invariant な Dict[FieldT, FieldT]。str は FieldT だが
+        # dict の不変性でスタブが dict[str,str] を受けないため、実型のまま cast で昇格。
+        dead_fields = cast(
+            "dict[FieldT, FieldT]", {**fields, "_reason": "decode_error", "_src": msg_id}
+        )
+        r().xadd(stream + DEAD_SUFFIX, dead_fields)
         r().xack(stream, group, msg_id)
         return
 
@@ -258,7 +276,7 @@ def _handle_one(
         handler(obj)
         r().xack(stream, group, msg_id)
     except Exception:
-        attempts = r().hincrby(f"attempts:{stream}", msg_id, 1)
+        attempts: int = sync(r().hincrby(f"attempts:{stream}", msg_id, 1))
         log.exception(
             "handler failed",
             **log_extra(msg_id=msg_id, attempts=attempts),

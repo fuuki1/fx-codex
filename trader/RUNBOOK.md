@@ -93,7 +93,10 @@ make ps
 | `TV_ALLOWED_IPS` / `WEBHOOK_SECRET` | webhook の IP / secret 検証 |
 
 ## 9. 既知の制約（拡張ポイント）
-- セッション判定は祝日未考慮（市場休日カレンダーの注入が望ましい）。
+- セッション判定は祝日を考慮する（`market_calendar` を `within_session` に注入済み。FX/日本株/米株の
+  祝日＋米株の半日取引を反映）。ただし**収録年は 2024–2027**で、範囲外の年はフェイルセーフに
+  「祝日でない」扱いになる（正当な取引を誤ってブロックしないため）。**毎年 `_JP_HOLIDAYS` と
+  収録レンジの更新が必須**（`is_within_coverage()` で収録切れを検知できる）。
 - 戦略のポジション管理は単純化（状態変化時に固定数量を発注）。実運用ロジックは要拡張。
 - exactly-once は近似（claim 後クラッシュ時は重複回避を優先し、reconcile で人手確認）。
 - バックテスタ `fx_backtester`（`optimize/auto_optimize.py` が依存）は本リポジトリ範囲外。

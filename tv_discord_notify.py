@@ -21,9 +21,12 @@ import os
 import sys
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import Any
 
 import requests
-from tradingview_ta import get_multiple_analysis
+from tradingview_ta import Analysis, get_multiple_analysis
+
+import params_gate
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
@@ -58,15 +61,24 @@ def load_webhook_url() -> str | None:
 
 
 def load_strategy_windows() -> tuple[int, int]:
+    """params_gate を通した MA 窓を返す。不合格なら既定値(20/100)で継続する。
+
+    ライブ戦略と同じゲートを共有し、検証されていないパラメータに基づく目線を
+    表示しないようにする。"""
     params_path = PROJECT_ROOT / "strategy_params.json"
     fast, slow = 20, 100
-    if params_path.exists():
-        try:
-            params = json.loads(params_path.read_text(encoding="utf-8"))
-            fast = int(params.get("fast_window", fast))
-            slow = int(params.get("slow_window", slow))
-        except (ValueError, json.JSONDecodeError):
-            pass
+    if not params_path.exists():
+        return fast, slow
+    params, errors = params_gate.load_validated_params(params_path)
+    if errors or params is None:
+        print(
+            "[warn] strategy_params.json が検証ゲートに不合格のため既定値"
+            f"(MA {fast}/{slow})で継続: " + "; ".join(errors),
+            file=sys.stderr,
+        )
+        return fast, slow
+    fast = int(params.get("fast_window", fast))
+    slow = int(params.get("slow_window", slow))
     return fast, slow
 
 
@@ -77,31 +89,43 @@ def ma_cross_state(indicators: dict, fast_window: int, slow_window: int) -> tupl
     if fast is None or slow is None:
         return None, f"MA({fast_window}/{slow_window}): データなし"
     if fast > slow:
-        return "long", f"MA({fast_window}/{slow_window}): ゴールデン(ロング目線)"
+        return "long", (
+            f"移動平均線MA({fast_window}/{slow_window}): ゴールデンクロス(買いが優勢のサイン)"
+        )
     if fast < slow:
-        return "short", f"MA({fast_window}/{slow_window}): デッド(ショート目線)"
-    return None, f"MA({fast_window}/{slow_window}): 拮抗"
+        return "short", (
+            f"移動平均線MA({fast_window}/{slow_window}): デッドクロス(売りが優勢のサイン)"
+        )
+    return None, f"移動平均線MA({fast_window}/{slow_window}): 拮抗(方向感なし)"
 
 
 def agreement_line(symbol: str, recommendation: str, ma_side: str | None) -> str:
     rec_ja = RECOMMENDATION_JA.get(recommendation, recommendation)
     if ma_side is None or recommendation == "NEUTRAL":
-        return f"➖ {symbol} 1h: TradingView総合は「{rec_ja}」、判断は保留"
+        return f"➖ {symbol} 1h: TradingView総合は「{rec_ja}」— 方向感が弱いため判断は保留"
     tv_side = (
         "long"
         if recommendation in ("BUY", "STRONG_BUY")
         else "short" if recommendation in ("SELL", "STRONG_SELL") else None
     )
     if tv_side == ma_side:
-        side_ja = "ロング" if ma_side == "long" else "ショート"
-        return f"✅ {symbol} 1h: 自作MAクロス({side_ja})とTradingView({rec_ja})が一致"
-    return f"⚠️ {symbol} 1h: 自作MAクロスとTradingView({rec_ja})の見解が不一致"
+        side_ja = "ロング=買い" if ma_side == "long" else "ショート=売り"
+        return (
+            f"✅ {symbol} 1h: 自作MAクロス({side_ja})とTradingView({rec_ja})が一致"
+            " — 2つの分析が同じ方向"
+        )
+    return (
+        f"⚠️ {symbol} 1h: 自作MAクロスとTradingView({rec_ja})の見解が不一致"
+        " — 方向感が定まらず、取引は控えたい場面"
+    )
 
 
-def fetch_analysis(symbols: list[str], intervals: list[str]) -> dict[str, dict[str, object]]:
+def fetch_analysis(
+    symbols: list[str], intervals: list[str]
+) -> dict[str, dict[str, Analysis | None]]:
     """interval → {"EXCHANGE:SYMBOL": Analysis|None} の辞書を返す。"""
     qualified = [f"{EXCHANGE}:{s}" for s in symbols]
-    results: dict[str, dict[str, object]] = {}
+    results: dict[str, dict[str, Analysis | None]] = {}
     for interval in intervals:
         results[interval] = get_multiple_analysis(
             screener=SCREENER, interval=interval, symbols=qualified
@@ -112,7 +136,7 @@ def fetch_analysis(symbols: list[str], intervals: list[str]) -> dict[str, dict[s
 def build_embeds(
     symbols: list[str],
     intervals: list[str],
-    analysis: dict[str, dict[str, object]],
+    analysis: dict[str, dict[str, Analysis | None]],
     fast_window: int,
     slow_window: int,
 ) -> tuple[list[dict], list[str]]:
@@ -145,9 +169,15 @@ def build_embeds(
             if close is not None:
                 lines.append(f"終値: {close:.5g}")
             if rsi is not None:
-                lines.append(f"RSI(14): {rsi:.1f}")
+                if rsi >= 70:
+                    rsi_note = " 買われすぎ気味"
+                elif rsi <= 30:
+                    rsi_note = " 売られすぎ気味"
+                else:
+                    rsi_note = ""
+                lines.append(f"RSI(14): {rsi:.1f}{rsi_note}")
             if macd is not None and macd_signal is not None:
-                macd_state = "上抜け" if macd > macd_signal else "下抜け"
+                macd_state = "上向きの勢い" if macd > macd_signal else "下向きの勢い"
                 lines.append(f"MACD: {macd:+.5f} ({macd_state})")
             lines.append(ma_text)
             fields.append({"name": interval, "value": "\n".join(lines), "inline": True})
@@ -170,11 +200,25 @@ def build_embeds(
                 "timestamp": now_iso,
             }
         )
+    embeds.append(
+        {
+            "title": "📘 見方(FX初心者向け)",
+            "color": COLOR_NEUTRAL,
+            "description": (
+                "・**15m/1h/4h/1d**: チャートの時間軸。短いほど直近の動きを反映\n"
+                "・**総合**: TradingViewのテクニカル指標の多数決(買い/中立/売りの指標数)\n"
+                "・**RSI**: 買われすぎ・売られすぎの目安。70以上=買われすぎ、30以下=売られすぎ\n"
+                "・**MACD**: 相場の勢いを示す指標。上向き=上昇の勢い、下向き=下降の勢い\n"
+                "・**MAクロス**: 移動平均線の並び。ゴールデンクロス=買い目線、"
+                "デッドクロス=売り目線"
+            ),
+        }
+    )
     return embeds, headlines
 
 
 def post_to_discord(webhook_url: str, content: str, embeds: list[dict]) -> None:
-    payload = {
+    payload: dict[str, Any] = {
         "username": "fx-codex チャート分析",
         "content": content,
         "embeds": embeds,

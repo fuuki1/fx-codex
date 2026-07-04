@@ -8,6 +8,12 @@ select = ["E", "F", "I", "UP", "B"]
 # E501: 日本語コメントで行が伸びがちなので長さは緩める
 ignore = ["E501", "B008"]
 
+[tool.mypy]
+# 稼働スタック（app/）を型ゲート対象にする。コンテナと同じ Python 3.12 で判定。
+python_version = "3.12"
+# サードパーティ（ib_async 等）に型スタブが無くても本体の型検査は続ける。
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "fx-codex/tests"]
 pythonpath = ["fx-codex"]

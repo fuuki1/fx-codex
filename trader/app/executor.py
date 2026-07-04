@@ -149,6 +149,8 @@ def _build_orders(
 
     action = sig["side"]  # BUY / SELL
     qty = float(sig["qty"])
+    # LimitOrder / MarketOrder は別クラスだが IB の Order として同一に扱う（片方に固定しない）。
+    parent: Any
     if sig.get("type") == "LIMIT" and sig.get("price"):
         parent = LimitOrder(action, qty, float(sig["price"]))
     else:
@@ -282,7 +284,7 @@ def _record_fill(sig: dict[str, Any], *, status: str, ref: str) -> None:
 def _bump_error_counter() -> None:
     """連続エラーが閾値に達したら自動 Kill switch。"""
     try:
-        n = common.r().incr(common.KEY_CONSEC_ERRORS)
+        n: int = common.sync(common.r().incr(common.KEY_CONSEC_ERRORS))
     except Exception:
         return
     if n >= settings.max_consecutive_errors:

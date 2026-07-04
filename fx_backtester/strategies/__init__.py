@@ -11,7 +11,7 @@ STRATEGY_REGISTRY = {
     "rsi_mean_reversion": RSIMeanReversion,
 }
 
-DEFAULT_PARAM_GRIDS = {
+DEFAULT_PARAM_GRIDS: dict[str, dict[str, list[object]]] = {
     "ai_logistic": {
         "min_train_bars": [200, 300],
         "long_threshold": [0.54, 0.58],

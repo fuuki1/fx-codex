@@ -155,9 +155,12 @@ class SimulatedExecution:
         if not multipliers or bar is None:
             return 1.0
         timestamp = getattr(bar, "name", None)
+        hour_attr = getattr(timestamp, "hour", None)
+        if hour_attr is None:
+            return 1.0
         try:
-            hour = int(timestamp.hour)
-        except AttributeError:
+            hour = int(hour_attr)
+        except (TypeError, ValueError):
             return 1.0
         multiplier = multipliers.get(hour, 1.0)
         if multiplier <= 0:

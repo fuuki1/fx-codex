@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 import requests
 
@@ -25,6 +27,11 @@ from .news import KNOWN_CURRENCIES, NewsItem
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_ATTEMPTS = 2
+CLAUDE_RETRY_WAIT_SECONDS = 1.5
+
+# 記事数シュリンク: score×n/(n+K)。記事1件の"weak"だけで±1.0に振れるのを防ぐ
+LEXICON_SHRINK_K = 2
 
 # タグ付けされた通貨に対して強気(通貨高)方向の語彙
 POSITIVE_TERMS = (
@@ -114,12 +121,13 @@ _PAIR_MOVE_RE = re.compile(r"\b([A-Z]{3})\s*/\s*([A-Z]{3})\b|\b([A-Z]{6})\b")
 @dataclass
 class CurrencySentiment:
     currency: str
-    score: float = 0.0  # -1.0(弱気)〜+1.0(強気)
+    score: float = 0.0  # -1.0(弱気)〜+1.0(強気)。確信度で減衰済みの実効値
     positives: int = 0
     negatives: int = 0
     headline_count: int = 0
     themes: list[str] = field(default_factory=list)
     comment: str = ""
+    confidence: float | None = None  # Claude分析時のみ(0.0〜1.0)
 
     @property
     def label_ja(self) -> str:
@@ -184,6 +192,10 @@ def _pair_move_scores(text: str) -> dict[str, float]:
     return scores
 
 
+# analyst.py(自前分析エンジン)も同じ構文解析を使う公開エイリアス
+pair_move_scores = _pair_move_scores
+
+
 def score_headlines_lexicon(
     items: Iterable[NewsItem], currencies: Sequence[str] | None = None
 ) -> dict[str, CurrencySentiment]:
@@ -215,7 +227,11 @@ def score_headlines_lexicon(
     for sentiment in result.values():
         total = sentiment.positives + sentiment.negatives
         if total > 0:
-            sentiment.score = round((sentiment.positives - sentiment.negatives) / total, 3)
+            raw = (sentiment.positives - sentiment.negatives) / total
+            # 根拠となる記事が少ないほど0へ収縮させ、少数記事の過大評価を防ぐ
+            count = max(sentiment.headline_count, 1)
+            shrink = count / (count + LEXICON_SHRINK_K)
+            sentiment.score = round(raw * shrink, 3)
     return result
 
 
@@ -244,6 +260,49 @@ def _extract_json_block(text: str) -> dict | None:
         return json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _clip_float(value: object, low: float, high: float, default: float) -> float:
+    try:
+        return max(low, min(high, float(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def build_analysis_from_claude_json(
+    parsed: Mapping | None, universe: Sequence[str]
+) -> MarketAnalysis | None:
+    """Claudeが返したJSONを検証してMarketAnalysisへ変換する。
+
+    実効スコア = bias × confidence。確信の薄い判断ほど0へ減衰させ、
+    「材料が薄いのに強い数値」がそのまま複合スコアへ流れるのを防ぐ。
+    """
+    if not parsed or not isinstance(parsed.get("currencies"), Mapping):
+        return None
+    result: dict[str, CurrencySentiment] = {}
+    for ccy in universe:
+        info = parsed["currencies"].get(ccy) or {}
+        if not isinstance(info, Mapping):
+            info = {}
+        bias = _clip_float(info.get("bias", 0.0), -1.0, 1.0, default=0.0)
+        # confidence欠落時は0.5(半信半疑)として保守的に扱う
+        confidence = _clip_float(info.get("confidence", 0.5), 0.0, 1.0, default=0.5)
+        result[ccy] = CurrencySentiment(
+            currency=ccy,
+            score=round(bias * confidence, 3),
+            themes=[str(t) for t in (info.get("themes") or [])][:3],
+            comment=str(info.get("comment", ""))[:80],
+            confidence=round(confidence, 3),
+        )
+    regime = str(parsed.get("market_regime", "neutral")).strip().lower()
+    if regime not in ("risk_on", "risk_off", "neutral"):
+        regime = "neutral"
+    return MarketAnalysis(
+        currencies=result,
+        regime=regime,
+        summary=str(parsed.get("summary", ""))[:400],
+        engine="claude",
+    )
 
 
 def analyze_with_claude(
@@ -290,7 +349,7 @@ def analyze_with_claude(
         "次のJSONだけを出力してください(前後に文章を付けない):\n"
         + json.dumps(schema_example, ensure_ascii=False)
     )
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "max_tokens": 2000,
         "messages": [{"role": "user", "content": prompt}],
@@ -301,43 +360,22 @@ def analyze_with_claude(
         "content-type": "application/json",
     }
     http = session or requests
-    try:
-        response = http.post(ANTHROPIC_API_URL, json=payload, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        body = response.json()
-        text = "".join(
-            block.get("text", "")
-            for block in body.get("content", [])
-            if block.get("type") == "text"
-        )
-        parsed = _extract_json_block(text)
-    except Exception:  # noqa: BLE001 - API失敗は語彙ベースへフォールバック
-        return None
-    if not parsed or "currencies" not in parsed:
-        return None
-
-    result: dict[str, CurrencySentiment] = {}
-    for ccy in universe:
-        info = parsed["currencies"].get(ccy, {}) or {}
+    body = None
+    for attempt in range(CLAUDE_ATTEMPTS):
         try:
-            bias = max(-1.0, min(1.0, float(info.get("bias", 0.0))))
-        except (TypeError, ValueError):
-            bias = 0.0
-        result[ccy] = CurrencySentiment(
-            currency=ccy,
-            score=round(bias, 3),
-            themes=[str(t) for t in (info.get("themes") or [])][:3],
-            comment=str(info.get("comment", ""))[:80],
-        )
-    regime = str(parsed.get("market_regime", "neutral")).strip().lower()
-    if regime not in ("risk_on", "risk_off", "neutral"):
-        regime = "neutral"
-    return MarketAnalysis(
-        currencies=result,
-        regime=regime,
-        summary=str(parsed.get("summary", ""))[:400],
-        engine="claude",
+            response = http.post(ANTHROPIC_API_URL, json=payload, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            body = response.json()
+            break
+        except Exception:  # noqa: BLE001 - API失敗は再試行→語彙ベースへフォールバック
+            if attempt + 1 < CLAUDE_ATTEMPTS:
+                time.sleep(CLAUDE_RETRY_WAIT_SECONDS)
+    if body is None:
+        return None
+    text = "".join(
+        block.get("text", "") for block in body.get("content", []) if block.get("type") == "text"
     )
+    return build_analysis_from_claude_json(_extract_json_block(text), universe)
 
 
 def analyze_market(
@@ -346,8 +384,16 @@ def analyze_market(
     use_llm: bool = True,
     api_key: str | None = None,
     model: str | None = None,
+    macro=None,  # macro.MacroSnapshot | None(循環import回避のため型は緩め)
+    now=None,  # datetime | None。自前エンジンの鮮度減衰の基準時刻(テスト注入用)
 ) -> MarketAnalysis:
-    """LLM分析を試み、使えなければ語彙ベースで返す。"""
+    """エンジン序列: Claude API(任意) → 自前分析エンジン(既定)。
+
+    Claude APIはANTHROPIC_API_KEYがある場合の上乗せオプション。
+    失敗・キー無しの既定経路は analyst.py の自前エンジンで、否定・強調・
+    鮮度減衰・テーマ抽出を備え、決定論的に同じ入力から同じ判断を返す。
+    旧来の単純語彙カウント(score_headlines_lexicon)は比較・検証用に残す。
+    """
     if use_llm:
         key = api_key or load_api_key()
         if key:
@@ -359,10 +405,10 @@ def analyze_market(
                     if ccy in counts:
                         sentiment.headline_count = counts[ccy].headline_count
                 return analysis
-    return MarketAnalysis(
-        currencies=score_headlines_lexicon(items, currencies),
-        engine="lexicon",
-    )
+    # 遅延import: analyst は本モジュールのデータクラスを使うため循環になる
+    from .analyst import analyze_headlines
+
+    return analyze_headlines(items, currencies, now=now, macro=macro)
 
 
 def pair_bias(base: str, quote: str, currencies: Mapping[str, CurrencySentiment]) -> float:
