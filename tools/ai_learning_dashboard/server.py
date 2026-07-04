@@ -31,6 +31,44 @@ PROMOTION_FILE = "promotion_state.json"
 # 時間足別モード(fx_briefing --per-timeframe)の記録
 TF_JOURNAL_FILE = "briefing_tf_journal.jsonl"
 TF_LEARNING_FILE = "briefing_tf_learning.json"
+# 5分ごとの価格スナップショット(fx_tf_snapshot.py)。短い足の採点窓に入る
+# 将来価格を密に供給する価格専用系列。採点の将来価格解決に使う(判断は無い)。
+TF_PRICES_FILE = "briefing_tf_prices.jsonl"
+
+# 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
+# ダッシュボードは fx_intel に依存しない方針なのでここに独立して持つ。
+_CLOSE_WEEKDAY = 4  # 金曜
+_CLOSE_HOUR_UTC = 21
+_WEEKEND_CLOSURE = timedelta(hours=49)
+
+
+def _closure_start_on_or_before(moment: datetime) -> datetime:
+    anchor = moment.replace(hour=_CLOSE_HOUR_UTC, minute=0, second=0, microsecond=0)
+    anchor -= timedelta(days=(moment.weekday() - _CLOSE_WEEKDAY) % 7)
+    if anchor > moment:
+        anchor -= timedelta(days=7)
+    return anchor
+
+
+def _open_hours_between(start: datetime, end: datetime) -> float:
+    """start→end の経過から週末クローズ分を除いた市場オープン時間(時間単位)。
+
+    fx_intel.market.open_hours_between と同じロジック。採点の将来価格を
+    fx_intel 本体と同じ「市場オープン時間換算」で選ぶために使う(壁時計時間で
+    採点すると週末跨ぎで本体の学習的中率とズレるため)。
+    """
+    if end <= start:
+        return 0.0
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
+    closed = timedelta()
+    cursor = _closure_start_on_or_before(end_utc)
+    while cursor + _WEEKEND_CLOSURE > start_utc:
+        overlap = min(cursor + _WEEKEND_CLOSURE, end_utc) - max(cursor, start_utc)
+        if overlap > timedelta():
+            closed += overlap
+        cursor -= timedelta(days=7)
+    return (end_utc - start_utc - closed).total_seconds() / 3600.0
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -98,15 +136,28 @@ def _future_close(
     horizon_hours: float = 24.0,
     tolerance_hours: float = 2.0,
 ) -> float | None:
-    lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
-    upper = ts + timedelta(hours=horizon_hours + tolerance_hours)
+    """記録時刻から主ホライズン後(市場オープン時間換算)に最も近い終値。
+
+    fx_intel.price_history.future_close_from_series と同じく、経過は
+    _open_hours_between で数える(週末クローズを除外)。壁時計の候補窓で
+    ざっくり絞ってから、オープン時間換算の age で厳密に判定する。
+    """
+    if not series:
+        return None
+    # オープン時間は壁時計を超えないため、候補は壁時計で
+    # [下限, 上限 + 週末クローズ1回分] に限られる
+    window_lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
+    window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + _WEEKEND_CLOSURE
     best: tuple[float, float] | None = None
     for point_ts, close in series:
-        if point_ts < lower:
+        if point_ts < window_lower:
             continue
-        if point_ts > upper:
+        if point_ts > window_upper:
             break
-        gap = abs((point_ts - (ts + timedelta(hours=horizon_hours))).total_seconds())
+        age = _open_hours_between(ts, point_ts)
+        if not (horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours):
+            continue
+        gap = abs(age - horizon_hours)
         if best is None or gap < best[0]:
             best = (gap, close)
     return best[1] if best is not None else None
@@ -191,9 +242,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             stat["evaluated"] += 1
             stat["hits"] += int(hit)
             if timeframe:
-                tf_stat = by_timeframe.setdefault(
-                    timeframe, {"evaluated": 0, "hits": 0, "flat": 0}
-                )
+                tf_stat = by_timeframe.setdefault(timeframe, {"evaluated": 0, "hits": 0, "flat": 0})
                 tf_stat["evaluated"] += 1
                 tf_stat["hits"] += int(hit)
             outcome = "hit" if hit else "miss"
@@ -350,15 +399,21 @@ def build_state(log_dir: Path) -> dict[str, Any]:
     promotion_path = log_dir / PROMOTION_FILE
     tf_journal_path = log_dir / TF_JOURNAL_FILE
     tf_learning_path = log_dir / TF_LEARNING_FILE
+    tf_prices_path = log_dir / TF_PRICES_FILE
 
     entries = _read_journal(journal_path)
     tf_entries = _read_journal(tf_journal_path)
+    # 価格スナップショット(direction 無し)。採点対象は増えないが、短い足の
+    # 将来価格系列を密にして 15m/1h も採点可能にする(fx_briefing 本体と同じ結合)。
+    tf_price_rows = _read_journal(tf_prices_path)
     learning = _load_json(learning_path)
     ml = _load_json(ml_path)
     promotion = _load_json(promotion_path)
     # 融合1判断行(24h)と時間足別行(各主ホライズン)を同じ採点器で評価する。
     # _evaluate_journal は行ごとに timeframe/horizon_hours を見て採点する。
-    evaluated = _evaluate_journal(entries + tf_entries)
+    # 価格スナップショット行は将来価格系列にだけ寄与する(direction 無しなので
+    # 採点対象=directional にはカウントされない)。
+    evaluated = _evaluate_journal(entries + tf_entries + tf_price_rows)
 
     evaluated_count = int(learning.get("evaluated", 0) or evaluated["evaluated"])
     hits = int(learning.get("hits", 0) or evaluated["hits"])
@@ -374,6 +429,7 @@ def build_state(log_dir: Path) -> dict[str, Any]:
             PROMOTION_FILE: _file_status(promotion_path),
             TF_JOURNAL_FILE: _file_status(tf_journal_path),
             TF_LEARNING_FILE: _file_status(tf_learning_path),
+            TF_PRICES_FILE: _file_status(tf_prices_path),
         },
         "journal": _journal_summary(entries + tf_entries),
         "evaluation": evaluated,

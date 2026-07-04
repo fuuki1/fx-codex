@@ -187,3 +187,27 @@ def test_snapshot_entries_feed_into_series() -> None:
     rows = ph.snapshot_entries({"USDJPY": {"1h": 157.0}}, now=T0)
     series = ph.build_close_series(rows)
     assert series[("USDJPY", "1h")] == [(T0, 157.0)]
+
+
+# ------------------------------------------------- 5分密系列で15mが解決できる
+
+
+def test_dense_5min_series_resolves_15m_future_close() -> None:
+    """5分刻みの価格系列なら 15m の主ホライズン(15分)の将来価格が取れる。
+
+    毎時刻みの系列では窓[9,21分]に点が無く解決できないが、5分刻みなら
+    15分後ちょうどの点が入る。fx_tf_snapshot が供給する密系列の狙い。
+    """
+    dense = ph.build_close_series(
+        ph.snapshot_entries({"USDJPY": {"15m": 150.0}}, now=T0)
+        + ph.snapshot_entries({"USDJPY": {"15m": 150.05}}, now=T0 + timedelta(minutes=15))
+    )[("USDJPY", "15m")]
+    close = ph.future_close_from_series(dense, T0, horizon_hours=0.25, tolerance_hours=0.1)
+    assert close == 150.05
+
+    # 毎時刻みだと同じ 15m ホライズンは解決できない(窓外)
+    hourly = ph.build_close_series(
+        ph.snapshot_entries({"USDJPY": {"15m": 150.0}}, now=T0)
+        + ph.snapshot_entries({"USDJPY": {"15m": 150.5}}, now=T0 + timedelta(hours=1))
+    )[("USDJPY", "15m")]
+    assert ph.future_close_from_series(hourly, T0, 0.25, 0.1) is None

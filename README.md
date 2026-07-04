@@ -72,8 +72,12 @@ tests/
 .venv/bin/python fx_briefing.py --dry-run        # 送信せず内容確認
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
-./fx_briefing_loop.sh &                          # 毎時10分に自動送信
+./fx_briefing_loop.sh &                          # 毎時10分に自動送信(融合＋時間足別の2通)
 ```
+
+`fx_briefing_loop.sh` は毎時、**融合1判断モード（本命：委員会・ML・昇格ゲートあり）と
+時間足別モード（`--per-timeframe`）の2通**を連続送信します。時間足別の採点を回すには、
+別途 `fx_tf_snapshot_loop.sh`（5分ごとの価格記録）も起動してください（下記）。
 
 ### 時間足別モード (`--per-timeframe`)
 
@@ -86,10 +90,15 @@ tests/
   未来の値動きで採点します(15m→15分後 / 1h→1時間後 / 4h→4時間後 / 1d→24時間後)。
   補助ホライズン(15m: 30分/1h、1h: 4h/8h 等)は Discord 表示・分析確認用の
   「観測」で、学習には主ホライズンのみを使います(多重検定の回避)。
-- **将来価格の調達**: TradingView スキャナーは現在値しか返さないため、時間足別
-  専用ジャーナル `logs/briefing_tf_journal.jsonl` の後続エントリの終値を「過去判断
-  から見た将来価格」として使います(実行間隔に依存しない)。外部の履歴OHLC
-  (yfinance/OANDA 等)を差し込む注入口も用意しています(`fx_intel/price_history.py`)。
+- **将来価格の調達(5分スナップショット)**: TradingView スキャナーは現在値しか
+  返さないため、記録から主ホライズン後の実勢価格を後続の終値から取ります。ただし
+  判断ジャーナル `logs/briefing_tf_journal.jsonl` は毎時しか追記されないため、
+  短い足(特に 15m: 採点窓 9〜21分)は後続点が得られず永久に採点されません。
+  そこで **`fx_tf_snapshot.py` が5分ごとに各時間足の現在終値だけを
+  `logs/briefing_tf_prices.jsonl` へ記録**し、採点時にこの密な価格系列を判断
+  ジャーナルと結合します。これで **15m / 1h / 4h / 1d のすべてが採点可能**に
+  なります。外部の履歴OHLC(yfinance/OANDA 等)を差し込む注入口も用意しています
+  (`fx_intel/price_history.py`)。
 - **symbol×timeframe セル別の学習**: 融合モードと同じ学習コア(複合重み再推定・
   確信度キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier)を、
   `(通貨ペア × 時間足)` のセル単位で適用します。「この通貨のこの時間足でのこの状態の
@@ -101,7 +110,14 @@ tests/
 ```bash
 .venv/bin/python fx_briefing.py --per-timeframe --dry-run   # 時間足別の内容確認
 .venv/bin/python fx_briefing.py --per-timeframe             # Discordへ送信
+./fx_tf_snapshot_loop.sh &                                  # 5分ごとに価格を記録(採点用)
 ```
+
+時間足別モードで全時間足を学習させるには、判断と価格採点用の系列の**2本立て**が必要です。
+判断は `fx_briefing_loop.sh` が毎時 `--per-timeframe` を自動送信するので、追加で
+起動するのは価格スナップショットループ(`fx_tf_snapshot_loop.sh`、5分ごと)だけです。
+価格スナップショットは価格取得のみ(判断・学習・Discord通知はしない)なので API 負荷は
+軽く、Discord は毎時のままです(手動で単発確認したいときは上のコマンドを使います)。
 
 副産物として `research_pack/upcoming_events.csv`(最新スナップショット、毎回上書き)と
 `research_pack/event_history.csv`(追記アーカイブ)を書き出します。いずれも

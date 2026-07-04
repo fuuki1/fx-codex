@@ -80,6 +80,7 @@ from fx_intel import (
     macro,
     ml,
     news,
+    price_history,
     promotion,
     sentiment,
     technicals,
@@ -98,6 +99,11 @@ DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
 # ジャーナルを分ける(採点ホライズンもスキーマも異なるため)
 DEFAULT_TF_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_tf_journal.jsonl"
 DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
+# 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
+# 判断ジャーナルは毎時しか追記されず短い足の採点窓に入る点が得られないため、
+# この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
+# direction を持たない価格行なので採点対象は増やさず将来価格系列だけを密にする。
+DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
@@ -195,11 +201,26 @@ def _run_per_timeframe(
     """
     journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
 
+    # 採点用の将来価格系列を組む。判断ジャーナル(源A)は毎時しか追記されず、
+    # 短い足(15m:採点窓[9,21分])はそこに入る点が得られないため、
+    # fx_tf_snapshot.py が5分ごとに記録する価格専用系列と、今回の現在価格を
+    # 結合する。direction を持たない価格行は採点対象を増やさず将来価格系列だけを
+    # 密にするので、15m/1h/4h/1d の全時間足が採点可能になる。
+    price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
+    current_snapshot = price_history.snapshot_entries(
+        {
+            symbol: {tf: tech_map[symbol].close(tf) for tf in timeframe.DEFAULT_TIMEFRAMES}
+            for symbol in symbols
+        },
+        now=now,
+    )
+    scoring_entries = journal_entries + price_rows + current_snapshot
+
     # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
     tf_learn = tf_learning.TimeframeLearning()
     learning_note = ""
     if not args.no_learning:
-        tf_learn = tf_learning.derive_timeframe_learning(journal_entries, now=now)
+        tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
         learning_note = tf_learn.summary_ja()
         if not args.dry_run:
             try:
@@ -226,11 +247,12 @@ def _run_per_timeframe(
             profile_lookup=profile_lookup,
         )
 
-    # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意
+    # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意。
+    # 将来価格は採点と同じ結合系列(判断+価格スナップショット)から取る
     aux_reports_by_symbol: dict[str, dict[str, str]] = {}
     if not args.no_learning and journal_entries:
         for tf in timeframe.DEFAULT_TIMEFRAMES:
-            line = tf_learning.auxiliary_horizon_report_ja(journal_entries, tf)
+            line = tf_learning.auxiliary_horizon_report_ja(scoring_entries, tf)
             if line:
                 aux_reports_by_symbol.setdefault("_shared", {})[tf] = line
 
