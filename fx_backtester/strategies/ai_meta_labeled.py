@@ -21,6 +21,7 @@ ai_logistic との違い:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,6 +41,9 @@ from fx_backtester.strategies.ai_logistic import (
     _sigmoid,
 )
 from fx_backtester.strategies.base import Strategy
+
+# 二次モデルの共通契約: 1行の特徴量DataFrame → P(張るべき) の float
+_MetaPredictor = Callable[[pd.DataFrame], float]
 
 
 @dataclass
@@ -71,6 +75,13 @@ class AIMetaLabeledStrategy(Strategy):
     l2: float = 0.001
     meta_threshold: float = 0.55  # 二次 P(張るべき) がこれ以上で一次方向にエントリ
     stop_atr_multiple: float = 2.0
+    # 二次モデルの選択: "logistic"(既定・依存ゼロの自前ロジスティック)か
+    # "gbdt"(レポートが実務的王者とするGBDT=fx_intel.gbm。Newtonブースティング+
+    # ヒストグラム分割の純Python実装)。GBDTは非線形・特徴量交互作用を拾える。
+    secondary_model: str = "logistic"
+    gbdt_n_estimators: int = 120
+    gbdt_max_depth: int = 3
+    gbdt_learning_rate: float = 0.1
 
     @property
     def name(self) -> str:
@@ -121,9 +132,9 @@ class AIMetaLabeledStrategy(Strategy):
         touch_ts = barriers["touch_ts"]
         positions = {ts: i for i, ts in enumerate(data.index)}
 
-        weights: np.ndarray | None = None
-        mean: pd.Series | None = None
-        std: pd.Series | None = None
+        # 二次モデルは「特徴量→P(張るべき)」を返す予測器。ロジスティックとGBDTの
+        # どちらでも同じ契約(fit→predict closure)にして学習ループをモデル非依存にする。
+        predictor: _MetaPredictor | None = None
         last_train_position: int | None = None
 
         for position, timestamp in enumerate(data.index):
@@ -144,28 +155,22 @@ class AIMetaLabeledStrategy(Strategy):
                 continue
 
             should_retrain = (
-                weights is None
+                predictor is None
                 or last_train_position is None
                 or position - last_train_position >= self.retrain_interval
             )
             if should_retrain:
-                fitted = _fit_logistic(
-                    features.loc[train_index],
-                    meta_y.loc[train_index].astype(float),
-                    learning_rate=self.learning_rate,
-                    epochs=self.epochs,
-                    l2=self.l2,
+                fitted = self._fit_secondary(
+                    features.loc[train_index], meta_y.loc[train_index].astype(float)
                 )
                 if fitted is None:
                     continue
-                weights, mean, std = fitted
+                predictor = fitted
                 last_train_position = position
 
-            if weights is None or mean is None or std is None:
+            if predictor is None:
                 continue
-            transformed = _filled_finite_frame((features.loc[[timestamp]] - mean) / std)
-            x = np.concatenate(([1.0], transformed.iloc[0].to_numpy(dtype=float)))
-            probability = float(_sigmoid(np.array([x @ weights]))[0])
+            probability = predictor(features.loc[[timestamp]])
             meta_prob.at[timestamp] = probability
             model_ready.at[timestamp] = True
             # 二次が「張るべき」と言ったときだけ一次方向にエントリ(=サイズ1)
@@ -198,6 +203,52 @@ class AIMetaLabeledStrategy(Strategy):
         side[fast < slow] = -1
         side[fast.isna() | slow.isna()] = 0
         return side
+
+    def _fit_secondary(
+        self, train_features: pd.DataFrame, train_labels: pd.Series
+    ) -> _MetaPredictor | None:
+        """二次モデルを学習し、1行の特徴量→P(張るべき) を返す予測器を作る。
+
+        secondary_model="logistic" は既存の依存ゼロロジスティック、"gbdt" は
+        fx_intel.gbm の勾配ブースティング木。学習不能(片方のラベルしか無い等)は None。
+        """
+        if self.secondary_model == "logistic":
+            fitted = _fit_logistic(
+                train_features, train_labels,
+                learning_rate=self.learning_rate, epochs=self.epochs, l2=self.l2,
+            )
+            if fitted is None:
+                return None
+            weights, mean, std = fitted
+
+            def predict_logistic(row: pd.DataFrame) -> float:
+                transformed = _filled_finite_frame((row - mean) / std)
+                x = np.concatenate(([1.0], transformed.iloc[0].to_numpy(dtype=float)))
+                return float(_sigmoid(np.array([x @ weights]))[0])
+
+            return predict_logistic
+
+        # GBDT: fx_intel.gbm(標準ライブラリのみ)。fx_intel→fx_backtester の
+        # 逆依存は無いため、この一方向リーフ import は循環を作らない。
+        from fx_intel.gbm import GradientBoostingClassifier
+
+        labels = [int(v) for v in train_labels.to_list()]
+        if len(set(labels)) < 2:
+            return None  # 片方のクラスしか無いと学習できない
+        rows = _filled_finite_frame(train_features).to_numpy(dtype=float).tolist()
+        model = GradientBoostingClassifier(
+            n_estimators=self.gbdt_n_estimators,
+            max_depth=self.gbdt_max_depth,
+            learning_rate=self.gbdt_learning_rate,
+            seed=0,
+        )
+        model.fit(rows, labels)
+
+        def predict_gbdt(row: pd.DataFrame) -> float:
+            x = _filled_finite_frame(row).iloc[0].to_numpy(dtype=float).tolist()
+            return float(model.predict_proba(x))
+
+        return predict_gbdt
 
     def _features(self, data: pd.DataFrame) -> pd.DataFrame:
         """二次モデルの特徴量。価格系はFFDで定常化しつつ記憶を保持する。"""
@@ -242,6 +293,13 @@ class AIMetaLabeledStrategy(Strategy):
             raise ValueError("retrain_interval must be positive")
         if not 0.5 <= self.meta_threshold < 1.0:
             raise ValueError("meta_threshold must satisfy 0.5 <= t < 1")
+        if self.secondary_model not in ("logistic", "gbdt"):
+            raise ValueError("secondary_model must be 'logistic' or 'gbdt'")
+        if self.secondary_model == "gbdt":
+            if self.gbdt_n_estimators <= 0 or self.gbdt_max_depth <= 0:
+                raise ValueError("gbdt_n_estimators/gbdt_max_depth must be positive")
+            if self.gbdt_learning_rate <= 0:
+                raise ValueError("gbdt_learning_rate must be positive")
         for name, value in (
             ("volatility_window", self.volatility_window),
             ("rsi_window", self.rsi_window),
