@@ -127,6 +127,30 @@ def main(argv: list[str] | None = None) -> int:
         help="Parameter grid item like fast_window=10,20. Can be repeated.",
     )
 
+    # deploy-gate: walk-forward → PBO/DSR/SPA → ドリフト → デプロイ合否を1本で判定
+    gate_parser = _add_common_arguments(subparsers.add_parser("deploy-gate"))
+    gate_parser.add_argument("--train-bars", type=int, default=500)
+    gate_parser.add_argument("--test-bars", type=int, default=100)
+    gate_parser.add_argument("--step-bars", type=int)
+    gate_parser.add_argument("--purge-bars", type=int, default=DEFAULT_CLI_VALUES["purge_bars"])
+    gate_parser.add_argument("--embargo-bars", type=int, default=DEFAULT_CLI_VALUES["embargo_bars"])
+    gate_parser.add_argument("--max-params", type=int, default=20)
+    gate_parser.add_argument(
+        "--grid", action="append", default=[],
+        help="Parameter grid item like fast_window=10,20. Can be repeated.",
+    )
+    gate_parser.add_argument("--dsr-min", type=float, default=0.95, help="DSR下限(未満は棄却)")
+    gate_parser.add_argument("--pbo-max", type=float, default=0.5, help="PBO上限(以上は棄却)")
+    gate_parser.add_argument("--spa-max", type=float, default=0.05, help="SPA p値上限(以上は棄却)")
+    gate_parser.add_argument("--pbo-blocks", type=int, default=8)
+    gate_parser.add_argument("--spa-bootstrap", type=int, default=1000)
+    gate_parser.add_argument("--spa-seed", type=int, default=7)
+    gate_parser.add_argument(
+        "--allow-drift", action="store_true",
+        help="OOSドリフト検出をデプロイ拒否条件にしない(監視のみ)",
+    )
+    gate_parser.add_argument("--output-verdict", help="判定JSONの書き出し先(任意)")
+
     research_parser = subparsers.add_parser("research-pack")
     research_parser.add_argument(
         "--output-dir",
@@ -210,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_backtest(args)
     if args.command == "walk-forward":
         return _run_walk_forward(args)
+    if args.command == "deploy-gate":
+        return _run_deploy_gate(args)
     if args.command == "research-pack":
         return _run_research_pack(args)
     if args.command == "qa-data":
@@ -506,6 +532,62 @@ def _run_walk_forward(args: argparse.Namespace) -> int:
         summary.to_csv(args.output_summary, index=False)
     print(summary.to_json(orient="records", indent=2, force_ascii=False, date_format="iso"))
     return 0
+
+
+def _run_deploy_gate(args: argparse.Namespace) -> int:
+    """walk-forward → PBO/DSR/SPA → ドリフト を束ね、デプロイ合否を判定する。
+
+    デプロイ拒否(deploy_ok=False)なら終了コード1を返し、CI やデプロイスクリプトが
+    そのままゲートに使えるようにする(合格は0)。
+    """
+    from fx_backtester.validation_pipeline import DeployGateConfig, evaluate_deploy_gate
+
+    base_config = _build_config(args)
+    data = filter_price_data_by_date(load_price_csvs(args.data), args.start_date, args.end_date)
+    events = filter_economic_events_by_date(
+        load_economic_events_csv(args.events),
+        args.start_date,
+        args.end_date,
+        minutes_before=base_config.no_trade_minutes_before,
+        minutes_after=base_config.no_trade_minutes_after,
+    )
+    strategy_factory = _strategy_factory_from_args(args)
+    parameter_grid = _build_grid(args.strategy, args.grid)
+    validate_backtest_inputs(data, base_config).raise_for_errors()
+
+    def engine_factory(strategy: Any) -> BacktestEngine:
+        return BacktestEngine(strategy, base_config, events)
+
+    validator = WalkForwardValidator(
+        strategy_factory,
+        parameter_grid,
+        engine_factory,
+        WalkForwardConfig(
+            train_bars=args.train_bars,
+            test_bars=args.test_bars,
+            step_bars=args.step_bars,
+            purge_bars=args.purge_bars,
+            embargo_bars=args.embargo_bars,
+            max_parameter_combinations=args.max_params,
+        ),
+    )
+    gate_config = DeployGateConfig(
+        dsr_min=args.dsr_min,
+        pbo_max=args.pbo_max,
+        spa_max=args.spa_max,
+        pbo_blocks=args.pbo_blocks,
+        spa_bootstrap=args.spa_bootstrap,
+        spa_seed=args.spa_seed,
+        require_no_drift=not args.allow_drift,
+    )
+    verdict = evaluate_deploy_gate(validator, data, gate_config)
+    payload = verdict.to_dict()
+    if args.output_verdict:
+        Path(args.output_verdict).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+        )
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    return 0 if verdict.deploy_ok else 1
 
 
 def _run_research_pack(args: argparse.Namespace) -> int:
