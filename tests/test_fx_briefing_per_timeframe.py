@@ -11,6 +11,7 @@ import pytest
 import fx_briefing
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
+from fx_intel.tf_learning import derive_timeframe_learning, save_timeframe_learning
 
 
 def _view(interval, rec, close, rsi=55.0, adx=25.0, atr=0.15):
@@ -57,11 +58,13 @@ def patched_paths(tmp_path):
     """ジャーナル・学習の書き込み先を一時ディレクトリへ差し替える。"""
     tf_journal = tmp_path / "briefing_tf_journal.jsonl"
     tf_learning = tmp_path / "briefing_tf_learning.json"
+    tf_baseline = tmp_path / "briefing_tf_baseline.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", tf_journal),
         mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_PATH", tf_learning),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_BASELINE_PATH", tf_baseline),
     ):
-        yield tf_journal, tf_learning
+        yield tf_journal, tf_learning, tf_baseline
 
 
 def _run(argv, capsys):
@@ -87,13 +90,13 @@ def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
 
 
 def test_per_timeframe_dry_run_does_not_write_journal(patched_paths, capsys) -> None:
-    tf_journal, _ = patched_paths
+    tf_journal, _, _ = patched_paths
     _run(["--per-timeframe", "--dry-run", "--no-macro", "--symbols", "USDJPY"], capsys)
     assert not tf_journal.exists()  # dry-run は記録しない
 
 
 def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) -> None:
-    tf_journal, tf_learning = patched_paths
+    tf_journal, _tf_learning, _tf_baseline = patched_paths
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
         # webhook 未設定なので送信段階で rc=1 になるが、ジャーナル追記はその前に済む
         _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
@@ -108,7 +111,7 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
 
 def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
     """既存の時間足別ジャーナルがあれば学習が働き、学習ファイルが書かれる。"""
-    tf_journal, tf_learning = patched_paths
+    tf_journal, tf_learning, _tf_baseline = patched_paths
     # 事前に 1h の負け履歴を仕込む(全 miss で減衰が発動する量)
     start = datetime(2026, 6, 22, 8, 0, tzinfo=UTC)
     price = 156.0
@@ -144,10 +147,48 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
 
 
 def test_no_learning_flag_skips_profile(patched_paths, capsys) -> None:
-    tf_journal, tf_learning = patched_paths
+    _tf_journal, tf_learning, _tf_baseline = patched_paths
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
         _run(
             ["--per-timeframe", "--no-learning", "--no-macro", "--symbols", "USDJPY"],
             capsys,
         )
     assert not tf_learning.exists()  # 学習無効時は保存しない
+
+
+def test_per_timeframe_uses_historical_baseline_until_live_matures(patched_paths, capsys) -> None:
+    """ライブ履歴が薄い間は、履歴baselineのセル別減衰を本番学習へ反映する。"""
+    _tf_journal, tf_learning, tf_baseline = patched_paths
+    start = datetime(2026, 6, 22, 8, 0, tzinfo=UTC)
+    price = 156.0
+    baseline_rows = []
+    for i in range(20):
+        ts = start + timedelta(hours=i)
+        baseline_rows.append(
+            {
+                "ts": ts.isoformat(),
+                "symbol": "USDJPY",
+                "timeframe": "1h",
+                "horizon_hours": 1.0,
+                "direction": "long",
+                "conviction": 60,
+                "tech_score": 0.5,
+                "news_score": 0.2,
+                "close": price,
+                "atr": 0.10,
+                "features": {"rsi_1h": 70.0, "adx_1h": 15.0},
+            }
+        )
+        price -= 0.05
+    save_timeframe_learning(
+        derive_timeframe_learning(baseline_rows, now=start + timedelta(days=3)),
+        tf_baseline,
+    )
+
+    with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
+        _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
+
+    payload = json.loads(tf_learning.read_text(encoding="utf-8"))
+    cell = payload["profiles"]["USDJPY|1h"]
+    assert cell["symbol_factors"]["USDJPY"] < 1.0
+    assert cell["notes_ja"][0].startswith("履歴ベースライン")

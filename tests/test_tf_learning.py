@@ -12,6 +12,8 @@ from fx_intel.tf_learning import (
     derive_timeframe_learning,
     entries_for_timeframe,
     evaluate_timeframe_history,
+    load_timeframe_learning,
+    merge_timeframe_learning,
     save_timeframe_learning,
 )
 
@@ -74,6 +76,26 @@ def _winning_4h(count: int = 12) -> list[dict]:
             )
         )
         price += 0.20
+    return entries
+
+
+def _winning_1h(count: int = 25) -> list[dict]:
+    """1h の long 判断を記録し、実際は上昇し続ける(全 hit)履歴。"""
+    entries = []
+    price = 156.0
+    for i in range(count):
+        entries.append(
+            _entry(
+                START + timedelta(hours=i),
+                "1h",
+                1.0,
+                "long",
+                price,
+                rsi_1h=55.0,
+                adx_1h=30.0,
+            )
+        )
+        price += 0.05
     return entries
 
 
@@ -201,3 +223,35 @@ def test_save_timeframe_learning_roundtrip(tmp_path) -> None:
     assert cell["evaluated"] > 0
     assert "symbol_factors" in cell
     assert "condition_stats" in cell
+
+
+def test_load_timeframe_learning_roundtrip(tmp_path) -> None:
+    learning = derive_timeframe_learning(_losing_1h(20), now=START + timedelta(days=3))
+    path = tmp_path / "tf_learning.json"
+    save_timeframe_learning(learning, path)
+
+    loaded = load_timeframe_learning(path)
+
+    assert ("USDJPY", "1h") in loaded.profiles
+    _, _, conviction_factor, adjuster = loaded.profile_lookup("USDJPY", "1h")
+    assert conviction_factor < 1.0
+    assert adjuster is not None
+
+
+def test_baseline_used_until_live_cell_has_enough_samples() -> None:
+    baseline = derive_timeframe_learning(_losing_1h(20), now=START + timedelta(days=3))
+
+    merged = merge_timeframe_learning(
+        TimeframeLearning(),
+        baseline,
+        min_live_evaluated=20,
+    )
+    _, _, baseline_factor, _ = merged.profile_lookup("USDJPY", "1h")
+    assert baseline_factor < 1.0
+    assert "履歴ベースライン" in merged.per_timeframe["1h"].notes_ja[0]
+
+    live = derive_timeframe_learning(_winning_1h(25), now=START + timedelta(days=3))
+    merged = merge_timeframe_learning(live, baseline, min_live_evaluated=20)
+    _, _, live_factor, _ = merged.profile_lookup("USDJPY", "1h")
+    assert live_factor == 1.0
+    assert not merged.per_timeframe["1h"].notes_ja[0].startswith("履歴ベースライン")

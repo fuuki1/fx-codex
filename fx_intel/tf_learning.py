@@ -38,11 +38,16 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from .learning import (
+    CONDITION_FACTOR_MIN,
     DERIVE_THIN_GAP_HOURS,
+    ConvictionBin,
     EvaluatedCall,
     LearnedProfile,
     NEWS_WEIGHT,
+    SYMBOL_FACTOR_MIN,
     TECH_WEIGHT,
+    TECH_WEIGHT_MAX,
+    TECH_WEIGHT_MIN,
     derive_profile,
     evaluate_history,
     thin_calls,
@@ -58,6 +63,7 @@ ConditionAdjuster = Callable[[Mapping[str, float], str], tuple[float, str]]
 ProfileLookup = Callable[[str, str], tuple[float, float, float, ConditionAdjuster | None]]
 
 TIMEFRAME_LABEL_JA = {"15m": "15分足", "1h": "1時間足", "4h": "4時間足", "1d": "日足"}
+BASELINE_MIN_LIVE_EVALUATED = 20
 
 
 def entries_for_timeframe(entries: Iterable[Mapping[str, object]], timeframe: str) -> list[dict]:
@@ -258,6 +264,108 @@ def save_timeframe_learning(learning: TimeframeLearning, path: str | Path) -> No
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_timeframe_learning(path: str | Path) -> TimeframeLearning:
+    """保存済みの時間足別学習を読む。無い/壊れている場合は空プロファイル。"""
+    target = Path(path)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return TimeframeLearning()
+    if not isinstance(payload, dict):
+        return TimeframeLearning()
+
+    profiles: dict[tuple[str, str], LearnedProfile] = {}
+    raw_profiles = payload.get("profiles")
+    if isinstance(raw_profiles, dict):
+        for key, raw_profile in raw_profiles.items():
+            parts = str(key).split("|", 1)
+            if len(parts) != 2 or not isinstance(raw_profile, dict):
+                continue
+            symbol, timeframe = parts[0].upper(), parts[1]
+            profile = _profile_from_dict(raw_profile)
+            if profile is not None:
+                profiles[(symbol, timeframe)] = profile
+
+    per_timeframe: dict[str, LearnedProfile] = {}
+    raw_per_timeframe = payload.get("per_timeframe")
+    if isinstance(raw_per_timeframe, dict):
+        for timeframe, raw_profile in raw_per_timeframe.items():
+            if not isinstance(raw_profile, dict):
+                continue
+            profile = _profile_from_dict(raw_profile)
+            if profile is not None:
+                per_timeframe[str(timeframe)] = profile
+
+    return TimeframeLearning(
+        generated_at=str(payload.get("generated_at", "")),
+        profiles=profiles,
+        per_timeframe=per_timeframe,
+    )
+
+
+def merge_timeframe_learning(
+    live: TimeframeLearning,
+    baseline: TimeframeLearning,
+    min_live_evaluated: int = BASELINE_MIN_LIVE_EVALUATED,
+) -> TimeframeLearning:
+    """ライブ学習が薄いセルだけ、履歴ベースラインで補う。
+
+    live.evaluated が十分に貯まったセルは live を優先する。履歴側は初期学習の
+    安定化にだけ使い、現行運用の実績が揃ったら自然に外れる設計。
+    """
+    profiles = dict(live.profiles)
+    for key, baseline_profile in baseline.profiles.items():
+        live_profile = live.profiles.get(key)
+        if _should_use_baseline(live_profile, baseline_profile, min_live_evaluated):
+            profiles[key] = _with_baseline_note(
+                baseline_profile,
+                live_evaluated=0 if live_profile is None else live_profile.evaluated,
+                min_live_evaluated=min_live_evaluated,
+            )
+
+    per_timeframe = dict(live.per_timeframe)
+    for timeframe, baseline_profile in baseline.per_timeframe.items():
+        live_profile = live.per_timeframe.get(timeframe)
+        if _should_use_baseline(live_profile, baseline_profile, min_live_evaluated):
+            per_timeframe[timeframe] = _with_baseline_note(
+                baseline_profile,
+                live_evaluated=0 if live_profile is None else live_profile.evaluated,
+                min_live_evaluated=min_live_evaluated,
+            )
+
+    return TimeframeLearning(
+        generated_at=live.generated_at or baseline.generated_at,
+        profiles=profiles,
+        per_timeframe=per_timeframe,
+    )
+
+
+def _should_use_baseline(
+    live_profile: LearnedProfile | None,
+    baseline_profile: LearnedProfile,
+    min_live_evaluated: int,
+) -> bool:
+    if baseline_profile.evaluated <= 0:
+        return False
+    return live_profile is None or live_profile.evaluated < min_live_evaluated
+
+
+def _with_baseline_note(
+    profile: LearnedProfile,
+    *,
+    live_evaluated: int,
+    min_live_evaluated: int,
+) -> LearnedProfile:
+    clone = _profile_from_dict(_profile_to_dict(profile)) or LearnedProfile()
+    note = (
+        "履歴ベースラインを使用中"
+        f" — ライブ採点{live_evaluated}/{min_live_evaluated}件"
+        "が貯まるまでは過去チャート学習を優先"
+    )
+    clone.notes_ja = [note, *clone.notes_ja]
+    return clone
+
+
 def _profile_to_dict(profile: LearnedProfile) -> dict:
     """LearnedProfile を保存用の素の辞書にする(save_profile と同じ形)。"""
     return {
@@ -282,3 +390,134 @@ def _profile_to_dict(profile: LearnedProfile) -> dict:
         "condition_factors": profile.condition_factors,
         "notes_ja": profile.notes_ja,
     }
+
+
+def _profile_from_dict(payload: Mapping[str, object]) -> LearnedProfile | None:
+    try:
+        tech_weight = _float_value(payload.get("tech_weight"), TECH_WEIGHT)
+        news_weight = _float_value(payload.get("news_weight"), NEWS_WEIGHT)
+        if not (TECH_WEIGHT_MIN <= tech_weight <= TECH_WEIGHT_MAX):
+            tech_weight, news_weight = TECH_WEIGHT, NEWS_WEIGHT
+
+        bins: list[ConvictionBin] = []
+        raw_bins = payload.get("bins")
+        if isinstance(raw_bins, list):
+            for row in raw_bins:
+                if not isinstance(row, Mapping):
+                    continue
+                bins.append(
+                    ConvictionBin(
+                        low=_int_value(row.get("low")),
+                        high=_int_value(row.get("high")),
+                        evaluated=_int_value(row.get("evaluated")),
+                        hits=_int_value(row.get("hits")),
+                    )
+                )
+
+        symbol_factors: dict[str, float] = {}
+        raw_symbol_factors = payload.get("symbol_factors")
+        if isinstance(raw_symbol_factors, Mapping):
+            for symbol, factor in raw_symbol_factors.items():
+                value = _float_value(factor, 1.0)
+                symbol_factors[str(symbol)] = max(SYMBOL_FACTOR_MIN, min(1.0, value))
+
+        symbol_stats: dict[str, dict[str, int]] = {}
+        raw_symbol_stats = payload.get("symbol_stats")
+        if isinstance(raw_symbol_stats, Mapping):
+            for symbol, stat in raw_symbol_stats.items():
+                if not isinstance(stat, Mapping):
+                    continue
+                symbol_stats[str(symbol)] = {
+                    "evaluated": _int_value(stat.get("evaluated")),
+                    "hits": _int_value(stat.get("hits")),
+                }
+
+        condition_stats: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
+        raw_condition_stats = payload.get("condition_stats")
+        if isinstance(raw_condition_stats, Mapping):
+            for key, buckets in raw_condition_stats.items():
+                if not isinstance(buckets, Mapping):
+                    continue
+                bucket_stats: dict[str, dict[str, dict[str, int]]] = {}
+                for label, directions in buckets.items():
+                    if not isinstance(directions, Mapping):
+                        continue
+                    direction_stats: dict[str, dict[str, int]] = {}
+                    for direction, cell in directions.items():
+                        if direction not in ("long", "short") or not isinstance(cell, Mapping):
+                            continue
+                        direction_stats[str(direction)] = {
+                            "evaluated": _int_value(cell.get("evaluated")),
+                            "hits": _int_value(cell.get("hits")),
+                        }
+                    bucket_stats[str(label)] = direction_stats
+                condition_stats[str(key)] = bucket_stats
+
+        condition_factors: dict[str, dict[str, dict[str, float]]] = {}
+        raw_condition_factors = payload.get("condition_factors")
+        if isinstance(raw_condition_factors, Mapping):
+            for key, buckets in raw_condition_factors.items():
+                if not isinstance(buckets, Mapping):
+                    continue
+                bucket_factors: dict[str, dict[str, float]] = {}
+                for label, directions in buckets.items():
+                    if not isinstance(directions, Mapping):
+                        continue
+                    direction_factors: dict[str, float] = {}
+                    for direction, factor in directions.items():
+                        if direction not in ("long", "short"):
+                            continue
+                        value = _float_value(factor, 1.0)
+                        direction_factors[str(direction)] = max(
+                            CONDITION_FACTOR_MIN, min(1.0, value)
+                        )
+                    bucket_factors[str(label)] = direction_factors
+                condition_factors[str(key)] = bucket_factors
+
+        raw_notes = payload.get("notes_ja")
+        notes = [str(note) for note in raw_notes] if isinstance(raw_notes, list) else []
+
+        return LearnedProfile(
+            generated_at=str(payload.get("generated_at", "")),
+            evaluated=_int_value(payload.get("evaluated")),
+            hits=_int_value(payload.get("hits")),
+            flat=_int_value(payload.get("flat")),
+            tech_weight=tech_weight,
+            news_weight=news_weight,
+            tech_hit_rate=_optional_float(payload.get("tech_hit_rate")),
+            news_hit_rate=_optional_float(payload.get("news_hit_rate")),
+            conviction_brier=_optional_float(payload.get("conviction_brier")),
+            conviction_brier_base=_optional_float(payload.get("conviction_brier_base")),
+            bins=bins,
+            symbol_stats=symbol_stats,
+            symbol_factors=symbol_factors,
+            condition_stats=condition_stats,
+            condition_factors=condition_factors,
+            notes_ja=notes,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_value(value: object, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    return default
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    return None
+
+
+def _int_value(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float, str)):
+        return int(value)
+    return default

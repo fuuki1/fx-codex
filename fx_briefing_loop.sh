@@ -11,13 +11,13 @@
 #
 # Desktop配下はmacOSのTCC制限でlaunchd/cronから読めないため、
 # ターミナルから直接起動すること。
-#   ./fx_briefing_loop.sh &
+#   nohup ./fx_briefing_loop.sh </dev/null > logs/fx_briefing_loop.out 2> logs/fx_briefing_loop.err &
 cd "$(dirname "$0")" || exit 1
 mkdir -p logs
 
 while true; do
-  .venv/bin/python fx_briefing.py >> logs/fx_briefing.log 2>&1 || true
-  .venv/bin/python fx_briefing.py --per-timeframe >> logs/fx_briefing_tf.log 2>&1 || true
+  .venv/bin/python fx_briefing.py </dev/null >> logs/fx_briefing.log 2>&1 || true
+  .venv/bin/python fx_briefing.py --per-timeframe </dev/null >> logs/fx_briefing_tf.log 2>&1 || true
   now=$(date +%s)
   next=$(( (now / 3600 + 1) * 3600 + 600 ))
   sleep $(( next - now ))

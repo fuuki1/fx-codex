@@ -32,7 +32,7 @@ from pathlib import Path
 from fx_intel import price_history, technicals
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
+DEFAULT_SYMBOLS = ["USDJPY", "EURUSD", "GBPUSD"]
 # fx_briefing._run_per_timeframe が採点入力に結合する価格専用系列。
 # 判断ジャーナル(briefing_tf_journal.jsonl)とは別ファイルにして、
 # 価格行(direction 無し)が判断行と混ざらないようにする。

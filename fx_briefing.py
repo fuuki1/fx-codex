@@ -90,7 +90,7 @@ from fx_intel import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
+DEFAULT_SYMBOLS = ["USDJPY", "EURUSD", "GBPUSD"]
 DEFAULT_EVENTS_CSV = PROJECT_ROOT / "research_pack" / "upcoming_events.csv"
 DEFAULT_EVENTS_ARCHIVE = PROJECT_ROOT / "research_pack" / "event_history.csv"
 DEFAULT_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_journal.jsonl"
@@ -99,6 +99,7 @@ DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
 # ジャーナルを分ける(採点ホライズンもスキーマも異なるため)
 DEFAULT_TF_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_tf_journal.jsonl"
 DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
+DEFAULT_TF_BASELINE_PATH = PROJECT_ROOT / "logs" / "briefing_tf_baseline.json"
 # 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
 # 判断ジャーナルは毎時しか追記されず短い足の採点窓に入る点が得られないため、
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
@@ -220,7 +221,19 @@ def _run_per_timeframe(
     tf_learn = tf_learning.TimeframeLearning()
     learning_note = ""
     if not args.no_learning:
-        tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+        live_tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+        tf_learn = live_tf_learn
+        baseline_path = Path(args.tf_learning_baseline) if args.tf_learning_baseline else None
+        if baseline_path is not None and baseline_path.exists():
+            baseline = tf_learning.load_timeframe_learning(baseline_path)
+            if baseline.profiles or baseline.per_timeframe:
+                tf_learn = tf_learning.merge_timeframe_learning(
+                    live_tf_learn,
+                    baseline,
+                    min_live_evaluated=args.tf_learning_min_live_samples,
+                )
+            else:
+                fetch_warnings.append(f"時間足別履歴ベースラインが空または破損: {baseline_path}")
         learning_note = tf_learn.summary_ja()
         if not args.dry_run:
             try:
@@ -366,8 +379,22 @@ def main(argv: list[str] | None = None) -> int:
         help="時間足別モード: 15m/1h/4h/1d を独立に判断し、時間足ごとの主ホライズン"
         "(15m→15分後/1h→1h/4h→4h/1d→24h)で自己採点・学習する",
     )
+    parser.add_argument(
+        "--tf-learning-baseline",
+        type=Path,
+        default=DEFAULT_TF_BASELINE_PATH,
+        help="時間足別モードで使う履歴学習ベースラインJSON(無ければ無視)",
+    )
+    parser.add_argument(
+        "--tf-learning-min-live-samples",
+        type=int,
+        default=tf_learning.BASELINE_MIN_LIVE_EVALUATED,
+        help="この採点件数に達した symbol×timeframe セルは履歴ベースラインよりライブ実績を優先",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
+    if args.tf_learning_min_live_samples < 0:
+        parser.error("--tf-learning-min-live-samples must be >= 0")
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
     fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
