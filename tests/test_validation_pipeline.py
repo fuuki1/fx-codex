@@ -53,7 +53,8 @@ def _validator() -> WalkForwardValidator:
     config = BacktestConfig(
         initial_cash=100_000,
         execution=ExecutionConfig(
-            spread_pips={"USDJPY": 0.5}, slippage_pips={"USDJPY": 0.2},
+            spread_pips={"USDJPY": 0.5},
+            slippage_pips={"USDJPY": 0.2},
             commission_per_million_usd=0.0,
         ),
     )
@@ -62,7 +63,9 @@ def _validator() -> WalkForwardValidator:
         MovingAverageCross,
         grid,
         lambda strategy: BacktestEngine(strategy, config),
-        WalkForwardConfig(train_bars=250, test_bars=100, embargo_bars=10, max_parameter_combinations=8),
+        WalkForwardConfig(
+            train_bars=250, test_bars=100, embargo_bars=10, max_parameter_combinations=8
+        ),
     )
 
 

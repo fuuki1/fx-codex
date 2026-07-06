@@ -167,9 +167,7 @@ def test_spa_high_pvalue_for_pure_noise() -> None:
     # 全戦略が平均ゼロのノイズ → 最良の優位はデータマイニングの産物(p値大)
     rng = np.random.default_rng(12)
     index = pd.date_range("2024-01-01", periods=300, freq="h")
-    perf = pd.DataFrame(
-        {f"noise_{k}": rng.normal(0.0, 0.01, 300) for k in range(10)}, index=index
-    )
+    perf = pd.DataFrame({f"noise_{k}": rng.normal(0.0, 0.01, 300) for k in range(10)}, index=index)
     result = superior_predictive_ability(perf, n_bootstrap=500, seed=2)
     assert result["spa_pvalue"] > 0.10  # 有意でない
 

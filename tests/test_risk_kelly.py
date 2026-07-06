@@ -16,7 +16,10 @@ T0 = pd.Timestamp("2025-06-02 09:00:00")
 def _size(manager: RiskManager, equity: float = 100_000.0) -> float:
     """EURUSD・ストップ20pips相当で1トレードのユニット数を得る簡易ヘルパ。"""
     units, _stop, _risk = manager.position_size(
-        "EURUSD", equity, entry_price=1.10, stop_distance=0.0020,
+        "EURUSD",
+        equity,
+        entry_price=1.10,
+        stop_distance=0.0020,
         conversion_rates={"EUR": 1.10},
     )
     return units
@@ -49,9 +52,12 @@ def test_kelly_off_no_var_lock_by_default() -> None:
 def test_kelly_on_changes_effective_risk() -> None:
     manager = RiskManager(
         RiskConfig(
-            risk_per_trade_pct=0.01, risk_cap_pct=0.01,
-            use_fractional_kelly=True, kelly_fraction=0.5,
-            kelly_min_trades=50, kelly_full_confidence_trades=100,
+            risk_per_trade_pct=0.01,
+            risk_cap_pct=0.01,
+            use_fractional_kelly=True,
+            kelly_fraction=0.5,
+            kelly_min_trades=50,
+            kelly_full_confidence_trades=100,
             kelly_max_risk_pct=0.02,
         )
     )
@@ -68,8 +74,11 @@ def test_kelly_on_bigger_risk_gives_more_units() -> None:
     fixed = RiskManager(RiskConfig(risk_per_trade_pct=0.01, risk_cap_pct=0.01))
     kelly = RiskManager(
         RiskConfig(
-            risk_per_trade_pct=0.01, risk_cap_pct=0.01,
-            use_fractional_kelly=True, kelly_fraction=0.5, kelly_max_risk_pct=0.02,
+            risk_per_trade_pct=0.01,
+            risk_cap_pct=0.01,
+            use_fractional_kelly=True,
+            kelly_fraction=0.5,
+            kelly_max_risk_pct=0.02,
         )
     )
     kelly.update_risk_budget([2.0] * 60 + [-1.0] * 40)  # 高エッジ
@@ -79,7 +88,9 @@ def test_kelly_on_bigger_risk_gives_more_units() -> None:
 def test_kelly_insufficient_sample_falls_back() -> None:
     manager = RiskManager(
         RiskConfig(
-            risk_per_trade_pct=0.01, use_fractional_kelly=True, kelly_min_trades=50,
+            risk_per_trade_pct=0.01,
+            use_fractional_kelly=True,
+            kelly_min_trades=50,
         )
     )
     manager.update_risk_budget([1.0, -1.0, 1.0])  # 3件だけ
@@ -91,8 +102,11 @@ def test_kelly_insufficient_sample_falls_back() -> None:
 def test_kelly_negative_edge_shrinks_to_zero_risk() -> None:
     manager = RiskManager(
         RiskConfig(
-            risk_per_trade_pct=0.01, use_fractional_kelly=True,
-            kelly_fraction=0.5, kelly_min_trades=50, kelly_full_confidence_trades=50,
+            risk_per_trade_pct=0.01,
+            use_fractional_kelly=True,
+            kelly_fraction=0.5,
+            kelly_min_trades=50,
+            kelly_full_confidence_trades=50,
         )
     )
     # 勝率40%で負のエッジ → f*=0 → target=0、標本50で完全移行 → effective≈0
@@ -105,9 +119,7 @@ def test_kelly_negative_edge_shrinks_to_zero_risk() -> None:
 
 
 def test_var_gate_blocks_new_entries_when_breached() -> None:
-    manager = RiskManager(
-        RiskConfig(var_limit_pct=0.03, var_confidence=0.95, var_min_samples=30)
-    )
+    manager = RiskManager(RiskConfig(var_limit_pct=0.03, var_confidence=0.95, var_min_samples=30))
     # 下位5%点が -5% になる分布 → VaR 5% > 上限3% → ロック
     manager.update_var([-0.05] * 5 + [0.0] * 95)
     assert manager.var_estimate is not None

@@ -126,9 +126,9 @@ def test_no_lookahead_future_change_does_not_alter_past_signals() -> None:
 def test_gbdt_secondary_model_generates_valid_output() -> None:
     """secondary_model='gbdt' でも学習が回り、-1/0/1 の出力が出る。"""
     data = _price_frame()
-    signals = _fast_strategy(secondary_model="gbdt", gbdt_n_estimators=40, gbdt_max_depth=2).generate(
-        "EURUSD", data
-    )
+    signals = _fast_strategy(
+        secondary_model="gbdt", gbdt_n_estimators=40, gbdt_max_depth=2
+    ).generate("EURUSD", data)
     assert bool(signals["meta_model_ready"].any())
     assert set(signals["target_position"].unique()).issubset({-1, 0, 1})
     # メタ確率は確率として [0,1]
@@ -161,9 +161,7 @@ def test_invalid_params_raise() -> None:
     with pytest.raises(ValueError):
         AIMetaLabeledStrategy(meta_threshold=0.3).generate("EURUSD", _price_frame(60))
     with pytest.raises(ValueError):
-        AIMetaLabeledStrategy(fast_window=50, slow_window=20).generate(
-            "EURUSD", _price_frame(60)
-        )
+        AIMetaLabeledStrategy(fast_window=50, slow_window=20).generate("EURUSD", _price_frame(60))
 
 
 def test_strategy_runs_from_cli(tmp_path) -> None:

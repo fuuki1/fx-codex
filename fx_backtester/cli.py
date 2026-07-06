@@ -136,7 +136,9 @@ def main(argv: list[str] | None = None) -> int:
     gate_parser.add_argument("--embargo-bars", type=int, default=DEFAULT_CLI_VALUES["embargo_bars"])
     gate_parser.add_argument("--max-params", type=int, default=20)
     gate_parser.add_argument(
-        "--grid", action="append", default=[],
+        "--grid",
+        action="append",
+        default=[],
         help="Parameter grid item like fast_window=10,20. Can be repeated.",
     )
     gate_parser.add_argument("--dsr-min", type=float, default=0.95, help="DSR下限(未満は棄却)")
@@ -146,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     gate_parser.add_argument("--spa-bootstrap", type=int, default=1000)
     gate_parser.add_argument("--spa-seed", type=int, default=7)
     gate_parser.add_argument(
-        "--allow-drift", action="store_true",
+        "--allow-drift",
+        action="store_true",
         help="OOSドリフト検出をデプロイ拒否条件にしない(監視のみ)",
     )
     gate_parser.add_argument("--output-verdict", help="判定JSONの書き出し先(任意)")

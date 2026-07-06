@@ -33,7 +33,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-
 # ---------------------------------------------------------------- 分数次差分(FFD)
 
 

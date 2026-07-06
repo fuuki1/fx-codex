@@ -27,7 +27,6 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-
 # ---------------------------------------------------------------- フラクショナル・ケリー
 
 
@@ -60,8 +59,12 @@ def kelly_fraction_from_r_multiples(
     n = len(values)
     if n < min_trades:
         return KellyEstimate(
-            kelly_fraction=0.0, win_rate=0.0, payoff_ratio=0.0, sample_size=n,
-            usable=False, note=f"サンプル不足({n}/{min_trades}トレード)",
+            kelly_fraction=0.0,
+            win_rate=0.0,
+            payoff_ratio=0.0,
+            sample_size=n,
+            usable=False,
+            note=f"サンプル不足({n}/{min_trades}トレード)",
         )
 
     wins = [v for v in values if v > 0]
@@ -70,8 +73,11 @@ def kelly_fraction_from_r_multiples(
     win_rate = len(wins) / n
     if not wins or not losses:
         return KellyEstimate(
-            kelly_fraction=0.0, win_rate=round(win_rate, 4), payoff_ratio=0.0,
-            sample_size=n, usable=False,
+            kelly_fraction=0.0,
+            win_rate=round(win_rate, 4),
+            payoff_ratio=0.0,
+            sample_size=n,
+            usable=False,
             note="勝ちまたは負けが皆無でペイオフ比を定義できない",
         )
 
@@ -79,8 +85,12 @@ def kelly_fraction_from_r_multiples(
     avg_loss = sum(losses) / len(losses)
     if avg_loss <= 0:
         return KellyEstimate(
-            kelly_fraction=0.0, win_rate=round(win_rate, 4), payoff_ratio=0.0,
-            sample_size=n, usable=False, note="平均負けRが非正",
+            kelly_fraction=0.0,
+            win_rate=round(win_rate, 4),
+            payoff_ratio=0.0,
+            sample_size=n,
+            usable=False,
+            note="平均負けRが非正",
         )
     b = avg_win / avg_loss
     p = win_rate
@@ -89,8 +99,12 @@ def kelly_fraction_from_r_multiples(
     kelly = max(0.0, min(1.0, raw))
     note = f"f*={kelly:.3f} (勝率{p:.1%}, ペイオフ{b:.2f}, n={n})"
     return KellyEstimate(
-        kelly_fraction=round(kelly, 4), win_rate=round(p, 4),
-        payoff_ratio=round(b, 3), sample_size=n, usable=True, note=note,
+        kelly_fraction=round(kelly, 4),
+        win_rate=round(p, 4),
+        payoff_ratio=round(b, 3),
+        sample_size=n,
+        usable=True,
+        note=note,
     )
 
 
@@ -128,8 +142,10 @@ def fractional_kelly_risk_pct(
     blend = max(0.0, min(1.0, progress))
     risk = baseline_pct * (1.0 - blend) + target * blend
     risk = max(0.0, min(risk, max_risk_pct))
-    label = "クォーター" if abs(fraction - 0.25) < 1e-9 else (
-        "ハーフ" if abs(fraction - 0.5) < 1e-9 else f"×{fraction:g}"
+    label = (
+        "クォーター"
+        if abs(fraction - 0.25) < 1e-9
+        else ("ハーフ" if abs(fraction - 0.5) < 1e-9 else f"×{fraction:g}")
     )
     note = (
         f"{label}ケリー: f*{estimate.kelly_fraction:.3f}×{fraction:g}→目標{target:.2%}, "
@@ -188,8 +204,12 @@ def historical_var(
     tail = values[: rank + 1]  # 分位点以下(=最悪側)のテール
     cvar_pct = max(0.0, -(sum(tail) / len(tail))) if tail else var_pct
     return VaREstimate(
-        var_pct=round(var_pct, 6), cvar_pct=round(cvar_pct, 6),
-        confidence=confidence, sample_size=n, method="historical", usable=True,
+        var_pct=round(var_pct, 6),
+        cvar_pct=round(cvar_pct, 6),
+        confidence=confidence,
+        sample_size=n,
+        method="historical",
+        usable=True,
     )
 
 
@@ -218,8 +238,12 @@ def parametric_var(
     phi = math.exp(-0.5 * z * z) / math.sqrt(2 * math.pi)
     cvar_pct = max(0.0, -(mean - std * phi / alpha)) if alpha > 0 else var_pct
     return VaREstimate(
-        var_pct=round(var_pct, 6), cvar_pct=round(cvar_pct, 6),
-        confidence=confidence, sample_size=n, method="parametric", usable=True,
+        var_pct=round(var_pct, 6),
+        cvar_pct=round(cvar_pct, 6),
+        confidence=confidence,
+        sample_size=n,
+        method="parametric",
+        usable=True,
     )
 
 
@@ -248,14 +272,30 @@ def _inv_norm_cdf(p: float) -> float:
     """
     if not 0.0 < p < 1.0:
         raise ValueError("p must be in (0, 1)")
-    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-         6.680131188771972e+01, -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
-         3.754408661907416e+00]
+    a = [
+        -3.969683028665376e01,
+        2.209460984245205e02,
+        -2.759285104469687e02,
+        1.383577518672690e02,
+        -3.066479806614716e01,
+        2.506628277459239e00,
+    ]
+    b = [
+        -5.447609879822406e01,
+        1.615858368580409e02,
+        -1.556989798598866e02,
+        6.680131188771972e01,
+        -1.328068155288572e01,
+    ]
+    c = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e00,
+        -2.549732539343734e00,
+        4.374664141464968e00,
+        2.938163982698783e00,
+    ]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e00, 3.754408661907416e00]
     p_low = 0.02425
     p_high = 1.0 - p_low
     if p < p_low:
@@ -266,8 +306,10 @@ def _inv_norm_cdf(p: float) -> float:
     if p <= p_high:
         q = p - 0.5
         r = q * q
-        return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (
-            ((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0
+        return (
+            (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5])
+            * q
+            / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
         )
     q = math.sqrt(-2.0 * math.log(1.0 - p))
     return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (

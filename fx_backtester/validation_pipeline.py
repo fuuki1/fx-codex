@@ -158,9 +158,7 @@ def evaluate_deploy_gate(
             pbo_value = float(pbo_result["pbo"])
             metrics["pbo_detail"] = pbo_result
             if pbo_value >= config.pbo_max:
-                reasons.append(
-                    f"PBO {pbo_value:.3f} ≥ {config.pbo_max:.2f}(IS順位にOOS予測力なし)"
-                )
+                reasons.append(f"PBO {pbo_value:.3f} ≥ {config.pbo_max:.2f}(IS順位にOOS予測力なし)")
         except _GATE_ERRORS as error:
             reasons.append(f"PBOを計算できない({error})")
     else:
@@ -199,9 +197,7 @@ def evaluate_deploy_gate(
             "total": drift_scan.total,
         }
         if drift_points:
-            reasons.append(
-                f"OOS期間で勝率ドリフトを検出(点{drift_points})→要再学習(デプロイ保留)"
-            )
+            reasons.append(f"OOS期間で勝率ドリフトを検出(点{drift_points})→要再学習(デプロイ保留)")
 
     return DeployVerdict(
         deploy_ok=not reasons,

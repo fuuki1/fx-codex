@@ -11,7 +11,6 @@ import pytest
 
 from fx_intel.drift import ADWIN, scan_for_drift
 
-
 # ---------------------------------------------------------------- 基本挙動
 
 

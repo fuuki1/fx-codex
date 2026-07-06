@@ -95,9 +95,11 @@ class AIMetaLabeledStrategy(Strategy):
         side = self._primary_side(close)
 
         # --- トリプルバリア → メタラベル(side方向で利確に届いたか) ---
-        volatility = close.pct_change().rolling(
-            self.volatility_window, min_periods=self.volatility_window
-        ).std()
+        volatility = (
+            close.pct_change()
+            .rolling(self.volatility_window, min_periods=self.volatility_window)
+            .std()
+        )
         # イベント点: 既定は「一次方向が出た全バー」。CUSUM ON なら累積変化が
         # σ×cusum_multiple を超えた点だけに絞り(自己相関の間引き)、さらに一次方向が
         # 出ている点との積を取る(方向の無い点にはトリプルバリアを張れないため)。
@@ -146,9 +148,7 @@ class AIMetaLabeledStrategy(Strategy):
             # touch_ts が現時点以前に確定しているイベントだけを学習に使う
             matured = touch_ts[touch_ts.map(lambda t: positions.get(t, len(data)) < position)]
             train_index = matured.index.intersection(meta_y.index)
-            train_index = train_index[
-                features.reindex(train_index).notna().all(axis=1)
-            ]
+            train_index = train_index[features.reindex(train_index).notna().all(axis=1)]
             train_count = len(train_index)
             train_rows.at[timestamp] = train_count
             if train_count < self.min_train_bars:
@@ -214,8 +214,11 @@ class AIMetaLabeledStrategy(Strategy):
         """
         if self.secondary_model == "logistic":
             fitted = _fit_logistic(
-                train_features, train_labels,
-                learning_rate=self.learning_rate, epochs=self.epochs, l2=self.l2,
+                train_features,
+                train_labels,
+                learning_rate=self.learning_rate,
+                epochs=self.epochs,
+                l2=self.l2,
             )
             if fitted is None:
                 return None
@@ -269,9 +272,11 @@ class AIMetaLabeledStrategy(Strategy):
         output["rsi_scaled"] = (rsi(close, self.rsi_window) - 50) / 50
         output["atr_pct"] = atr / close
         output["range_pct"] = (high - low) / close.replace(0, pd.NA)
-        output["volatility"] = close.pct_change().rolling(
-            self.volatility_window, min_periods=self.volatility_window
-        ).std()
+        output["volatility"] = (
+            close.pct_change()
+            .rolling(self.volatility_window, min_periods=self.volatility_window)
+            .std()
+        )
         return _finite_frame(output)
 
     def _validate_params(self) -> None:

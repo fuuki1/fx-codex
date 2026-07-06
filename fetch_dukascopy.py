@@ -117,8 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             continue
         print(
-            f"  ✓ {result.out_path} — {result.bar_count}本 "
-            f"(ティック{result.tick_count}件)",
+            f"  ✓ {result.out_path} — {result.bar_count}本 " f"(ティック{result.tick_count}件)",
             file=sys.stderr,
         )
     return exit_code

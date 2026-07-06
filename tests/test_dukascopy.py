@@ -142,7 +142,9 @@ def test_bars_to_csv_rows_matches_backtester_schema() -> None:
 def test_bars_to_csv_rows_non_jpy_five_digits() -> None:
     bars = [dk.Bar(BASE, 1.08123, 1.08160, 1.08100, 1.08150, 5, 0.00008)]
     rows = dk.bars_to_csv_rows(bars, "EURUSD")
-    assert rows[1].startswith("2025-06-02 09:00:00,EURUSD,1.08123,1.08160,1.08100,1.08150,5,0.00008")
+    assert rows[1].startswith(
+        "2025-06-02 09:00:00,EURUSD,1.08123,1.08160,1.08100,1.08150,5,0.00008"
+    )
 
 
 # ---------------------------------------------------------------- fetch(モックセッション)
@@ -178,9 +180,7 @@ class _FakeSession:
 def test_fetch_ticks_uses_session_and_caches(tmp_path) -> None:
     raw = _make_bi5([(0, 143500, 143480, 1.0, 1.0)])
     session = _FakeSession({9: raw, 10: None})  # 10時は404(休場)
-    ticks = dk.fetch_ticks(
-        "USDJPY", BASE, BASE + timedelta(hours=1), tmp_path, session=session
-    )
+    ticks = dk.fetch_ticks("USDJPY", BASE, BASE + timedelta(hours=1), tmp_path, session=session)
     assert len(ticks) == 1
     assert ticks[0].bid == pytest.approx(143.480)
     # 9時・10時の2スロットを取得しに行っている
@@ -188,9 +188,7 @@ def test_fetch_ticks_uses_session_and_caches(tmp_path) -> None:
 
     # 2回目はキャッシュから読むのでネットワークに触れない
     session2 = _FakeSession({})
-    ticks2 = dk.fetch_ticks(
-        "USDJPY", BASE, BASE + timedelta(hours=1), tmp_path, session=session2
-    )
+    ticks2 = dk.fetch_ticks("USDJPY", BASE, BASE + timedelta(hours=1), tmp_path, session=session2)
     assert len(ticks2) == 1
     assert session2.calls == []  # キャッシュヒットで get 未呼び出し
 
@@ -206,7 +204,11 @@ def test_fetch_ticks_404_is_not_an_error(tmp_path) -> None:
 def test_fetch_ticks_rejects_oversized_range(tmp_path) -> None:
     with pytest.raises(ValueError):
         dk.fetch_ticks(
-            "USDJPY", BASE, BASE + timedelta(days=200), tmp_path, max_hours=24,
+            "USDJPY",
+            BASE,
+            BASE + timedelta(days=200),
+            tmp_path,
+            max_hours=24,
         )
 
 
@@ -221,9 +223,7 @@ def test_fetch_ticks_url_encodes_zero_based_month(tmp_path) -> None:
 
 
 def test_download_bars_csv_writes_readable_file(tmp_path) -> None:
-    raw = _make_bi5(
-        [(0, 143500, 143480, 1.0, 1.0), (1_800_000, 143600, 143580, 1.0, 1.0)]  # +30分
-    )
+    raw = _make_bi5([(0, 143500, 143480, 1.0, 1.0), (1_800_000, 143600, 143580, 1.0, 1.0)])  # +30分
     session = _FakeSession({9: raw})
     out = tmp_path / "out" / "USDJPY_1h.csv"
     result = dk.download_bars_csv(

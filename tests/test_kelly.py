@@ -15,7 +15,6 @@ from fx_backtester.kelly import (
     var_breached,
 )
 
-
 # ---------------------------------------------------------------- ケリー比率
 
 
@@ -77,7 +76,10 @@ def test_fractional_kelly_quarter_blends_with_sample() -> None:
     r = [1.0] * 60 + [-1.0] * 40  # n=100
     est = kelly_fraction_from_r_multiples(r, min_trades=50)
     risk, note = fractional_kelly_risk_pct(
-        est, baseline_pct=0.01, fraction=0.25, max_risk_pct=0.02,
+        est,
+        baseline_pct=0.01,
+        fraction=0.25,
+        max_risk_pct=0.02,
         full_confidence_trades=100,
     )
     # target=0.05 だが max_risk_pct=0.02 でクリップされる
@@ -89,7 +91,10 @@ def test_fractional_kelly_respects_max_cap() -> None:
     r = [3.0] * 70 + [-1.0] * 30  # 高エッジで f* 大
     est = kelly_fraction_from_r_multiples(r, min_trades=50)
     risk, _ = fractional_kelly_risk_pct(
-        est, baseline_pct=0.01, fraction=0.5, max_risk_pct=0.015,
+        est,
+        baseline_pct=0.01,
+        fraction=0.5,
+        max_risk_pct=0.015,
         full_confidence_trades=100,
     )
     assert risk <= 0.015  # ハーフでも上限を超えない
@@ -100,7 +105,10 @@ def test_fractional_kelly_partial_blend_between_bounds() -> None:
     r = [1.0] * 45 + [-1.0] * 30  # n=75, p=0.6, f*=0.2
     est = kelly_fraction_from_r_multiples(r, min_trades=50)
     risk, _ = fractional_kelly_risk_pct(
-        est, baseline_pct=0.01, fraction=0.1, max_risk_pct=0.05,
+        est,
+        baseline_pct=0.01,
+        fraction=0.1,
+        max_risk_pct=0.05,
         full_confidence_trades=100,
     )
     # target = 0.2*0.1 = 0.02。ブレンド (75-50)/(100-50)=0.5 → 0.01*0.5 + 0.02*0.5 = 0.015

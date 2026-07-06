@@ -124,7 +124,7 @@ def test_cusum_filter_no_events_when_flat() -> None:
 
 def test_triple_barrier_upper_hit_gives_plus_one() -> None:
     # 単調上昇で必ず上バリアに先着する
-    close = pd.Series([100.0 * (1.01 ** i) for i in range(30)], index=_index(30))
+    close = pd.Series([100.0 * (1.01**i) for i in range(30)], index=_index(30))
     vol = pd.Series(0.01, index=close.index)  # σ=1%
     labels = triple_barrier_labels(
         close, upper_multiple=2.0, lower_multiple=2.0, vertical_bars=10, volatility=vol
@@ -134,7 +134,7 @@ def test_triple_barrier_upper_hit_gives_plus_one() -> None:
 
 
 def test_triple_barrier_lower_hit_gives_minus_one() -> None:
-    close = pd.Series([100.0 * (0.99 ** i) for i in range(30)], index=_index(30))
+    close = pd.Series([100.0 * (0.99**i) for i in range(30)], index=_index(30))
     vol = pd.Series(0.01, index=close.index)
     labels = triple_barrier_labels(
         close, upper_multiple=2.0, lower_multiple=2.0, vertical_bars=10, volatility=vol
@@ -154,12 +154,16 @@ def test_triple_barrier_vertical_timeout_gives_zero() -> None:
 
 def test_triple_barrier_respects_side_for_short() -> None:
     # 下落系列でも side=-1(ショート)なら利確方向に届くので +1
-    close = pd.Series([100.0 * (0.99 ** i) for i in range(30)], index=_index(30))
+    close = pd.Series([100.0 * (0.99**i) for i in range(30)], index=_index(30))
     vol = pd.Series(0.01, index=close.index)
     side = pd.Series(-1, index=close.index)
     labels = triple_barrier_labels(
-        close, upper_multiple=2.0, lower_multiple=2.0, vertical_bars=10,
-        volatility=vol, side=side,
+        close,
+        upper_multiple=2.0,
+        lower_multiple=2.0,
+        vertical_bars=10,
+        volatility=vol,
+        side=side,
     )
     assert (labels["label"].iloc[:5] == 1).all()  # ショートが当たった=張って正解
 
@@ -199,9 +203,7 @@ def test_meta_labels_requires_label_column() -> None:
 
 
 def test_sample_weights_scale_with_absolute_return() -> None:
-    barriers = pd.DataFrame(
-        {"label": [1, 1, 1], "ret": [0.01, 0.02, 0.03]}, index=_index(3)
-    )
+    barriers = pd.DataFrame({"label": [1, 1, 1], "ret": [0.01, 0.02, 0.03]}, index=_index(3))
     weights = sample_weights_by_return(barriers)
     assert weights.mean() == pytest.approx(1.0)  # 平均1に正規化
     assert weights.iloc[2] > weights.iloc[0]  # 大きく動いたサンプルほど重い

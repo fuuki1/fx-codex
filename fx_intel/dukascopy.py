@@ -378,16 +378,24 @@ def download_bars_csv(
     if not bars:
         warnings.append(f"{symbol} {timeframe}: 集約後のバーが0本(ティック{len(ticks)}件)")
         return DownloadResult(
-            symbol=symbol, timeframe=timeframe, tick_count=len(ticks),
-            bar_count=0, out_path=None, warnings=warnings,
+            symbol=symbol,
+            timeframe=timeframe,
+            tick_count=len(ticks),
+            bar_count=0,
+            out_path=None,
+            warnings=warnings,
         )
     rows = bars_to_csv_rows(bars, symbol)
     destination = Path(out_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return DownloadResult(
-        symbol=symbol, timeframe=timeframe, tick_count=len(ticks),
-        bar_count=len(bars), out_path=destination, warnings=warnings,
+        symbol=symbol,
+        timeframe=timeframe,
+        tick_count=len(ticks),
+        bar_count=len(bars),
+        out_path=destination,
+        warnings=warnings,
     )
 
 
@@ -412,7 +420,9 @@ def make_future_price_provider(
     """
     tf_normalized = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
-    def provider(symbol: str, timeframe: str, target_time: datetime, tolerance_hours: float) -> float | None:
+    def provider(
+        symbol: str, timeframe: str, target_time: datetime, tolerance_hours: float
+    ) -> float | None:
         if timeframe not in tf_normalized and timeframe != "":
             return None
         target = target_time if target_time.tzinfo else target_time.replace(tzinfo=UTC)
