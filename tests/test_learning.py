@@ -513,12 +513,75 @@ def test_profile_save_and_load_roundtrip(tmp_path) -> None:
     assert loaded.conviction_brier_base == profile.conviction_brier_base
     assert loaded.condition_stats == profile.condition_stats
     assert loaded.condition_factors == profile.condition_factors
+    assert loaded.expectancy == profile.expectancy
     assert loaded.notes_ja == profile.notes_ja
     # 復元したプロファイルでも状態別の減衰がそのまま機能する
     assert (
         loaded.condition_adjustment({"rsi_1h": 80.0}, "long")[0]
         == profile.condition_adjustment({"rsi_1h": 80.0}, "long")[0]
     )
+
+
+def test_profile_save_and_load_preserves_expectancy_summary(tmp_path) -> None:
+    expectancy = {
+        "overall": {
+            "evaluated": 25,
+            "tradable": 25,
+            "min_samples": 20,
+            "sample_ok": True,
+            "expectancy_r": -0.1,
+        }
+    }
+    profile = learning.derive_profile([], now=NOW, expectancy_summary=expectancy)
+    path = tmp_path / "learning_expectancy.json"
+
+    learning.save_profile(profile, path)
+    loaded = learning.load_profile(path)
+
+    assert loaded.expectancy == expectancy
+    assert any("期待R" in note for note in loaded.notes_ja)
+
+
+def test_expectancy_adjustment_blocks_negative_expectancy() -> None:
+    profile = learning.LearnedProfile(
+        expectancy={
+            "by_symbol": {
+                "USDJPY": {
+                    "tradable": 20,
+                    "min_samples": 20,
+                    "sample_ok": True,
+                    "expectancy_r": -0.2,
+                    "profit_factor_r": 0.8,
+                }
+            }
+        }
+    )
+
+    factor, reason = profile.expectancy_adjustment("USDJPY", "long")
+
+    assert factor == learning.EXPECTANCY_BLOCK_FACTOR
+    assert "期待R" in reason and "非正" in reason
+    assert profile.expectancy_adjustment("USDJPY", "neutral") == (1.0, "")
+
+
+def test_expectancy_adjustment_marks_sample_guard() -> None:
+    profile = learning.LearnedProfile(
+        expectancy={
+            "by_direction": {
+                "long": {
+                    "tradable": 6,
+                    "min_samples": 20,
+                    "sample_ok": False,
+                    "expectancy_r": 0.3,
+                }
+            }
+        }
+    )
+
+    factor, reason = profile.expectancy_adjustment("EURUSD", "long")
+
+    assert factor == learning.EXPECTANCY_WEAK_FACTOR
+    assert "期待値サンプル不足" in reason
 
 
 def test_load_profile_missing_or_corrupt_returns_default(tmp_path) -> None:
@@ -690,6 +753,24 @@ def test_build_trade_plan_condition_adjuster_damps_and_explains() -> None:
     assert damped.direction == baseline.direction
     assert damped.conviction == round(baseline.conviction * 0.7)
     assert any("学習調整" in w and "買われすぎ圏" in w for w in damped.warnings)
+
+
+def test_build_trade_plan_expectancy_adjuster_damps_and_explains() -> None:
+    baseline = briefing.build_trade_plan("USDJPY", bullish_tech(), CURRENCIES, [], [], now=NOW)
+    received: list[tuple[str, str]] = []
+
+    def adjuster(symbol, direction):
+        received.append((symbol, direction))
+        return learning.EXPECTANCY_BLOCK_FACTOR, "通貨ペア USDJPYの期待Rは-0.20Rで非正"
+
+    damped = briefing.build_trade_plan(
+        "USDJPY", bullish_tech(), CURRENCIES, [], [], now=NOW, expectancy_adjuster=adjuster
+    )
+
+    assert received == [("USDJPY", "long")]
+    assert damped.direction == baseline.direction
+    assert damped.conviction == round(baseline.conviction * learning.EXPECTANCY_BLOCK_FACTOR)
+    assert any("期待値ガード" in warning and "非正" in warning for warning in damped.warnings)
 
 
 def test_condition_adjuster_skipped_for_non_directional_plans() -> None:

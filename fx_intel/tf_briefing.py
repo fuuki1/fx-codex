@@ -21,6 +21,7 @@ from .briefing import (
     COLOR_STANDBY,
     JST,
     REGIME_HINT_JA,
+    _data_fetch_report_lines,
     _events_lines,
     _sentiment_lines,
     format_price,
@@ -127,6 +128,22 @@ def _symbol_embed(
     }
 
 
+def _timeframe_technical_status(plans_by_symbol: Mapping[str, Sequence[TimeframePlan]]) -> str:
+    if not plans_by_symbol:
+        return "テクニカル: 対象ペアなし"
+
+    parts = []
+    fully_available = 0
+    for symbol, plans in plans_by_symbol.items():
+        available = sum(1 for plan in plans if plan.close is not None)
+        if available >= 4:
+            fully_available += 1
+        parts.append(f"{symbol} {available}/4足")
+
+    status = "取得OK" if fully_available == len(plans_by_symbol) else "一部取得"
+    return f"テクニカル: {status} ({', '.join(parts)})"
+
+
 def build_timeframe_discord_payload(
     plans_by_symbol: Mapping[str, Sequence[TimeframePlan]],
     analysis: MarketAnalysis,
@@ -137,6 +154,9 @@ def build_timeframe_discord_payload(
     journal_note: str = "",
     aux_reports_by_symbol: Mapping[str, Mapping[str, str]] | None = None,
     now: datetime | None = None,
+    news_count: int | None = None,
+    calendar_event_count: int | None = None,
+    calendar_ok: bool | None = None,
 ) -> dict:
     """時間足別ブリーフィングのDiscord Webデータを組み立てる。
 
@@ -200,14 +220,23 @@ def build_timeframe_discord_payload(
                 "inline": False,
             }
         )
-    if fetch_warnings:
-        macro_fields.append(
-            {
-                "name": "データ取得の注意",
-                "value": "\n".join(f"・{w}" for w in list(fetch_warnings)[:6]),
-                "inline": False,
-            }
-        )
+    macro_fields.append(
+        {
+            "name": "データ取得状況",
+            "value": "\n".join(
+                _data_fetch_report_lines(
+                    tech_status=_timeframe_technical_status(plans_by_symbol),
+                    analysis=analysis,
+                    events_48h=events_48h,
+                    fetch_warnings=fetch_warnings,
+                    news_count=news_count,
+                    calendar_event_count=calendar_event_count,
+                    calendar_ok=calendar_ok,
+                )
+            )[:1024],
+            "inline": False,
+        }
+    )
     macro_fields.append(
         {
             "name": "📘 用語ミニ解説(FX初心者向け)",

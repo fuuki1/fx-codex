@@ -270,7 +270,7 @@ def build_timeframe_plan(
         },
         {
             "key": "news",
-            "label_ja": "ニュース",
+            "label_ja": "AI/ニュース",
             "score": news_score,
             "weight": round(news_weight / total_weight, 3) if total_weight else 0.0,
         },

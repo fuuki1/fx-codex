@@ -37,6 +37,7 @@ from .briefing import (
     ScoreComponent,
     TradePlan,
     build_trade_plan,
+    _data_quality,
     _extract_features,
 )
 from .calendar import RiskWindow, symbol_currencies
@@ -124,6 +125,13 @@ def ml_opinion(
     score = round(p_long - p_short, 3)
     if abs(score) < ML_MIN_EDGE:
         return None
+    rationale_ja = [
+        f"的中確率 ロング{p_long:.0%} vs ショート{p_short:.0%}",
+    ]
+    if artifact.val_brier is not None and artifact.baseline_brier is not None:
+        rationale_ja.append(
+            f"検証Brier {artifact.val_brier:.3f}(基準率 {artifact.baseline_brier:.3f})"
+        )
     return Opinion(
         role="ml",
         label_ja="ML委員(GBDT確率モデル)",
@@ -131,14 +139,7 @@ def ml_opinion(
         weight=ML_WEIGHT,
         stage=stage,
         active=stage in STAGE_ACTIVE,
-        rationale_ja=[
-            f"的中確率 ロング{p_long:.0%} vs ショート{p_short:.0%}",
-            (
-                f"検証Brier {artifact.val_brier:.3f}(基準率 {artifact.baseline_brier:.3f})"
-                if artifact.val_brier is not None and artifact.baseline_brier is not None
-                else ""
-            ),
-        ],
+        rationale_ja=rationale_ja,
     )
 
 
@@ -156,6 +157,7 @@ def deliberate(
     news_weight: float = NEWS_WEIGHT,
     conviction_factor: float = 1.0,
     condition_adjuster: Callable[[Mapping[str, float], str], tuple[float, str]] | None = None,
+    expectancy_adjuster: Callable[[str, str], tuple[float, str]] | None = None,
     macro_snapshot: MacroSnapshot | None = None,
     ml_artifact: MLArtifact | None = None,
     stages: Mapping[str, str] | None = None,
@@ -184,6 +186,9 @@ def deliberate(
 
     relevant_count = sum(1 for item in news_items if _relevance(item) > 0)
     chart_features = _extract_features(tech, relevant_count)
+    # build_trade_plan と同一の式でデータ品質を先に確定させ、ML委員へ渡す。
+    # ここで None を渡すと学習時(実値)と推論時(中央値補完)で特徴量がずれる
+    data_quality = _data_quality(tech.coverage(), relevant_count, calendar_ok)
 
     opinions: list[Opinion] = []
     macro = macro_opinion(symbol, macro_snapshot, stage=stages.get("macro", "shadow"))
@@ -194,7 +199,7 @@ def deliberate(
         tech_score,
         news_score,
         chart_features,
-        data_quality=None,  # 品質はbuild_trade_plan内で確定するため学習時は中央値補完
+        data_quality=data_quality,  # 学習時(build_dataset)と同じ実値を渡す
         stage=stages.get("ml", "shadow"),
     )
     if ml is not None:
@@ -233,6 +238,7 @@ def deliberate(
         news_weight=news_weight,
         conviction_factor=conviction_factor,
         condition_adjuster=condition_adjuster,
+        expectancy_adjuster=expectancy_adjuster,
         extra_components=extra_components,
         extra_features=extra_features,
         committee_notes=committee_notes,

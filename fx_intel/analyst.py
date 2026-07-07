@@ -46,7 +46,6 @@ VOLUME_SHRINK_K = 3.0  # 確信度の物量項 n/(n+K)
 HEDGE_DAMPEN = 0.7
 NEGATION_FLIP = -0.6  # 否定は単純反転でなく弱めて反転(「not hawkish」≠「dovish」)
 INTENSIFIER_BOOST = 1.3
-NEGATION_WINDOW_CHARS = 32  # フレーズ直前のこの範囲に否定語があれば反転
 
 # ソース信頼度(未知ソースは0.8)。専門メディアを優先する
 SOURCE_WEIGHTS = {"fxstreet": 1.0, "reuters": 1.0, "bloomberg": 1.0}
@@ -115,6 +114,8 @@ NEGATIVE_PHRASES: tuple[tuple[str, float, str], ...] = (
     ("weak", 0.25, "growth"),
 )
 
+POLARITY_PHRASES = tuple(phrase for phrase, _, _ in POSITIVE_PHRASES + NEGATIVE_PHRASES)
+
 NEGATION_TERMS = (
     "not ",
     "no ",
@@ -133,6 +134,16 @@ NEGATION_TERMS = (
     "delay ",
     "postpones",
 )
+
+
+def _term_pattern(term: str) -> str:
+    return re.escape(term.strip()).replace(r"\ ", r"\s+")
+
+
+_NEGATION_RE = re.compile(
+    "|".join(rf"(?<![a-z0-9]){_term_pattern(term)}(?![a-z0-9])" for term in NEGATION_TERMS)
+)
+_CLAUSE_BOUNDARY_RE = re.compile(r"[,.;:!?]|\b(?:but|however|while|whereas|although|though)\b")
 
 HEDGE_TERMS = (
     "may ",
@@ -226,6 +237,8 @@ class _CurrencyEvidence:
     weighted_abs: float = 0.0
     effective_items: float = 0.0  # 鮮度・ソース重み込みの実効見出し数
     headline_count: int = 0
+    positives: int = 0
+    negatives: int = 0
     theme_weights: dict[str, float] = field(default_factory=dict)
 
 
@@ -236,6 +249,28 @@ def _source_weight(source: str) -> float:
 def _recency_weight(published: datetime, now: datetime) -> float:
     age_hours = max(0.0, (now - published).total_seconds() / 3600.0)
     return math.pow(0.5, age_hours / RECENCY_HALF_LIFE_HOURS)
+
+
+def _clause_start(lowered: str, index: int) -> int:
+    start = 0
+    for match in _CLAUSE_BOUNDARY_RE.finditer(lowered, 0, index):
+        start = match.end()
+    return start
+
+
+def _has_polarity_phrase(lowered: str, start: int, end: int) -> bool:
+    segment = lowered[start:end]
+    return any(phrase in segment for phrase in POLARITY_PHRASES)
+
+
+def _is_negated(lowered: str, phrase_index: int) -> bool:
+    clause_start = _clause_start(lowered, phrase_index)
+    negation: re.Match[str] | None = None
+    for match in _NEGATION_RE.finditer(lowered, clause_start, phrase_index):
+        negation = match
+    if negation is None:
+        return False
+    return not _has_polarity_phrase(lowered, negation.end(), phrase_index)
 
 
 def _phrase_hits(
@@ -252,8 +287,7 @@ def _phrase_hits(
         if index < 0:
             continue
         contribution = polarity * weight
-        window = lowered[max(0, index - NEGATION_WINDOW_CHARS) : index]
-        if any(term in window for term in NEGATION_TERMS):
+        if _is_negated(lowered, index):
             contribution *= NEGATION_FLIP
         hits.append((contribution, theme))
     return hits
@@ -274,6 +308,16 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 def _normalize(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text.lower())
+
+
+def _add_evidence(agg: _CurrencyEvidence, value: float, theme: str) -> None:
+    agg.weighted_sum += value
+    agg.weighted_abs += abs(value)
+    agg.theme_weights[theme] = agg.theme_weights.get(theme, 0.0) + abs(value)
+    if value > 0:
+        agg.positives += 1
+    elif value < 0:
+        agg.negatives += 1
 
 
 def score_headlines(
@@ -309,16 +353,12 @@ def score_headlines(
             if ccy in item.currencies:
                 for contribution, theme in hits:
                     value = contribution * modifier * item_weight
-                    agg.weighted_sum += value
-                    agg.weighted_abs += abs(value)
-                    agg.theme_weights[theme] = agg.theme_weights.get(theme, 0.0) + abs(value)
+                    _add_evidence(agg, value, theme)
             # 「USD/JPY rises」型の構文は方向が明確なので重め(0.7)に加算
             move = move_scores.get(ccy, 0.0)
             if move:
                 value = (0.7 if move > 0 else -0.7) * item_weight
-                agg.weighted_sum += value
-                agg.weighted_abs += abs(value)
-                agg.theme_weights["flow"] = agg.theme_weights.get("flow", 0.0) + abs(value)
+                _add_evidence(agg, value, "flow")
 
     result: dict[str, CurrencySentiment] = {}
     for ccy in sorted(universe):
@@ -337,19 +377,10 @@ def score_headlines(
                 direction = 1 if agg.weighted_sum > 0 else -1
                 sentiment.comment = COMMENT_JA.get((top_themes[0][0], direction), "")
             # 集計の生カウント(表示・デバッグ用)
-            sentiment.positives = sum(1 for c, _ in _count_signs(agg) if c > 0)
-            sentiment.negatives = sum(1 for c, _ in _count_signs(agg) if c < 0)
+            sentiment.positives = agg.positives
+            sentiment.negatives = agg.negatives
         result[ccy] = sentiment
     return result
-
-
-def _count_signs(agg: _CurrencyEvidence) -> list[tuple[float, None]]:
-    """positives/negatives表示用の擬似カウント(合計符号ベース)。"""
-    if agg.weighted_sum > 0:
-        return [(1.0, None)]
-    if agg.weighted_sum < 0:
-        return [(-1.0, None)]
-    return []
 
 
 def detect_regime_from_headlines(items: Sequence[NewsItem]) -> tuple[str, str]:

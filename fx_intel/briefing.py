@@ -184,6 +184,22 @@ def _tech_score(tech: PairTechnicals) -> tuple[float, str]:
     return _clip(alignment + MA_AGREEMENT_BONUS * ma_dir), ma_note
 
 
+def _data_quality(tech_cov: float, relevant_news_count: int, calendar_ok: bool) -> float:
+    """根拠データの揃い具合(0.0〜1.0)。テクニカル・ニュース・カレンダーの加重。
+
+    build_trade_plan の方向見送りゲートと、committee のML委員特徴量が同じ値を
+    共有するための単一の真実の出所。両者で別々に計算すると train/serve skew に
+    なるため、必ずここを通す。
+    """
+    news_cov = min(1.0, relevant_news_count / NEWS_FULL_COVERAGE_COUNT)
+    return round(
+        QUALITY_TECH_WEIGHT * tech_cov
+        + QUALITY_NEWS_WEIGHT * news_cov
+        + QUALITY_CALENDAR_WEIGHT * (1.0 if calendar_ok else 0.0),
+        3,
+    )
+
+
 def _extract_features(tech: PairTechnicals, news_count: int) -> dict[str, float]:
     """判断時点のチャート状態を学習用の特徴量にする(取得できたものだけ)。
 
@@ -230,6 +246,66 @@ def _interval_summary(tech: PairTechnicals) -> str:
     return " | ".join(parts) if parts else "テクニカル取得失敗"
 
 
+def _trade_plan_technical_status(plans: Sequence[TradePlan]) -> str:
+    if not plans:
+        return "テクニカル: 対象ペアなし"
+
+    parts = []
+    fully_available = 0
+    for plan in plans:
+        available = sum(
+            1 for interval in ("15m", "1h", "4h", "1d") if f"{interval} " in plan.interval_summary
+        )
+        if available >= 4:
+            fully_available += 1
+        parts.append(f"{plan.symbol} {available}/4足")
+
+    status = "取得OK" if fully_available == len(plans) else "一部取得"
+    return f"テクニカル: {status} ({', '.join(parts)})"
+
+
+def _data_fetch_report_lines(
+    *,
+    tech_status: str,
+    analysis: MarketAnalysis,
+    events_48h: Sequence[EconomicEvent],
+    fetch_warnings: Sequence[str],
+    news_count: int | None = None,
+    calendar_event_count: int | None = None,
+    calendar_ok: bool | None = None,
+) -> list[str]:
+    engine_ja = {
+        "claude": "Claude分析",
+        "analyst": "自前分析エンジン",
+        "lexicon": "語彙分析",
+    }.get(analysis.engine, analysis.engine)
+    if news_count is None:
+        news_count = sum(c.headline_count for c in analysis.currencies.values())
+        news_label = "通貨別の延べ記事"
+    else:
+        news_label = "記事"
+
+    if calendar_ok is False:
+        calendar_status = "取得注意"
+    elif calendar_ok is True or calendar_event_count is not None or events_48h:
+        calendar_status = "取得OK"
+    else:
+        calendar_status = "状態未確認"
+    total_events = "" if calendar_event_count is None else f" / 全イベント{calendar_event_count}件"
+
+    lines = [
+        f"・{tech_status}",
+        f"・ニュース: 取得OK ({news_label}{news_count}件)",
+        f"・経済指標: {calendar_status} (今後48hの高重要イベント{len(events_48h)}件{total_events})",
+        f"・AI/分析: {engine_ja}",
+    ]
+    if fetch_warnings:
+        lines.extend(f"・注意: {warning}" for warning in list(fetch_warnings)[:6])
+    else:
+        lines.append("・注意: なし")
+    return lines
+
+
 def _event_warnings(
     windows: Sequence[RiskWindow], now: datetime, lookahead_hours: float = 12.0
 ) -> tuple[bool, list[str]]:
@@ -266,6 +342,7 @@ def build_trade_plan(
     news_weight: float = NEWS_WEIGHT,
     conviction_factor: float = 1.0,
     condition_adjuster: Callable[[Mapping[str, float], str], tuple[float, str]] | None = None,
+    expectancy_adjuster: Callable[[str, str], tuple[float, str]] | None = None,
     extra_components: Sequence[ScoreComponent] = (),
     extra_features: Mapping[str, float] | None = None,
     committee_notes: Sequence[str] = (),
@@ -288,6 +365,11 @@ def build_trade_plan(
     受けて(減衰係数, 理由文)を返し、係数<1.0なら確信度を減衰して理由を
     注意点に載せる。方向が決まった後(long/shortのときだけ)呼ばれ、
     方向判断そのものは変えない。
+
+    expectancy_adjuster は「MFE/MAE/TP/SL採点から見てこのペア・方向に
+    実行期待値があるか」を判定するフック。(symbol, "long"/"short")を
+    受けて(減衰係数, 理由文)を返し、係数<1.0なら確信度を減衰して理由を
+    注意点に載せる。方向判断そのものは変えない。
 
     extra_components はマクロ・MLなど追加委員の意見(committee.py参照)。
     複合スコアは全委員の重み付き平均になり、重みは全体で正規化するため
@@ -316,7 +398,7 @@ def build_trade_plan(
         },
         {
             "key": "news",
-            "label_ja": "ニュース",
+            "label_ja": "AI/ニュース",
             "score": news_score,
             "weight": round(news_weight / total_weight, 3),
         },
@@ -351,13 +433,7 @@ def build_trade_plan(
 
     # データ品質: 根拠データの揃い具合。確信度の減衰と方向判断の見送りに使う
     tech_cov = tech.coverage()
-    news_cov = min(1.0, len(relevant_items) / NEWS_FULL_COVERAGE_COUNT)
-    quality = round(
-        QUALITY_TECH_WEIGHT * tech_cov
-        + QUALITY_NEWS_WEIGHT * news_cov
-        + QUALITY_CALENDAR_WEIGHT * (1.0 if calendar_ok else 0.0),
-        3,
-    )
+    quality = _data_quality(tech_cov, len(relevant_items), calendar_ok)
     conviction = min(100, round(abs(composite) * 100 * quality))
 
     in_event_window, warnings = _event_warnings(windows, now)
@@ -423,6 +499,14 @@ def build_trade_plan(
         if condition_factor < 1.0 and condition_reason:
             conviction = round(conviction * condition_factor)
             warnings.append(f"📉 学習調整: {condition_reason}")
+
+    # 期待値ガード: TP/SL到達やMFE/MAEの実績から、実行期待値が薄い条件を減衰
+    if expectancy_adjuster is not None and direction in ("long", "short"):
+        expectancy_factor, expectancy_reason = expectancy_adjuster(symbol, direction)
+        expectancy_factor = max(0.0, min(1.0, expectancy_factor))
+        if expectancy_factor < 1.0 and expectancy_reason:
+            conviction = round(conviction * expectancy_factor)
+            warnings.append(f"📉 期待値ガード: {expectancy_reason}")
 
     close = tech.close()
     atr = tech.atr()
@@ -527,7 +611,7 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
     else:
         parts = (
             f"テクニカル {plan.tech_score:+.2f}({plan.tech_weight:.0%})"
-            f" + ニュース {plan.news_score:+.2f}({plan.news_weight:.0%})"
+            f" + AI/ニュース {plan.news_score:+.2f}({plan.news_weight:.0%})"
         )
     breakdown = (
         f"根拠の内訳: {parts}"
@@ -611,6 +695,9 @@ def build_discord_payload(
     learning_note: str = "",
     promotion_note: str = "",
     now: datetime | None = None,
+    news_count: int | None = None,
+    calendar_event_count: int | None = None,
+    calendar_ok: bool | None = None,
 ) -> dict:
     """Discord Webhook用のペイロードを組み立てる。"""
     now = now or datetime.now(UTC)
@@ -667,14 +754,23 @@ def build_discord_payload(
                 "inline": False,
             }
         )
-    if fetch_warnings:
-        macro_fields.append(
-            {
-                "name": "データ取得の注意",
-                "value": "\n".join(f"・{w}" for w in list(fetch_warnings)[:6]),
-                "inline": False,
-            }
-        )
+    macro_fields.append(
+        {
+            "name": "データ取得状況",
+            "value": "\n".join(
+                _data_fetch_report_lines(
+                    tech_status=_trade_plan_technical_status(plans),
+                    analysis=analysis,
+                    events_48h=events_48h,
+                    fetch_warnings=fetch_warnings,
+                    news_count=news_count,
+                    calendar_event_count=calendar_event_count,
+                    calendar_ok=calendar_ok,
+                )
+            )[:1024],
+            "inline": False,
+        }
+    )
     macro_fields.append(
         {
             "name": "📘 用語ミニ解説(FX初心者向け)",

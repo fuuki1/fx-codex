@@ -65,6 +65,7 @@ from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from .briefing import CONFLICT_THRESHOLD, NEWS_WEIGHT, TECH_WEIGHT
+from .coerce import to_int
 from .journal import (
     DEFAULT_ATR_FRACTION,
     DEFAULT_HORIZON_HOURS,
@@ -104,6 +105,11 @@ MIN_CONDITION_SAMPLES = 12  # バケット×方向のセルごとに必要な採
 CONDITION_FACTOR_MIN = 0.7
 CONDITION_HIT_RATE_TRIGGER = 0.45  # これ未満のセルだけ減衰対象
 CONDITION_NOTABLE_DELTA = 0.10  # 全体的中率から±これ以上ずれたら学習メモに載せる
+
+# MFE/MAE/TP/SL期待値ガード。サンプル不足は弱い減衰、期待R非正は強い減衰。
+EXPECTANCY_BLOCK_FACTOR = 0.45
+EXPECTANCY_WEAK_FACTOR = 0.80
+EXPECTANCY_MIN_PROFIT_FACTOR = 1.05
 
 DIRECTION_LABEL_JA = {"long": "ロング", "short": "ショート"}
 
@@ -279,6 +285,10 @@ class LearnedProfile:
     condition_stats: dict[str, dict[str, dict[str, dict[str, int]]]] = field(default_factory=dict)
     # 苦手な状態×方向の減衰係数: {特徴量キー: {バケット名: {"long"/"short": 係数}}}
     condition_factors: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    # MFE/MAE/TP/SLベースの期待値サマリー(trade_outcome.summarize_expectancy)。
+    # 期待値はまず保存・表示だけに使い、重み変更はサンプルと品質が十分な時だけ
+    # 後続フェーズで明示的に接続する。
+    expectancy: dict[str, object] = field(default_factory=dict)
     notes_ja: list[str] = field(default_factory=list)
 
     @property
@@ -333,6 +343,17 @@ class LearnedProfile:
             if worst is None or factor < worst[0]:
                 worst = (factor, reason)
         return worst if worst is not None else (1.0, "")
+
+    def expectancy_adjustment(self, symbol: str, direction: str) -> tuple[float, str]:
+        """MFE/MAE/TP/SL期待値が悪い条件なら(減衰係数, 理由)を返す。
+
+        briefing.build_trade_plan の expectancy_adjuster に渡すためのフック。
+        通貨ペア別、方向別、全体の順に一致する統計を見て、最も厳しい係数を
+        1つだけ適用する。複数条件を掛け合わせると過剰減衰になりやすいため。
+        """
+        if direction not in ("long", "short"):
+            return 1.0, ""
+        return expectancy_adjustment_from_summary(self.expectancy, symbol, direction)
 
     def summary_ja(self) -> str:
         """Discord表示用の学習メモ。"""
@@ -593,6 +614,7 @@ def derive_profile(
     now: datetime | None = None,
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
     horizon_label: str = "約24時間後",
+    expectancy_summary: Mapping[str, object] | None = None,
 ) -> LearnedProfile:
     """採点済みの判断一覧から学習プロファイルを導く。
 
@@ -693,8 +715,10 @@ def derive_profile(
         symbol_factors=symbol_factors,
         condition_stats=condition_stats,
         condition_factors=condition_factors,
+        expectancy=dict(expectancy_summary or {}),
     )
     profile.notes_ja = _build_notes_ja(profile, weights_adjusted, tech_n, news_n, horizon_label)
+    profile.notes_ja.extend(_expectancy_notes_ja(profile.expectancy))
     profile.notes_ja.extend(reflection_report_ja(scored))
     return profile
 
@@ -810,6 +834,160 @@ def _build_notes_ja(
             f" → 確信度を×{factor:.2f}に減衰して慎重に評価"
         )
     return notes
+
+
+def _expectancy_notes_ja(expectancy: Mapping[str, object]) -> list[str]:
+    """MFE/MAE/TP/SLベースの期待値サマリーを学習メモ用に整形する。"""
+    overall = expectancy.get("overall")
+    if not isinstance(overall, Mapping):
+        return []
+    evaluated = _int_from_mapping(overall, "evaluated")
+    tradable = _int_from_mapping(overall, "tradable")
+    low_quality = _int_from_mapping(overall, "low_quality")
+    if evaluated <= 0:
+        return []
+    if tradable <= 0:
+        return [
+            f"トレード期待値採点: 評価候補{evaluated}件はSL/TPまたは経路価格が不足"
+            "しており期待Rは参考外"
+        ]
+
+    sample_ok = bool(overall.get("sample_ok"))
+    min_samples = _int_from_mapping(overall, "min_samples")
+    sample_note = "" if sample_ok else f"（学習反映は{min_samples}件から。現在{tradable}件）"
+    expectancy_r = _number_from_mapping(overall, "expectancy_r")
+    profit_factor = _number_from_mapping(overall, "profit_factor_r")
+    tp1_rate = _number_from_mapping(overall, "tp1_rate")
+    tp2_rate = _number_from_mapping(overall, "tp2_rate")
+    sl_rate = _number_from_mapping(overall, "sl_rate")
+    avg_mfe = _number_from_mapping(overall, "avg_mfe_r")
+    avg_mae = _number_from_mapping(overall, "avg_mae_r")
+    notes = [
+        "トレード期待値採点(MFE/MAE/TP/SL): "
+        f"期待R {_fmt_signed(expectancy_r, 'R')} / PF {_fmt_number(profit_factor)}"
+        f" / TP1 {_fmt_pct(tp1_rate)} / TP2 {_fmt_pct(tp2_rate)} / SL {_fmt_pct(sl_rate)}"
+        f" / 平均MFE {_fmt_signed(avg_mfe, 'R')} / 平均MAE {_fmt_number(avg_mae, 'R')}"
+        f" (n={tradable}/{evaluated}){sample_note}"
+    ]
+    quality = expectancy.get("quality")
+    if isinstance(quality, Mapping):
+        avg_quality = _number_from_mapping(quality, "avg_path_quality")
+        flags = quality.get("flags")
+        close_only = 0
+        if isinstance(flags, Mapping):
+            close_only = int(flags.get("close_only_path", 0) or 0)
+        if low_quality or close_only:
+            notes.append(
+                "経路データ品質: "
+                f"平均{_fmt_pct(avg_quality)} / 低品質{low_quality}件"
+                f" / close系列のみ{close_only}件"
+                "（high/low未使用のためTP/SL到達順は保守的な参考値）"
+            )
+    return notes
+
+
+def expectancy_adjustment_from_summary(
+    expectancy_summary: Mapping[str, object],
+    symbol: str,
+    direction: str,
+) -> tuple[float, str]:
+    """期待値サマリーから、指定ペア・方向の確信度減衰係数を返す。"""
+    if not isinstance(expectancy_summary, Mapping) or direction not in ("long", "short"):
+        return 1.0, ""
+    worst: tuple[float, str] = (1.0, "")
+    for label, stats in _matching_expectancy_stats(symbol, direction, expectancy_summary):
+        factor, reason = _expectancy_guard_for_stats(label, stats)
+        if factor < worst[0]:
+            worst = (factor, reason)
+    return worst
+
+
+def _matching_expectancy_stats(
+    symbol: str,
+    direction: str,
+    expectancy_summary: Mapping[str, object],
+) -> list[tuple[str, Mapping[str, object]]]:
+    output: list[tuple[str, Mapping[str, object]]] = []
+    normalized_symbol = symbol.upper()
+    by_symbol = expectancy_summary.get("by_symbol")
+    if isinstance(by_symbol, Mapping):
+        stats = by_symbol.get(normalized_symbol) or by_symbol.get(symbol)
+        if isinstance(stats, Mapping):
+            output.append((f"通貨ペア {normalized_symbol}", stats))
+    by_direction = expectancy_summary.get("by_direction")
+    if isinstance(by_direction, Mapping):
+        stats = by_direction.get(direction)
+        if isinstance(stats, Mapping):
+            direction_ja = DIRECTION_LABEL_JA.get(direction, direction)
+            output.append((f"方向 {direction_ja}", stats))
+    overall = expectancy_summary.get("overall")
+    if isinstance(overall, Mapping):
+        output.append(("全体", overall))
+    return output
+
+
+def _expectancy_guard_for_stats(
+    label: str,
+    stats: Mapping[str, object],
+) -> tuple[float, str]:
+    tradable = _int_from_mapping(stats, "tradable")
+    if tradable <= 0:
+        return 1.0, ""
+
+    min_samples = _int_from_mapping(stats, "min_samples")
+    sample_text = f"n={tradable}" + (f"/{min_samples}" if min_samples else "")
+    sample_ok = bool(stats.get("sample_ok"))
+    expectancy_r = _number_from_mapping(stats, "expectancy_r")
+    profit_factor = _number_from_mapping(stats, "profit_factor_r")
+    avg_mfe = _number_from_mapping(stats, "avg_mfe_r")
+    avg_mae = _number_from_mapping(stats, "avg_mae_r")
+
+    if not sample_ok:
+        return (
+            EXPECTANCY_WEAK_FACTOR,
+            f"{label}は期待値サンプル不足({sample_text})のため"
+            f"確信度を×{EXPECTANCY_WEAK_FACTOR:.2f}に減衰",
+        )
+    if expectancy_r is not None and expectancy_r <= 0:
+        return (
+            EXPECTANCY_BLOCK_FACTOR,
+            f"{label}の期待Rは{expectancy_r:+.2f}R({sample_text})で非正のため"
+            f"確信度を×{EXPECTANCY_BLOCK_FACTOR:.2f}に減衰",
+        )
+    if profit_factor is not None and profit_factor < EXPECTANCY_MIN_PROFIT_FACTOR:
+        return (
+            EXPECTANCY_WEAK_FACTOR,
+            f"{label}のPFは{profit_factor:.2f}({sample_text})で薄いため"
+            f"確信度を×{EXPECTANCY_WEAK_FACTOR:.2f}に減衰",
+        )
+    if avg_mfe is not None and avg_mae is not None and avg_mfe <= avg_mae:
+        return (
+            EXPECTANCY_WEAK_FACTOR,
+            f"{label}は平均MFE{avg_mfe:.2f}Rに対し平均MAE{avg_mae:.2f}Rで"
+            f"逆行圧力が強いため確信度を×{EXPECTANCY_WEAK_FACTOR:.2f}に減衰",
+        )
+    return 1.0, ""
+
+
+def _int_from_mapping(mapping: Mapping[str, object], key: str) -> int:
+    return to_int(mapping.get(key))
+
+
+def _number_from_mapping(mapping: Mapping[str, object], key: str) -> float | None:
+    value = mapping.get(key)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0%}"
+
+
+def _fmt_number(value: float | None, suffix: str = "") -> str:
+    return "—" if value is None else f"{value:.2f}{suffix}"
+
+
+def _fmt_signed(value: float | None, suffix: str = "") -> str:
+    return "—" if value is None else f"{value:+.2f}{suffix}"
 
 
 # ------------------------------------------------- 反省レポート(失敗理由の分類)
@@ -988,6 +1166,7 @@ def save_profile(profile: LearnedProfile, path: str | Path) -> None:
         "symbol_factors": profile.symbol_factors,
         "condition_stats": profile.condition_stats,
         "condition_factors": profile.condition_factors,
+        "expectancy": profile.expectancy,
         "notes_ja": profile.notes_ja,
     }
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1072,6 +1251,11 @@ def load_profile(path: str | Path) -> LearnedProfile:
             symbol_factors=symbol_factors,
             condition_stats=condition_stats,
             condition_factors=condition_factors,
+            expectancy=(
+                dict(payload.get("expectancy", {}))
+                if isinstance(payload.get("expectancy"), dict)
+                else {}
+            ),
             notes_ja=[str(note) for note in payload.get("notes_ja", [])],
         )
     except (KeyError, TypeError, ValueError):

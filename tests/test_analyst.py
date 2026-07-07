@@ -46,6 +46,25 @@ def test_negation_flips_polarity() -> None:
     assert negated["JPY"].score < hawkish["JPY"].score
 
 
+def test_long_negation_scope_flips_polarity() -> None:
+    items = [make_news("Fed is not currently in any position to publicly consider a rate hike")]
+
+    scores = score_headlines(items, ["USD"], now=NOW)
+
+    assert scores["USD"].score < 0
+    assert scores["USD"].negatives == 1
+
+
+def test_negation_does_not_leak_across_clause() -> None:
+    items = [make_news("Fed rules out rate cut, signals rate hike")]
+
+    scores = score_headlines(items, ["USD"], now=NOW)
+
+    assert scores["USD"].score > 0
+    assert scores["USD"].positives == 2
+    assert scores["USD"].negatives == 0
+
+
 def test_hedge_dampens_confidence() -> None:
     """ヘッジ語(may/speculation)が付くと断定形より寄与が小さい。"""
     firm = score_headlines([make_news("Fed hawkish on rate hike")], ["USD"], now=NOW)
@@ -76,6 +95,21 @@ def test_pair_move_syntax_moves_both_legs() -> None:
     scores = score_headlines(items, ["USD", "JPY"], now=NOW)
     assert scores["USD"].score > 0
     assert scores["JPY"].score < 0
+
+
+def test_positive_negative_counts_reflect_evidence_items() -> None:
+    items = [
+        make_news("Fed signals rate hike and hot inflation"),
+        make_news("Fed dovish rate cut"),
+        make_news("USD/JPY rises sharply to fresh highs"),
+    ]
+
+    scores = score_headlines(items, ["USD", "JPY"], now=NOW)
+
+    assert scores["USD"].positives == 3
+    assert scores["USD"].negatives == 2
+    assert scores["JPY"].positives == 0
+    assert scores["JPY"].negatives == 1
 
 
 def test_regime_from_headlines_detects_risk_off() -> None:

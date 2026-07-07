@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, UTC
 
+from fx_intel import learning
 from fx_intel.committee import deliberate, macro_opinion, ml_opinion
 from fx_intel.macro import CotReport, MacroSnapshot
 from fx_intel.ml import MLArtifact
@@ -64,6 +65,19 @@ def test_ml_opinion_none_when_unusable() -> None:
     assert ml_opinion(MLArtifact(), 0.5, 0.3, {}, stage="paper") is None
 
 
+def test_ml_opinion_omits_missing_brier_note() -> None:
+    class EdgeArtifact(MLArtifact):
+        def direction_edge(self, *args, **kwargs) -> tuple[float, float]:
+            return (0.62, 0.51)
+
+    opinion = ml_opinion(EdgeArtifact(usable=True), 0.5, 0.3, {}, stage="paper")
+
+    assert opinion is not None
+    assert opinion.rationale_ja == ["的中確率 ロング62% vs ショート51%"]
+    assert "" not in opinion.rationale_ja
+    assert not opinion.note_ja().endswith(" / ")
+
+
 def test_shadow_member_recorded_but_not_in_composite() -> None:
     plan = deliberate(
         "USDJPY",
@@ -116,6 +130,26 @@ def test_deliberate_without_extras_matches_build_trade_plan() -> None:
     assert plan_committee.composite == plan_direct.composite
     assert plan_committee.direction == plan_direct.direction
     assert plan_committee.conviction == plan_direct.conviction
+
+
+def test_deliberate_forwards_expectancy_adjuster() -> None:
+    baseline = deliberate("USDJPY", _tech(), _scores(), [], [], now=NOW)
+    adjusted = deliberate(
+        "USDJPY",
+        _tech(),
+        _scores(),
+        [],
+        [],
+        now=NOW,
+        expectancy_adjuster=lambda symbol, direction: (
+            learning.EXPECTANCY_BLOCK_FACTOR,
+            f"{symbol} {direction}の期待Rは-0.20Rで非正",
+        ),
+    )
+
+    assert adjusted.direction == baseline.direction
+    assert adjusted.conviction == round(baseline.conviction * learning.EXPECTANCY_BLOCK_FACTOR)
+    assert any("期待値ガード" in warning for warning in adjusted.warnings)
 
 
 def test_risk_officer_gate_still_applies_over_committee() -> None:

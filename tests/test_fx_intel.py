@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 import requests
 
-from fx_intel import briefing
+from fx_intel import briefing, technicals
 from fx_intel.calendar import (
     EconomicEvent,
     active_and_next_window,
@@ -36,7 +36,7 @@ from fx_intel.sentiment import (
     pair_bias,
     score_headlines_lexicon,
 )
-from fx_intel.technicals import PairTechnicals, build_interval_view
+from fx_intel.technicals import PairTechnicals, build_interval_view, fetch_pair_technicals
 
 UTC = UTC
 NOW = datetime(2026, 7, 2, 8, 0, tzinfo=UTC)
@@ -421,6 +421,105 @@ def make_view(interval: str, rec: str, **kwargs):
     return build_interval_view(interval, summary, indicators, 20, 100)
 
 
+class _ScannerResponse:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.content = b"" if status_code == 429 else b"{}"
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def _scanner_value(key: str) -> float | None:
+    values = {
+        "Recommend.Other": 0.2,
+        "Recommend.All": 0.4,
+        "Recommend.MA": 0.4,
+        "RSI": 55.0,
+        "RSI[1]": 54.0,
+        "MACD.macd": 0.2,
+        "MACD.signal": 0.1,
+        "ADX": 22.0,
+        "ATR": 0.5,
+        "close": 150.0,
+        "SMA20": 149.0,
+        "SMA100": 148.0,
+    }
+    return values.get(key)
+
+
+def _scanner_payload(request_json: dict, ticker: str) -> dict:
+    values = []
+    for column in request_json["columns"]:
+        key = str(column).split("|", 1)[0]
+        values.append(_scanner_value(key))
+    return {"totalCount": 1, "data": [{"s": ticker, "d": values}]}
+
+
+def test_fetch_pair_technicals_uses_browser_user_agent(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    def fake_post(url, json, headers, timeout):
+        calls.append((url, json, headers, timeout))
+        return _ScannerResponse(200, _scanner_payload(json, "OANDA:USDJPY"))
+
+    monkeypatch.setattr(technicals.requests, "post", fake_post)
+
+    tech, warnings = fetch_pair_technicals(
+        ["USDJPY"], intervals=("1h",), cache_path=tmp_path / "technical_cache.json"
+    )
+
+    assert warnings == []
+    assert tech["USDJPY"].views["1h"].recommendation == "BUY"
+    assert tech["USDJPY"].views["1h"].close == 150.0
+    assert "Mozilla/5.0" in calls[0][2]["User-Agent"]
+
+
+def test_fetch_pair_technicals_routes_non_forex_symbols(monkeypatch, tmp_path) -> None:
+    seen_urls = []
+    seen_tickers = []
+
+    def fake_post(url, json, headers, timeout):
+        seen_urls.append(url)
+        seen_tickers.extend(json["symbols"]["tickers"])
+        return _ScannerResponse(200, _scanner_payload(json, "OANDA:XAUUSD"))
+
+    monkeypatch.setattr(technicals.requests, "post", fake_post)
+
+    tech, warnings = fetch_pair_technicals(
+        ["XAUUSD"], intervals=("1h",), cache_path=tmp_path / "technical_cache.json"
+    )
+
+    assert warnings == []
+    assert seen_urls == ["https://scanner.tradingview.com/cfd/scan"]
+    assert seen_tickers == ["OANDA:XAUUSD"]
+    assert tech["XAUUSD"].views["1h"].recommendation == "BUY"
+
+
+def test_fetch_pair_technicals_uses_short_lived_cache_on_429(monkeypatch, tmp_path) -> None:
+    cache_path = tmp_path / "technical_cache.json"
+
+    def successful_post(url, json, headers, timeout):
+        return _ScannerResponse(200, _scanner_payload(json, "OANDA:USDJPY"))
+
+    monkeypatch.setattr(technicals.requests, "post", successful_post)
+    tech, warnings = fetch_pair_technicals(["USDJPY"], intervals=("1h",), cache_path=cache_path)
+    assert warnings == []
+    assert tech["USDJPY"].views["1h"].close == 150.0
+
+    def rate_limited_post(url, json, headers, timeout):
+        return _ScannerResponse(429)
+
+    monkeypatch.setattr(technicals.requests, "post", rate_limited_post)
+    monkeypatch.setattr(technicals, "FETCH_RETRY_WAIT_SECONDS", 0.0)
+
+    cached, warnings = fetch_pair_technicals(["USDJPY"], intervals=("1h",), cache_path=cache_path)
+
+    assert cached["USDJPY"].views["1h"].close == 150.0
+    assert any("直近成功キャッシュ" in warning for warning in warnings)
+
+
 def test_alignment_score_and_ma_side() -> None:
     tech = PairTechnicals(symbol="USDJPY")
     tech.views = {
@@ -756,14 +855,48 @@ def test_build_discord_payload_structure() -> None:
     field_names = [f["name"] for f in macro["fields"]]
     assert "通貨センチメント" in field_names
     assert "今後48時間の重要イベント" in field_names
-    assert "データ取得の注意" in field_names
+    assert "データ取得状況" in field_names
     assert "判断の検証(自己採点)" in field_names
+    status_field = next(f for f in macro["fields"] if f["name"] == "データ取得状況")
+    assert "テクニカル: 取得OK" in status_field["value"]
+    assert "注意: テスト警告" in status_field["value"]
     pair_embed = payload["embeds"][1]
     assert pair_embed["title"].startswith("USDJPY")
     assert any("売買プラン" in f["name"] for f in pair_embed["fields"])
     plan_field = next(f for f in pair_embed["fields"] if f["name"] == "判断")
     assert "買い" in plan_field["value"]  # 初心者向けの言い換えが入る
     assert any("用語ミニ解説" in f["name"] for f in macro["fields"])
+
+
+def test_build_discord_payload_always_reports_data_fetch_status() -> None:
+    from fx_intel.sentiment import MarketAnalysis
+
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.4, headline_count=5),
+        "JPY": CurrencySentiment("JPY", score=-0.2, headline_count=3),
+    }
+    analysis = MarketAnalysis(currencies=currencies, regime="risk_on", engine="lexicon")
+    plan = briefing.build_trade_plan(
+        "USDJPY", bullish_tech(), currencies, [], [make_news("USD/JPY rises")], now=NOW
+    )
+    payload = briefing.build_discord_payload(
+        [plan],
+        analysis,
+        [],
+        ["JPY", "USD"],
+        20,
+        100,
+        news_count=1,
+        calendar_event_count=3,
+        calendar_ok=True,
+        now=NOW,
+    )
+    macro = payload["embeds"][0]
+    status_field = next(f for f in macro["fields"] if f["name"] == "データ取得状況")
+    assert "テクニカル: 取得OK (USDJPY 4/4足)" in status_field["value"]
+    assert "ニュース: 取得OK (記事1件)" in status_field["value"]
+    assert "経済指標: 取得OK" in status_field["value"]
+    assert "注意: なし" in status_field["value"]
 
 
 def test_price_formatting_by_symbol() -> None:

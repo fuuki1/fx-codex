@@ -62,6 +62,10 @@ def test_payload_has_header_and_one_embed_per_symbol() -> None:
     assert len(payload["embeds"]) == 2
     assert payload["embeds"][0]["title"] == "マクロ・センチメント概況"
     assert payload["embeds"][1]["title"].startswith("USDJPY")
+    header_fields = {f["name"]: f["value"] for f in payload["embeds"][0]["fields"]}
+    assert "データ取得状況" in header_fields
+    assert "テクニカル: 取得OK (USDJPY 4/4足)" in header_fields["データ取得状況"]
+    assert "注意: なし" in header_fields["データ取得状況"]
 
 
 def test_symbol_embed_has_field_per_timeframe() -> None:
@@ -136,3 +140,17 @@ def test_aux_report_rendered_when_provided() -> None:
     )
     fields = " ".join(str(f.get("value", "")) for f in payload["embeds"][1]["fields"])
     assert "補助ホライズン" in fields
+
+
+def test_fetch_warning_rendered_in_status_field() -> None:
+    payload = build_timeframe_discord_payload(
+        {"USDJPY": _plans()},
+        _analysis(),
+        [],
+        ["USD"],
+        fetch_warnings=["TradingView 15m 取得失敗"],
+        now=NOW,
+    )
+    header_fields = {f["name"]: f["value"] for f in payload["embeds"][0]["fields"]}
+    assert "データ取得状況" in header_fields
+    assert "注意: TradingView 15m 取得失敗" in header_fields["データ取得状況"]
