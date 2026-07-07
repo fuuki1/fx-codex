@@ -22,7 +22,7 @@ fi
 
 # --- launchd LaunchAgent を設置 ---
 mkdir -p "$HOME/Library/LaunchAgents"
-for label in com.trader.supervisor com.trader.backup; do
+for label in com.trader.supervisor com.trader.backup com.trader.optimize; do
   src="deploy/$label.plist"
   dst="$HOME/Library/LaunchAgents/$label.plist"
   sed "s#__TRADER_DIR__#$HERE#g" "$src" > "$dst"

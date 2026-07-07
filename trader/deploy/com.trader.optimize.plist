@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  週次で自律最適化（walk-forward / OOS 検証）を実行する LaunchAgent。
+  日曜 05:00（TIME_ZONE 設定に従う。既定 Asia/Tokyo）は FX が休場中で IB Gateway への
+  ヒストリカルデータ取得が取引の妨げにならない時間帯。
+  __TRADER_DIR__ は bootstrap.sh が実パスに置換する。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.trader.optimize</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__TRADER_DIR__/deploy/optimize.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__TRADER_DIR__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>5</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__TRADER_DIR__/logs/optimize.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__TRADER_DIR__/logs/optimize.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
