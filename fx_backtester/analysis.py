@@ -25,6 +25,7 @@ from fx_backtester.strategies.baselines import (
     FlatStrategy,
     RandomDirectionStrategy,
 )
+from fx_backtester.trade_quality import TradeQualityConfig, evaluate_trade_quality
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,14 @@ class RunAnalysisConfig:
     cost_multipliers: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
     min_period_days: int = 365
     min_oos_trades: int = 30
+    min_expectancy_trades: int = 30
+    full_confidence_trades: int = 100
+    min_segment_trades: int = 20
+    expectancy_bootstrap_samples: int = 1_000
+    expectancy_bootstrap_seed: int = 42
+    min_expectancy_r: float = 0.0
+    min_tp_sl_score: float = 55.0
+    max_unpriced_trade_pct: float = 0.05
     min_walk_forward_folds: int = 3
     min_forward_days: int = 30
     min_monte_carlo_paths: int = 1_000
@@ -62,6 +71,8 @@ def analyze_run_artifacts(
     equity = _read_equity(source / "equity_curve.csv")
     metrics = _read_json(source / "metrics.json")
     run_config = _read_json(source / "config.json")
+    qa_report = _read_optional_csv(source / "data_qa.csv")
+    price_data, data_load_error = _load_run_price_data(source)
     initial_cash = float(metrics.get("initial_cash", run_config.get("initial_cash", 100_000.0)))
 
     walk_forward_path = _default_existing_path(
@@ -98,6 +109,23 @@ def analyze_run_artifacts(
         trades,
         forward_path,
     )
+    trade_quality = evaluate_trade_quality(
+        trades,
+        price_data,
+        qa_report=qa_report,
+        config=TradeQualityConfig(
+            min_trades=analysis_config.min_expectancy_trades,
+            full_confidence_trades=analysis_config.full_confidence_trades,
+            min_segment_trades=analysis_config.min_segment_trades,
+            expectancy_bootstrap_samples=analysis_config.expectancy_bootstrap_samples,
+            expectancy_bootstrap_seed=analysis_config.expectancy_bootstrap_seed,
+            min_expectancy_r=analysis_config.min_expectancy_r,
+            min_tp_sl_score=analysis_config.min_tp_sl_score,
+            max_unpriced_trade_pct=analysis_config.max_unpriced_trade_pct,
+        ),
+        conversion_rates=run_config.get("conversion_rates", {}),
+        data_load_error=data_load_error,
+    )
     baseline = baseline_comparison_summary(source, metrics, run_config)
     readiness = commercial_readiness_summary(
         source,
@@ -114,6 +142,7 @@ def analyze_run_artifacts(
         monte_carlo,
         forward,
         walk_forward_path,
+        trade_quality,
         analysis_config,
     )
     diagnosis = strategy_diagnosis_summary(
@@ -128,6 +157,7 @@ def analyze_run_artifacts(
         baseline,
         paper_diff,
         readiness,
+        trade_quality,
     )
 
     paths = {
@@ -147,6 +177,14 @@ def analyze_run_artifacts(
         "strategy_diagnosis": destination / "strategy_diagnosis.json",
         "baseline_comparison": destination / "baseline_comparison.csv",
         "paper_backtest_diff": destination / "paper_backtest_diff.json",
+        "mfe_mae_by_trade": destination / "mfe_mae_by_trade.csv",
+        "edge_segments": destination / "edge_segments.csv",
+        "trade_expectancy": destination / "trade_expectancy.json",
+        "sample_guard": destination / "sample_guard.json",
+        "mfe_mae_summary": destination / "mfe_mae_summary.json",
+        "tp_sl_score": destination / "tp_sl_score.json",
+        "data_quality_monitor": destination / "data_quality_monitor.json",
+        "ai_trade_decision": destination / "ai_trade_decision.json",
         "monte_carlo_quantiles": destination / "monte_carlo_quantiles.csv",
         "oos_summary": destination / "oos_summary.json",
         "lot_control": destination / "lot_control_summary.json",
@@ -173,6 +211,14 @@ def analyze_run_artifacts(
     _write_json(paths["strategy_diagnosis"], diagnosis["summary"])
     baseline.to_csv(paths["baseline_comparison"], index=False)
     _write_json(paths["paper_backtest_diff"], paper_diff)
+    trade_quality["by_trade"].to_csv(paths["mfe_mae_by_trade"], index=False)
+    trade_quality["segments"].to_csv(paths["edge_segments"], index=False)
+    _write_json(paths["trade_expectancy"], trade_quality["expectancy"])
+    _write_json(paths["sample_guard"], trade_quality["sample_guard"])
+    _write_json(paths["mfe_mae_summary"], trade_quality["mfe_mae"])
+    _write_json(paths["tp_sl_score"], trade_quality["tp_sl"])
+    _write_json(paths["data_quality_monitor"], trade_quality["data_quality"])
+    _write_json(paths["ai_trade_decision"], trade_quality["ai_decision"])
     _write_json(paths["oos_summary"], oos)
     _write_json(paths["lot_control"], lot)
     _write_json(paths["monte_carlo"], monte_carlo["summary"])
@@ -206,6 +252,7 @@ def analyze_run_artifacts(
             pnl=pnl,
             diagnosis=diagnosis,
             baseline=baseline,
+            trade_quality=trade_quality,
             oos=oos,
             monte_carlo=monte_carlo["summary"],
             forward=forward,
@@ -684,6 +731,7 @@ def strategy_diagnosis_summary(
     baseline: pd.DataFrame,
     paper_diff: dict[str, Any],
     readiness: dict[str, Any],
+    trade_quality: dict[str, Any],
 ) -> dict[str, Any]:
     pnl_summary = pnl["summary"]
     net_pnl = float(pnl_summary["total_net_pnl"])
@@ -827,6 +875,52 @@ def strategy_diagnosis_summary(
                 "high",
                 "Paper trading or forward evidence is missing.",
                 paper_diff,
+            )
+        )
+
+    quality_decision = trade_quality["ai_decision"]
+    if not bool(quality_decision.get("deployable")):
+        findings.append(
+            _finding(
+                "trade_decision_quality_blocked",
+                "high",
+                "Trade-level expectancy, sample, TP/SL, or data-quality gates block AI deployment.",
+                quality_decision,
+            )
+        )
+
+    expectancy = trade_quality["expectancy"]
+    if expectancy.get("status") in {"negative_or_zero", "weak_positive"}:
+        findings.append(
+            _finding(
+                "expectancy_not_confirmed",
+                "high",
+                "Expected value is not confirmed by confidence-adjusted R-multiple analysis.",
+                expectancy,
+            )
+        )
+
+    mfe_mae = trade_quality["mfe_mae"]
+    if (
+        float(mfe_mae.get("avg_mfe_r", 0.0)) >= 1.0
+        and float(mfe_mae.get("avg_capture_efficiency", 0.0)) < 0.35
+    ):
+        findings.append(
+            _finding(
+                "low_mfe_capture",
+                "medium",
+                "Trades often produce favorable excursion, but exits capture too little of it.",
+                mfe_mae,
+            )
+        )
+
+    if float(mfe_mae.get("mae_reached_1r_rate", 0.0)) > 0.35:
+        findings.append(
+            _finding(
+                "high_mae_pressure",
+                "medium",
+                "A large share of trades reaches at least 1R adverse excursion.",
+                mfe_mae,
             )
         )
 
@@ -1133,6 +1227,7 @@ def commercial_readiness_summary(
     monte_carlo: dict[str, Any],
     forward: dict[str, Any],
     walk_forward_summary_path: Path | None,
+    trade_quality: dict[str, Any],
     config: RunAnalysisConfig,
 ) -> dict[str, Any]:
     audit = audit_run_artifacts(run_dir)
@@ -1154,6 +1249,11 @@ def commercial_readiness_summary(
     stressed = _cost_row(cost, 1.5, 1.5)
     stressed_net = float(stressed["adjusted_net_pnl"]) if stressed else 0.0
     mc_summary = monte_carlo["summary"]
+    quality_decision = trade_quality["ai_decision"]
+    sample_guard = trade_quality["sample_guard"]
+    expectancy = trade_quality["expectancy"]
+    tp_sl = trade_quality["tp_sl"]
+    data_quality = trade_quality["data_quality"]
 
     gates = [
         _gate(
@@ -1162,6 +1262,41 @@ def commercial_readiness_summary(
             "required",
             "Backtest artifacts must pass structural audit.",
             audit,
+        ),
+        _gate(
+            "data_quality_monitor",
+            bool(data_quality.get("passed")),
+            "required",
+            "Price QA and trade-window coverage must be valid for trade-level scoring.",
+            data_quality,
+        ),
+        _gate(
+            "sample_guard",
+            bool(sample_guard.get("passed")),
+            "required",
+            f"Trade-level expectancy requires at least {config.min_expectancy_trades} trades.",
+            sample_guard,
+        ),
+        _gate(
+            "expectancy_edge",
+            bool(expectancy.get("passed")),
+            "required",
+            "R-multiple expectancy must remain positive after bootstrap confidence adjustment.",
+            expectancy,
+        ),
+        _gate(
+            "tp_sl_score",
+            bool(tp_sl.get("passed")),
+            "advisory",
+            f"TP/SL behavior score should be at least {config.min_tp_sl_score:.1f}.",
+            tp_sl,
+        ),
+        _gate(
+            "ai_trade_decision",
+            bool(quality_decision.get("deployable")),
+            "required",
+            "AI trade decision quality gate must be deployable.",
+            quality_decision,
         ),
         _gate(
             "multiple_periods",
@@ -1289,6 +1424,7 @@ def write_analysis_dashboard(
     pnl: dict[str, Any],
     diagnosis: dict[str, Any],
     baseline: pd.DataFrame,
+    trade_quality: dict[str, Any],
     oos: dict[str, Any],
     monte_carlo: dict[str, Any],
     forward: dict[str, Any],
@@ -1300,6 +1436,12 @@ def write_analysis_dashboard(
     gates = pd.DataFrame(readiness["gates"])
     pnl_summary = pnl["summary"]
     diagnosis_summary = diagnosis["summary"]
+    expectancy = trade_quality["expectancy"]
+    sample_guard = trade_quality["sample_guard"]
+    mfe_mae = trade_quality["mfe_mae"]
+    tp_sl = trade_quality["tp_sl"]
+    data_quality = trade_quality["data_quality"]
+    ai_decision = trade_quality["ai_decision"]
     target_months = int(len(monthly_target))
     target_months_met = int(monthly_target["target_met"].astype(bool).sum()) if target_months else 0
     target_label = f"{target_months_met}/{target_months}" if target_months else "0/0"
@@ -1328,6 +1470,36 @@ def write_analysis_dashboard(
             "Profit factor",
             _number(metrics.get("profit_factor", 0.0)),
             "Expectancy: " + _money(metrics.get("expectancy_usd", 0.0)),
+        ),
+        (
+            "EV confidence",
+            str(expectancy.get("status", "unknown")),
+            "R CI low: " + _number(expectancy.get("expectancy_ci_low", 0.0)),
+        ),
+        (
+            "Sample guard",
+            str(sample_guard.get("status", "unknown")),
+            "Weight: " + _pct(sample_guard.get("confidence_weight", 0.0)),
+        ),
+        (
+            "TP/SL score",
+            _number(tp_sl.get("score", 0.0)),
+            "Minimum: " + _number(tp_sl.get("minimum_score", 0.0)),
+        ),
+        (
+            "MFE / MAE",
+            _number(mfe_mae.get("mfe_to_mae_ratio", 0.0)),
+            "Avg MFE: " + _number(mfe_mae.get("avg_mfe_r", 0.0)) + "R",
+        ),
+        (
+            "Data quality",
+            str(data_quality.get("status", "unknown")),
+            "Pricing: " + _pct(data_quality.get("pricing_coverage", 0.0)),
+        ),
+        (
+            "AI decision",
+            str(ai_decision.get("verdict", "unknown")),
+            "Deployable: " + str(ai_decision.get("deployable", False)),
         ),
         (
             "MC ruin probability",
@@ -1528,6 +1700,14 @@ def write_analysis_dashboard(
         {_file_link("usable_segments.csv", "Keep/block segments")}
         {_file_link("baseline_comparison.csv", "Baselines")}
         {_file_link("paper_backtest_diff.json", "Paper diff")}
+        {_file_link("mfe_mae_by_trade.csv", "MFE/MAE trades")}
+        {_file_link("edge_segments.csv", "EV segments")}
+        {_file_link("trade_expectancy.json", "Expected value")}
+        {_file_link("sample_guard.json", "Sample guard")}
+        {_file_link("mfe_mae_summary.json", "MFE/MAE summary")}
+        {_file_link("tp_sl_score.json", "TP/SL score")}
+        {_file_link("data_quality_monitor.json", "Data monitor")}
+        {_file_link("ai_trade_decision.json", "AI decision")}
         {_file_link("monte_carlo_summary.json", "Ruin risk")}
         {_file_link("oos_summary.json", "IS/OOS")}
         {_file_link("commercial_readiness.json", "Gates")}
@@ -1540,6 +1720,34 @@ def write_analysis_dashboard(
     <section>
       <h2>Strategy Diagnosis</h2>
       {_html_table(_findings_table(diagnosis_summary.get("findings", [])), html_rows)}
+    </section>
+    <section>
+      <h2>AI Trade Decision</h2>
+      {_html_table(_dict_table(ai_decision, exclude=("blockers", "improvement_actions")), html_rows)}
+    </section>
+    <section>
+      <h2>Improvement Actions</h2>
+      {_html_table(pd.DataFrame(ai_decision.get("improvement_actions", [])), html_rows)}
+    </section>
+    <section>
+      <h2>Expected Value</h2>
+      {_html_table(_dict_table(expectancy), html_rows)}
+    </section>
+    <section>
+      <h2>MFE / MAE Summary</h2>
+      {_html_table(_dict_table(mfe_mae), html_rows)}
+    </section>
+    <section>
+      <h2>TP / SL Score</h2>
+      {_html_table(_dict_table(tp_sl, exclude=("components",)), html_rows)}
+    </section>
+    <section>
+      <h2>Edge Segments</h2>
+      {_html_table(trade_quality["segments"], html_rows)}
+    </section>
+    <section>
+      <h2>MFE / MAE By Trade</h2>
+      {_html_table(trade_quality["by_trade"], html_rows)}
     </section>
     <section>
       <h2>Usable Segments</h2>
@@ -1839,6 +2047,30 @@ def _finite_float(value: Any) -> float:
     return float(value)
 
 
+def _read_optional_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _load_run_price_data(run_dir: Path) -> tuple[dict[str, pd.DataFrame], str | None]:
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return {}, "manifest.json is missing"
+    try:
+        manifest = _read_json(manifest_path)
+        data_paths = [
+            str(item["path"])
+            for item in manifest.get("inputs", {}).get("data", [])
+            if isinstance(item, dict) and item.get("path")
+        ]
+        if not data_paths:
+            return {}, "manifest has no input data paths"
+        return load_price_csvs(data_paths), None
+    except Exception as error:  # pragma: no cover - defensive artifact reporting
+        return {}, str(error)
+
+
 def _read_trades(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
     for column in ("signal_time", "order_time", "fill_time", "entry_time", "exit_time"):
@@ -2103,6 +2335,15 @@ def _findings_table(findings: list[dict[str, Any]]) -> pd.DataFrame:
     )
 
 
+def _dict_table(value: dict[str, Any], exclude: tuple[str, ...] = ()) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for key, item in value.items():
+        if key in exclude or isinstance(item, (dict, list, tuple)):
+            continue
+        rows.append({"metric": key, "value": item})
+    return pd.DataFrame(rows, columns=["metric", "value"])
+
+
 def _html_table(frame: pd.DataFrame, rows: int) -> str:
     if frame.empty:
         return '<p class="note">No rows.</p>'
@@ -2111,14 +2352,23 @@ def _html_table(frame: pd.DataFrame, rows: int) -> str:
         if pd.api.types.is_float_dtype(limited[column]):
             limited[column] = limited[column].map(_number)
         else:
-            limited[column] = limited[column].map(
-                lambda value: "" if pd.isna(value) else str(value)
-            )
+            limited[column] = limited[column].map(_cell_text)
     table = limited.to_html(index=False, escape=True)
     table = table.replace('<table border="1" class="dataframe">', "<table>")
     table = table.replace("<td>PASS</td>", '<td class="good-text">PASS</td>')
     table = table.replace("<td>BLOCK</td>", '<td class="bad-text">BLOCK</td>')
     return f'<div class="table-wrap">{table}</div>'
+
+
+def _cell_text(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(_json_value(value), ensure_ascii=False)
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value)
 
 
 def _money(value: Any) -> str:

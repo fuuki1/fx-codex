@@ -31,6 +31,7 @@ from fx_backtester.strategies.filters import (
     RegimeFilterConfig,
 )
 from fx_backtester.tradingview import append_tradingview_alert, parse_tradingview_alert
+from fx_backtester.trade_quality import TradeQualityConfig, evaluate_trade_quality
 from fx_backtester.validation import ProductValidationError, validate_backtest_inputs
 from fx_backtester.walk_forward import WalkForwardConfig, WalkForwardValidator
 
@@ -841,6 +842,74 @@ def test_stop_loss_gap_fills_at_worse_open_not_stop_price() -> None:
     assert round(float(trade["exit_fill_price"]), 5) == 0.79985
 
 
+def test_trade_quality_scores_mfe_mae_and_sample_guard() -> None:
+    index = pd.date_range("2024-01-01 00:00:00", periods=3, freq="h")
+    data = {
+        "EURUSD": pd.DataFrame(
+            {
+                "open": [1.00, 1.01, 1.02],
+                "high": [1.00, 1.03, 1.04],
+                "low": [1.00, 0.995, 0.99],
+                "close": [1.00, 1.02, 1.03],
+            },
+            index=index,
+        )
+    }
+    trades = pd.DataFrame(
+        [
+            {
+                "symbol": "EURUSD",
+                "strategy": "unit",
+                "direction": 1,
+                "entry_time": index[0],
+                "exit_time": index[-1],
+                "entry_price": 1.00,
+                "exit_price": 1.03,
+                "stop_price": 0.99,
+                "take_profit_price": 1.03,
+                "initial_risk_usd": 100.0,
+                "units": 10_000,
+                "r_multiple": 1.0,
+                "net_pnl": 100.0,
+                "exit_reason": "take_profit",
+            }
+        ]
+    )
+    qa_report = pd.DataFrame(
+        [
+            {
+                "symbol": "EURUSD",
+                "missing_pct": 0.0,
+                "duplicate_count": 0,
+                "invalid_ohlc_count": 0,
+                "null_ohlc_count": 0,
+                "passed": True,
+            }
+        ]
+    )
+
+    result = evaluate_trade_quality(
+        trades,
+        data,
+        qa_report=qa_report,
+        config=TradeQualityConfig(
+            min_trades=1,
+            full_confidence_trades=1,
+            min_segment_trades=1,
+            expectancy_bootstrap_samples=10,
+        ),
+    )
+
+    quality_trade = result["by_trade"].iloc[0]
+    assert round(float(quality_trade["mfe_r"]), 6) == 4.0
+    assert round(float(quality_trade["mae_r"]), 6) == 1.0
+    assert bool(quality_trade["tp_touched"]) is True
+    assert result["sample_guard"]["passed"] is True
+    assert result["expectancy"]["passed"] is True
+    assert result["data_quality"]["passed"] is True
+    assert result["ai_decision"]["deployable"] is True
+
+
 def test_cross_jpy_uses_usdjpy_conversion_data() -> None:
     index = pd.date_range("2024-01-01 00:00:00", periods=3, freq="h")
     data = {
@@ -1235,6 +1304,14 @@ def test_analyze_run_writes_commercial_validation_pack(tmp_path) -> None:
         "strategy_diagnosis.json",
         "baseline_comparison.csv",
         "paper_backtest_diff.json",
+        "mfe_mae_by_trade.csv",
+        "edge_segments.csv",
+        "trade_expectancy.json",
+        "sample_guard.json",
+        "mfe_mae_summary.json",
+        "tp_sl_score.json",
+        "data_quality_monitor.json",
+        "ai_trade_decision.json",
         "lot_control_summary.json",
         "monte_carlo_summary.json",
         "monte_carlo_quantiles.csv",
@@ -1261,6 +1338,12 @@ def test_analyze_run_writes_commercial_validation_pack(tmp_path) -> None:
     assert round(reconstructed, 6) == round(pnl["total_net_pnl"], 6)
     diagnosis = json.loads((output_dir / "strategy_diagnosis.json").read_text(encoding="utf-8"))
     assert "primary_cause" in diagnosis
+    ai_decision = json.loads((output_dir / "ai_trade_decision.json").read_text(encoding="utf-8"))
+    assert "deployable" in ai_decision
+    assert "improvement_actions" in ai_decision
+    expectancy = json.loads((output_dir / "trade_expectancy.json").read_text(encoding="utf-8"))
+    assert "expectancy_ci_low" in expectancy
+    assert not pd.read_csv(output_dir / "mfe_mae_by_trade.csv").empty
 
 
 def test_monthly_target_summary_flags_shortfall() -> None:

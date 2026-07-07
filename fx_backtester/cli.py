@@ -204,6 +204,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     analyze_parser.add_argument("--min-period-days", type=int, default=365)
     analyze_parser.add_argument("--min-oos-trades", type=int, default=30)
+    analyze_parser.add_argument("--min-expectancy-trades", type=int, default=30)
+    analyze_parser.add_argument("--full-confidence-trades", type=int, default=100)
+    analyze_parser.add_argument("--min-segment-trades", type=int, default=20)
+    analyze_parser.add_argument("--expectancy-bootstrap-samples", type=int, default=1_000)
+    analyze_parser.add_argument("--expectancy-bootstrap-seed", type=int, default=42)
+    analyze_parser.add_argument("--min-expectancy-r", type=float, default=0.0)
+    analyze_parser.add_argument("--min-tp-sl-score", type=float, default=55.0)
+    analyze_parser.add_argument("--max-unpriced-trade-pct", type=float, default=0.05)
     analyze_parser.add_argument("--min-walk-forward-folds", type=int, default=3)
     analyze_parser.add_argument("--min-forward-days", type=int, default=30)
     analyze_parser.add_argument(
@@ -646,6 +654,14 @@ def _run_analyze_run(args: argparse.Namespace) -> int:
             cost_multipliers=cost_multipliers,
             min_period_days=args.min_period_days,
             min_oos_trades=args.min_oos_trades,
+            min_expectancy_trades=args.min_expectancy_trades,
+            full_confidence_trades=args.full_confidence_trades,
+            min_segment_trades=args.min_segment_trades,
+            expectancy_bootstrap_samples=args.expectancy_bootstrap_samples,
+            expectancy_bootstrap_seed=args.expectancy_bootstrap_seed,
+            min_expectancy_r=args.min_expectancy_r,
+            min_tp_sl_score=args.min_tp_sl_score,
+            max_unpriced_trade_pct=args.max_unpriced_trade_pct,
             min_walk_forward_folds=args.min_walk_forward_folds,
             min_forward_days=args.min_forward_days,
             monthly_target_return_pct=_pct_value(args.monthly_target_return),

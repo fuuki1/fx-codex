@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +95,7 @@ def load_price_csv(
     return output
 
 
-def load_price_csvs(paths: list[str | Path]) -> dict[str, pd.DataFrame]:
+def load_price_csvs(paths: Sequence[str | Path]) -> dict[str, pd.DataFrame]:
     loaded: dict[str, pd.DataFrame] = {}
     for path in paths:
         for symbol, frame in load_price_csv(path).items():
