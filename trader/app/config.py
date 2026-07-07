@@ -33,6 +33,15 @@ IB_BAR_SIZE_STR = {
 _IB_BAR_SIZES = frozenset(IB_BAR_SIZE_STR)
 
 
+def _hhmm_to_min(s: str) -> int:
+    """"HH:MM" を 0..1439 の分へ。不正値は fail-fast（設定ミスを起動時に落とす）。"""
+    h, _, m = s.strip().partition(":")
+    minutes = int(h) * 60 + int(m or 0)
+    if not 0 <= minutes <= 1439:
+        raise ValueError(f"invalid HH:MM time: {s!r}")
+    return minutes
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -91,6 +100,104 @@ class Settings(BaseSettings):
     # 減らす方向（決済）は常に通す。MAX_POSITION_QTY は 1 注文の上限、
     # こちらは累積の上限（同方向シグナル連打による積み上がりを止める）。
     max_net_position_qty: float = 10_000
+
+    # ---- プロ級リスクエンジン（risk_engine.py）------------------------------
+    # 既存 8 チェックに「追加」する形で動く（置換ではない）。モード:
+    #   off     … 評価しない（既定。挙動・負荷とも従来と完全に同一）
+    #   shadow  … 評価してログに残すだけ（発注には一切影響しない。導入前の観測用）
+    #   enforce … 却下・サイジング・Kill switch 連動を実際に適用する
+    # 昇格手順: off → shadow で risk_engine_decision ログを確認 → enforce。
+    risk_engine_mode: Literal["off", "shadow", "enforce"] = "off"
+    # サイズは確信ではなくストップ距離と口座リスクで決める（Kovner）。既定 OFF＝
+    # 明示有効化するまで qty はシグナルのまま（後方互換）。有効化前に account_equity
+    # と risk_value_per_point を必ず実値に合わせること。
+    risk_sizing_enabled: bool = False
+    account_equity: float = 1_000_000.0      # 口座残高（口座通貨。サイジングの基準）
+    risk_per_trade_pct: float = 0.5          # 1 取引で許容する口座割合（%）
+    require_stop_for_sizing: bool = False    # True で stop 無しシグナルを却下
+    lot_step: float = 1000.0                 # 発注ロットの最小刻み（切り捨て）
+    min_lot: float = 1000.0                  # これ未満になるサイズは発注しない
+    # 価格 1.0 動いたときの「1 単位あたり損益（口座通貨）」。JPY 建てペア×JPY 口座は 1.0。
+    # 例: "USDJPY=1.0,EURJPY=1.0"。未指定の銘柄は 1.0 とみなす。
+    risk_value_per_point: Annotated[dict[str, float], NoDecode] = Field(default_factory=dict)
+    # 週次損失上限（0 で無効）。超過で Kill switch（翌週まで新規停止／手動解除）。
+    max_weekly_loss_jpy: float = 0.0
+    # エンジン側の日次／週次損失の集計境界 timezone。既定は JST（既存チェック 7 と同じ境界）。
+    risk_day_timezone: str = "Asia/Tokyo"
+    # 連敗スロットル（Lipschutz: 連敗時はサイズ縮小→停止）
+    loss_streak_reduce_at: int = 3           # この連敗数でサイズ縮小
+    loss_streak_reduce_factor: float = 0.5   # 縮小係数（0.5＝半減）
+    loss_streak_halt_at: int = 5             # この連敗数で新規停止（0 で無効）
+    recent_trades_window: int = 50           # 連敗判定に見る直近トレード数
+    # 集中・相関（Lipschutz: 高相関は 1 つの巨大ポジション）
+    max_concurrent_positions: int = 3        # 同時に持てる別銘柄数（0 で無効）
+    max_currency_exposure: float = 0.0       # 1 通貨あたり純エクスポージャ上限（0 で無効）
+    # 重要指標ブラックアウト窓の定義ファイル（無ければ無効）
+    risk_blackout_file: str = "risk_calendar.json"
+    # 非対称性（「外れても小さく当たれば大きい」）。報酬/リスク比の下限（0=無効）。
+    # シグナルに利確距離（tp_distance）がある時のみ評価。
+    min_reward_risk: float = 0.0
+    # True で利確目標の無いシグナルを却下（R:R を必須化）。
+    require_target_for_rr: bool = False
+    # True で「根拠（reason）」の無いシグナルを却下（理由を文章化できないなら入らない）。
+    require_reason: bool = False
+    # 実現損益の高値からのドローダウンが口座の何%で Kill Switch（0=無効）。
+    # 基準は「全期間の累計実現損益」の高値（HWM）。窓を切ると古い利益が期間外へ抜けて
+    # 損失が無くても DD が膨らむ＝誤発火するため、窓は設けない。
+    max_drawdown_pct: float = 0.0
+    # 薄商い時間帯（UTC, "HH:MM-HH:MM" カンマ区切り）。新規を抑止。例: FX ロールオーバ "20:55-22:05"。
+    thin_liquidity_windows: Annotated[list[tuple[int, int]], NoDecode] = Field(default_factory=list)
+
+    @field_validator("risk_value_per_point", mode="before")
+    @classmethod
+    def _parse_value_per_point(cls, v: object) -> object:
+        """"USDJPY=1.0,EURJPY=1.0" 形式を {symbol: float} に変換。
+
+        不正な要素は fail-fast で落とす（設定ミスのまま黙って動かさない）。
+        """
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            out: dict[str, float] = {}
+            for part in v.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                key, _, val = part.partition("=")
+                out[key.strip().upper()] = float(val)
+            return out
+        return v
+
+    @field_validator("thin_liquidity_windows", mode="before")
+    @classmethod
+    def _parse_thin_windows(cls, v: object) -> object:
+        """"HH:MM-HH:MM,HH:MM-HH:MM" を [(start_min, end_min), ...]（UTC 分）へ変換。
+
+        日跨ぎ（例 23:30-00:30）は start>end として表現し、評価側でラップ処理する。
+        """
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            out: list[tuple[int, int]] = []
+            for part in v.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                lo, _, hi = part.partition("-")
+                out.append((_hhmm_to_min(lo), _hhmm_to_min(hi)))
+            return out
+        return v
+
+    @field_validator("loss_streak_reduce_factor")
+    @classmethod
+    def _check_reduce_factor(cls, v: float) -> float:
+        # (0, 1] のみ許可。1 超だと連敗ごとにサイズが増える＝マルチンゲール化して危険。
+        if not 0 < v <= 1:
+            raise ValueError(
+                f"loss_streak_reduce_factor must be in (0, 1]; got {v} "
+                "(>1 would ENLARGE size on a losing streak = martingale)"
+            )
+        return v
 
     # ---- 自作戦略（strategy.py）------------------------------------------
     # 既定 OFF。明示的に有効化しない限り自動シグナルは出さない（安全側）。

@@ -16,6 +16,7 @@ from datetime import datetime
 
 import common
 import httpx
+import journal
 from config import settings
 from domain import JST
 from logging_setup import log_extra, setup_logging
@@ -97,8 +98,11 @@ def maybe_daily_summary() -> None:
     except Exception:
         n, pnl = 0, 0
     ks = "ON" if common.kill_switch_on() else "OFF"
+    # 期待値ジャーナル（直近30日）。journal_summary は DB 不通でも空集計を返す（best-effort）。
+    journal_line = journal.format_summary(journal.journal_summary(30), 30)
     common.notify(
-        f"📊 日次: 約定{n}件 / 実現損益 {float(pnl):.0f} / KillSwitch {ks} / mode {settings.trading_mode}",
+        f"📊 日次: 約定{n}件 / 実現損益 {float(pnl):.0f} / KillSwitch {ks} / mode {settings.trading_mode}\n"
+        f"📒 {journal_line}",
         throttle=False,
     )
     log.info("daily summary sent", **log_extra(fills=n, pnl=float(pnl)))

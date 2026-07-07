@@ -128,6 +128,8 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
     # stop_distance は基準となる price（TradingView なら {{close}}）が無いと解決できない。
     stop_price = _optional_positive(raw.get("stop_price"), "stop_price")
     stop_distance = _optional_positive(raw.get("stop_distance"), "stop_distance")
+    # 利確距離（任意）。risk_engine の報酬/リスク比（min_reward_risk）ゲートが参照する。
+    tp_distance = _optional_positive(raw.get("tp_distance"), "tp_distance")
     close = bool(raw.get("close", False))
     if stop_distance is not None and stop_price is None:
         if price is None:
@@ -153,6 +155,7 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
         "price": price,
         "stop_price": stop_price,
         "stop_distance": stop_distance,
+        "tp_distance": tp_distance,
         "close": close,
         "ts": ts,
         "idem": compute_idem(raw),
