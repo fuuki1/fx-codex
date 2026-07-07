@@ -68,6 +68,13 @@ fmt: ## ruff で自動整形
 backup: ## DB バックアップを取得
 	./deploy/backup.sh
 
+.PHONY: migrate
+migrate: ## db/migrations/*.sql を順に適用（既存 DB に列追加。冪等）
+	@set -e; for f in $$(ls db/migrations/*.sql | sort); do \
+		echo "applying $$f"; \
+		$(COMPOSE) exec -T timescaledb psql -v ON_ERROR_STOP=1 -U $${POSTGRES_USER:-trader} -d $${POSTGRES_DB:-trader} < $$f; \
+	done; echo "migrations OK"
+
 .PHONY: reconcile
 reconcile: ## ブローカーと DB のリコンサイルを手動実行
 	$(COMPOSE) run --rm --no-deps executor python reconcile.py --once
