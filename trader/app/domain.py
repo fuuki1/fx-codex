@@ -30,6 +30,53 @@ class SignalError(ValueError):
 
 
 # ============================================================================
+# 時刻パース / 鮮度
+# ============================================================================
+# これより大きい数値は「ミリ秒 epoch」とみなす（秒 epoch は ~1.7e9 / ミリ秒は ~1.7e12）。
+_MILLIS_THRESHOLD = 1e12
+
+
+def parse_ts(value: Any, *, now: float | None = None) -> float:
+    """多様な時刻表現を UNIX 秒（float）へ。解釈不能/未指定は「現在時刻」を返す。
+
+    受け付ける形式:
+      - 数値 / 数値文字列（秒 epoch。大きすぎる値はミリ秒 epoch として補正）
+      - ISO 8601 文字列（TradingView の ``{{timenow}}`` 例: ``2024-01-01T00:00:00Z``）
+
+    ※ 文字列 epoch に対し ``float()`` を直接使うと ISO 文字列で ValueError になり
+       normalize_signal が 500 を返してしまう。ここで吸収して堅牢化する。
+    """
+    fallback = now if now is not None else time.time()
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, bool):  # True/False を 1.0/0.0 と誤解しない
+        return fallback
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > _MILLIS_THRESHOLD else float(value)
+    s = str(value).strip()
+    try:
+        num = float(s)
+        return num / 1000.0 if num > _MILLIS_THRESHOLD else num
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.timestamp()
+    except ValueError:
+        return fallback
+
+
+def signal_is_stale(ts: float, now: float, max_age_sec: float) -> bool:
+    """シグナルが古すぎる／未来すぎるなら True（max_age_sec<=0 で常に False=無効）。"""
+    if max_age_sec <= 0:
+        return False
+    age = now - ts
+    return age > max_age_sec or age < -max_age_sec
+
+
+# ============================================================================
 # 正規化
 # ============================================================================
 def compute_idem(raw: dict[str, Any]) -> str:
@@ -92,6 +139,10 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
 
     asset = str(raw.get("asset", "")).strip().lower() or _infer_asset(symbol)
 
+    # 鮮度判定用の時刻。TradingView は ``{{timenow}}``（発火時刻・ISO）を推奨。
+    # 何も無ければ受信時刻（= 常に新鮮扱い）。bar 時刻 ``{{time}}`` は古くなりうるので非推奨。
+    ts = parse_ts(raw.get("ts") or raw.get("timenow") or raw.get("time"))
+
     return {
         "source": source,
         "symbol": symbol,
@@ -103,7 +154,7 @@ def normalize_signal(raw: dict[str, Any], *, source: str = "tradingview") -> dic
         "stop_price": stop_price,
         "stop_distance": stop_distance,
         "close": close,
-        "ts": float(raw.get("ts") or time.time()),
+        "ts": ts,
         "idem": compute_idem(raw),
     }
 
