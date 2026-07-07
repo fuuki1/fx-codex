@@ -109,6 +109,7 @@ DEFAULT_NOTICE_JOURNAL_PATH = PROJECT_ROOT / "logs" / "trade_notice_journal.json
 DEFAULT_NOTICE_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "trade_notice_feedback.json"
 DEFAULT_NOTICE_SMOKE_DIR = PROJECT_ROOT / "logs" / "notice_pipeline_smoke"
 DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
+DEFAULT_TRADE_IMPROVEMENT_REGISTRY = PROJECT_ROOT / "logs" / "trade_improvement_candidates.json"
 # 時間足別モード(--per-timeframe)専用の記録。融合1判断モードと混ざらないよう
 # ジャーナルを分ける(採点ホライズンもスキーマも異なるため)
 DEFAULT_TF_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_tf_journal.jsonl"
@@ -375,6 +376,7 @@ def score_notice_journal_cli(
 def score_trade_outcomes_cli(
     journal_path: Path,
     json_report_path: Path | None = None,
+    improvement_registry_path: Path | None = None,
 ) -> int:
     """CLI entry for MFE/MAE/TP/SL expectancy audit of briefing decisions."""
     entries = list(journal.read_entries(journal_path))
@@ -382,8 +384,16 @@ def score_trade_outcomes_cli(
     summary = trade_outcome.summarize_expectancy(outcomes)
     findings = trade_outcome.expectancy_findings(summary)
     candidates = trade_outcome.improvement_candidates(summary)
+    registry = None
+    if improvement_registry_path is not None:
+        previous = trade_outcome.load_improvement_registry(improvement_registry_path)
+        registry = trade_outcome.update_improvement_registry(previous, candidates)
+        trade_outcome.save_improvement_registry(registry, improvement_registry_path)
     print(trade_outcome.format_expectancy_report_ja(summary))
     print(trade_outcome.format_improvement_candidates_ja(candidates))
+    if registry is not None:
+        print(trade_outcome.format_improvement_registry_ja(registry))
+        print(f"改善候補レジストリを保存しました: {improvement_registry_path}")
     if json_report_path is not None:
         json_report_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -391,6 +401,7 @@ def score_trade_outcomes_cli(
             "summary": summary,
             "findings": findings,
             "improvement_candidates": [candidate.to_dict() for candidate in candidates],
+            "improvement_registry": registry,
             "outcomes": [outcome.to_dict() for outcome in outcomes],
         }
         json_report_path.write_text(
@@ -792,6 +803,17 @@ def main(argv: list[str] | None = None) -> int:
         help="--score-trade-outcomes のJSONレポート保存先",
     )
     parser.add_argument(
+        "--trade-improvement-registry",
+        type=Path,
+        default=DEFAULT_TRADE_IMPROVEMENT_REGISTRY,
+        help="期待値改善候補レジストリJSONの保存先",
+    )
+    parser.add_argument(
+        "--update-trade-improvement-registry",
+        action="store_true",
+        help="--score-trade-outcomes の改善候補をレジストリへ保存・更新する",
+    )
+    parser.add_argument(
         "--trade-outcome-health-require-sample",
         action="store_true",
         help="--check-trade-outcome-health でサンプル不足をFAIL扱いにする",
@@ -849,6 +871,7 @@ def main(argv: list[str] | None = None) -> int:
         return score_trade_outcomes_cli(
             args.trade_outcome_journal,
             args.trade_outcome_json,
+            args.trade_improvement_registry if args.update_trade_improvement_registry else None,
         )
     if args.check_trade_outcome_health:
         return check_trade_outcome_health_cli(

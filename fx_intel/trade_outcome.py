@@ -14,7 +14,9 @@ from bisect import bisect_left
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
+import json
 import math
+from pathlib import Path
 
 from .coerce import to_int
 from .journal import DEFAULT_HORIZON_HOURS, DEFAULT_TOLERANCE_HOURS
@@ -35,6 +37,7 @@ STATUS_OK = "ok"
 STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
 EXPECTANCY_BLOCK_FACTOR = 0.45
+IMPROVEMENT_REGISTRY_SCHEMA = 1
 
 
 @dataclass(frozen=True)
@@ -500,6 +503,92 @@ def format_improvement_candidates_ja(
         lines.append(
             f"・[{candidate.priority}] {candidate.title_ja}: "
             f"{candidate.rationale_ja} / 検証: {candidate.validation_ja}"
+        )
+    return "\n".join(lines)
+
+
+def update_improvement_registry(
+    previous: Mapping[str, object] | None,
+    candidates: Sequence[TradeImprovementCandidate],
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Merge current candidates into a persistent improvement-candidate registry."""
+    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    previous_records = _registry_records(previous)
+    current_ids = {candidate.candidate_id for candidate in candidates}
+    records: dict[str, dict] = {}
+
+    for candidate in candidates:
+        prior = previous_records.get(candidate.candidate_id, {})
+        first_seen = str(prior.get("first_seen") or generated_at)
+        seen_count = _stat_int(prior, "seen_count") + 1
+        record = {
+            **candidate.to_dict(),
+            "status": "active",
+            "first_seen": first_seen,
+            "last_seen": generated_at,
+            "resolved_at": None,
+            "seen_count": seen_count,
+        }
+        records[candidate.candidate_id] = record
+
+    for candidate_id, prior in previous_records.items():
+        if candidate_id in current_ids:
+            continue
+        record = dict(prior)
+        record["status"] = "resolved"
+        record.setdefault("first_seen", generated_at)
+        record.setdefault("last_seen", generated_at)
+        record["resolved_at"] = record.get("resolved_at") or generated_at
+        record["seen_count"] = _stat_int(record, "seen_count")
+        records[candidate_id] = record
+
+    active_count = sum(1 for record in records.values() if record.get("status") == "active")
+    resolved_count = sum(1 for record in records.values() if record.get("status") == "resolved")
+    return {
+        "schema": IMPROVEMENT_REGISTRY_SCHEMA,
+        "generated_at": generated_at,
+        "active_count": active_count,
+        "resolved_count": resolved_count,
+        "candidates": records,
+    }
+
+
+def load_improvement_registry(path: str | Path) -> dict:
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_improvement_registry(registry: Mapping[str, object], path: str | Path) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def format_improvement_registry_ja(
+    registry: Mapping[str, object],
+    *,
+    limit: int = 5,
+) -> str:
+    records = _registry_records(registry)
+    if not records:
+        return "改善候補レジストリ: 候補なし"
+    active = [record for record in records.values() if str(record.get("status", "")) == "active"]
+    resolved = [
+        record for record in records.values() if str(record.get("status", "")) == "resolved"
+    ]
+    lines = [f"改善候補レジストリ: active={len(active)} / resolved={len(resolved)}"]
+    for record in sorted(
+        active,
+        key=lambda item: (-_stat_int(item, "seen_count"), str(item.get("candidate_id", ""))),
+    )[:limit]:
+        lines.append(
+            f"・{record.get('title_ja', record.get('candidate_id'))}"
+            f" (seen={_stat_int(record, 'seen_count')}, priority={record.get('priority', '-')})"
         )
     return "\n".join(lines)
 
@@ -991,7 +1080,25 @@ def _candidate_id(finding: Mapping[str, object], index: int) -> str:
     normalized = "".join(ch if ch.isalnum() else "-" for ch in raw).strip("-")
     while "--" in normalized:
         normalized = normalized.replace("--", "-")
-    return f"trade-improvement-{index}-{normalized or 'overall'}"
+    return f"trade-improvement-{normalized or f'candidate-{index}'}"
+
+
+def _registry_records(registry: Mapping[str, object] | None) -> dict[str, dict]:
+    if not isinstance(registry, Mapping):
+        return {}
+    raw = registry.get("candidates")
+    if isinstance(raw, Mapping):
+        return {str(key): dict(value) for key, value in raw.items() if isinstance(value, Mapping)}
+    if isinstance(raw, list):
+        output: dict[str, dict] = {}
+        for value in raw:
+            if not isinstance(value, Mapping):
+                continue
+            candidate_id = str(value.get("candidate_id", ""))
+            if candidate_id:
+                output[candidate_id] = dict(value)
+        return output
+    return {}
 
 
 def _finding(
@@ -1124,9 +1231,13 @@ def _parse_ts(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(str(value))
     except (TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+    return _utc(parsed)
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _float(value: object) -> float | None:

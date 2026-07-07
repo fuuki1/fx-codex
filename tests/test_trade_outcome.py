@@ -82,6 +82,47 @@ def test_expectancy_findings_mark_sample_guard() -> None:
     assert "サンプル不足" in report
 
 
+def test_improvement_registry_tracks_active_and_resolved_candidates() -> None:
+    weak_summary = to.summarize_expectancy(
+        [_outcome(1.0) for _ in range(4)],
+        min_samples=10,
+        group_min_samples=5,
+    )
+    healthy_summary = to.summarize_expectancy(
+        [_outcome(1.0) for _ in range(10)],
+        min_samples=10,
+        group_min_samples=5,
+    )
+    first_seen = NOW
+    second_seen = NOW + timedelta(hours=1)
+    resolved_at = NOW + timedelta(hours=2)
+
+    first = to.update_improvement_registry(
+        {},
+        to.improvement_candidates(weak_summary),
+        now=first_seen,
+    )
+    second = to.update_improvement_registry(
+        first,
+        to.improvement_candidates(weak_summary),
+        now=second_seen,
+    )
+    resolved = to.update_improvement_registry(
+        second,
+        to.improvement_candidates(healthy_summary),
+        now=resolved_at,
+    )
+
+    candidate_id, record = next(iter(second["candidates"].items()))
+    assert record["status"] == "active"
+    assert record["first_seen"] == first_seen.isoformat()
+    assert record["last_seen"] == second_seen.isoformat()
+    assert record["seen_count"] == 2
+    assert resolved["candidates"][candidate_id]["status"] == "resolved"
+    assert resolved["candidates"][candidate_id]["resolved_at"] == resolved_at.isoformat()
+    assert "active=0" in to.format_improvement_registry_ja(resolved)
+
+
 def test_expectancy_health_warns_for_sample_guard() -> None:
     summary = to.summarize_expectancy(
         [_outcome(1.0) for _ in range(4)],
@@ -118,6 +159,7 @@ def test_expectancy_health_fails_for_negative_expectancy() -> None:
 def test_score_trade_outcomes_cli_writes_json_report(tmp_path, capsys) -> None:
     journal_path = tmp_path / "briefing_journal.jsonl"
     json_path = tmp_path / "trade_outcomes.json"
+    registry_path = tmp_path / "trade_improvement_candidates.json"
     rows = [
         {
             "ts": NOW.isoformat(),
@@ -155,17 +197,21 @@ def test_score_trade_outcomes_cli_writes_json_report(tmp_path, capsys) -> None:
         encoding="utf-8",
     )
 
-    exit_code = score_trade_outcomes_cli(journal_path, json_path)
+    exit_code = score_trade_outcomes_cli(journal_path, json_path, registry_path)
 
     assert exit_code == 0
     output = capsys.readouterr().out
     assert "トレード期待値監視" in output
     assert "JSONを保存" in output
+    assert "改善候補レジストリを保存" in output
     payload = json.loads(json_path.read_text(encoding="utf-8"))
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert payload["summary"]["overall"]["evaluated"] == 1
     assert payload["outcomes"][0]["tp1_hit"] is True
     assert payload["findings"][0]["severity"] == "sample_guard"
     assert payload["improvement_candidates"][0]["action_type"] == "collect_samples"
+    assert payload["improvement_registry"]["active_count"] >= 1
+    assert registry["active_count"] == payload["improvement_registry"]["active_count"]
 
 
 def test_check_trade_outcome_health_cli_returns_failure_for_negative_expectancy(
