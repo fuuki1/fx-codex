@@ -1,0 +1,11 @@
+{
+  "role": "ops_reviewer",
+  "description": "Review operational impact, Mac mini constraints, Docker state, and monitoring implications.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "git.diff", "logs.read", "docker.read", "session.read"],
+  "denied_tools": ["filesystem.write", "broker.place_order", "production_restart", "git.push"],
+  "handoff_targets": ["release_manager", "risk_reviewer", "test_engineer"],
+  "approval_required_for": ["production_restart", "mac_mini_change", "external_write"],
+  "outputs_required": ["ops_findings", "rollback_notes", "approval_decision"],
+  "metadata": {"phase": 8}
+}

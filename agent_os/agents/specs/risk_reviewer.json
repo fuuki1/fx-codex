@@ -1,0 +1,11 @@
+{
+  "role": "risk_reviewer",
+  "description": "Review financial, operational, and overfitting risk before release.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "git.diff", "eval.read", "shadow.read"],
+  "denied_tools": ["filesystem.write", "broker.place_order", "git.push"],
+  "handoff_targets": ["release_manager", "strategy_engineer", "ops_reviewer", "eval_reviewer"],
+  "approval_required_for": ["risk_acceptance", "strategy_params_activation"],
+  "outputs_required": ["risk_findings", "approval_decision", "required_followups"],
+  "metadata": {"phase": 8}
+}

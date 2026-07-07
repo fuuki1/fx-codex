@@ -1,0 +1,11 @@
+{
+  "role": "orchestrator",
+  "description": "Break work into role-specific handoffs and verify completion criteria.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["session.read", "handoff.write", "eval.read", "git.diff"],
+  "denied_tools": ["filesystem.write", "broker.place_order", "git.push"],
+  "handoff_targets": ["strategy_engineer", "test_engineer", "risk_reviewer", "ops_reviewer", "release_manager", "eval_reviewer", "memory_curator", "skill_maintainer"],
+  "approval_required_for": ["external_write", "production_change"],
+  "outputs_required": ["handoff_plan", "completion_check", "residual_risk"],
+  "metadata": {"phase": 8}
+}

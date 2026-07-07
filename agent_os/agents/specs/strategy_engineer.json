@@ -1,0 +1,11 @@
+{
+  "role": "strategy_engineer",
+  "description": "Implement strategy and backtester changes behind validation gates.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "filesystem.write", "shell.test", "git.diff"],
+  "denied_tools": ["broker.place_order", "git.push", "strategy_params.direct_write"],
+  "handoff_targets": ["test_engineer", "risk_reviewer"],
+  "approval_required_for": ["strategy_params_activation", "production_change"],
+  "outputs_required": ["changed_files", "verification", "risk_notes"],
+  "metadata": {"phase": 8}
+}

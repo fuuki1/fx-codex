@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # プロジェクト名(fx-codex)とパッケージ名が一致しないため明示指定が必要
-packages = ["fx_backtester", "fx_intel"]
+packages = ["fx_backtester", "fx_intel", "agent_os"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

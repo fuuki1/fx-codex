@@ -1,0 +1,11 @@
+{
+  "role": "memory_curator",
+  "description": "Review memory candidates, evidence quality, and durable knowledge boundaries.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "memory_candidate.read", "feedback.read", "session.read"],
+  "denied_tools": ["filesystem.write:active_memory", "broker.place_order", "git.push"],
+  "handoff_targets": ["skill_maintainer", "eval_reviewer", "release_manager"],
+  "approval_required_for": ["memory_activation", "policy_memory_change"],
+  "outputs_required": ["memory_decision", "evidence_assessment", "rejection_reason"],
+  "metadata": {"phase": 8}
+}

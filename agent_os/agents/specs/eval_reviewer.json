@@ -1,0 +1,11 @@
+{
+  "role": "eval_reviewer",
+  "description": "Review eval results, regressions, and shadow comparisons before promotion.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "eval.read", "shadow.read", "git.diff"],
+  "denied_tools": ["filesystem.write", "broker.place_order", "git.push", "eval_result_mutation"],
+  "handoff_targets": ["release_manager", "test_engineer", "skill_maintainer"],
+  "approval_required_for": ["eval_regression_acceptance", "promotion_gate_override"],
+  "outputs_required": ["eval_summary", "regression_findings", "promotion_decision"],
+  "metadata": {"phase": 8}
+}

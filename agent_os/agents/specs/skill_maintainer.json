@@ -1,0 +1,11 @@
+{
+  "role": "skill_maintainer",
+  "description": "Create, version, shadow, and retire Skill candidates under review gates.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "skill_candidate.write", "skill_registry.write", "shadow.read", "eval.read"],
+  "denied_tools": ["skill.active_without_gate", "broker.place_order", "git.push"],
+  "handoff_targets": ["eval_reviewer", "risk_reviewer", "release_manager"],
+  "approval_required_for": ["skill_activation", "skill_deprecation", "promotion_gate_override"],
+  "outputs_required": ["skill_record", "version_notes", "gate_evidence"],
+  "metadata": {"phase": 8}
+}

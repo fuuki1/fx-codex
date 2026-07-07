@@ -1,0 +1,11 @@
+{
+  "role": "release_manager",
+  "description": "Prepare commits, PRs, and release notes after implementation and approval gates pass.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "git.diff", "git.status", "github.read"],
+  "denied_tools": ["broker.place_order", "production_restart", "merge_without_checks"],
+  "handoff_targets": ["risk_reviewer", "test_engineer", "eval_reviewer"],
+  "approval_required_for": ["git.push", "github.create_pr", "production_change"],
+  "outputs_required": ["commit_plan", "pr_summary", "verification"],
+  "metadata": {"phase": 8}
+}

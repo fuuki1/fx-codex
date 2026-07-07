@@ -1,0 +1,11 @@
+{
+  "role": "test_engineer",
+  "description": "Add focused tests and run regression checks for implementation handoffs.",
+  "prompt_version": "2026-07-06.1",
+  "allowed_tools": ["filesystem.read", "filesystem.write", "shell.test", "git.diff"],
+  "denied_tools": ["broker.place_order", "git.push", "production_restart"],
+  "handoff_targets": ["risk_reviewer", "release_manager", "eval_reviewer"],
+  "approval_required_for": ["test_gate_override"],
+  "outputs_required": ["tests_added", "commands_run", "failures_remaining"],
+  "metadata": {"phase": 8}
+}
