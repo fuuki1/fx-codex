@@ -147,7 +147,9 @@ class ParamStore:
         if mtime == self._mtime:
             return self.params
 
-        params, errors = load_validated_params(self.path)
+        params, errors = load_validated_params(
+            self.path, expected_bar_interval_sec=settings.strategy_bar_size_sec
+        )
         if errors or params is None:
             # 拒否/読み込み不能。再検証を毎ループ走らせないよう mtime は進める（指摘5）。
             self._mtime = mtime

@@ -26,18 +26,26 @@
 
 ---
 
-## [残課題・別PR] バー時間軸と backtest 時間軸の不一致
+## [解決済み] バー時間軸と backtest 時間軸の不一致
 
 **深刻度**: 中（沈黙は解消したが、戦略の意味論が backtest と一致しない可能性）
+**状態**: 解決（対応案どおり params_gate を拡張）
 
 `auto_optimize.py` は時間足（hourly 形状）データで `slow_window` を最適化するが、
 既定の `STRATEGY_BAR_SIZE_SEC=5`（5 秒足）では同じ `slow_window=100` でも MA が
 約 8 分しか張らず、backtest とは別物の戦略になる。上記修正で沈黙は解消したが、
-「配備 params の時間軸」と「live のバー間隔」を突き合わせる仕組みは未整備。
+「配備 params の時間軸」と「live のバー間隔」を突き合わせる仕組みは未整備だった。
 
-**対応案**:
-- `provenance` に最適化データのバー間隔を記録し、`STRATEGY_BAR_SIZE_SEC` と一致
-  しなければ warning／拒否する（params_gate 拡張）。
+**対応（実装済み）**:
+- `params_gate.data_provenance()` が最適化データの CSV からバー間隔を推定し
+  （連続行の時間差の中央値 = 日足の週末ギャップに頑健）、
+  `provenance.data.bar_interval_sec` として記録する。生成側はどこも変更不要
+  （root の auto_optimize.py も、trader 側の将来の実データ最適化も自動で記録される）。
+- 読み込み側 `validate_params()` / `load_validated_params()` に
+  `expected_bar_interval_sec` を追加。trader の `strategy.py`（ParamStore）は
+  `STRATEGY_BAR_SIZE_SEC` を渡し、記録された間隔と 10% 超ずれていれば拒否する。
+- `bar_interval_sec` の記録が無い既存ファイルは互換のため突合しない
+  （次回の最適化実行から自動で記録される）。
 
 ---
 

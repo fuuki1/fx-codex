@@ -172,6 +172,48 @@ def test_validate_params_rejects_low_trade_count() -> None:
     assert any("取引数が不足" in e for e in errors)
 
 
+# ── バー間隔（時間軸）の来歴と突合 ───────────────────────────────────────────
+
+
+def test_data_provenance_records_bar_interval(tmp_path: Path) -> None:
+    hourly = write_price_csv(tmp_path / "hourly.csv", periods=200, freq="h")
+    prov = params_gate.data_provenance(hourly, 200, "2024-01-01", "2024-01-09")
+    assert prov["bar_interval_sec"] == 3600
+
+
+def test_data_provenance_bar_interval_robust_to_weekend_gaps(tmp_path: Path) -> None:
+    # 営業日ベースの日足: 週末ギャップ(259200秒)が混ざっても中央値で 86400 になる
+    daily = write_price_csv(tmp_path / "daily.csv", periods=200, freq="B")
+    prov = params_gate.data_provenance(daily, 200, "2024-01-01", "2024-10-08")
+    assert prov["bar_interval_sec"] == 86400
+
+
+def test_validate_params_rejects_bar_interval_mismatch() -> None:
+    # 日足(86400秒)で最適化したパラメータを 5 秒足 live へ配備しようとすると拒否
+    params = valid_params()
+    params["provenance"]["data"]["bar_interval_sec"] = 86400
+    errors = params_gate.validate_params(params, expected_bar_interval_sec=5)
+    assert any("バー間隔不一致" in e for e in errors)
+
+
+def test_validate_params_accepts_matching_bar_interval() -> None:
+    params = valid_params()
+    params["provenance"]["data"]["bar_interval_sec"] = 5
+    assert params_gate.validate_params(params, expected_bar_interval_sec=5) == []
+
+
+def test_validate_params_grandfathers_missing_bar_interval() -> None:
+    # bar_interval_sec 導入前のファイルは記録が無い → 互換のため突合しない
+    assert params_gate.validate_params(valid_params(), expected_bar_interval_sec=5) == []
+
+
+def test_validate_params_ignores_bar_interval_without_expectation() -> None:
+    # 期待値を渡さない呼び出し（flat 側の promote 等）は従来どおり時間軸を見ない
+    params = valid_params()
+    params["provenance"]["data"]["bar_interval_sec"] = 86400
+    assert params_gate.validate_params(params) == []
+
+
 def test_load_validated_params_handles_bad_file(tmp_path: Path) -> None:
     missing, errors = params_gate.load_validated_params(tmp_path / "none.json")
     assert missing is None and errors

@@ -79,6 +79,43 @@ def _parse_timestamp(raw: str) -> datetime | None:
         return None
 
 
+def _infer_bar_interval_sec(path: Path) -> int | None:
+    """CSV の timestamp 列から代表的なバー間隔（秒）を推定する。
+
+    連続する行の時間差の中央値を採用する（日足データの週末ギャップのような
+    外れ値に頑健）。解釈できる時間差が 2 個未満なら None（来歴に記録しない）。
+    """
+    deltas: list[float] = []
+    prev: datetime | None = None
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+                return None
+            columns = [c.strip().lower() for c in header]
+            if "timestamp" not in columns:
+                return None
+            ts_idx = columns.index("timestamp")
+            for row in reader:
+                if len(row) <= ts_idx:
+                    continue
+                ts = _parse_timestamp(row[ts_idx])
+                if ts is None:
+                    continue
+                if prev is not None:
+                    delta = (ts - prev).total_seconds()
+                    if delta > 0:
+                        deltas.append(delta)
+                prev = ts
+    except OSError:
+        return None
+    if len(deltas) < 2:
+        return None
+    deltas.sort()
+    return int(round(deltas[len(deltas) // 2]))
+
+
 def validate_data_source(
     raw: str | None,
     *,
@@ -156,14 +193,24 @@ def validate_data_source(
 
 
 def data_provenance(path: Path, rows: int, start: str, end: str) -> dict:
-    """candidate に埋め込むデータ来歴。読み込み側の validate_params() が必須とする。"""
-    return {
+    """candidate に埋め込むデータ来歴。読み込み側の validate_params() が必須とする。
+
+    bar_interval_sec は最適化データのバー間隔（秒）。読み込み側が live のバー間隔
+    （trader の STRATEGY_BAR_SIZE_SEC）と突合し、別時間軸で最適化されたパラメータ
+    （例: 日足で選んだ slow_window を 5 秒足へ適用 = 別物の戦略）の配備を防ぐ。
+    推定できない場合は省略される（読み込み側は記録が有る場合のみ突合する）。
+    """
+    provenance: dict = {
         "path": str(path),
         "sha256": sha256_file(path),
         "rows": rows,
         "start": start,
         "end": end,
     }
+    interval = _infer_bar_interval_sec(path)
+    if interval is not None:
+        provenance["bar_interval_sec"] = interval
+    return provenance
 
 
 def _check_number(
@@ -184,11 +231,17 @@ def validate_params(
     params: dict,
     *,
     min_trade_count: int = MIN_TRADE_COUNT,
+    expected_bar_interval_sec: int | None = None,
 ) -> list[str]:
     """配備パラメータを検証し、エラーの一覧を返す（空なら合格）。
 
     読み込み側（strategy.py / promote_params.py）はエラーが1つでもあれば
-    このパラメータを適用せず、現行パラメータを維持すること。"""
+    このパラメータを適用せず、現行パラメータを維持すること。
+
+    expected_bar_interval_sec を渡すと、来歴に記録された最適化データのバー間隔
+    （provenance.data.bar_interval_sec）と突合し、不一致なら拒否する。来歴に
+    記録が無い場合は突合しない（bar_interval_sec 導入前のファイルとの互換。
+    次回の最適化から記録される）。"""
     if not isinstance(params, dict):
         return [f"パラメータが dict でない: {type(params).__name__}"]
 
@@ -219,6 +272,18 @@ def validate_params(
         sha = data.get("sha256")
         if isinstance(sha, str) and sha in synthetic_hashes():
             errors.append("合成サンプルデータで最適化されたパラメータ。配備禁止")
+        interval = data.get("bar_interval_sec")
+        if (
+            expected_bar_interval_sec is not None
+            and isinstance(interval, (int, float))
+            and not isinstance(interval, bool)
+            and abs(float(interval) - expected_bar_interval_sec) > 0.1 * expected_bar_interval_sec
+        ):
+            errors.append(
+                f"バー間隔不一致: 最適化データは {interval} 秒足、live は "
+                f"{expected_bar_interval_sec} 秒足。別時間軸で最適化されたパラメータは"
+                "同じ slow_window でも別物の戦略になるため配備できない"
+            )
 
     trade_count = provenance.get("trade_count")
     if not isinstance(trade_count, int) or isinstance(trade_count, bool):
@@ -240,6 +305,7 @@ def load_validated_params(
     path: Path | str,
     *,
     min_trade_count: int = MIN_TRADE_COUNT,
+    expected_bar_interval_sec: int | None = None,
 ) -> tuple[dict | None, list[str]]:
     """パラメータファイルを読み込んで検証する。(params, errors) を返す。
 
@@ -252,7 +318,11 @@ def load_validated_params(
         params = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         return None, [f"パラメータファイルを読めない: {path} ({e})"]
-    errors = validate_params(params, min_trade_count=min_trade_count)
+    errors = validate_params(
+        params,
+        min_trade_count=min_trade_count,
+        expected_bar_interval_sec=expected_bar_interval_sec,
+    )
     if errors:
         return None, errors
     return params, []

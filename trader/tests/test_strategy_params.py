@@ -100,6 +100,27 @@ def test_rejected_reload_keeps_last_good(tmp_path: Path) -> None:
     assert loaded["fast_window"] == 12  # 99 は採用されない
 
 
+def test_params_with_wrong_bar_interval_are_rejected(tmp_path: Path) -> None:
+    """日足（86400秒）で最適化されたパラメータは 5 秒足 live では配備できない。
+
+    同じ slow_window でもバー間隔が違えば MA の張る時間が桁で変わり、backtest と
+    別物の戦略になる（ISSUES.md「バー時間軸と backtest 時間軸の不一致」の解消）。
+    """
+    path = tmp_path / "strategy_params.json"
+    params = _valid_params()
+    params["provenance"]["data"]["bar_interval_sec"] = 86400
+    _write(path, params)
+    assert ParamStore(str(path)).get() is None
+
+
+def test_params_with_matching_bar_interval_load(tmp_path: Path) -> None:
+    path = tmp_path / "strategy_params.json"
+    params = _valid_params()
+    params["provenance"]["data"]["bar_interval_sec"] = 5  # 既定 STRATEGY_BAR_SIZE_SEC と一致
+    _write(path, params)
+    assert ParamStore(str(path)).get() is not None
+
+
 def test_out_of_bounds_params_are_rejected(tmp_path: Path) -> None:
     path = tmp_path / "strategy_params.json"
     _write(path, _valid_params(atr_multiple=50.0))
