@@ -26,6 +26,14 @@
 15. price_history — 採点用の将来価格調達(ジャーナル後続行 + 外部OHLC注入口)
 16. tf_learning  — (symbol×timeframe) セル別の主ホライズン採点・学習
 17. tf_briefing  — 時間足別のDiscordペイロード生成
+18. market_structure / notice_history / trade_notice / notice_renderer /
+    notice_journal / discord_delivery
+                 — 構造化された長文売買通知とDiscord分割送信
+19. notice_quality — 詳細通知ジャーナルを未来OHLCで品質評価
+20. notice_feedback — 詳細通知品質を条件別に集計し次回通知へ注意反映
+21. notice_smoke — 詳細通知の生成→監査→採点→フィードバックE2Eスモーク
+22. notice_health — 詳細通知の運用前ヘルスチェック
+23. trade_outcome — 判断ジャーナルをMFE/MAE/TP/SL期待値で監査
 
 tv_discord_notify.py と同じく fx_backtester 非依存で単体動作する
 (必要な外部パッケージは requests と tradingview_ta のみ。gbm/ml/promotion は
@@ -38,13 +46,23 @@ __all__ = [
     "calendar",
     "committee",
     "drift",
+    "discord_delivery",
     "dukascopy",
     "gbm",
     "journal",
     "learning",
     "macro",
+    "market_structure",
     "ml",
     "news",
+    "notice_feedback",
+    "notice_health",
+    "notice_history",
+    "notice_journal",
+    "notice_policy",
+    "notice_quality",
+    "notice_renderer",
+    "notice_smoke",
     "price_history",
     "promotion",
     "sentiment",
@@ -52,4 +70,6 @@ __all__ = [
     "tf_briefing",
     "tf_learning",
     "timeframe",
+    "trade_notice",
+    "trade_outcome",
 ]

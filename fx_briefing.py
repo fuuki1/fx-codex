@@ -75,11 +75,20 @@ from fx_intel import (
     briefing,
     calendar,
     committee,
+    discord_delivery,
     journal,
     learning,
     macro,
+    market_structure,
     ml,
     news,
+    notice_feedback,
+    notice_health,
+    notice_history,
+    notice_journal,
+    notice_quality,
+    notice_renderer,
+    notice_smoke,
     price_history,
     promotion,
     sentiment,
@@ -87,6 +96,8 @@ from fx_intel import (
     tf_briefing,
     tf_learning,
     timeframe,
+    trade_notice,
+    trade_outcome,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -94,6 +105,9 @@ DEFAULT_SYMBOLS = ["USDJPY", "EURUSD", "GBPUSD"]
 DEFAULT_EVENTS_CSV = PROJECT_ROOT / "research_pack" / "upcoming_events.csv"
 DEFAULT_EVENTS_ARCHIVE = PROJECT_ROOT / "research_pack" / "event_history.csv"
 DEFAULT_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_journal.jsonl"
+DEFAULT_NOTICE_JOURNAL_PATH = PROJECT_ROOT / "logs" / "trade_notice_journal.jsonl"
+DEFAULT_NOTICE_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "trade_notice_feedback.json"
+DEFAULT_NOTICE_SMOKE_DIR = PROJECT_ROOT / "logs" / "notice_pipeline_smoke"
 DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
 # 時間足別モード(--per-timeframe)専用の記録。融合1判断モードと混ざらないよう
 # ジャーナルを分ける(採点ホライズンもスキーマも異なるため)
@@ -108,6 +122,7 @@ DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
+DEFAULT_NOTICE_DUKASCOPY_CACHE = PROJECT_ROOT / "logs" / "dukascopy_notice_cache"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
@@ -177,6 +192,273 @@ def post_to_discord(webhook_url: str, payload: dict) -> None:
     response = requests.post(webhook_url, json=payload, timeout=15)
     if response.status_code >= 300:
         raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
+
+
+def load_notice_entry_levels(
+    paths: list[Path] | None,
+    plans: list[briefing.TradePlan],
+    now: datetime,
+    lookback_bars: int,
+    fetch_warnings: list[str],
+) -> dict[str, market_structure.EntryLevels]:
+    """Load optional OHLC CSVs and derive detailed-notice entry levels."""
+    if not paths:
+        return {}
+    try:
+        from fx_backtester.data import load_price_csvs
+    except Exception as error:  # noqa: BLE001 - optional integration path
+        fetch_warnings.append(f"詳細通知OHLCローダー使用不可: {error}")
+        return {}
+    try:
+        data = load_price_csvs(paths)
+    except Exception as error:  # noqa: BLE001 - user-provided CSV validation
+        fetch_warnings.append(f"詳細通知OHLC読み込み失敗: {error}")
+        return {}
+
+    levels_by_symbol: dict[str, market_structure.EntryLevels] = {}
+    plan_by_symbol = {plan.symbol: plan for plan in plans}
+    for symbol, plan in plan_by_symbol.items():
+        frame = data.get(symbol)
+        if frame is None or frame.empty:
+            continue
+        selected = _ohlc_frame_until(frame, now)
+        if selected.empty:
+            fetch_warnings.append(f"詳細通知OHLC: {symbol} は分析時刻以前のバーがありません")
+            continue
+        bars = [
+            market_structure.OhlcBar(
+                timestamp=_timestamp_to_utc(timestamp),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+            )
+            for timestamp, row in selected.tail(max(lookback_bars, 5)).iterrows()
+        ]
+        if plan.close is None:
+            continue
+        levels = market_structure.build_entry_levels(
+            symbol,
+            plan.direction,
+            bars,
+            current_price=float(plan.close),
+            atr=plan.atr,
+            lookback_bars=lookback_bars,
+        )
+        if levels is not None:
+            levels_by_symbol[symbol] = levels
+    if not levels_by_symbol:
+        fetch_warnings.append("詳細通知OHLC: 使用可能な市場構造レベルなし。ATR暫定ラインで継続")
+    return levels_by_symbol
+
+
+def load_dukascopy_notice_entry_levels(
+    *,
+    enabled: bool,
+    plans: list[briefing.TradePlan],
+    now: datetime,
+    cache_dir: Path,
+    timeframe_name: str,
+    hours_back: float,
+    lookback_bars: int,
+    existing: dict[str, market_structure.EntryLevels],
+    fetch_warnings: list[str],
+) -> dict[str, market_structure.EntryLevels]:
+    """Optionally fill missing detailed-notice entry levels from Dukascopy."""
+    if not enabled:
+        return existing
+    missing_symbols = [plan.symbol for plan in plans if plan.symbol not in existing]
+    if not missing_symbols:
+        return existing
+    try:
+        result = notice_history.dukascopy_notice_bars(
+            missing_symbols,
+            now=now,
+            cache_dir=cache_dir,
+            timeframe=timeframe_name,
+            hours_back=hours_back,
+        )
+    except Exception as error:  # noqa: BLE001 - optional source degradation
+        fetch_warnings.append(f"Dukascopy通知OHLC補完失敗: {error}")
+        return existing
+    fetch_warnings.extend(result.warnings)
+    fallback = notice_history.entry_levels_from_bars(
+        plans,
+        result.bars_by_symbol,
+        lookback_bars=lookback_bars,
+    )
+    merged = notice_history.merge_entry_levels(existing, fallback)
+    if not fallback:
+        fetch_warnings.append("Dukascopy通知OHLC: 市場構造レベルを補完できませんでした")
+    return merged
+
+
+def _ohlc_frame_until(frame, now: datetime):
+    import pandas as pd
+
+    if getattr(frame.index, "tz", None) is None:
+        cutoff = pd.Timestamp(now).tz_convert("UTC").tz_localize(None)
+    else:
+        cutoff = pd.Timestamp(now).tz_convert(frame.index.tz)
+    return frame[frame.index <= cutoff]
+
+
+def _timestamp_to_utc(timestamp) -> datetime:
+    parsed = timestamp.to_pydatetime() if hasattr(timestamp, "to_pydatetime") else timestamp
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def load_notice_quality_bars(paths: list[Path]) -> dict[str, list[market_structure.OhlcBar]]:
+    """Load OHLC CSVs for detailed-notice quality scoring."""
+    from fx_backtester.data import load_price_csvs
+
+    data = load_price_csvs(paths)
+    output: dict[str, list[market_structure.OhlcBar]] = {}
+    for symbol, frame in data.items():
+        rows: list[market_structure.OhlcBar] = []
+        for timestamp, row in frame.iterrows():
+            rows.append(
+                market_structure.OhlcBar(
+                    timestamp=_timestamp_to_utc(timestamp),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                )
+            )
+        output[symbol] = rows
+    return output
+
+
+def score_notice_journal_cli(
+    journal_path: Path,
+    ohlc_paths: list[Path],
+    feedback_path: Path | None = None,
+    json_report_path: Path | None = None,
+    csv_report_path: Path | None = None,
+) -> int:
+    """CLI entry for detailed-notice quality scoring."""
+    entries = list(notice_journal.read_notice_entries(journal_path))
+    bars_by_symbol = load_notice_quality_bars(ohlc_paths)
+    outcomes = notice_quality.score_notice_entries(entries, bars_by_symbol)
+    summary = notice_quality.summarize_outcomes(outcomes)
+    print(notice_quality.format_summary_ja(summary))
+    profile = notice_feedback.build_feedback_profile(entries, outcomes)
+    print(notice_feedback.format_profile_ja(profile))
+    if json_report_path is not None:
+        notice_quality.write_quality_report_json(json_report_path, entries, outcomes)
+        print(f"詳細通知評価JSONを保存しました: {json_report_path}")
+    if csv_report_path is not None:
+        notice_quality.write_quality_outcomes_csv(csv_report_path, entries, outcomes)
+        print(f"詳細通知評価CSVを保存しました: {csv_report_path}")
+    if feedback_path is not None:
+        notice_feedback.save_profile(profile, feedback_path)
+        print(f"詳細通知フィードバックを保存しました: {feedback_path}")
+    for outcome in outcomes[-10:]:
+        touched = "" if outcome.touched_at is None else f" @ {outcome.touched_at.isoformat()}"
+        if outcome.entry_check == notice_quality.ENTRY_CHECK_TRIGGERED:
+            trigger = (
+                f" trigger={outcome.entry_scenario}"
+                f"@{outcome.entry_triggered_at.isoformat() if outcome.entry_triggered_at else '?'}"
+            )
+        elif outcome.entry_check == notice_quality.ENTRY_CHECK_NOT_TRIGGERED:
+            trigger = " trigger=none"
+        else:
+            trigger = ""
+        reason = "" if not outcome.reason else f" ({outcome.reason})"
+        print(f"- {outcome.symbol} {outcome.direction} {outcome.outcome}{touched}{trigger}{reason}")
+    return 0
+
+
+def score_trade_outcomes_cli(
+    journal_path: Path,
+    json_report_path: Path | None = None,
+) -> int:
+    """CLI entry for MFE/MAE/TP/SL expectancy audit of briefing decisions."""
+    entries = list(journal.read_entries(journal_path))
+    outcomes = trade_outcome.evaluate_trade_outcomes(entries)
+    summary = trade_outcome.summarize_expectancy(outcomes)
+    findings = trade_outcome.expectancy_findings(summary)
+    candidates = trade_outcome.improvement_candidates(summary)
+    print(trade_outcome.format_expectancy_report_ja(summary))
+    print(trade_outcome.format_improvement_candidates_ja(candidates))
+    if json_report_path is not None:
+        json_report_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": 1,
+            "summary": summary,
+            "findings": findings,
+            "improvement_candidates": [candidate.to_dict() for candidate in candidates],
+            "outcomes": [outcome.to_dict() for outcome in outcomes],
+        }
+        json_report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"トレード期待値監査JSONを保存しました: {json_report_path}")
+    return 0
+
+
+def check_trade_outcome_health_cli(
+    journal_path: Path,
+    *,
+    require_sample_ok: bool = False,
+) -> int:
+    """CLI entry for operational health checks of trade expectancy scoring."""
+    entries = list(journal.read_entries(journal_path))
+    outcomes = trade_outcome.evaluate_trade_outcomes(entries)
+    summary = trade_outcome.summarize_expectancy(outcomes)
+    report = trade_outcome.check_expectancy_health(
+        summary,
+        require_sample_ok=require_sample_ok,
+    )
+    print(trade_outcome.format_expectancy_health_ja(report))
+    return report.exit_code
+
+
+def smoke_notice_pipeline_cli(output_dir: Path) -> int:
+    """CLI entry for the offline detailed-notice pipeline smoke test."""
+    result = notice_smoke.run_notice_pipeline_smoke(output_dir)
+    print("詳細通知E2Eスモーク: OK")
+    print(result.summary_text)
+    print(f"出力先: {result.output_dir}")
+    print(f"- journal: {result.journal_path}")
+    print(f"- report: {result.report_markdown_path}")
+    print(f"- quality_json: {result.quality_json_path}")
+    print(f"- quality_csv: {result.quality_csv_path}")
+    print(f"- feedback: {result.feedback_path}")
+    print(
+        f"結果: outcome={result.outcome} / "
+        f"entry_scenario={result.entry_scenario or '-'} / chunks={result.chunk_count}"
+    )
+    return 0
+
+
+def check_notice_health_cli(
+    *,
+    journal_path: Path,
+    feedback_path: Path,
+    quality_json_path: Path | None,
+    quality_csv_path: Path | None,
+    smoke_dir: Path | None,
+    require_discord: bool,
+    max_journal_age_hours: float | None,
+) -> int:
+    """CLI entry for detailed-notice operational health checks."""
+    report = notice_health.check_notice_health(
+        journal_path=journal_path,
+        feedback_path=feedback_path,
+        webhook_url=load_webhook_url(),
+        require_discord=require_discord,
+        quality_json_path=quality_json_path,
+        quality_csv_path=quality_csv_path,
+        smoke_dir=smoke_dir,
+        max_journal_age_hours=max_journal_age_hours,
+    )
+    print(notice_health.format_health_report_ja(report))
+    return report.exit_code
 
 
 def _run_per_timeframe(
@@ -286,6 +568,9 @@ def _run_per_timeframe(
         learning_note=learning_note,
         aux_reports_by_symbol={s: aux_reports_by_symbol.get("_shared", {}) for s in symbols},
         now=now,
+        news_count=len(items),
+        calendar_event_count=len(events),
+        calendar_ok=calendar_ok,
     )
 
     if args.dry_run:
@@ -391,10 +676,185 @@ def main(argv: list[str] | None = None) -> int:
         default=tf_learning.BASELINE_MIN_LIVE_EVALUATED,
         help="この採点件数に達した symbol×timeframe セルは履歴ベースラインよりライブ実績を優先",
     )
+    parser.add_argument(
+        "--notice-style",
+        choices=("standard", "detailed"),
+        default="standard",
+        help="Discord通知形式。standardは従来embed、detailedは長文の売買分析通知",
+    )
+    parser.add_argument(
+        "--notice-ohlc",
+        nargs="+",
+        type=Path,
+        help="詳細通知のエントリー条件に使うOHLC CSV。形式は timestamp,symbol,open,high,low,close",
+    )
+    parser.add_argument(
+        "--notice-ohlc-lookback",
+        type=int,
+        default=48,
+        help="詳細通知OHLCから市場構造を読む直近バー数(既定48)",
+    )
+    parser.add_argument(
+        "--notice-dukascopy",
+        action="store_true",
+        help="詳細通知でOHLC CSVが無い通貨をDukascopyティックから自動補完する",
+    )
+    parser.add_argument(
+        "--notice-dukascopy-cache",
+        type=Path,
+        default=DEFAULT_NOTICE_DUKASCOPY_CACHE,
+        help="詳細通知Dukascopy補完の.bi5キャッシュディレクトリ",
+    )
+    parser.add_argument(
+        "--notice-dukascopy-timeframe",
+        choices=tuple(dukas_tf for dukas_tf in ("5m", "15m", "30m", "1h")),
+        default="15m",
+        help="詳細通知Dukascopy補完に使う時間足(既定15m)",
+    )
+    parser.add_argument(
+        "--notice-dukascopy-hours",
+        type=float,
+        default=18.0,
+        help="詳細通知Dukascopy補完で何時間前まで取得するか(既定18)",
+    )
+    parser.add_argument(
+        "--score-notice-journal",
+        action="store_true",
+        help="詳細通知ジャーナルをOHLC CSVで評価して終了する",
+    )
+    parser.add_argument(
+        "--score-trade-outcomes",
+        action="store_true",
+        help="判断ジャーナルからMFE/MAE/TP/SL期待値を監査して終了する",
+    )
+    parser.add_argument(
+        "--check-trade-outcome-health",
+        action="store_true",
+        help="判断ジャーナルの期待値・サンプル数・経路品質をヘルスチェックして終了する",
+    )
+    parser.add_argument(
+        "--smoke-notice-pipeline",
+        action="store_true",
+        help="詳細通知の生成→ジャーナル→採点→JSON/CSV→フィードバック保存をオフライン検証して終了する",
+    )
+    parser.add_argument(
+        "--check-notice-health",
+        action="store_true",
+        help="詳細通知のジャーナル・フィードバック・評価成果物・Discord設定を点検して終了する",
+    )
+    parser.add_argument(
+        "--notice-health-require-discord",
+        action="store_true",
+        help="--check-notice-health で Discord webhook 未設定を失敗扱いにする",
+    )
+    parser.add_argument(
+        "--notice-health-max-journal-age-hours",
+        type=float,
+        help="詳細通知ジャーナル最新行がこの時間より古ければ警告する",
+    )
+    parser.add_argument(
+        "--notice-smoke-dir",
+        type=Path,
+        default=DEFAULT_NOTICE_SMOKE_DIR,
+        help="--smoke-notice-pipeline の成果物保存ディレクトリ",
+    )
+    parser.add_argument(
+        "--notice-journal",
+        type=Path,
+        default=DEFAULT_NOTICE_JOURNAL_PATH,
+        help="詳細通知ジャーナルJSONLのパス",
+    )
+    parser.add_argument(
+        "--notice-score-ohlc",
+        nargs="+",
+        type=Path,
+        help="詳細通知ジャーナル評価に使う未来OHLC CSV",
+    )
+    parser.add_argument(
+        "--notice-score-json",
+        type=Path,
+        help="詳細通知ジャーナル評価のJSONレポート保存先",
+    )
+    parser.add_argument(
+        "--notice-score-csv",
+        type=Path,
+        help="詳細通知ジャーナル評価のCSVレポート保存先",
+    )
+    parser.add_argument(
+        "--trade-outcome-journal",
+        type=Path,
+        default=DEFAULT_JOURNAL_PATH,
+        help="--score-trade-outcomes で読む判断ジャーナルJSONL",
+    )
+    parser.add_argument(
+        "--trade-outcome-json",
+        type=Path,
+        help="--score-trade-outcomes のJSONレポート保存先",
+    )
+    parser.add_argument(
+        "--trade-outcome-health-require-sample",
+        action="store_true",
+        help="--check-trade-outcome-health でサンプル不足をFAIL扱いにする",
+    )
+    parser.add_argument(
+        "--notice-feedback-profile",
+        type=Path,
+        default=DEFAULT_NOTICE_FEEDBACK_PATH,
+        help="詳細通知フィードバックJSONのパス",
+    )
+    parser.add_argument(
+        "--update-notice-feedback",
+        action="store_true",
+        help="--score-notice-journal の結果から詳細通知フィードバックJSONを保存する",
+    )
+    parser.add_argument(
+        "--no-notice-feedback",
+        action="store_true",
+        help="詳細通知生成時に過去の詳細通知フィードバックを反映しない",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
     if args.tf_learning_min_live_samples < 0:
         parser.error("--tf-learning-min-live-samples must be >= 0")
+    if args.notice_ohlc_lookback < 5:
+        parser.error("--notice-ohlc-lookback must be >= 5")
+    if args.notice_dukascopy_hours < 1:
+        parser.error("--notice-dukascopy-hours must be >= 1")
+    if args.per_timeframe and args.notice_style == "detailed":
+        parser.error("--notice-style detailed は融合1判断モード専用です")
+    if args.smoke_notice_pipeline:
+        return smoke_notice_pipeline_cli(args.notice_smoke_dir)
+    if args.check_notice_health:
+        return check_notice_health_cli(
+            journal_path=args.notice_journal,
+            feedback_path=args.notice_feedback_profile,
+            quality_json_path=args.notice_score_json,
+            quality_csv_path=args.notice_score_csv,
+            smoke_dir=args.notice_smoke_dir,
+            require_discord=args.notice_health_require_discord,
+            max_journal_age_hours=args.notice_health_max_journal_age_hours,
+        )
+    if args.score_notice_journal:
+        if not args.notice_score_ohlc:
+            parser.error("--score-notice-journal requires --notice-score-ohlc")
+        feedback_path = args.notice_feedback_profile if args.update_notice_feedback else None
+        return score_notice_journal_cli(
+            args.notice_journal,
+            args.notice_score_ohlc,
+            feedback_path,
+            args.notice_score_json,
+            args.notice_score_csv,
+        )
+    if args.score_trade_outcomes:
+        return score_trade_outcomes_cli(
+            args.trade_outcome_journal,
+            args.trade_outcome_json,
+        )
+    if args.check_trade_outcome_health:
+        return check_trade_outcome_health_cli(
+            args.trade_outcome_journal,
+            require_sample_ok=args.trade_outcome_health_require_sample,
+        )
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
     fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
@@ -477,7 +937,9 @@ def main(argv: list[str] | None = None) -> int:
     journal_entries = list(journal.read_entries(DEFAULT_JOURNAL_PATH))
     if not args.no_learning:
         calls = learning.evaluate_history(journal_entries)
-        profile = learning.derive_profile(calls, now=now)
+        trade_outcomes = trade_outcome.evaluate_trade_outcomes(journal_entries)
+        expectancy_summary = trade_outcome.summarize_expectancy(trade_outcomes)
+        profile = learning.derive_profile(calls, now=now, expectancy_summary=expectancy_summary)
         learning_note = profile.summary_ja()
         # ホライズン別(4h/24h/72h)の的中率観測。学習は24hのみを使う
         horizon_line = learning.horizon_report_ja(journal_entries)
@@ -543,6 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
                 news_weight=profile.news_weight,
                 conviction_factor=profile.conviction_factor(symbol),
                 condition_adjuster=profile.condition_adjustment,
+                expectancy_adjuster=profile.expectancy_adjustment,
                 macro_snapshot=macro_snapshot,
                 ml_artifact=ml_artifact if not args.no_ml else None,
                 stages=stages,
@@ -564,6 +1027,81 @@ def main(argv: list[str] | None = None) -> int:
     if ml_artifact.model is not None:
         learning_note = (learning_note + "\n" + ml_artifact.summary_ja()).strip()
 
+    if args.notice_style == "detailed":
+        entry_levels_by_symbol = load_notice_entry_levels(
+            args.notice_ohlc,
+            plans,
+            now,
+            args.notice_ohlc_lookback,
+            fetch_warnings,
+        )
+        entry_levels_by_symbol = load_dukascopy_notice_entry_levels(
+            enabled=args.notice_dukascopy,
+            plans=plans,
+            now=now,
+            cache_dir=args.notice_dukascopy_cache,
+            timeframe_name=args.notice_dukascopy_timeframe,
+            hours_back=args.notice_dukascopy_hours,
+            lookback_bars=args.notice_ohlc_lookback,
+            existing=entry_levels_by_symbol,
+            fetch_warnings=fetch_warnings,
+        )
+        detailed_notices = trade_notice.build_detailed_notices(
+            plans,
+            tech_map,
+            analysis,
+            events_48h,
+            now=now,
+            entry_levels_by_symbol=entry_levels_by_symbol,
+        )
+        if not args.no_notice_feedback:
+            feedback_profile = notice_feedback.load_profile(args.notice_feedback_profile)
+            detailed_notices = [
+                notice_feedback.apply_feedback_to_notice(
+                    notice,
+                    feedback_profile,
+                    entry_levels_by_symbol.get(notice.symbol),
+                    expectancy_summary=profile.expectancy,
+                )
+                for notice in detailed_notices
+            ]
+        report_text = notice_renderer.render_notices_markdown(detailed_notices)
+        if args.dry_run:
+            print(report_text)
+            return 0
+
+        webhook_url = load_webhook_url()
+        if not webhook_url:
+            print(
+                "DISCORD_WEBHOOK_URL が未設定です。環境変数か .env に設定してください。",
+                file=sys.stderr,
+            )
+            return 1
+
+        payloads = discord_delivery.build_discord_text_payloads(report_text)
+        for payload in payloads:
+            post_to_discord(webhook_url, payload)
+        if not args.no_journal:
+            try:
+                notice_journal.append_detailed_notices(
+                    DEFAULT_NOTICE_JOURNAL_PATH,
+                    detailed_notices,
+                    report_text=report_text,
+                    entry_levels_by_symbol=entry_levels_by_symbol,
+                    chunk_count=len(payloads),
+                    delivery="discord",
+                    now=now,
+                )
+            except OSError as error:
+                warning = f"詳細通知ジャーナル書き込み失敗: {error}"
+                fetch_warnings.append(warning)
+                print(f"[warn] {warning}", file=sys.stderr)
+        print(
+            f"詳細売買通知を送信しました ({', '.join(symbols)} | "
+            f"{len(payloads)}分割 | ニュース{len(items)}件 | イベント{len(events_48h)}件)"
+        )
+        return 0
+
     payload = briefing.build_discord_payload(
         plans,
         analysis,
@@ -576,6 +1114,9 @@ def main(argv: list[str] | None = None) -> int:
         learning_note=learning_note,
         promotion_note=promotion_note,
         now=now,
+        news_count=len(items),
+        calendar_event_count=len(events),
+        calendar_ok=calendar_ok,
     )
 
     if args.dry_run:
