@@ -270,9 +270,53 @@ def fetch_prices(
 # ============================================================================
 # シグナル発行（状態変化時のみ）
 # ============================================================================
+def _actual_position(ib: Any, symbol: str) -> float | None:
+    """IB の実建玉（符号付き数量）を返す。読めなければ None（Redis 状態へフォールバック）。
+
+    Forex の contract.symbol は基軸通貨のみ（USDJPY → "USD"）のため、
+    localSymbol（"USD.JPY"）と symbol+currency の連結でも照合する。
+    一致する建玉が無い場合は 0.0（フラット）を返す。
+    """
+    try:
+        total = 0.0
+        found = False
+        for p in ib.positions():
+            c = p.contract
+            local = str(getattr(c, "localSymbol", "") or "").replace(".", "").upper()
+            pair = (
+                str(getattr(c, "symbol", "") or "") + str(getattr(c, "currency", "") or "")
+            ).upper()
+            plain = str(getattr(c, "symbol", "") or "").upper()
+            if symbol.upper() in (local, pair, plain):
+                total += float(p.position)
+                found = True
+        return total if found else 0.0
+    except Exception:
+        log.exception("failed to read actual position", **log_extra(symbol=symbol))
+        return None
+
+
 def emit_if_changed(
-    symbol: str, asset: str, target: int, stop_distance: float, price: float
+    symbol: str,
+    asset: str,
+    target: int,
+    stop_distance: float,
+    price: float,
+    actual_position: float | None = None,
 ) -> None:
+    """目標方向（target）へ建玉を寄せる差分注文を signals へ発行する。
+
+    数量は「目標建玉（target×STRATEGY_QTY）− 現在建玉」の差分。反転（+1↔-1）は
+    2 倍量になり、フラット化で止まらず実際にドテンする（従来は固定 STRATEGY_QTY を
+    送っていたため、反転シグナルでも建玉は 0 になるだけで、Redis の状態(-1/+1)と
+    実建玉が乖離し、さらにブラケットの子ストップが「存在しない建玉」を守る形で残る
+    → 到達時に意図しない新規ポジションを作っていた）。
+
+    現在建玉は IB の実建玉（actual_position）を優先し、読めない時だけ Redis の
+    前回状態から推定する（保護ストップ約定後など、状態と実建玉が乖離していても
+    過不足のない数量になる）。position_qty には発注後の想定建玉サイズを載せる
+    （executor が保護ストップの数量に使う。qty はドテン時 2 倍のため使えない）。
+    """
     prev: str | None = common.sync(common.r().hget(STATE_KEY, symbol))
     prev_state = int(prev) if prev is not None else 0
     if target == prev_state or target == 0:
@@ -284,12 +328,48 @@ def emit_if_changed(
             **log_extra(symbol=symbol, stop_distance=stop_distance, price=price),
         )
         return
-    side = "BUY" if target == 1 else "SELL"
+
+    if actual_position is not None:
+        current = actual_position
+        if current != prev_state * settings.strategy_qty:
+            # 状態乖離（保護ストップ約定・手動介入・部分約定等）。観測ログに残す。
+            log.warning(
+                "position state divergence",
+                **log_extra(symbol=symbol, redis_state=prev_state, actual=current),
+            )
+            common.log_event(
+                "position_divergence",
+                {"symbol": symbol, "redis_state": prev_state, "actual_position": current},
+            )
+    else:
+        current = prev_state * settings.strategy_qty
+
+    target_qty = target * settings.strategy_qty
+    delta = target_qty - current
+    if delta == 0:
+        # 既に目標建玉（乖離時にありうる）。状態だけ実態へ同期して終わる。
+        common.r().hset(STATE_KEY, symbol, str(target))
+        return
+    if (delta > 0) != (target > 0):
+        # 現建玉が目標を同方向に超過（手動介入疑い）。自動で減らさず人に上げる。
+        log.error(
+            "position exceeds target -> manual check",
+            **log_extra(symbol=symbol, actual=current, target_qty=target_qty),
+        )
+        common.notify(
+            f"⚠️ 実建玉が戦略の目標を超過: {symbol} 実建玉={current:g} 目標={target_qty:g}。"
+            f"自動発注を見送りました。手動で確認してください。",
+            key=f"position_over:{symbol}",
+        )
+        return
+
+    side = "BUY" if delta > 0 else "SELL"
     raw = {
         "symbol": symbol,
         "asset": asset,
         "side": side,
-        "qty": settings.strategy_qty,
+        "qty": abs(delta),
+        "position_qty": settings.strategy_qty,
         "type": "MARKET",
         "ts": time.time(),
         "price": price,
@@ -304,7 +384,10 @@ def emit_if_changed(
     common.publish(common.STREAM_SIGNALS, sig)
     # redis は値を文字列化して保存する。hget 側は int(prev) で読み戻す（str で明示）。
     common.r().hset(STATE_KEY, symbol, str(target))
-    log.info("strategy signal", **log_extra(symbol=symbol, side=side, target=target))
+    log.info(
+        "strategy signal",
+        **log_extra(symbol=symbol, side=side, target=target, qty=abs(delta)),
+    )
 
 
 def main() -> None:
@@ -325,6 +408,12 @@ def main() -> None:
         ib = IB()
         ib.connect(settings.ib_host, settings.ib_port, clientId=settings.ib_client_id + 70, timeout=15)
         log.info("strategy connected to IB")
+        try:
+            # 実建玉の購読（emit_if_changed の差分サイジングに使う）。失敗しても
+            # Redis 状態ベースのサイジングで動けるため、接続自体は落とさない。
+            ib.reqPositions()
+        except Exception:
+            log.exception("reqPositions failed -> state-based sizing fallback")
     except Exception:
         log.exception("strategy could not connect to IB -> idle loop")
 
@@ -351,6 +440,7 @@ def main() -> None:
                             sig["target"],
                             sig["stop_distance"],
                             float(df["close"].iloc[-1]),
+                            actual_position=_actual_position(ib, settings.strategy_symbol),
                         )
                 ib.sleep(0.2)
         except Exception:

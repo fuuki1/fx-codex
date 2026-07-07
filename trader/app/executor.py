@@ -164,7 +164,11 @@ def _build_orders(
 
     parent.orderId = next_id()
     parent.transmit = False
-    stop = StopOrder("SELL" if action == "BUY" else "BUY", qty, stop_px)
+    # 保護ストップの数量は「発注後の建玉」に合わせる。ドテン（反転）シグナルは
+    # qty が建玉の 2 倍（決済+新規）になるため、position_qty（反転後の建玉サイズ）
+    # があればそちらを使う。無いシグナル（webhook 等）は従来どおり注文数量と同じ。
+    stop_qty = float(sig.get("position_qty") or qty)
+    stop = StopOrder("SELL" if action == "BUY" else "BUY", stop_qty, stop_px)
     stop.orderId = next_id()
     stop.parentId = parent.orderId
     stop.orderRef = order_ref + "-sl"

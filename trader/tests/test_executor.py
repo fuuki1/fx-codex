@@ -77,6 +77,30 @@ def test_build_orders_close_is_single_order():
     assert parent.transmit is True
 
 
+def test_build_orders_flip_stop_uses_position_qty():
+    """ドテン（qty=2倍量）でも保護ストップは反転後の建玉サイズ（position_qty）。
+
+    ストップを注文数量（2倍）で張ると、到達時に建玉を閉じた上で逆方向へ
+    さらに 1 単位建ててしまう。
+    """
+    sig = {
+        "symbol": "USDJPY",
+        "asset": "fx",
+        "side": "SELL",
+        "qty": 2000,            # 決済 1000 + 新規 1000
+        "position_qty": 1000,   # 反転後の建玉
+        "type": "MARKET",
+        "price": 150.0,
+        "stop_distance": 0.5,
+    }
+    parent, stop = executor._build_orders(sig, "tx-flip", next_id=_next_id_from(10))
+    assert float(parent.totalQuantity) == 2000.0
+    assert stop is not None
+    assert float(stop.totalQuantity) == 1000.0
+    assert stop.action == "BUY"                  # ショートの保護は BUY ストップ
+    assert float(stop.auxPrice) == 150.5
+
+
 # ---- handle（FakeIB で配線を確認）------------------------------------------
 class _FakeTrade:
     def __init__(self, order):

@@ -217,6 +217,122 @@ def test_strategy_skip_without_valid_stop(fake_redis, monkeypatch):
     assert fake_redis.xlen("signals") == 0
 
 
+def _emitted(fake_redis) -> list[dict]:
+    import json as _json
+
+    return [_json.loads(fields["data"]) for _id, fields in fake_redis.xrange("signals")]
+
+
+def test_strategy_flip_doubles_qty_and_sets_position_qty(fake_redis, monkeypatch):
+    """反転(+1→-1)は決済+新規の 2 倍量。position_qty は反転後の建玉サイズ。
+
+    従来は反転でも固定 STRATEGY_QTY を送っていたため、実際にはフラット化する
+    だけで Redis 状態(-1)と実建玉(0)が乖離していた（発見#1）。
+    """
+    import common
+    import strategy
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    strategy.emit_if_changed("USDJPY", "fx", 1, 0.01, 150.0)   # flat -> long
+    strategy.emit_if_changed("USDJPY", "fx", -1, 0.02, 150.5)  # long -> short (flip)
+
+    first, second = _emitted(fake_redis)
+    q = strategy.settings.strategy_qty
+    assert first["side"] == "BUY" and first["qty"] == q
+    assert first["position_qty"] == q
+    assert second["side"] == "SELL" and second["qty"] == 2 * q
+    assert second["position_qty"] == q
+    assert fake_redis.hget("strategy:state", "USDJPY") == "-1"
+
+
+def test_strategy_flip_uses_actual_position_when_stop_already_fired(fake_redis, monkeypatch):
+    """保護ストップ約定で実建玉=0 なのに Redis 状態が +1 のまま → 実建玉基準で 1 倍量。
+
+    Redis 状態だけで 2 倍量を送ると、意図の 2 倍のショートを建ててしまう。
+    実建玉が読めるときはそれを優先し、乖離は position_divergence として記録する。
+    """
+    import common
+    import strategy
+
+    events: list[str] = []
+    monkeypatch.setattr(common, "log_event", lambda kind, payload: events.append(kind))
+    fake_redis.hset("strategy:state", "USDJPY", "1")  # 状態は long のまま
+
+    strategy.emit_if_changed("USDJPY", "fx", -1, 0.02, 150.0, actual_position=0.0)
+
+    (sig,) = _emitted(fake_redis)
+    assert sig["side"] == "SELL"
+    assert sig["qty"] == strategy.settings.strategy_qty  # 2倍ではなく 1 倍
+    assert "position_divergence" in events
+
+
+def test_strategy_skips_when_already_at_target(fake_redis, monkeypatch):
+    """実建玉が既に目標建玉（乖離時にありうる）→ 発注せず状態だけ同期する。"""
+    import common
+    import strategy
+
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    fake_redis.hset("strategy:state", "USDJPY", "1")
+    q = strategy.settings.strategy_qty
+
+    strategy.emit_if_changed("USDJPY", "fx", -1, 0.02, 150.0, actual_position=-q)
+
+    assert fake_redis.xlen("signals") == 0
+    assert fake_redis.hget("strategy:state", "USDJPY") == "-1"
+
+
+def test_strategy_refuses_when_position_exceeds_target(fake_redis, monkeypatch):
+    """実建玉が目標を同方向に超過（手動介入疑い）→ 自動で減らさず通知して見送る。"""
+    import common
+    import strategy
+
+    notes: list[str] = []
+    monkeypatch.setattr(common, "log_event", lambda *a, **k: None)
+    monkeypatch.setattr(common, "notify", lambda msg, **k: notes.append(msg))
+    fake_redis.hset("strategy:state", "USDJPY", "1")
+    q = strategy.settings.strategy_qty
+
+    strategy.emit_if_changed("USDJPY", "fx", -1, 0.02, 150.0, actual_position=-2 * q)
+
+    assert fake_redis.xlen("signals") == 0
+    assert len(notes) == 1 and "超過" in notes[0]
+
+
+def test_actual_position_matches_fx_and_stock_contracts():
+    """Forex は localSymbol("USD.JPY")/symbol+currency、株は symbol で照合する。"""
+    from types import SimpleNamespace
+
+    import strategy
+
+    def pos(symbol, currency, local, amount):
+        return SimpleNamespace(
+            contract=SimpleNamespace(symbol=symbol, currency=currency, localSymbol=local),
+            position=amount,
+        )
+
+    class FakeIB:
+        def positions(self):
+            return [
+                pos("USD", "JPY", "USD.JPY", 1000.0),
+                pos("AAPL", "USD", "AAPL", 50.0),
+            ]
+
+    ib = FakeIB()
+    assert strategy._actual_position(ib, "USDJPY") == 1000.0
+    assert strategy._actual_position(ib, "AAPL") == 50.0
+    assert strategy._actual_position(ib, "EURUSD") == 0.0  # 建玉なし = フラット
+
+
+def test_actual_position_returns_none_on_error():
+    import strategy
+
+    class BrokenIB:
+        def positions(self):
+            raise RuntimeError("ib down")
+
+    assert strategy._actual_position(BrokenIB(), "USDJPY") is None
+
+
 # ---- optimizer score -------------------------------------------------------
 def test_optimizer_score():
     import auto_optimize
