@@ -488,6 +488,35 @@ def test_build_trade_plan_long_with_levels() -> None:
     assert plan.target2 == pytest.approx(150.0 + 0.5 * 5.0)
 
 
+def test_build_trade_plan_uses_approved_target_r_adjuster() -> None:
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    plan = briefing.build_trade_plan(
+        "USDJPY",
+        bullish_tech(),
+        currencies,
+        [],
+        [],
+        now=NOW,
+        atr_multiple=2.5,
+        target_r_adjuster=lambda _symbol, _direction, _conviction: (
+            0.75,
+            1.5,
+            "承認済み候補",
+        ),
+    )
+    risk_distance = 0.5 * 2.5
+
+    assert plan.direction == "long"
+    assert plan.stop == pytest.approx(150.0 - risk_distance)
+    assert plan.target1 == pytest.approx(150.0 + risk_distance * 0.75)
+    assert plan.target2 == pytest.approx(150.0 + risk_distance * 1.5)
+    assert plan.target_policy["target1_r"] == 0.75
+    assert any("承認済みTP/SL" in warning for warning in plan.warnings)
+
+
 def test_build_trade_plan_closed_on_weekend() -> None:
     """市場休場中はどれだけシグナルが強くても方向判断を出さない(stale価格ガード)。"""
     currencies = {

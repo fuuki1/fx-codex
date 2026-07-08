@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 
+import pytest
+
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import (
     AUXILIARY_HORIZON_HOURS,
@@ -130,6 +132,54 @@ def test_missing_timeframe_is_neutral_not_crash() -> None:
     assert plan.direction == "neutral"
     assert plan.close is None
     assert any("取得に失敗" in w for w in plan.warnings)
+
+
+def test_expectancy_guard_can_block_timeframe_plan() -> None:
+    def guard(symbol: str, direction: str, conviction: int):
+        assert symbol == "USDJPY"
+        assert direction == "long"
+        assert conviction > 0
+        return 0.4, "USDJPY:long の期待Rがマイナス", True
+
+    plan = build_timeframe_plan(
+        "USDJPY",
+        "1h",
+        _all_up_tech(),
+        {},
+        [],
+        [],
+        now=OPEN_NOW,
+        expectancy_adjuster=guard,
+    )
+    assert plan.direction == "neutral"
+    assert plan.conviction == 0
+    assert plan.stop is None
+    assert any("期待値ガード" in warning for warning in plan.warnings)
+
+
+def test_timeframe_plan_uses_approved_target_r_adjuster() -> None:
+    plan = build_timeframe_plan(
+        "USDJPY",
+        "1h",
+        _all_up_tech(),
+        {},
+        [],
+        [],
+        now=OPEN_NOW,
+        target_r_adjuster=lambda _symbol, _direction, _conviction: (
+            0.75,
+            1.5,
+            "承認済み候補",
+        ),
+    )
+    risk_distance = 0.15 * 2.5
+
+    assert plan.direction == "long"
+    assert plan.stop == pytest.approx(156.25 - risk_distance)
+    assert plan.target1 == pytest.approx(156.25 + risk_distance * 0.75)
+    assert plan.target2 == pytest.approx(156.25 + risk_distance * 1.5)
+    assert plan.target_policy["target1_r"] == 0.75
+    assert any("承認済みTP/SL" in warning for warning in plan.warnings)
 
 
 def test_features_use_shared_learning_keys() -> None:

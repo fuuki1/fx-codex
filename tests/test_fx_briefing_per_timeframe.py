@@ -9,8 +9,10 @@ from unittest import mock
 import pytest
 
 import fx_briefing
+from fx_intel.calendar import EconomicEvent
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
+from fx_intel import trade_outcome as to
 
 
 def _view(interval, rec, close, rsi=55.0, adx=25.0, atr=0.15):
@@ -52,23 +54,63 @@ def _analysis():
     )
 
 
+def _approved_tp_registry(path) -> None:
+    candidate = to.TradeImprovementCandidate(
+        "approved-overall-tp",
+        "TP/SL候補",
+        "overall",
+        "high",
+        "tp_sl_variant_paper_test",
+        "TP1=0.75R / TP2=1.5Rをpaper検証",
+        "期待R改善",
+        {
+            "target1_r": 0.75,
+            "target2_r": 1.5,
+            "scope": "overall",
+            "key": "",
+        },
+        "paper",
+        "approval",
+    )
+    registry = to.update_improvement_registry(
+        None, [candidate], now=datetime(2026, 7, 1, tzinfo=UTC)
+    )
+    registry = to.update_improvement_registry(
+        registry,
+        [candidate],
+        now=datetime(2026, 7, 1, 1, tzinfo=UTC),
+    )
+    registry, result = to.set_improvement_candidate_approval(
+        registry,
+        candidate.candidate_id,
+        "approved",
+        actor="tester",
+        now=datetime(2026, 7, 1, 2, tzinfo=UTC),
+    )
+    assert result["status"] == "approved"
+    to.save_improvement_registry(registry, path)
+
+
 @pytest.fixture
 def patched_paths(tmp_path):
     """ジャーナル・学習の書き込み先を一時ディレクトリへ差し替える。"""
     tf_journal = tmp_path / "briefing_tf_journal.jsonl"
+    tf_prices = tmp_path / "briefing_tf_prices.jsonl"
     tf_learning = tmp_path / "briefing_tf_learning.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", tf_journal),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", tf_prices),
         mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_PATH", tf_learning),
     ):
         yield tf_journal, tf_learning
 
 
-def _run(argv, capsys):
+def _run(argv, capsys, calendar_result=None):
     """全ネットワーク経路をモックして fx_briefing.main を実行、payload を返す。"""
+    calendar_result = calendar_result if calendar_result is not None else ([], [])
     with (
         mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
-        mock.patch("fx_intel.calendar.fetch_calendar", return_value=([], [])),
+        mock.patch("fx_intel.calendar.fetch_calendar", return_value=calendar_result),
         mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
         mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
     ):
@@ -141,6 +183,107 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
     assert tf_learning.exists()
     payload = json.loads(tf_learning.read_text(encoding="utf-8"))
     assert "USDJPY|1h" in payload["profiles"]
+
+
+def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsys) -> None:
+    tf_journal, _ = patched_paths
+    tf_prices = fx_briefing.DEFAULT_TF_PRICES_PATH
+    start = datetime(2026, 6, 22, 8, 0, tzinfo=UTC)
+    journal_lines = []
+    price_lines = []
+    for i in range(20):
+        ts = start + timedelta(hours=i * 3)
+        journal_lines.append(
+            json.dumps(
+                {
+                    "ts": ts.isoformat(),
+                    "symbol": "USDJPY",
+                    "timeframe": "1h",
+                    "horizon_hours": 1.0,
+                    "direction": "long",
+                    "conviction": 70,
+                    "composite": 0.7,
+                    "tech_score": 0.7,
+                    "news_score": 0.1,
+                    "close": 100.0,
+                    "atr": 1.0,
+                    "stop": 99.0,
+                    "target1": 101.0,
+                    "target2": 102.0,
+                    "data_quality": 1.0,
+                    "features": {},
+                    "components": [],
+                }
+            )
+        )
+        price_lines.append(
+            json.dumps(
+                {
+                    "ts": (ts + timedelta(hours=1)).isoformat(),
+                    "symbol": "USDJPY",
+                    "timeframe": "1h",
+                    "close": 99.0,
+                }
+            )
+        )
+    tf_journal.write_text("\n".join(journal_lines) + "\n", encoding="utf-8")
+    tf_prices.write_text("\n".join(price_lines) + "\n", encoding="utf-8")
+
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--dry-run",
+            "--no-learning",
+            "--no-macro",
+            "--no-export-events",
+            "--no-event-archive",
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "時間足別期待値監視" in out
+    assert "・1h: 期待R -1.00R" in out
+    assert "期待値ガード" in out
+    assert "1時間足" in out
+
+
+def test_per_timeframe_applies_approved_tp_sl_registry(patched_paths, tmp_path, capsys) -> None:
+    registry_path = tmp_path / "trade_registry.json"
+    _approved_tp_registry(registry_path)
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--dry-run",
+            "--no-learning",
+            "--no-macro",
+            "--no-export-events",
+            "--no-event-archive",
+            "--trade-improvement-registry",
+            str(registry_path),
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "承認済みTP/SL" in out
+    assert "T1 156.531" in out
+    assert "T2 156.812" in out
 
 
 def test_no_learning_flag_skips_profile(patched_paths, capsys) -> None:

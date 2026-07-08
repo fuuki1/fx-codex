@@ -90,8 +90,10 @@ def _timeframe_field(plan: TimeframePlan) -> dict:
         metric_parts.append(f"ATR {format_price(plan.symbol, plan.atr)}")
     if metric_parts:
         lines.append(" / ".join(metric_parts))
-    # 学習調整などの警告は1件だけ簡潔に載せる(embed肥大を防ぐ)
-    learn_warnings = [w for w in plan.warnings if "学習調整" in w]
+    # 学習調整・期待値ガード・承認済みTP/SLは1件だけ簡潔に載せる(embed肥大を防ぐ)
+    learn_warnings = [
+        w for w in plan.warnings if "学習調整" in w or "期待値ガード" in w or "承認済みTP/SL" in w
+    ]
     if learn_warnings:
         lines.append(learn_warnings[0])
     return {

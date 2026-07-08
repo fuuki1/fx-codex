@@ -49,6 +49,7 @@
     .venv/bin/python fx_briefing.py --symbols USDJPY GBPJPY --no-llm
     .venv/bin/python fx_briefing.py --train-ml       # ML確率モデルを再学習して保存
     .venv/bin/python fx_briefing.py --promote-live ml # 条件を満たせばML委員をliveへ承認
+    .venv/bin/python fx_briefing.py --score-trade-outcomes # TP/SL込み期待値を監査
 
 副産物として以下を書き出す(いずれも fx_backtester の --events でそのまま使える形式):
 - research_pack/upcoming_events.csv — 最新スナップショット(毎回上書き)
@@ -63,6 +64,7 @@ Claude分析は ANTHROPIC_API_KEY が設定されている場合のみ有効。
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Mapping
 import json
 import sys
 from datetime import datetime, timedelta, UTC
@@ -87,6 +89,7 @@ from fx_intel import (
     tf_briefing,
     tf_learning,
     timeframe,
+    trade_outcome,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -107,6 +110,8 @@ DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
+DEFAULT_TRADE_IMPROVEMENT_REGISTRY = PROJECT_ROOT / "logs" / "trade_improvement_candidates.json"
+DEFAULT_TRADE_MONITOR_PATH = PROJECT_ROOT / "logs" / "trade_outcome_monitor.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
@@ -178,6 +183,296 @@ def post_to_discord(webhook_url: str, payload: dict) -> None:
         raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
 
 
+def score_trade_outcomes_cli(
+    journal_path: Path,
+    *,
+    json_report_path: Path | None = None,
+    improvement_registry_path: Path | None = None,
+    monitor_json_path: Path | None = None,
+) -> int:
+    """判断ジャーナルをMFE/MAE/TP/SLで採点し、期待値監査レポートを出す。"""
+    entries = list(journal.read_entries(journal_path))
+    outcomes = trade_outcome.evaluate_trade_outcomes(entries)
+    summary = trade_outcome.summarize_expectancy(outcomes)
+    findings = trade_outcome.expectancy_findings(summary)
+    candidates = trade_outcome.improvement_candidates(summary)
+    registry = None
+    paused_policies: list[dict] = []
+
+    if improvement_registry_path is not None:
+        previous = trade_outcome.load_improvement_registry(improvement_registry_path)
+        registry = trade_outcome.update_improvement_registry(
+            previous,
+            candidates,
+            managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
+        )
+        registry, paused_policies = trade_outcome.auto_pause_underperforming_approved_policies(
+            registry,
+            summary,
+        )
+        trade_outcome.save_improvement_registry(registry, improvement_registry_path)
+
+    print(trade_outcome.format_expectancy_report_ja(summary))
+    print(trade_outcome.format_improvement_candidates_ja(candidates))
+    if registry is not None:
+        print(trade_outcome.format_improvement_registry_ja(registry))
+        for paused in paused_policies:
+            print(
+                f"承認済みTP/SLを自動停止しました: {paused['candidate_id']} — {paused['reason_ja']}"
+            )
+        print(f"改善候補レジストリを保存しました: {improvement_registry_path}")
+
+    if json_report_path is not None:
+        json_report_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": 1,
+            "summary": summary,
+            "findings": findings,
+            "improvement_candidates": [candidate.to_dict() for candidate in candidates],
+            "improvement_registry": registry,
+            "auto_paused_policies": paused_policies,
+            "outcomes": [outcome.to_dict() for outcome in outcomes],
+        }
+        json_report_path.write_text(
+            json.dumps(
+                trade_outcome.json_safe(payload),
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        print(f"トレード期待値監査JSONを保存しました: {json_report_path}")
+    if monitor_json_path is not None:
+        health_report = trade_outcome.check_expectancy_health(summary)
+        snapshot = trade_outcome.build_monitoring_snapshot(
+            summary,
+            registry=registry,
+            health_report=health_report,
+        )
+        monitor_json_path.parent.mkdir(parents=True, exist_ok=True)
+        monitor_json_path.write_text(
+            json.dumps(
+                trade_outcome.json_safe(snapshot),
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        print(f"トレード期待値監視JSONを保存しました: {monitor_json_path}")
+    return 0
+
+
+def check_trade_outcome_health_cli(
+    journal_path: Path,
+    *,
+    require_sample_ok: bool = False,
+) -> int:
+    """期待値監査のCI/cron向けヘルスチェック。"""
+    entries = list(journal.read_entries(journal_path))
+    outcomes = trade_outcome.evaluate_trade_outcomes(entries)
+    summary = trade_outcome.summarize_expectancy(outcomes)
+    report = trade_outcome.check_expectancy_health(
+        summary,
+        require_sample_ok=require_sample_ok,
+    )
+    print(trade_outcome.format_expectancy_health_ja(report))
+    return report.exit_code
+
+
+def approve_trade_candidate_cli(
+    registry_path: Path,
+    candidate_id: str,
+    *,
+    decision: str,
+    actor: str = "manual",
+    note: str = "",
+) -> int:
+    registry = trade_outcome.load_improvement_registry(registry_path)
+    updated, result = trade_outcome.set_improvement_candidate_approval(
+        registry,
+        candidate_id,
+        decision,
+        actor=actor,
+        note=note,
+    )
+    print(result["message_ja"])
+    if result["status"] not in {"approved", "rejected", "resumed"}:
+        return 1
+    trade_outcome.save_improvement_registry(updated, registry_path)
+    print(trade_outcome.format_improvement_registry_ja(updated))
+    print(f"改善候補レジストリを保存しました: {registry_path}")
+    return 0
+
+
+def retest_trade_variants_cli(
+    journal_path: Path,
+    *,
+    json_report_path: Path | None = None,
+    improvement_registry_path: Path | None = None,
+    target1_r_candidates: list[float] | None = None,
+    target2_r_candidates: list[float] | None = None,
+) -> int:
+    """TP1/TP2候補を過去ジャーナルでpaper再採点する。"""
+    entries = list(journal.read_entries(journal_path))
+    report = trade_outcome.retest_tp_sl_variants(
+        entries,
+        target1_r_candidates=target1_r_candidates or trade_outcome.DEFAULT_TP1_R_CANDIDATES,
+        target2_r_candidates=target2_r_candidates or trade_outcome.DEFAULT_TP2_R_CANDIDATES,
+    )
+    candidates = trade_outcome.variant_improvement_candidates(report)
+    registry = None
+    baseline = report.get("baseline")
+    overall = baseline.get("overall") if isinstance(baseline, dict) else None
+    evaluated = int(overall.get("evaluated", 0)) if isinstance(overall, dict) else 0
+    if improvement_registry_path is not None and evaluated > 0:
+        previous = trade_outcome.load_improvement_registry(improvement_registry_path)
+        registry = trade_outcome.update_improvement_registry(
+            previous,
+            candidates,
+            managed_action_types=trade_outcome.VARIANT_CANDIDATE_ACTION_TYPES,
+        )
+        trade_outcome.save_improvement_registry(registry, improvement_registry_path)
+
+    print(trade_outcome.format_variant_retest_report_ja(report))
+    print(trade_outcome.format_improvement_candidates_ja(candidates))
+    if registry is not None:
+        print(trade_outcome.format_improvement_registry_ja(registry))
+        print(f"改善候補レジストリを保存しました: {improvement_registry_path}")
+    if json_report_path is not None:
+        json_report_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(report)
+        payload["improvement_registry"] = registry
+        json_report_path.write_text(
+            json.dumps(
+                trade_outcome.json_safe(payload),
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        print(f"TP/SL候補paper再採点JSONを保存しました: {json_report_path}")
+    return 0
+
+
+def make_trade_expectancy_adjuster(
+    summary: dict,
+) -> Callable[[str, str, int], tuple[float, str, bool]]:
+    def adjust(symbol: str, direction: str, conviction: int) -> tuple[float, str, bool]:
+        adjustment = trade_outcome.decision_adjustment(summary, symbol, direction, conviction)
+        return adjustment.factor, adjustment.reason_ja, adjustment.block
+
+    return adjust
+
+
+def make_approved_tp_sl_adjuster(
+    registry: Mapping[str, object],
+) -> briefing.TargetRAdjuster | None:
+    if not trade_outcome.approved_target_policies(registry):
+        return None
+
+    def adjust(
+        symbol: str,
+        direction: str,
+        conviction: int,
+    ) -> briefing.TargetRAdjustment | None:
+        policy = trade_outcome.select_approved_target_policy(
+            registry,
+            symbol,
+            direction,
+            conviction,
+        )
+        if policy is None:
+            return None
+        reason = (
+            f"{policy.reason_ja} "
+            f"(TP1={policy.target1_r:g}R / TP2={policy.target2_r:g}R, "
+            f"id={policy.candidate_id})"
+        )
+        return policy.target1_r, policy.target2_r, reason, policy.to_dict()
+
+    return adjust
+
+
+def make_timeframe_trade_expectancy_lookup(
+    scoring_entries: list[Mapping[str, object]],
+) -> tuple[timeframe.ExpectancyLookup | None, str, dict[str, dict]]:
+    summaries: dict[str, dict] = {}
+    for tf in timeframe.DEFAULT_TIMEFRAMES:
+        tf_entries = [entry for entry in scoring_entries if str(entry.get("timeframe", "")) == tf]
+        if not tf_entries:
+            continue
+        horizon_hours = timeframe.PRIMARY_HORIZON_HOURS.get(tf, 24.0)
+        outcomes = trade_outcome.evaluate_trade_outcomes(
+            tf_entries,
+            horizon_hours=horizon_hours,
+            tolerance_hours=timeframe.tolerance_for(horizon_hours),
+        )
+        summary = trade_outcome.summarize_expectancy(outcomes)
+        overall = summary.get("overall")
+        if isinstance(overall, Mapping) and int(overall.get("evaluated", 0) or 0) > 0:
+            summaries[tf] = summary
+
+    if not summaries:
+        return None, "", {}
+
+    adjusters = {tf: make_trade_expectancy_adjuster(summary) for tf, summary in summaries.items()}
+
+    def lookup(_symbol: str, tf: str) -> timeframe.ExpectancyAdjuster | None:
+        return adjusters.get(tf)
+
+    return lookup, format_timeframe_expectancy_report_ja(summaries), summaries
+
+
+def format_timeframe_expectancy_report_ja(summaries: Mapping[str, Mapping[str, object]]) -> str:
+    if not summaries:
+        return ""
+    lines = ["時間足別期待値監視(MFE/MAE/TP/SL):"]
+    for tf in timeframe.DEFAULT_TIMEFRAMES:
+        summary = summaries.get(tf)
+        if not isinstance(summary, Mapping):
+            continue
+        overall = summary.get("overall")
+        if not isinstance(overall, Mapping):
+            continue
+        evaluated = int(overall.get("evaluated", 0) or 0)
+        if evaluated <= 0:
+            continue
+        tradable = int(overall.get("tradable", 0) or 0)
+        min_samples = int(overall.get("min_samples", 0) or 0)
+        sample_status = "OK" if bool(overall.get("sample_ok")) else f"不足 {tradable}/{min_samples}"
+        lines.append(
+            f"・{tf}: 期待R {_fmt_expectancy_value(overall.get('expectancy_r'), 'R')}"
+            f" / PF {_fmt_expectancy_value(overall.get('profit_factor_r'), '')}"
+            f" / SL {_fmt_expectancy_pct(overall.get('sl_rate'))}"
+            f" (n={tradable}/{evaluated}, sample={sample_status})"
+        )
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _fmt_expectancy_value(value: object, suffix: str) -> str:
+    if not isinstance(value, int | float):
+        return "n/a"
+    if value == float("inf"):
+        return "∞"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}{suffix}"
+
+
+def _fmt_expectancy_pct(value: object) -> str:
+    if not isinstance(value, int | float):
+        return "n/a"
+    return f"{value * 100:.0f}%"
+
+
+def append_note(base: str, addition: str) -> str:
+    if not addition:
+        return base
+    return (base + "\n" + addition).strip()
+
+
 def _run_per_timeframe(
     *,
     args,
@@ -229,6 +524,19 @@ def _run_per_timeframe(
                 fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
 
     profile_lookup = tf_learn.profile_lookup if not args.no_learning else None
+    target_r_adjuster = None
+    if not args.no_trade_expectancy:
+        target_r_adjuster = make_approved_tp_sl_adjuster(
+            trade_outcome.load_improvement_registry(args.trade_improvement_registry)
+        )
+    expectancy_lookup = None
+    if not args.no_trade_expectancy:
+        expectancy_lookup, expectancy_note, _expectancy_summaries = (
+            make_timeframe_trade_expectancy_lookup(scoring_entries)
+        )
+        learning_note = append_note(learning_note, expectancy_note)
+        if args.no_trade_expectancy_guard:
+            expectancy_lookup = None
 
     # 各ペア・各時間足の独立判断
     plans_by_symbol: dict[str, list[timeframe.TimeframePlan]] = {}
@@ -245,6 +553,8 @@ def _run_per_timeframe(
             atr_multiple=atr_multiple,
             calendar_ok=calendar_ok,
             profile_lookup=profile_lookup,
+            expectancy_lookup=expectancy_lookup,
+            target_r_adjuster=target_r_adjuster,
         )
 
     # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意。
@@ -339,6 +649,16 @@ def main(argv: list[str] | None = None) -> int:
         help="学習プロファイルによる重み・確信度の自動調整を行わない(既定重みで実行)",
     )
     parser.add_argument(
+        "--no-trade-expectancy",
+        action="store_true",
+        help="TP/SL込み期待値監査・改善候補レジストリ・期待値ガードを使わない",
+    )
+    parser.add_argument(
+        "--no-trade-expectancy-guard",
+        action="store_true",
+        help="期待値監査は表示・記録するが、今回の判断への減衰/見送り反映は行わない",
+    )
+    parser.add_argument(
         "--no-macro",
         action="store_true",
         help="マクロデータ(COT・金利・VIX・ドル指数)の取得と委員を使わない",
@@ -366,12 +686,180 @@ def main(argv: list[str] | None = None) -> int:
         help="時間足別モード: 15m/1h/4h/1d を独立に判断し、時間足ごとの主ホライズン"
         "(15m→15分後/1h→1h/4h→4h/1d→24h)で自己採点・学習する",
     )
+    parser.add_argument(
+        "--score-trade-outcomes",
+        action="store_true",
+        help="判断ジャーナルをMFE/MAE/TP/SLで採点し、期待値監査レポートを表示する",
+    )
+    parser.add_argument(
+        "--retest-trade-variants",
+        action="store_true",
+        help="TP1/TP2のR倍率候補を過去ジャーナルでpaper再採点する",
+    )
+    parser.add_argument(
+        "--check-trade-outcome-health",
+        action="store_true",
+        help="期待値・サンプル数・経路品質のヘルスチェックを実行し、失敗時に終了コード1を返す",
+    )
+    parser.add_argument(
+        "--trade-outcome-journal",
+        type=Path,
+        default=DEFAULT_JOURNAL_PATH,
+        help="期待値監査に使う判断ジャーナル(JSONL)",
+    )
+    parser.add_argument(
+        "--trade-outcome-json",
+        type=Path,
+        default=None,
+        help="期待値監査の詳細JSONを書き出すパス",
+    )
+    parser.add_argument(
+        "--trade-variant-json",
+        type=Path,
+        default=None,
+        help="TP/SL候補paper再採点の詳細JSONを書き出すパス",
+    )
+    parser.add_argument(
+        "--trade-monitor-json",
+        type=Path,
+        default=None,
+        help="cron/dashboard向けの期待値監視JSONを書き出すパス",
+    )
+    parser.add_argument(
+        "--tp1-r-candidates",
+        type=float,
+        nargs="+",
+        default=None,
+        help="paper再採点するTP1のR倍率候補(例: 0.75 1.0 1.25)",
+    )
+    parser.add_argument(
+        "--tp2-r-candidates",
+        type=float,
+        nargs="+",
+        default=None,
+        help="paper再採点するTP2のR倍率候補(例: 1.5 2.0 2.5)",
+    )
+    parser.add_argument(
+        "--trade-improvement-registry",
+        type=Path,
+        default=DEFAULT_TRADE_IMPROVEMENT_REGISTRY,
+        help="改善候補レジストリJSONの保存先",
+    )
+    parser.add_argument(
+        "--update-trade-improvement-registry",
+        action="store_true",
+        help="期待値監査やTP/SL候補再採点で検出した改善候補をレジストリへ反映する",
+    )
+    parser.add_argument(
+        "--approve-trade-candidate",
+        metavar="CANDIDATE_ID",
+        default=None,
+        help="paper_readyの改善候補を人間承認し、stage=approvedとして記録する",
+    )
+    parser.add_argument(
+        "--reject-trade-candidate",
+        metavar="CANDIDATE_ID",
+        default=None,
+        help="activeな改善候補を却下し、stage=rejectedとして記録する",
+    )
+    parser.add_argument(
+        "--resume-trade-candidate",
+        metavar="CANDIDATE_ID",
+        default=None,
+        help="auto_pausedの改善候補を人間判断で再開し、stage=approvedへ戻す",
+    )
+    parser.add_argument(
+        "--trade-approval-actor",
+        default="manual",
+        help="改善候補の承認/却下者名",
+    )
+    parser.add_argument(
+        "--trade-approval-note",
+        default="",
+        help="改善候補の承認/却下メモ",
+    )
+    parser.add_argument(
+        "--trade-outcome-health-require-sample",
+        action="store_true",
+        help="ヘルスチェックで最低サンプル数未満を失敗扱いにする",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
     args = parser.parse_args(argv)
+
+    lifecycle_actions = [
+        bool(args.approve_trade_candidate),
+        bool(args.reject_trade_candidate),
+        bool(args.resume_trade_candidate),
+    ]
+    if sum(lifecycle_actions) > 1:
+        print(
+            "--approve-trade-candidate / --reject-trade-candidate / "
+            "--resume-trade-candidate は同時に使えません。"
+        )
+        return 2
+    if args.approve_trade_candidate:
+        return approve_trade_candidate_cli(
+            args.trade_improvement_registry,
+            args.approve_trade_candidate,
+            decision="approved",
+            actor=args.trade_approval_actor,
+            note=args.trade_approval_note,
+        )
+    if args.reject_trade_candidate:
+        return approve_trade_candidate_cli(
+            args.trade_improvement_registry,
+            args.reject_trade_candidate,
+            decision="rejected",
+            actor=args.trade_approval_actor,
+            note=args.trade_approval_note,
+        )
+    if args.resume_trade_candidate:
+        return approve_trade_candidate_cli(
+            args.trade_improvement_registry,
+            args.resume_trade_candidate,
+            decision="resumed",
+            actor=args.trade_approval_actor,
+            note=args.trade_approval_note,
+        )
+
+    if args.score_trade_outcomes:
+        return score_trade_outcomes_cli(
+            args.trade_outcome_journal,
+            json_report_path=args.trade_outcome_json,
+            improvement_registry_path=(
+                args.trade_improvement_registry if args.update_trade_improvement_registry else None
+            ),
+            monitor_json_path=args.trade_monitor_json,
+        )
+    if args.retest_trade_variants:
+        return retest_trade_variants_cli(
+            args.trade_outcome_journal,
+            json_report_path=args.trade_variant_json,
+            improvement_registry_path=(
+                args.trade_improvement_registry if args.update_trade_improvement_registry else None
+            ),
+            target1_r_candidates=args.tp1_r_candidates,
+            target2_r_candidates=args.tp2_r_candidates,
+        )
+    if args.check_trade_outcome_health:
+        return check_trade_outcome_health_cli(
+            args.trade_outcome_journal,
+            require_sample_ok=args.trade_outcome_health_require_sample,
+        )
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
     fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
     now = datetime.now(UTC)
+    trade_improvement_registry = (
+        trade_outcome.load_improvement_registry(args.trade_improvement_registry)
+        if not args.no_trade_expectancy
+        else {}
+    )
+    target_r_adjuster = (
+        make_approved_tp_sl_adjuster(trade_improvement_registry)
+        if not args.no_trade_expectancy
+        else None
+    )
 
     currencies: set[str] = set()
     for symbol in symbols:
@@ -462,6 +950,46 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as error:
                 fetch_warnings.append(f"学習プロファイル保存失敗: {error}")
 
+    expectancy_adjuster = None
+    if not args.no_trade_expectancy:
+        trade_outcomes = trade_outcome.evaluate_trade_outcomes(journal_entries)
+        trade_expectancy_summary = trade_outcome.summarize_expectancy(trade_outcomes)
+        trade_expectancy_note = trade_outcome.format_expectancy_report_ja(
+            trade_expectancy_summary, limit=3
+        )
+        if trade_expectancy_note != "トレード期待値監視: 対象なし":
+            learning_note = append_note(learning_note, trade_expectancy_note)
+        overall_stats = trade_expectancy_summary.get("overall")
+        evaluated_outcomes = (
+            int(overall_stats.get("evaluated", 0)) if isinstance(overall_stats, dict) else 0
+        )
+        if not args.dry_run and evaluated_outcomes > 0:
+            try:
+                candidates = trade_outcome.improvement_candidates(trade_expectancy_summary)
+                registry = trade_outcome.update_improvement_registry(
+                    trade_improvement_registry,
+                    candidates,
+                    now=now,
+                    managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
+                )
+                registry, paused_policies = (
+                    trade_outcome.auto_pause_underperforming_approved_policies(
+                        registry,
+                        trade_expectancy_summary,
+                        now=now,
+                    )
+                )
+                for paused in paused_policies:
+                    fetch_warnings.append(
+                        "承認済みTP/SLを自動停止: "
+                        f"{paused['candidate_id']} — {paused['reason_ja']}"
+                    )
+                trade_outcome.save_improvement_registry(registry, args.trade_improvement_registry)
+            except OSError as error:
+                fetch_warnings.append(f"期待値改善候補レジストリ保存失敗: {error}")
+        if not args.no_trade_expectancy_guard:
+            expectancy_adjuster = make_trade_expectancy_adjuster(trade_expectancy_summary)
+
     # 7. ML確率モデル: --train-mlで強制再学習。それ以外も保存済みモデルが
     #    無い/staleなら自動再学習する(スキルゲートは train_artifact 内)
     ml_artifact = ml.MLArtifact()
@@ -516,6 +1044,8 @@ def main(argv: list[str] | None = None) -> int:
                 news_weight=profile.news_weight,
                 conviction_factor=profile.conviction_factor(symbol),
                 condition_adjuster=profile.condition_adjustment,
+                expectancy_adjuster=expectancy_adjuster,
+                target_r_adjuster=target_r_adjuster,
                 macro_snapshot=macro_snapshot,
                 ml_artifact=ml_artifact if not args.no_ml else None,
                 stages=stages,
@@ -535,7 +1065,7 @@ def main(argv: list[str] | None = None) -> int:
                 fetch_warnings.append(f"判断ジャーナル書き込み失敗: {error}")
 
     if ml_artifact.model is not None:
-        learning_note = (learning_note + "\n" + ml_artifact.summary_ja()).strip()
+        learning_note = append_note(learning_note, ml_artifact.summary_ja())
 
     payload = briefing.build_discord_payload(
         plans,

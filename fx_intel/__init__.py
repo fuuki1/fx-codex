@@ -23,6 +23,7 @@
 15. price_history — 採点用の将来価格調達(ジャーナル後続行 + 外部OHLC注入口)
 16. tf_learning  — (symbol×timeframe) セル別の主ホライズン採点・学習
 17. tf_briefing  — 時間足別のDiscordペイロード生成
+18. trade_outcome — MFE/MAE/TP/SL採点・期待値監査・改善候補レジストリ
 
 tv_discord_notify.py と同じく fx_backtester 非依存で単体動作する
 (必要な外部パッケージは requests と tradingview_ta のみ。gbm/ml/promotion は
@@ -47,4 +48,5 @@ __all__ = [
     "tf_briefing",
     "tf_learning",
     "timeframe",
+    "trade_outcome",
 ]
