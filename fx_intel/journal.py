@@ -77,6 +77,7 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                         "stop": plan.stop,
                         "target1": plan.target1,
                         "target2": plan.target2,
+                        "target_policy": plan.target_policy,
                         "data_quality": plan.data_quality,
                         # チャート状態の特徴量(learning.pyの状態別学習に使う)
                         "features": plan.features,
@@ -130,6 +131,7 @@ def append_timeframe_plans(
                         "stop": plan.stop,
                         "target1": plan.target1,
                         "target2": plan.target2,
+                        "target_policy": plan.target_policy,
                         "data_quality": plan.data_quality,
                         "features": plan.features,
                         "components": plan.components,
