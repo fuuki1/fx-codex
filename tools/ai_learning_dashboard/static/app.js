@@ -4,6 +4,8 @@ const state = {
 
 const JOURNAL_FILE = "briefing_journal.jsonl";
 const LEARNING_FILE = "briefing_learning.json";
+const TF_JOURNAL_FILE = "briefing_tf_journal.jsonl";
+const TF_LEARNING_FILE = "briefing_tf_learning.json";
 const ML_FILE = "ml_model.json";
 
 const $ = (id) => document.getElementById(id);
@@ -64,17 +66,24 @@ function setReality({ badge, title, body, tone, reasons }) {
 
 function renderReality(data) {
   const files = data.files || {};
-  const journalExists = Boolean(files[JOURNAL_FILE]?.exists);
-  const learningExists = Boolean(files[LEARNING_FILE]?.exists);
+  const fusionJournalExists = Boolean(files[JOURNAL_FILE]?.exists);
+  const timeframeJournalExists = Boolean(files[TF_JOURNAL_FILE]?.exists);
+  const journalExists = fusionJournalExists || timeframeJournalExists;
+  const fusionLearningExists = Boolean(files[LEARNING_FILE]?.exists);
+  const timeframeLearningExists = Boolean(files[TF_LEARNING_FILE]?.exists);
+  const learningExists = fusionLearningExists || timeframeLearningExists;
   const mlExists = Boolean(files[ML_FILE]?.exists);
   const journalTotal = Number(data.journal?.total || 0);
   const evaluated = Number(data.learning?.evaluated || 0);
   const pending = Number(data.evaluation?.pending || 0);
+  const source = data.learning_source || {};
   const reasons = [];
 
-  if (!journalExists || journalTotal === 0) {
+  if (!journalExists && !learningExists) {
     reasons.push("判断ログが0件なので、まだ当たり外れを学習できません。");
     reasons.push("dry-runやno-journalでは学習用ログが残らない可能性があります。");
+  } else if (!journalExists && learningExists) {
+    reasons.push("判断ログ本体は見つかりませんが、保存済みの学習ファイルを読んでいます。");
   } else if (evaluated === 0) {
     reasons.push(`判断ログは${journalTotal}件ありますが、約24時間後の比較がまだです。`);
     if (pending > 0) reasons.push(`${pending}件は採点待ちです。`);
@@ -82,6 +91,12 @@ function renderReality(data) {
     reasons.push(`${evaluated}件を採点済みです。的中率と重み調整に使えます。`);
   }
 
+  if (!fusionJournalExists && timeframeJournalExists) {
+    reasons.push("融合1判断ログは未作成ですが、時間足別判断ログがあります。");
+  }
+  if (source.mode === "timeframe") {
+    reasons.push("この表示は時間足別AI学習(15m/1h/4h/1d)を元にしています。");
+  }
   if (!learningExists) {
     reasons.push("重み調整ファイルはまだ作られていません。");
   }
@@ -91,12 +106,23 @@ function renderReality(data) {
     reasons.push("MLモデルはありますが、検証スコア不足などで判断参加は無効です。");
   }
 
-  if (!journalExists || journalTotal === 0) {
+  if (!journalExists && !learningExists) {
     setReality({
       badge: "not trained",
       title: "今は学習していません",
       body: "この画面はAI本体ではなく監視画面です。読み取る学習ログが無いため、現在の状態は未学習です。",
       tone: "is-bad",
+      reasons,
+    });
+    return;
+  }
+
+  if (source.mode === "timeframe" && evaluated > 0) {
+    setReality({
+      badge: "timeframe trained",
+      title: "時間足別AIは学習中",
+      body: "Discordの時間足別学習メモと同じ系統の学習ファイルを読み取り、時間足ごとの重みと的中率を表示しています。",
+      tone: "is-good",
       reasons,
     });
     return;
@@ -156,7 +182,10 @@ function renderFlow(data) {
   $("flowJournal").classList.toggle("active", data.journal.total > 0);
   $("flowMature").classList.toggle("active", data.evaluation.evaluated > 0);
   $("flowMature").classList.toggle("warn", data.evaluation.pending > 0 && data.evaluation.evaluated === 0);
-  $("flowProfile").classList.toggle("active", data.files["briefing_learning.json"].exists);
+  $("flowProfile").classList.toggle(
+    "active",
+    data.files[LEARNING_FILE].exists || data.files[TF_LEARNING_FILE].exists,
+  );
   $("flowMl").classList.toggle("active", data.ml.has_model);
   $("flowMl").classList.toggle("warn", !data.ml.usable && data.ml.has_model);
   $("flowPromotion").classList.toggle(
@@ -181,7 +210,8 @@ function renderMetrics(data) {
 
 function renderWeights(data) {
   const lw = data.learning;
-  setText("learningGenerated", shortDate(lw.generated_at));
+  const sourceLabel = lw.source_label_ja ? `${lw.source_label_ja} / ` : "";
+  setText("learningGenerated", `${sourceLabel}${shortDate(lw.generated_at)}`);
   setText("techWeight", pct(lw.tech_weight));
   setText("newsWeight", pct(lw.news_weight));
   setBar("techWeightBar", lw.tech_weight);
@@ -251,6 +281,26 @@ function renderTimeframeBars(data) {
   const target = $("timeframeBars");
   if (!target) return;
   target.replaceChildren();
+  const learnedRows = data.tf_learning?.timeframes || [];
+  if (learnedRows.length) {
+    learnedRows.forEach((row) => {
+      const evaluated = Number(row.evaluated || 0);
+      const hits = Number(row.hits || 0);
+      const rate = evaluated ? hits / evaluated : null;
+      const tf = row.timeframe || "";
+      const label = TIMEFRAME_LABEL[tf] || tf;
+      const horizon = TIMEFRAME_HORIZON[tf] || "";
+      target.appendChild(
+        barRow(
+          `${label}${horizon ? ` (${horizon})` : ""}`,
+          rate || 0,
+          `${pct(rate)} (${hits}/${evaluated}) / 技術${pct(row.tech_weight)} ニュース${pct(row.news_weight)}`,
+          rate >= 0.5 ? "green" : "red",
+        ),
+      );
+    });
+    return;
+  }
   const byTf = data.evaluation?.by_timeframe || {};
   const timeframes = Object.keys(byTf).sort(
     (a, b) => TIMEFRAME_ORDER.indexOf(a) - TIMEFRAME_ORDER.indexOf(b),
@@ -276,6 +326,156 @@ function renderTimeframeBars(data) {
         rate >= 0.5 ? "green" : "red",
       ),
     );
+  });
+}
+
+function renderOps(data) {
+  const ops = data.ops || {};
+  setText("opsHealth", ops.status || "unknown");
+
+  const processList = $("opsProcessList");
+  processList.replaceChildren();
+  const processes = ops.processes || [];
+  if (!processes.length) {
+    processList.appendChild(empty("プロセス情報を取得できません"));
+  }
+  processes.forEach((process) => {
+    const running = Boolean(process.running);
+    processList.appendChild(
+      tradeItem(
+        process.label_ja || process.key || "--",
+        running ? `稼働中 pid=${(process.pids || []).join(", ")}` : "停止中",
+        running ? "ok" : "warn",
+      ),
+    );
+  });
+
+  const inputList = $("opsInputList");
+  inputList.replaceChildren();
+  const signals = ops.signals || {};
+  [
+    ["判断ログ", signals.has_any_journal],
+    ["5分価格系列", signals.has_timeframe_prices],
+    ["学習プロファイル", signals.has_any_learning],
+  ].forEach(([label, ok]) => {
+    inputList.appendChild(
+      tradeItem(label, ok ? "あり" : "未作成", ok ? "ok" : "warn"),
+    );
+  });
+  const runtimeLogs = ops.runtime_logs || [];
+  runtimeLogs.forEach((row) => {
+    const age = num(row.age_minutes);
+    inputList.appendChild(
+      tradeItem(
+        row.label_ja || row.name || "--",
+        row.exists
+          ? `更新 ${shortDate(row.mtime)}${age === null ? "" : ` / ${Math.round(age)}分前`}`
+          : "未作成",
+        row.exists ? "ok" : "warn",
+      ),
+    );
+  });
+
+  const alertList = $("opsAlertList");
+  alertList.replaceChildren();
+  const alerts = ops.alerts || [];
+  if (!alerts.length) {
+    alertList.appendChild(empty("追加対応が必要な項目はありません"));
+    return;
+  }
+  alerts.slice(0, 6).forEach((alert) => {
+    alertList.appendChild(
+      tradeItem(
+        alert.message_ja || "--",
+        alert.action_ja || "",
+        alert.severity || "info",
+      ),
+    );
+  });
+}
+
+function signedR(value) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value > 0 ? "+" : ""}${value.toFixed(2)}R`
+    : "--";
+}
+
+function tradeItem(title, body, tone = "") {
+  const div = document.createElement("div");
+  div.className = `condition-item ${tone}`.trim();
+  const strong = document.createElement("strong");
+  strong.textContent = title;
+  const span = document.createElement("span");
+  span.textContent = body;
+  div.append(strong, span);
+  return div;
+}
+
+function renderTradeMonitor(data) {
+  const trade = data.trade_monitor || {};
+  const counts = trade.counts || {};
+  setText("tradeMonitorUpdated", shortDate(trade.generated_at));
+  setText("tradeHealth", trade.status || "unknown");
+  setText(
+    "tradeCounts",
+    `active ${counts.active || 0} / approved ${counts.approved || 0} / paused ${counts.auto_paused || 0}`,
+  );
+
+  const actions = $("tradeActionList");
+  actions.replaceChildren();
+  const paperReady = trade.paper_ready || [];
+  const paused = trade.auto_paused || [];
+  if (!paperReady.length && !paused.length) {
+    actions.appendChild(empty("承認待ち・自動停止中の改善候補はありません"));
+  }
+  paperReady.slice(0, 5).forEach((row) => {
+    actions.appendChild(
+      tradeItem(
+        `承認待ち ${row.priority || ""}`,
+        `${row.title_ja || row.candidate_id || "--"} / seen ${row.seen_count || 0}`,
+        "amber-text",
+      ),
+    );
+  });
+  paused.slice(0, 5).forEach((row) => {
+    actions.appendChild(
+      tradeItem(
+        "自動停止",
+        `${row.title_ja || row.candidate_id || "--"} / ${row.auto_pause_reason_ja || ""}`,
+        "red-text",
+      ),
+    );
+  });
+
+  const policyStats = $("tradePolicyStats");
+  policyStats.replaceChildren();
+  const stats = trade.approved_policy_stats || [];
+  if (!stats.length) {
+    policyStats.appendChild(empty("承認済みTP/SL候補の採点はまだありません"));
+  }
+  stats.slice(0, 8).forEach((row) => {
+    const expectancy = num(row.expectancy_r);
+    policyStats.appendChild(
+      tradeItem(
+        `${row.stage || "--"} ${row.candidate_id || "--"}`,
+        `期待R ${signedR(expectancy)} / PF ${num(row.profit_factor_r)?.toFixed(2) || "--"} / n=${row.tradable || 0}`,
+        expectancy !== null && expectancy < 0 ? "red-text" : "green-text",
+      ),
+    );
+  });
+
+  const events = $("tradeEvents");
+  events.replaceChildren();
+  const rows = trade.recent_events || [];
+  if (!rows.length) {
+    events.appendChild(empty("改善候補の監査イベントはまだありません"));
+    return;
+  }
+  rows.slice(-6).reverse().forEach((row) => {
+    const div = document.createElement("div");
+    div.className = "timeline-item";
+    div.textContent = `${shortDate(row.ts)}  ${row.event_type || "--"}: ${row.candidate_id || "--"} ${row.from_stage || ""}→${row.to_stage || ""}`;
+    events.appendChild(div);
   });
 }
 
@@ -404,6 +604,8 @@ function render(data) {
   renderStages(data);
   renderSymbolBars(data);
   renderTimeframeBars(data);
+  renderOps(data);
+  renderTradeMonitor(data);
   renderBins(data);
   renderMl(data);
   renderConditions(data);

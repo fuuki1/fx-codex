@@ -79,6 +79,27 @@
         </div>
       </section>
 
+      <section class="panel ops-panel" aria-label="運用状態">
+        <div class="panel-head">
+          <h2>運用状態</h2>
+          <span id="opsHealth" class="subtle">確認中</span>
+        </div>
+        <div class="ops-grid">
+          <div>
+            <h3>稼働プロセス</h3>
+            <div id="opsProcessList" class="condition-list"></div>
+          </div>
+          <div>
+            <h3>入力ログ</h3>
+            <div id="opsInputList" class="condition-list"></div>
+          </div>
+          <div>
+            <h3>次の確認点</h3>
+            <div id="opsAlertList" class="condition-list"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="main-grid">
         <article class="panel">
           <div class="panel-head">
@@ -125,10 +146,36 @@
 
         <article class="panel wide">
           <div class="panel-head">
-            <h2>時間足別の的中率</h2>
-            <span class="subtle">各主ホライズンで採点</span>
+            <h2>時間足別の学習成績</h2>
+            <span class="subtle">各主ホライズン / 学習重み</span>
           </div>
           <div id="timeframeBars" class="bars"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>期待値・改善候補監視</h2>
+            <span id="tradeMonitorUpdated" class="subtle">未生成</span>
+          </div>
+          <div class="trade-grid">
+            <div class="trade-status">
+              <span>health</span>
+              <strong id="tradeHealth">unknown</strong>
+              <small id="tradeCounts">active 0 / approved 0 / paused 0</small>
+            </div>
+            <div>
+              <h3>承認待ち・自動停止</h3>
+              <div id="tradeActionList" class="condition-list"></div>
+            </div>
+            <div>
+              <h3>候補別の期待値</h3>
+              <div id="tradePolicyStats" class="condition-list"></div>
+            </div>
+          </div>
+          <div class="panel-subsection">
+            <h3>監査イベント</h3>
+            <div id="tradeEvents" class="timeline"></div>
+          </div>
         </article>
 
         <article class="panel wide">
