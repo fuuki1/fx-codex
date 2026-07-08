@@ -6,6 +6,7 @@ dashboard は fx_intel 非依存の独立ツールなので、パス経由で im
 from __future__ import annotations
 
 import importlib.util
+import json
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
@@ -107,3 +108,184 @@ def test_recent_outcomes_include_timeframe(server) -> None:
 def test_tolerance_scales_with_horizon(server) -> None:
     assert server._tolerance_for(0.25) < server._tolerance_for(24.0)
     assert server._tolerance_for(999.0) == 2.0
+
+
+def test_build_state_includes_trade_outcome_monitor(server, tmp_path) -> None:
+    registry = {
+        "generated_at": START.isoformat(),
+        "candidates": {
+            "cand-ready": {
+                "candidate_id": "cand-ready",
+                "status": "active",
+                "stage": "paper_ready",
+                "priority": "high",
+                "title_ja": "承認待ち候補",
+                "seen_count": 2,
+            },
+            "cand-paused": {
+                "candidate_id": "cand-paused",
+                "status": "active",
+                "stage": "auto_paused",
+                "priority": "medium",
+                "title_ja": "停止候補",
+                "seen_count": 4,
+                "auto_pause_reason_ja": "期待Rが悪化",
+            },
+        },
+        "events": [
+            {
+                "ts": START.isoformat(),
+                "candidate_id": "cand-paused",
+                "event_type": "auto_paused",
+                "from_stage": "approved",
+                "to_stage": "auto_paused",
+            }
+        ],
+    }
+    monitor = {
+        "generated_at": (START + timedelta(hours=1)).isoformat(),
+        "status": "fail",
+        "exit_code": 1,
+        "registry": {
+            "active_count": 2,
+            "paper_ready_count": 1,
+            "approved_count": 0,
+            "auto_paused_count": 1,
+            "rejected_count": 0,
+            "resolved_count": 0,
+        },
+        "approved_policy_stats": [
+            {
+                "candidate_id": "cand-paused",
+                "stage": "auto_paused",
+                "tradable": 12,
+                "expectancy_r": -0.2,
+                "profit_factor_r": 0.8,
+            }
+        ],
+        "alerts": [{"type": "auto_paused", "severity": "warn", "candidate_id": "cand-paused"}],
+    }
+    (tmp_path / "trade_improvement_candidates.json").write_text(
+        json.dumps(registry),
+        encoding="utf-8",
+    )
+    (tmp_path / "trade_outcome_monitor.json").write_text(
+        json.dumps(monitor),
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+    trade = state["trade_monitor"]
+
+    assert trade["status"] == "fail"
+    assert trade["counts"]["paper_ready"] == 1
+    assert trade["counts"]["auto_paused"] == 1
+    assert trade["paper_ready"][0]["candidate_id"] == "cand-ready"
+    assert trade["approved_policy_stats"][0]["candidate_id"] == "cand-paused"
+    assert trade["recent_events"][0]["event_type"] == "auto_paused"
+
+
+def test_build_state_uses_timeframe_learning_when_fusion_learning_missing(
+    server,
+    tmp_path,
+) -> None:
+    tf_learning = {
+        "generated_at": START.isoformat(),
+        "per_timeframe": {
+            "15m": {
+                "generated_at": START.isoformat(),
+                "evaluated": 29,
+                "hits": 16,
+                "flat": 6,
+                "tech_weight": 0.63,
+                "news_weight": 0.37,
+                "tech_hit_rate": 0.55,
+                "news_hit_rate": 0.52,
+                "conviction_brier": 0.33,
+                "conviction_brier_base": 0.247,
+            },
+            "1h": {
+                "generated_at": START.isoformat(),
+                "evaluated": 34,
+                "hits": 17,
+                "flat": 6,
+                "tech_weight": 0.35,
+                "news_weight": 0.65,
+                "tech_hit_rate": 0.50,
+                "news_hit_rate": 0.62,
+            },
+        },
+    }
+    (tmp_path / "briefing_tf_learning.json").write_text(
+        json.dumps(tf_learning),
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+
+    assert state["learning_source"]["mode"] == "timeframe"
+    assert state["learning"]["source"] == "timeframe"
+    assert state["learning"]["evaluated"] == 63
+    assert state["learning"]["hits"] == 33
+    assert state["learning"]["tech_weight"] == pytest.approx(((0.63 * 29) + (0.35 * 34)) / 63)
+    assert state["tf_learning"]["timeframes"][0]["timeframe"] == "15m"
+    assert state["tf_learning"]["timeframes"][0]["hit_rate"] == pytest.approx(16 / 29)
+
+
+def test_build_state_reports_missing_learning_ops_inputs(server, tmp_path) -> None:
+    state = server.build_state(tmp_path, now=START, ps_output="")
+    ops = state["ops"]
+
+    assert ops["status"] == "warn"
+    assert ops["signals"]["has_any_journal"] is False
+    assert ops["signals"]["has_timeframe_prices"] is False
+    assert ops["signals"]["has_any_learning"] is False
+    assert ops["processes"][0]["running"] is False
+    assert ops["processes"][1]["running"] is False
+    assert any("判断ログ" in alert["message_ja"] for alert in ops["alerts"])
+    assert any("スナップショットループ" in alert["message_ja"] for alert in ops["alerts"])
+
+
+def test_build_state_reports_running_learning_ops(server, tmp_path) -> None:
+    (tmp_path / "briefing_tf_journal.jsonl").write_text(
+        json.dumps(_row(START, "15m", 0.25, "long", 150.0), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "briefing_tf_prices.jsonl").write_text(
+        json.dumps(_row(START + timedelta(minutes=15), "15m", 0.25, "neutral", 150.2)) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "briefing_tf_learning.json").write_text(
+        json.dumps(
+            {
+                "generated_at": START.isoformat(),
+                "per_timeframe": {
+                    "15m": {
+                        "evaluated": 1,
+                        "hits": 1,
+                        "flat": 0,
+                        "tech_weight": 0.60,
+                        "news_weight": 0.40,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ps_output = "\n".join(
+        [
+            "100 /bin/zsh ./fx_briefing_loop.sh",
+            "101 /bin/zsh ./fx_tf_snapshot_loop.sh",
+            "102 python3 tools/ai_learning_dashboard/server.py --port 8767",
+        ]
+    )
+
+    state = server.build_state(tmp_path, now=START, ps_output=ps_output)
+    ops = state["ops"]
+
+    assert ops["status"] == "ok"
+    assert ops["signals"]["has_any_journal"] is True
+    assert ops["signals"]["has_timeframe_prices"] is True
+    assert ops["signals"]["has_any_learning"] is True
+    assert [process["running"] for process in ops["processes"]] == [True, True, True]
+    assert ops["alerts"] == []

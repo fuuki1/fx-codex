@@ -8,10 +8,12 @@ small static UI and exposes a read-only JSON summary of logs/*.json/jsonl.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import json
 import math
 import mimetypes
 import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,12 +30,18 @@ JOURNAL_FILE = "briefing_journal.jsonl"
 LEARNING_FILE = "briefing_learning.json"
 ML_FILE = "ml_model.json"
 PROMOTION_FILE = "promotion_state.json"
+TRADE_MONITOR_FILE = "trade_outcome_monitor.json"
+TRADE_REGISTRY_FILE = "trade_improvement_candidates.json"
+BRIEFING_RUN_LOG_FILE = "fx_briefing.log"
+TF_BRIEFING_RUN_LOG_FILE = "fx_briefing_tf.log"
+TF_SNAPSHOT_RUN_LOG_FILE = "fx_tf_snapshot.log"
 # 時間足別モード(fx_briefing --per-timeframe)の記録
 TF_JOURNAL_FILE = "briefing_tf_journal.jsonl"
 TF_LEARNING_FILE = "briefing_tf_learning.json"
 # 5分ごとの価格スナップショット(fx_tf_snapshot.py)。短い足の採点窓に入る
 # 将来価格を密に供給する価格専用系列。採点の将来価格解決に使う(判断は無い)。
 TF_PRICES_FILE = "briefing_tf_prices.jsonl"
+_TIMEFRAME_ORDER = {"15m": 0, "1h": 1, "4h": 2, "1d": 3}
 
 # 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
 # ダッシュボードは fx_intel に依存しない方針なのでここに独立して持つ。
@@ -127,6 +135,173 @@ def _file_status(path: Path) -> dict[str, Any]:
         "size": stat.st_size,
         "mtime": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
         "path": str(path),
+    }
+
+
+def _file_status_with_age(path: Path, now: datetime) -> dict[str, Any]:
+    status = _file_status(path)
+    mtime = _parse_ts(status.get("mtime"))
+    status["age_minutes"] = (
+        round((now - mtime).total_seconds() / 60.0, 1) if mtime is not None else None
+    )
+    return status
+
+
+def _process_table(ps_output: str | None = None) -> list[dict[str, Any]]:
+    if ps_output is None:
+        try:
+            ps_output = subprocess.check_output(
+                ["ps", "-axo", "pid=,command="],
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            ps_output = ""
+    rows: list[dict[str, Any]] = []
+    for line in ps_output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "command": command.strip()})
+    return rows
+
+
+def _matching_processes(rows: list[dict[str, Any]], needle: str) -> list[dict[str, Any]]:
+    return [
+        {"pid": row["pid"], "command": row["command"]}
+        for row in rows
+        if needle in str(row.get("command", ""))
+        and " rg " not in str(row.get("command", ""))
+        and "ps -axo" not in str(row.get("command", ""))
+    ]
+
+
+def _runtime_process_status(rows: list[dict[str, Any]], key: str, label: str, needle: str) -> dict:
+    matches = _matching_processes(rows, needle)
+    return {
+        "key": key,
+        "label_ja": label,
+        "running": bool(matches),
+        "pids": [row["pid"] for row in matches],
+    }
+
+
+def _runtime_log_status(log_dir: Path, name: str, label: str, now: datetime) -> dict:
+    status = _file_status_with_age(log_dir / name, now)
+    status["name"] = name
+    status["label_ja"] = label
+    return status
+
+
+def _ops_status(
+    log_dir: Path,
+    files: Mapping[str, Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+    ps_output: str | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
+    rows = _process_table(ps_output)
+    processes = [
+        _runtime_process_status(
+            rows, "briefing_loop", "ブリーフィング送信ループ", "fx_briefing_loop.sh"
+        ),
+        _runtime_process_status(
+            rows, "tf_snapshot_loop", "時間足価格スナップショット", "fx_tf_snapshot_loop.sh"
+        ),
+        _runtime_process_status(
+            rows, "dashboard", "ダッシュボード", "tools/ai_learning_dashboard/server.py"
+        ),
+    ]
+    runtime_logs = [
+        _runtime_log_status(log_dir, BRIEFING_RUN_LOG_FILE, "融合1判断ログ", now),
+        _runtime_log_status(log_dir, TF_BRIEFING_RUN_LOG_FILE, "時間足別判断ログ", now),
+        _runtime_log_status(log_dir, TF_SNAPSHOT_RUN_LOG_FILE, "価格スナップショットログ", now),
+    ]
+    file_exists = {name: bool(info.get("exists")) for name, info in files.items()}
+    alerts: list[dict[str, str]] = []
+
+    if not file_exists.get(JOURNAL_FILE) and not file_exists.get(TF_JOURNAL_FILE):
+        alerts.append(
+            {
+                "severity": "warn",
+                "message_ja": "融合/時間足別の判断ログが未作成です",
+                "action_ja": "まず python3 tools/learning_capture.py でDiscord送信なしの学習ログを1回収集できます",
+            }
+        )
+    if not file_exists.get(TF_PRICES_FILE):
+        alerts.append(
+            {
+                "severity": "warn",
+                "message_ja": "時間足別採点用の5分価格系列が未作成です",
+                "action_ja": "python3 tools/learning_capture.py が1回分の価格系列も同時に保存します",
+            }
+        )
+    if not file_exists.get(LEARNING_FILE) and not file_exists.get(TF_LEARNING_FILE):
+        alerts.append(
+            {
+                "severity": "info",
+                "message_ja": "学習プロファイルが未作成です",
+                "action_ja": "判断ログが主ホライズン経過後に採点されると作成されます",
+            }
+        )
+    process_by_key = {process["key"]: process for process in processes}
+    if not process_by_key["briefing_loop"]["running"]:
+        alerts.append(
+            {
+                "severity": "warn",
+                "message_ja": "ブリーフィング送信ループが稼働していません",
+                "action_ja": "継続運用でDiscord送信も必要な場合だけ ./fx_briefing_loop.sh & を手動起動してください",
+            }
+        )
+    if not process_by_key["tf_snapshot_loop"]["running"]:
+        alerts.append(
+            {
+                "severity": "warn",
+                "message_ja": "5分価格スナップショットループが稼働していません",
+                "action_ja": "時間足別学習を継続するには ./fx_tf_snapshot_loop.sh & を起動してください",
+            }
+        )
+
+    for runtime_log in runtime_logs:
+        age = runtime_log.get("age_minutes")
+        if age is None:
+            continue
+        stale_after = 15 if runtime_log["name"] == TF_SNAPSHOT_RUN_LOG_FILE else 90
+        if age > stale_after:
+            alerts.append(
+                {
+                    "severity": "warn",
+                    "message_ja": f"{runtime_log['label_ja']}の更新が止まっています",
+                    "action_ja": f"最終更新から約{int(age)}分経過しています",
+                }
+            )
+
+    severity_rank = {"ok": 0, "info": 1, "warn": 2, "fail": 3}
+    status = "ok"
+    for alert in alerts:
+        severity = str(alert.get("severity", "info"))
+        if severity_rank.get(severity, 1) > severity_rank[status]:
+            status = severity
+
+    return {
+        "generated_at": now.isoformat(),
+        "status": status,
+        "processes": processes,
+        "runtime_logs": runtime_logs,
+        "signals": {
+            "has_any_journal": file_exists.get(JOURNAL_FILE, False)
+            or file_exists.get(TF_JOURNAL_FILE, False),
+            "has_timeframe_prices": file_exists.get(TF_PRICES_FILE, False),
+            "has_any_learning": file_exists.get(LEARNING_FILE, False)
+            or file_exists.get(TF_LEARNING_FILE, False),
+        },
+        "alerts": alerts[:12],
     }
 
 
@@ -357,6 +532,145 @@ def _condition_rows(learning: dict[str, Any]) -> list[dict[str, Any]]:
     return rows[:20]
 
 
+def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    per_timeframe = payload.get("per_timeframe")
+    if not isinstance(per_timeframe, dict):
+        per_timeframe = {}
+    rows: list[dict[str, Any]] = []
+    for timeframe, raw_profile in per_timeframe.items():
+        if not isinstance(raw_profile, dict):
+            continue
+        evaluated = int(raw_profile.get("evaluated", 0) or 0)
+        hits = int(raw_profile.get("hits", 0) or 0)
+        flat = int(raw_profile.get("flat", 0) or 0)
+        row = {
+            "timeframe": str(timeframe),
+            "generated_at": raw_profile.get("generated_at") or payload.get("generated_at"),
+            "evaluated": evaluated,
+            "hits": hits,
+            "flat": flat,
+            "hit_rate": hits / evaluated if evaluated else None,
+            "tech_weight": _number(raw_profile.get("tech_weight")),
+            "news_weight": _number(raw_profile.get("news_weight")),
+            "tech_hit_rate": _number(raw_profile.get("tech_hit_rate")),
+            "news_hit_rate": _number(raw_profile.get("news_hit_rate")),
+            "conviction_brier": _number(raw_profile.get("conviction_brier")),
+            "conviction_brier_base": _number(raw_profile.get("conviction_brier_base")),
+            "bins": raw_profile.get("bins") if isinstance(raw_profile.get("bins"), list) else [],
+            "notes_ja": (
+                raw_profile.get("notes_ja") if isinstance(raw_profile.get("notes_ja"), list) else []
+            ),
+        }
+        rows.append(row)
+    rows.sort(key=lambda row: (_TIMEFRAME_ORDER.get(str(row["timeframe"]), 99), row["timeframe"]))
+    evaluated = sum(int(row["evaluated"]) for row in rows)
+    hits = sum(int(row["hits"]) for row in rows)
+    flat = sum(int(row["flat"]) for row in rows)
+    return {
+        "generated_at": payload.get("generated_at") or _latest_generated_at(rows),
+        "evaluated": evaluated,
+        "hits": hits,
+        "flat": flat,
+        "hit_rate": hits / evaluated if evaluated else None,
+        "tech_weight": _weighted_average(rows, "tech_weight") or 0.55,
+        "news_weight": _weighted_average(rows, "news_weight") or 0.45,
+        "tech_hit_rate": _weighted_average(rows, "tech_hit_rate"),
+        "news_hit_rate": _weighted_average(rows, "news_hit_rate"),
+        "conviction_brier": _weighted_average(rows, "conviction_brier"),
+        "conviction_brier_base": _weighted_average(rows, "conviction_brier_base"),
+        "timeframes": rows,
+    }
+
+
+def _latest_generated_at(rows: list[dict[str, Any]]) -> str | None:
+    latest: datetime | None = None
+    for row in rows:
+        ts = _parse_ts(row.get("generated_at"))
+        if ts is not None and (latest is None or ts > latest):
+            latest = ts
+    return latest.isoformat() if latest else None
+
+
+def _weighted_average(rows: list[dict[str, Any]], key: str) -> float | None:
+    total_weight = 0
+    total = 0.0
+    for row in rows:
+        value = _number(row.get(key))
+        weight = int(row.get("evaluated", 0) or 0)
+        if value is None or weight <= 0:
+            continue
+        total += value * weight
+        total_weight += weight
+    return total / total_weight if total_weight else None
+
+
+def _learning_source(
+    learning: dict[str, Any],
+    tf_learning: dict[str, Any],
+    evaluated: dict[str, Any],
+) -> dict[str, Any]:
+    if learning:
+        return {"mode": "fusion", "label_ja": "融合1判断", "has_profile": True}
+    if tf_learning.get("timeframes"):
+        return {"mode": "timeframe", "label_ja": "時間足別", "has_profile": True}
+    if int(evaluated.get("evaluated", 0) or 0) > 0:
+        return {"mode": "evaluated", "label_ja": "採点のみ", "has_profile": False}
+    return {"mode": "none", "label_ja": "未学習", "has_profile": False}
+
+
+def _learning_payload(
+    learning: dict[str, Any],
+    evaluated: dict[str, Any],
+    tf_learning: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    source_mode = str(source.get("mode", "none"))
+    if source_mode == "timeframe":
+        evaluated_count = int(tf_learning.get("evaluated", 0) or 0)
+        hits = int(tf_learning.get("hits", 0) or 0)
+        return {
+            "source": source_mode,
+            "source_label_ja": source.get("label_ja"),
+            "generated_at": tf_learning.get("generated_at"),
+            "evaluated": evaluated_count,
+            "hits": hits,
+            "flat": int(tf_learning.get("flat", 0) or 0),
+            "hit_rate": hits / evaluated_count if evaluated_count else None,
+            "tech_weight": _number(tf_learning.get("tech_weight")) or 0.55,
+            "news_weight": _number(tf_learning.get("news_weight")) or 0.45,
+            "tech_hit_rate": _number(tf_learning.get("tech_hit_rate")),
+            "news_hit_rate": _number(tf_learning.get("news_hit_rate")),
+            "conviction_brier": _number(tf_learning.get("conviction_brier")),
+            "conviction_brier_base": _number(tf_learning.get("conviction_brier_base")),
+            "bins": [],
+            "notes_ja": [],
+            "symbols": [],
+            "conditions": [],
+        }
+
+    evaluated_count = int(learning.get("evaluated", 0) or evaluated["evaluated"])
+    hits = int(learning.get("hits", 0) or evaluated["hits"])
+    return {
+        "source": source_mode,
+        "source_label_ja": source.get("label_ja"),
+        "generated_at": learning.get("generated_at"),
+        "evaluated": evaluated_count,
+        "hits": hits,
+        "flat": int(learning.get("flat", 0) or evaluated["flat"]),
+        "hit_rate": hits / evaluated_count if evaluated_count else None,
+        "tech_weight": _number(learning.get("tech_weight")) or 0.55,
+        "news_weight": _number(learning.get("news_weight")) or 0.45,
+        "tech_hit_rate": _number(learning.get("tech_hit_rate")),
+        "news_hit_rate": _number(learning.get("news_hit_rate")),
+        "conviction_brier": _number(learning.get("conviction_brier")),
+        "conviction_brier_base": _number(learning.get("conviction_brier_base")),
+        "bins": learning.get("bins") if isinstance(learning.get("bins"), list) else [],
+        "notes_ja": learning.get("notes_ja") if isinstance(learning.get("notes_ja"), list) else [],
+        "symbols": _symbol_rows(learning, evaluated),
+        "conditions": _condition_rows(learning),
+    }
+
+
 def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     importance = payload.get("importance_by_name")
@@ -393,11 +707,114 @@ def _promotion_summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_state(log_dir: Path) -> dict[str, Any]:
+def _registry_records(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = payload.get("candidates")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): value for key, value in raw.items() if isinstance(value, dict)}
+
+
+def _registry_records_by_stage(
+    payload: dict[str, Any],
+    stage: str,
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    records = [
+        record
+        for record in _registry_records(payload).values()
+        if record.get("status") == "active" and record.get("stage") == stage
+    ]
+    records.sort(
+        key=lambda row: (
+            -int(row.get("seen_count", 0) or 0),
+            str(row.get("priority", "")),
+            str(row.get("candidate_id", "")),
+        )
+    )
+    return records[:limit]
+
+
+def _list_from_payload(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    raw = payload.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def _trade_monitor_summary(
+    monitor: dict[str, Any],
+    registry: dict[str, Any],
+) -> dict[str, Any]:
+    monitor_registry = monitor.get("registry")
+    if not isinstance(monitor_registry, dict):
+        monitor_registry = {}
+    records = _registry_records(registry)
+    active = [record for record in records.values() if record.get("status") == "active"]
+
+    def _count(stage: str) -> int:
+        value = monitor_registry.get(f"{stage}_count")
+        if isinstance(value, int):
+            return value
+        return sum(1 for record in active if record.get("stage") == stage)
+
+    paper_ready = _list_from_payload(monitor_registry, "paper_ready") or _registry_records_by_stage(
+        registry, "paper_ready"
+    )
+    approved = _list_from_payload(monitor_registry, "approved") or _registry_records_by_stage(
+        registry, "approved"
+    )
+    auto_paused = _list_from_payload(monitor_registry, "auto_paused") or _registry_records_by_stage(
+        registry, "auto_paused"
+    )
+    rejected = _list_from_payload(monitor_registry, "rejected") or _registry_records_by_stage(
+        registry, "rejected"
+    )
+    recent_events = (
+        _list_from_payload(monitor, "recent_events") or _list_from_payload(registry, "events")[-20:]
+    )
+    return {
+        "generated_at": monitor.get("generated_at") or registry.get("generated_at"),
+        "status": monitor.get("status") or monitor.get("health", {}).get("status") or "unknown",
+        "exit_code": int(monitor.get("exit_code", 0) or 0),
+        "health": monitor.get("health") if isinstance(monitor.get("health"), dict) else {},
+        "counts": {
+            "active": int(monitor_registry.get("active_count", len(active)) or 0),
+            "paper_ready": _count("paper_ready"),
+            "approved": _count("approved"),
+            "auto_paused": _count("auto_paused"),
+            "rejected": _count("rejected"),
+            "resolved": int(
+                monitor_registry.get(
+                    "resolved_count",
+                    sum(1 for record in records.values() if record.get("status") == "resolved"),
+                )
+                or 0
+            ),
+        },
+        "alerts": _list_from_payload(monitor, "alerts")[:20],
+        "paper_ready": paper_ready[:10],
+        "approved": approved[:10],
+        "auto_paused": auto_paused[:10],
+        "rejected": rejected[:10],
+        "approved_policy_stats": _list_from_payload(monitor, "approved_policy_stats")[:20],
+        "recent_events": recent_events[-20:],
+    }
+
+
+def build_state(
+    log_dir: Path,
+    *,
+    now: datetime | None = None,
+    ps_output: str | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
     journal_path = log_dir / JOURNAL_FILE
     learning_path = log_dir / LEARNING_FILE
     ml_path = log_dir / ML_FILE
     promotion_path = log_dir / PROMOTION_FILE
+    trade_monitor_path = log_dir / TRADE_MONITOR_FILE
+    trade_registry_path = log_dir / TRADE_REGISTRY_FILE
     tf_journal_path = log_dir / TF_JOURNAL_FILE
     tf_learning_path = log_dir / TF_LEARNING_FILE
     tf_prices_path = log_dir / TF_PRICES_FILE
@@ -408,53 +825,46 @@ def build_state(log_dir: Path) -> dict[str, Any]:
     # 将来価格系列を密にして 15m/1h も採点可能にする(fx_briefing 本体と同じ結合)。
     tf_price_rows = _read_journal(tf_prices_path)
     learning = _load_json(learning_path)
+    tf_learning = _timeframe_learning_summary(_load_json(tf_learning_path))
     ml = _load_json(ml_path)
     promotion = _load_json(promotion_path)
+    trade_monitor = _load_json(trade_monitor_path)
+    trade_registry = _load_json(trade_registry_path)
     # 融合1判断行(24h)と時間足別行(各主ホライズン)を同じ採点器で評価する。
     # _evaluate_journal は行ごとに timeframe/horizon_hours を見て採点する。
     # 価格スナップショット行は将来価格系列にだけ寄与する(direction 無しなので
     # 採点対象=directional にはカウントされない)。
     evaluated = _evaluate_journal(entries + tf_entries + tf_price_rows)
 
-    evaluated_count = int(learning.get("evaluated", 0) or evaluated["evaluated"])
-    hits = int(learning.get("hits", 0) or evaluated["hits"])
+    source = _learning_source(learning, tf_learning, evaluated)
+    learning_payload = _learning_payload(learning, evaluated, tf_learning, source)
+
+    files = {
+        JOURNAL_FILE: _file_status(journal_path),
+        LEARNING_FILE: _file_status(learning_path),
+        ML_FILE: _file_status(ml_path),
+        PROMOTION_FILE: _file_status(promotion_path),
+        TRADE_MONITOR_FILE: _file_status(trade_monitor_path),
+        TRADE_REGISTRY_FILE: _file_status(trade_registry_path),
+        TF_JOURNAL_FILE: _file_status(tf_journal_path),
+        TF_LEARNING_FILE: _file_status(tf_learning_path),
+        TF_PRICES_FILE: _file_status(tf_prices_path),
+    }
 
     return {
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": now.isoformat(),
         "read_only": True,
         "log_dir": str(log_dir),
-        "files": {
-            JOURNAL_FILE: _file_status(journal_path),
-            LEARNING_FILE: _file_status(learning_path),
-            ML_FILE: _file_status(ml_path),
-            PROMOTION_FILE: _file_status(promotion_path),
-            TF_JOURNAL_FILE: _file_status(tf_journal_path),
-            TF_LEARNING_FILE: _file_status(tf_learning_path),
-            TF_PRICES_FILE: _file_status(tf_prices_path),
-        },
+        "files": files,
+        "ops": _ops_status(log_dir, files, now=now, ps_output=ps_output),
         "journal": _journal_summary(entries + tf_entries),
         "evaluation": evaluated,
-        "learning": {
-            "generated_at": learning.get("generated_at"),
-            "evaluated": evaluated_count,
-            "hits": hits,
-            "flat": int(learning.get("flat", 0) or evaluated["flat"]),
-            "hit_rate": hits / evaluated_count if evaluated_count else None,
-            "tech_weight": _number(learning.get("tech_weight")) or 0.55,
-            "news_weight": _number(learning.get("news_weight")) or 0.45,
-            "tech_hit_rate": _number(learning.get("tech_hit_rate")),
-            "news_hit_rate": _number(learning.get("news_hit_rate")),
-            "conviction_brier": _number(learning.get("conviction_brier")),
-            "conviction_brier_base": _number(learning.get("conviction_brier_base")),
-            "bins": learning.get("bins") if isinstance(learning.get("bins"), list) else [],
-            "notes_ja": (
-                learning.get("notes_ja") if isinstance(learning.get("notes_ja"), list) else []
-            ),
-            "symbols": _symbol_rows(learning, evaluated),
-            "conditions": _condition_rows(learning),
-        },
+        "learning_source": source,
+        "learning": learning_payload,
+        "tf_learning": tf_learning,
         "ml": _ml_summary(ml),
         "promotion": _promotion_summary(promotion),
+        "trade_monitor": _trade_monitor_summary(trade_monitor, trade_registry),
     }
 
 

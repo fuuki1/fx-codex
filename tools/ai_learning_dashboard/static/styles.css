@@ -241,6 +241,24 @@ small {
   grid-column: 1 / -1;
 }
 
+.ops-panel {
+  min-height: 0;
+  margin-bottom: 12px;
+}
+
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ops-grid h3 {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .panel-head {
   display: flex;
   align-items: baseline;
@@ -426,6 +444,70 @@ small {
   font-size: 13px;
 }
 
+.condition-item.ok {
+  border-left: 4px solid var(--green);
+}
+
+.condition-item.info,
+.condition-item.warn {
+  border-left: 4px solid var(--amber);
+}
+
+.condition-item.fail,
+.condition-item.red {
+  border-left: 4px solid var(--red);
+}
+
+.trade-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1fr) minmax(260px, 1.2fr);
+  gap: 12px;
+}
+
+.trade-grid h3,
+.panel-subsection h3 {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.trade-status {
+  padding: 12px;
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.trade-status span,
+.trade-status small {
+  display: block;
+  color: var(--muted);
+}
+
+.trade-status strong {
+  display: block;
+  margin: 10px 0;
+  font-size: 28px;
+}
+
+.panel-subsection {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.green-text {
+  border-left: 4px solid var(--green);
+}
+
+.amber-text {
+  border-left: 4px solid var(--amber);
+}
+
+.red-text {
+  border-left: 4px solid var(--red);
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -471,7 +553,9 @@ th {
   .status-grid,
   .main-grid,
   .flow-panel,
-  .reality-panel {
+  .reality-panel,
+  .ops-grid,
+  .trade-grid {
     grid-template-columns: 1fr;
   }
 
