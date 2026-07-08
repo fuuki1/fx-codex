@@ -58,10 +58,16 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     journal_path = tmp_path / "briefing_journal.jsonl"
     learning_path = tmp_path / "briefing_learning.json"
     promotion_path = tmp_path / "promotion_state.json"
+    decision_log_path = tmp_path / "briefing_decisions.jsonl"
+    decision_latest_path = tmp_path / "briefing_decisions_latest.json"
+    decision_outcomes_path = tmp_path / "briefing_decision_outcomes.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
         mock.patch.object(fx_briefing, "DEFAULT_LEARNING_PATH", learning_path),
         mock.patch.object(fx_briefing, "DEFAULT_PROMOTION_STATE", promotion_path),
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_LOG_PATH", decision_log_path),
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_LATEST_PATH", decision_latest_path),
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_OUTCOMES_PATH", decision_outcomes_path),
         mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
         mock.patch("fx_intel.calendar.fetch_calendar", return_value=([], [])),
         mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
@@ -85,9 +91,18 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert rc == 0
     assert journal_path.exists()
     assert learning_path.exists()
+    assert decision_log_path.exists()
+    assert decision_latest_path.exists()
+    assert decision_outcomes_path.exists()
     rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
+    decision_rows = [
+        json.loads(line) for line in decision_log_path.read_text().splitlines() if line.strip()
+    ]
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
+    outcome_report = json.loads(decision_outcomes_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
+    assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
+    assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
     assert "evaluated" in profile
     assert "Discord送信なし" in capsys.readouterr().out
 
