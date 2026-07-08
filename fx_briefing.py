@@ -77,6 +77,7 @@ from fx_intel import (
     briefing,
     calendar,
     committee,
+    decision_feedback,
     decision_log,
     journal,
     learning,
@@ -120,6 +121,7 @@ DEFAULT_TRADE_MONITOR_PATH = PROJECT_ROOT / "logs" / "trade_outcome_monitor.json
 DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
+DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
@@ -375,6 +377,27 @@ def make_trade_expectancy_adjuster(
     return adjust
 
 
+def compose_trade_expectancy_adjusters(
+    first: Callable[[str, str, int], tuple[float, str, bool]] | None,
+    second: Callable[[str, str, int], tuple[float, str, bool]] | None,
+) -> Callable[[str, str, int], tuple[float, str, bool]] | None:
+    """Compose two non-mutating trade expectancy adjusters."""
+
+    if first is None:
+        return second
+    if second is None:
+        return first
+
+    def adjust(symbol: str, direction: str, conviction: int) -> tuple[float, str, bool]:
+        factor1, reason1, block1 = first(symbol, direction, conviction)
+        adjusted_conviction = round(conviction * max(0.0, min(1.10, factor1)))
+        factor2, reason2, block2 = second(symbol, direction, adjusted_conviction)
+        reasons = [reason for reason in (reason1, reason2) if reason]
+        return factor1 * factor2, " / ".join(reasons), block1 or block2
+
+    return adjust
+
+
 def make_approved_tp_sl_adjuster(
     registry: Mapping[str, object],
 ) -> briefing.TargetRAdjuster | None:
@@ -568,6 +591,25 @@ def _run_per_timeframe(
                 fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
 
     profile_lookup = tf_learn.profile_lookup if not args.no_learning else None
+    decision_feedback_profile = decision_feedback.DecisionFeedbackProfile()
+    decision_feedback_lookup = None
+    if not args.no_learning and not args.no_trade_expectancy:
+        decision_feedback_profile = decision_feedback.derive_decision_feedback(
+            decision_feedback.load_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
+            now=now,
+        )
+        learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
+        if not args.no_trade_expectancy_guard:
+            decision_feedback_lookup = decision_feedback_profile.expectancy_lookup
+        if not args.dry_run:
+            try:
+                decision_feedback.save_decision_feedback(
+                    decision_feedback_profile,
+                    DEFAULT_DECISION_FEEDBACK_PATH,
+                )
+            except OSError as error:
+                fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
+
     tp_sl_lookup = None
     tp_sl_learn = None
     if not args.no_learning and not args.no_trade_expectancy:
@@ -610,6 +652,10 @@ def _run_per_timeframe(
                 fetch_warnings.append(f"最大化プロファイル保存失敗: {error}")
     if maximization_lookup is not None:
         expectancy_lookup = maximization_lookup
+    expectancy_lookup = compose_timeframe_expectancy_lookups(
+        decision_feedback_lookup,
+        expectancy_lookup,
+    )
     expectancy_lookup = compose_timeframe_expectancy_lookups(tp_sl_lookup, expectancy_lookup)
 
     # 各ペア・各時間足の独立判断
@@ -663,6 +709,7 @@ def _run_per_timeframe(
                 timeframe_learning=tf_learn if not args.no_learning else None,
                 tp_sl_learning=tp_sl_learn,
                 maximization_profile=max_profile,
+                decision_feedback_profile=decision_feedback_profile,
                 expectancy_summaries=_expectancy_summaries,
             )
             decision_outcome_report = decision_log.score_decision_events(
@@ -679,6 +726,10 @@ def _run_per_timeframe(
             decision_log.save_outcome_report(
                 decision_outcome_report,
                 DEFAULT_DECISION_OUTCOMES_PATH,
+            )
+            decision_feedback.save_decision_feedback(
+                decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
+                DEFAULT_DECISION_FEEDBACK_PATH,
             )
         except OSError as error:
             fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
@@ -1073,7 +1124,26 @@ def main(argv: list[str] | None = None) -> int:
                 fetch_warnings.append(f"学習プロファイル保存失敗: {error}")
 
     expectancy_adjuster = None
+    decision_feedback_adjuster = None
+    decision_feedback_profile = decision_feedback.DecisionFeedbackProfile()
     trade_expectancy_summary: dict[str, object] = {}
+    if not args.no_learning and not args.no_trade_expectancy:
+        decision_feedback_profile = decision_feedback.derive_decision_feedback(
+            decision_feedback.load_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
+            now=now,
+        )
+        learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
+        if not args.no_trade_expectancy_guard:
+            decision_feedback_adjuster = decision_feedback_profile.fusion_adjuster()
+        if not args.dry_run:
+            try:
+                decision_feedback.save_decision_feedback(
+                    decision_feedback_profile,
+                    DEFAULT_DECISION_FEEDBACK_PATH,
+                )
+            except OSError as error:
+                fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
+
     if not args.no_trade_expectancy:
         trade_outcomes = trade_outcome.evaluate_trade_outcomes(journal_entries)
         trade_expectancy_summary = trade_outcome.summarize_expectancy(trade_outcomes)
@@ -1116,6 +1186,10 @@ def main(argv: list[str] | None = None) -> int:
                 fetch_warnings.append(f"期待値改善候補レジストリ保存失敗: {error}")
         if not args.no_trade_expectancy_guard:
             expectancy_adjuster = make_trade_expectancy_adjuster(trade_expectancy_summary)
+    expectancy_adjuster = compose_trade_expectancy_adjusters(
+        decision_feedback_adjuster,
+        expectancy_adjuster,
+    )
 
     # 7. ML確率モデル: --train-mlで強制再学習。それ以外も保存済みモデルが
     #    無い/staleなら自動再学習する(スキルゲートは train_artifact 内)
@@ -1207,6 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
                     trade_expectancy_summary=(
                         trade_expectancy_summary if not args.no_trade_expectancy else None
                     ),
+                    decision_feedback_profile=decision_feedback_profile,
                     ml_artifact=ml_artifact if not args.no_ml else None,
                     promotion_state=promotion_state,
                 )
@@ -1223,6 +1298,10 @@ def main(argv: list[str] | None = None) -> int:
                 decision_log.save_outcome_report(
                     decision_outcome_report,
                     DEFAULT_DECISION_OUTCOMES_PATH,
+                )
+                decision_feedback.save_decision_feedback(
+                    decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
+                    DEFAULT_DECISION_FEEDBACK_PATH,
                 )
             except OSError as error:
                 fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
