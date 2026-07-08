@@ -366,11 +366,12 @@ def build_timeframe_plan(
         expectancy_factor, expectancy_reason, expectancy_block = expectancy_adjuster(
             symbol, direction, conviction
         )
-        expectancy_factor = max(0.0, min(1.0, expectancy_factor))
-        if expectancy_factor < 1.0:
-            conviction = round(conviction * expectancy_factor)
+        expectancy_factor = max(0.0, min(1.10, expectancy_factor))
+        if expectancy_factor != 1.0:
+            conviction = min(100, round(conviction * expectancy_factor))
         if expectancy_reason:
-            warnings.append(f"📉 期待値ガード: {expectancy_reason}")
+            marker = "📈" if expectancy_factor > 1.0 and not expectancy_block else "📉"
+            warnings.append(f"{marker} 期待値ガード: {expectancy_reason}")
         if expectancy_block:
             direction = "neutral"
             conviction = 0

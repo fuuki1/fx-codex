@@ -1,0 +1,177 @@
+"""完全判断ログの保存テスト。ネットワーク不要。"""
+
+from __future__ import annotations
+
+from datetime import datetime, UTC
+import json
+
+from fx_intel import decision_log, learning, maximization, tf_learning, tp_sl_learning
+from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
+from fx_intel.technicals import PairTechnicals, build_interval_view
+from fx_intel.timeframe import TimeframePlan
+
+NOW = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
+
+
+def _analysis() -> MarketAnalysis:
+    return MarketAnalysis(
+        currencies={
+            "USD": CurrencySentiment("USD", score=0.3, headline_count=2),
+            "JPY": CurrencySentiment("JPY", score=-0.2, headline_count=1),
+        },
+        regime="neutral",
+        summary="test summary",
+        engine="lexicon",
+    )
+
+
+def _tech() -> PairTechnicals:
+    tech = PairTechnicals(symbol="USDJPY")
+    tech.views["1h"] = build_interval_view(
+        "1h",
+        {"RECOMMENDATION": "BUY", "BUY": 10, "SELL": 2, "NEUTRAL": 4},
+        {
+            "close": 150.0,
+            "RSI": 55.0,
+            "ADX": 28.0,
+            "ATR": 0.2,
+            "SMA20": 150.2,
+            "SMA100": 149.8,
+        },
+        20,
+        100,
+    )
+    return tech
+
+
+def _plan() -> TimeframePlan:
+    return TimeframePlan(
+        symbol="USDJPY",
+        timeframe="1h",
+        horizon_hours=1.0,
+        direction="long",
+        conviction=72,
+        tf_score=0.5,
+        news_score=0.2,
+        composite=0.37,
+        close=150.0,
+        atr=0.2,
+        rsi=55.0,
+        adx=28.0,
+        stop=149.5,
+        target1=150.5,
+        target2=151.0,
+        data_quality=0.9,
+        features={"rsi_1h": 55.0, "news_count": 2.0},
+        components=[{"key": "tech", "score": 0.5, "weight": 0.55}],
+        reason="1hレーティング 買い",
+        warnings=["📈 期待値ガード: テスト"],
+    )
+
+
+def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
+    learned = learning.LearnedProfile(generated_at=NOW.isoformat(), evaluated=12, hits=7)
+    tf_learn = tf_learning.TimeframeLearning(
+        generated_at=NOW.isoformat(),
+        profiles={("USDJPY", "1h"): learned},
+    )
+    tp_profile = tp_sl_learning.TpSlProfile(
+        generated_at=NOW.isoformat(),
+        evaluated=30,
+        hits=20,
+    )
+    tp_sl = tp_sl_learning.TimeframeTpSlLearning(
+        generated_at=NOW.isoformat(),
+        profiles={("USDJPY", "1h"): tp_profile},
+    )
+    max_cell = maximization.MaximizationCell(
+        symbol="USDJPY",
+        timeframe="1h",
+        direction="long",
+        tradable=100,
+        expectancy_r=0.2,
+        score=0.4,
+        action="boost",
+        factor=1.05,
+        reason_ja="強いセル",
+    )
+    max_profile = maximization.TimeframeMaximization(
+        generated_at=NOW.isoformat(),
+        cells={("USDJPY", "1h", "long"): max_cell},
+    )
+
+    events = decision_log.build_timeframe_decision_events(
+        {"USDJPY": [_plan()]},
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+        timeframe_learning=tf_learn,
+        tp_sl_learning=tp_sl,
+        maximization_profile=max_profile,
+        expectancy_summaries={"1h": {"overall": {"expectancy_r": 0.2}}},
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["decision_id"]
+    assert event["decision"]["target2"] == 151.0
+    assert event["audit"]["scoring_ready"] is True
+    assert event["technical_context"]["views"]["1h"]["atr"] == 0.2
+    assert event["market_context"]["currency_sentiment"]["USD"]["score"] == 0.3
+    assert event["learning_context"]["timeframe_learning"]["evaluated"] == 12
+    assert event["learning_context"]["tp_sl_learning"]["evaluated"] == 30
+    assert event["learning_context"]["maximization"]["active_cell"]["action"] == "boost"
+
+    jsonl = tmp_path / "decisions.jsonl"
+    latest = tmp_path / "latest.json"
+    decision_log.append_decision_events(jsonl, events)
+    decision_log.save_latest_snapshot(latest, events, now=NOW)
+
+    rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
+    payload = json.loads(latest.read_text(encoding="utf-8"))
+    assert rows[0]["decision_id"] == event["decision_id"]
+    assert payload["event_count"] == 1
+    assert payload["events"][0]["decision"]["direction"] == "long"
+
+
+def test_score_decision_events_uses_tp_sl_mfe_mae(tmp_path) -> None:
+    plan = _plan()
+    events = decision_log.build_timeframe_decision_events(
+        {"USDJPY": [plan]},
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+    )
+    price_rows = [
+        {
+            "ts": "2026-07-08T08:30:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 150.6,
+            "high": 150.7,
+            "low": 150.1,
+        },
+        {
+            "ts": "2026-07-08T09:00:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 150.8,
+            "high": 150.9,
+            "low": 150.3,
+        },
+    ]
+
+    report = decision_log.score_decision_events(events, price_entries=price_rows, now=NOW)
+    path = tmp_path / "outcomes.json"
+    decision_log.save_outcome_report(report, path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    outcome = payload["outcomes"][0]
+    assert payload["scoring_method"] == "tp_sl_mfe_mae_first_touch"
+    assert payload["summary"]["overall"]["tradable"] == 1
+    assert outcome["score_label"] == "tp_hit"
+    assert outcome["first_touch"] == "tp1"
+    assert outcome["realized_r"] == 1.0
+    assert outcome["mfe_r"] == 1.8
+    assert outcome["mae_r"] == 0.0
+    assert outcome["decision_id"] == events[0]["decision_id"]

@@ -77,9 +77,11 @@ from fx_intel import (
     briefing,
     calendar,
     committee,
+    decision_log,
     journal,
     learning,
     macro,
+    maximization,
     ml,
     news,
     price_history,
@@ -88,6 +90,7 @@ from fx_intel import (
     technicals,
     tf_briefing,
     tf_learning,
+    tp_sl_learning,
     timeframe,
     trade_outcome,
 )
@@ -102,6 +105,8 @@ DEFAULT_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_learning.json"
 # ジャーナルを分ける(採点ホライズンもスキーマも異なるため)
 DEFAULT_TF_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_tf_journal.jsonl"
 DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
+DEFAULT_TP_SL_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tp_sl_learning.json"
+DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
 # 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
 # 判断ジャーナルは毎時しか追記されず短い足の採点窓に入る点が得られないため、
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
@@ -112,6 +117,9 @@ DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
 DEFAULT_TRADE_IMPROVEMENT_REGISTRY = PROJECT_ROOT / "logs" / "trade_improvement_candidates.json"
 DEFAULT_TRADE_MONITOR_PATH = PROJECT_ROOT / "logs" / "trade_outcome_monitor.json"
+DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
+DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
+DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
@@ -426,6 +434,42 @@ def make_timeframe_trade_expectancy_lookup(
     return lookup, format_timeframe_expectancy_report_ja(summaries), summaries
 
 
+def compose_timeframe_expectancy_lookups(
+    first: timeframe.ExpectancyLookup | None,
+    second: timeframe.ExpectancyLookup | None,
+) -> timeframe.ExpectancyLookup | None:
+    """Compose two non-mutating timeframe expectancy lookups.
+
+    The TP/SL accuracy MVP uses the same hook as the existing expectancy guard,
+    but it never blocks by itself.  Composition lets both adjustments apply
+    without forcing either subsystem to know about the other.
+    """
+
+    if first is None:
+        return second
+    if second is None:
+        return first
+
+    def lookup(symbol: str, tf: str) -> timeframe.ExpectancyAdjuster | None:
+        first_adjuster = first(symbol, tf)
+        second_adjuster = second(symbol, tf)
+        if first_adjuster is None:
+            return second_adjuster
+        if second_adjuster is None:
+            return first_adjuster
+
+        def adjust(symbol_arg: str, direction: str, conviction: int) -> tuple[float, str, bool]:
+            factor1, reason1, block1 = first_adjuster(symbol_arg, direction, conviction)
+            adjusted_conviction = round(conviction * max(0.0, min(1.10, factor1)))
+            factor2, reason2, block2 = second_adjuster(symbol_arg, direction, adjusted_conviction)
+            reasons = [reason for reason in (reason1, reason2) if reason]
+            return factor1 * factor2, " / ".join(reasons), block1 or block2
+
+        return adjust
+
+    return lookup
+
+
 def format_timeframe_expectancy_report_ja(summaries: Mapping[str, Mapping[str, object]]) -> str:
     if not summaries:
         return ""
@@ -524,12 +568,27 @@ def _run_per_timeframe(
                 fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
 
     profile_lookup = tf_learn.profile_lookup if not args.no_learning else None
+    tp_sl_lookup = None
+    tp_sl_learn = None
+    if not args.no_learning and not args.no_trade_expectancy:
+        tp_sl_learn = tp_sl_learning.derive_timeframe_tp_sl_learning(scoring_entries, now=now)
+        learning_note = append_note(learning_note, tp_sl_learn.summary_ja())
+        tp_sl_lookup = tp_sl_learn.expectancy_lookup
+        if not args.dry_run:
+            try:
+                tp_sl_learning.save_timeframe_tp_sl_learning(
+                    tp_sl_learn, DEFAULT_TP_SL_LEARNING_PATH
+                )
+            except OSError as error:
+                fetch_warnings.append(f"TP/SL学習プロファイル保存失敗: {error}")
+
     target_r_adjuster = None
     if not args.no_trade_expectancy:
         target_r_adjuster = make_approved_tp_sl_adjuster(
             trade_outcome.load_improvement_registry(args.trade_improvement_registry)
         )
     expectancy_lookup = None
+    _expectancy_summaries: dict[str, dict] = {}
     if not args.no_trade_expectancy:
         expectancy_lookup, expectancy_note, _expectancy_summaries = (
             make_timeframe_trade_expectancy_lookup(scoring_entries)
@@ -537,6 +596,21 @@ def _run_per_timeframe(
         learning_note = append_note(learning_note, expectancy_note)
         if args.no_trade_expectancy_guard:
             expectancy_lookup = None
+    maximization_lookup = None
+    max_profile = None
+    if not args.no_learning and not args.no_trade_expectancy:
+        max_profile = maximization.derive_timeframe_maximization(scoring_entries, now=now)
+        learning_note = append_note(learning_note, max_profile.summary_ja())
+        if not args.no_trade_expectancy_guard:
+            maximization_lookup = max_profile.expectancy_lookup
+        if not args.dry_run:
+            try:
+                maximization.save_timeframe_maximization(max_profile, DEFAULT_MAXIMIZATION_PATH)
+            except OSError as error:
+                fetch_warnings.append(f"最大化プロファイル保存失敗: {error}")
+    if maximization_lookup is not None:
+        expectancy_lookup = maximization_lookup
+    expectancy_lookup = compose_timeframe_expectancy_lookups(tp_sl_lookup, expectancy_lookup)
 
     # 各ペア・各時間足の独立判断
     plans_by_symbol: dict[str, list[timeframe.TimeframePlan]] = {}
@@ -573,6 +647,41 @@ def _run_per_timeframe(
             journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
         except OSError as error:
             fetch_warnings.append(f"時間足別ジャーナル書き込み失敗: {error}")
+        try:
+            prior_decision_events = list(
+                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
+            )
+            decision_events = decision_log.build_timeframe_decision_events(
+                plans_by_symbol,
+                now=now,
+                analysis=analysis,
+                tech_map=tech_map,
+                news_items=items,
+                events_48h=events_48h,
+                fetch_warnings=fetch_warnings,
+                calendar_ok=calendar_ok,
+                timeframe_learning=tf_learn if not args.no_learning else None,
+                tp_sl_learning=tp_sl_learn,
+                maximization_profile=max_profile,
+                expectancy_summaries=_expectancy_summaries,
+            )
+            decision_outcome_report = decision_log.score_decision_events(
+                [*prior_decision_events, *decision_events],
+                price_entries=[*price_rows, *current_snapshot],
+                now=now,
+            )
+            decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
+            decision_log.save_latest_snapshot(
+                DEFAULT_DECISION_LATEST_PATH,
+                decision_events,
+                now=now,
+            )
+            decision_log.save_outcome_report(
+                decision_outcome_report,
+                DEFAULT_DECISION_OUTCOMES_PATH,
+            )
+        except OSError as error:
+            fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
     payload = tf_briefing.build_timeframe_discord_payload(
         plans_by_symbol,
@@ -964,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
                 fetch_warnings.append(f"学習プロファイル保存失敗: {error}")
 
     expectancy_adjuster = None
+    trade_expectancy_summary: dict[str, object] = {}
     if not args.no_trade_expectancy:
         trade_outcomes = trade_outcome.evaluate_trade_outcomes(journal_entries)
         trade_expectancy_summary = trade_outcome.summarize_expectancy(trade_outcomes)
@@ -1080,6 +1190,42 @@ def main(argv: list[str] | None = None) -> int:
                 journal.append_plans(DEFAULT_JOURNAL_PATH, plans, now=now)
             except OSError as error:
                 fetch_warnings.append(f"判断ジャーナル書き込み失敗: {error}")
+            try:
+                prior_decision_events = list(
+                    decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
+                )
+                decision_events = decision_log.build_fusion_decision_events(
+                    plans,
+                    now=now,
+                    analysis=analysis,
+                    tech_map=tech_map,
+                    news_items=items,
+                    events_48h=events_48h,
+                    fetch_warnings=fetch_warnings,
+                    calendar_ok=calendar_ok,
+                    learning_profile=profile if not args.no_learning else None,
+                    trade_expectancy_summary=(
+                        trade_expectancy_summary if not args.no_trade_expectancy else None
+                    ),
+                    ml_artifact=ml_artifact if not args.no_ml else None,
+                    promotion_state=promotion_state,
+                )
+                decision_outcome_report = decision_log.score_decision_events(
+                    [*prior_decision_events, *decision_events],
+                    now=now,
+                )
+                decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
+                decision_log.save_latest_snapshot(
+                    DEFAULT_DECISION_LATEST_PATH,
+                    decision_events,
+                    now=now,
+                )
+                decision_log.save_outcome_report(
+                    decision_outcome_report,
+                    DEFAULT_DECISION_OUTCOMES_PATH,
+                )
+            except OSError as error:
+                fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
     if ml_artifact.model is not None:
         learning_note = append_note(learning_note, ml_artifact.summary_ja())
