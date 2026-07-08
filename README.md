@@ -70,10 +70,15 @@ tests/
 
 ```bash
 .venv/bin/python fx_briefing.py --dry-run        # 送信せず内容確認
+.venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ・学習ファイルだけ更新
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
+python3 tools/learning_capture.py                # Discord送信なしで融合/時間足別/価格系列を1回収集
 ./fx_briefing_loop.sh &                          # 毎時10分に自動送信(融合＋時間足別の2通)
 ```
+
+`--dry-run` は表示確認用でログを保存しません。学習を進めたいがDiscordへ送信したくない場合は
+`--no-discord`、または `tools/learning_capture.py` を使います。
 
 `fx_briefing_loop.sh` は毎時、**融合1判断モード（本命：委員会・ML・昇格ゲートあり）と
 時間足別モード（`--per-timeframe`）の2通**を連続送信します。時間足別の採点を回すには、
@@ -118,6 +123,25 @@ tests/
 起動するのは価格スナップショットループ(`fx_tf_snapshot_loop.sh`、5分ごと)だけです。
 価格スナップショットは価格取得のみ(判断・学習・Discord通知はしない)なので API 負荷は
 軽く、Discord は毎時のままです(手動で単発確認したいときは上のコマンドを使います)。
+
+### MFE/MAE/TP/SL期待値監視ランナー
+
+`tools/trade_outcome_monitor.py` は cron/CI/dashboard 向けの運用コマンドです。判断
+ジャーナルを MFE/MAE/TP/SL で採点し、期待値・サンプル数・経路品質をチェックしたうえで、
+改善候補レジストリ、TP/SL候補paper再採点、承認済みTP/SLの自動停止、ダッシュボード用
+監視JSONを1回で更新します。候補の live 反映に相当する承認は自動化せず、既存の人間承認
+CLIだけで行います。
+
+```bash
+python3 tools/trade_outcome_monitor.py
+python3 tools/trade_outcome_monitor.py --journal logs/briefing_journal.jsonl --health-require-sample
+python3 fx_briefing.py --approve-trade-candidate <candidate_id> --trade-approval-actor <name>
+```
+
+主な出力は `logs/trade_outcome_monitor.json`、`logs/trade_improvement_candidates.json`、
+`logs/trade_outcome_report.json`、`logs/trade_variant_report.json` です。ヘルスチェックが
+失敗した場合は終了コード1を返しますが、監視JSONは書き出すためダッシュボード側で状態を
+確認できます。
 
 副産物として `research_pack/upcoming_events.csv`(最新スナップショット、毎回上書き)と
 `research_pack/event_history.csv`(追記アーカイブ)を書き出します。いずれも
