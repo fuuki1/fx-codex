@@ -31,6 +31,72 @@ SCORING_METRICS = (
     "sl_hit",
     "path_quality",
 )
+FAILURE_REASON_DEFS: dict[str, tuple[str, str]] = {
+    "unscored_missing_data": (
+        "採点不能(価格/TP/SL不足)",
+        "判断ログ・価格スナップショット・TP/SLを欠かさず残す",
+    ),
+    "low_path_quality": (
+        "経路品質不足",
+        "high/low付き価格系列を増やしてTP/SL先着の信頼度を上げる",
+    ),
+    "ambiguous_intrabar_touch": (
+        "同一足内でTP/SL順序が曖昧",
+        "より短い足またはtickに近い経路で再採点する",
+    ),
+    "sl_first": (
+        "SL先着",
+        "エントリー位置・SL幅・見送り条件を再確認する",
+    ),
+    "adverse_excursion_dominant": (
+        "MAEがMFE以上",
+        "入った直後に逆行しやすい条件を減衰する",
+    ),
+    "weak_favorable_excursion": (
+        "MFE不足",
+        "狙った方向に十分伸びない地合いでは確信度を抑える",
+    ),
+    "tp_too_far": (
+        "TPが遠い/利確未達",
+        "MFEに対してTP1が遠い可能性があるためTP候補を再検証する",
+    ),
+    "large_adverse_excursion": (
+        "逆行幅が大きい",
+        "許容損失到達前に撤退する条件を検討する",
+    ),
+    "confidence_overreach": (
+        "高確信度の外れ",
+        "確信度キャリブレーションを下げる候補",
+    ),
+    "htf_against_4h": (
+        "4h上位足逆行",
+        "4hの流れに逆らう取引は順行確認まで待つ",
+    ),
+    "htf_against_1d": (
+        "日足逆行",
+        "日足の流れに逆らう取引は小さく扱う",
+    ),
+    "rsi_extreme_follow": (
+        "RSI過熱圏への追随",
+        "押し目・戻りを待ってから判断する",
+    ),
+    "tech_news_conflict": (
+        "テクニカル/ニュース対立",
+        "根拠が割れたときは見送り寄りにする",
+    ),
+    "range_trend_call": (
+        "レンジ相場でのトレンド判断",
+        "ADXが低いときは伸びを期待しすぎない",
+    ),
+    "weak_tf_agreement": (
+        "時間足不一致",
+        "複数時間足がそろうまで確信度を落とす",
+    ),
+    "low_data_quality": (
+        "低データ品質",
+        "根拠データが欠けている判断を抑制する",
+    ),
+}
 
 
 def build_timeframe_decision_events(
@@ -320,6 +386,7 @@ def score_decision_events(
             meta = meta_by_key.get(
                 (outcome.symbol, outcome.direction, outcome.ts, timeframe, mode), {}
             )
+            failure_reasons = classify_failure_reasons(outcome, meta)
             outcome_dict = outcome.to_dict()
             outcome_dict.update(
                 {
@@ -330,6 +397,10 @@ def score_decision_events(
                     "score_method": SCORING_METHOD,
                     "score_label": _score_label(outcome),
                     "score_hit": outcome.realized_r is not None and outcome.realized_r > 0,
+                    "failure_reasons": failure_reasons,
+                    "primary_failure_reason": (
+                        failure_reasons[0]["key"] if failure_reasons else None
+                    ),
                 }
             )
             enriched_outcomes.append(outcome_dict)
@@ -343,6 +414,7 @@ def score_decision_events(
             "decision_events": len(event_entries),
             "scored_outcomes": len(enriched_outcomes),
             "summary": summarize_expectancy(all_outcomes),
+            "failure_reason_summary": _failure_reason_summary(enriched_outcomes),
             "by_timeframe": by_timeframe,
             "by_mode": {
                 mode: summarize_expectancy(outcomes) for mode, outcomes in sorted(by_mode.items())
@@ -361,6 +433,105 @@ def save_outcome_report(report: Mapping[str, object], path: str | Path) -> None:
         json.dumps(_json_ready(report), ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
+
+
+def classify_failure_reasons(
+    outcome: TradeOutcome,
+    decision_entry: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    """Classify why a TP/SL/MFE/MAE-scored decision failed or was not usable."""
+
+    decision_entry = decision_entry or {}
+    reasons: list[dict[str, object]] = []
+
+    def add(key: str, evidence: Mapping[str, object] | None = None) -> None:
+        if any(reason["key"] == key for reason in reasons):
+            return
+        label, advice = FAILURE_REASON_DEFS[key]
+        reasons.append(
+            {
+                "key": key,
+                "label_ja": label,
+                "advice_ja": advice,
+                "evidence": dict(evidence or {}),
+            }
+        )
+
+    if outcome.realized_r is not None and outcome.realized_r > 0 and outcome.tradable:
+        return []
+
+    flags = set(outcome.quality_flags)
+    if outcome.realized_r is None:
+        add("unscored_missing_data", {"quality_flags": list(outcome.quality_flags)})
+    if not outcome.tradable and outcome.realized_r is not None:
+        add(
+            "low_path_quality",
+            {"path_quality": outcome.path_quality, "quality_flags": list(outcome.quality_flags)},
+        )
+    if "ambiguous_intrabar_touch" in flags or outcome.first_touch == "ambiguous_sl_tp":
+        add("ambiguous_intrabar_touch", {"first_touch": outcome.first_touch})
+    if outcome.first_touch == "sl":
+        add("sl_first", {"first_touch_ts": outcome.first_touch_ts})
+
+    mfe_r = outcome.mfe_r
+    mae_r = outcome.mae_r
+    realized_r = outcome.realized_r
+    if mfe_r is not None and mae_r is not None and mae_r >= mfe_r:
+        add("adverse_excursion_dominant", {"mfe_r": mfe_r, "mae_r": mae_r})
+    if mfe_r is not None and mfe_r < 0.5:
+        add("weak_favorable_excursion", {"mfe_r": mfe_r})
+    if (
+        mfe_r is not None
+        and realized_r is not None
+        and realized_r <= 0
+        and outcome.first_touch not in ("tp1", "tp2")
+        and mfe_r >= 0.75
+    ):
+        add("tp_too_far", {"mfe_r": mfe_r, "first_touch": outcome.first_touch})
+    if mae_r is not None and mae_r >= 0.8:
+        add("large_adverse_excursion", {"mae_r": mae_r})
+    conviction = _int(decision_entry.get("conviction"))
+    if conviction >= 75 and (realized_r is None or realized_r <= 0):
+        add("confidence_overreach", {"conviction": conviction})
+
+    features = decision_entry.get("features")
+    features = features if isinstance(features, Mapping) else {}
+    direction = outcome.direction
+    rating_4h = _feature_float(features, "rating_4h")
+    rating_1d = _feature_float(features, "rating_1d")
+    if _rating_against_direction(rating_4h, direction):
+        add("htf_against_4h", {"rating_4h": rating_4h})
+    if _rating_against_direction(rating_1d, direction):
+        add("htf_against_1d", {"rating_1d": rating_1d})
+    rsi = _feature_float(features, "rsi_1h")
+    if rsi is not None and direction in ("long", "short"):
+        if (direction == "long" and rsi >= 65.0) or (direction == "short" and rsi <= 35.0):
+            add("rsi_extreme_follow", {"rsi_1h": rsi})
+    tech_score = _number_or_none(decision_entry.get("tech_score"))
+    news_score = _number_or_none(decision_entry.get("news_score"))
+    if (
+        tech_score is not None
+        and news_score is not None
+        and tech_score * news_score < 0
+        and min(abs(tech_score), abs(news_score)) >= 0.35
+    ):
+        add("tech_news_conflict", {"tech_score": tech_score, "news_score": news_score})
+    adx = _feature_float(features, "adx_1h")
+    if adx is not None and adx < 20.0:
+        add("range_trend_call", {"adx_1h": adx})
+    tf_agreement = _feature_float(features, "tf_agreement")
+    if tf_agreement is not None and tf_agreement < 0.5:
+        add("weak_tf_agreement", {"tf_agreement": tf_agreement})
+    data_quality = _number_or_none(decision_entry.get("data_quality"))
+    if data_quality is not None and data_quality < 0.7:
+        add("low_data_quality", {"data_quality": data_quality})
+
+    if not reasons and (realized_r is None or realized_r <= 0):
+        add(
+            "weak_favorable_excursion",
+            {"realized_r": realized_r, "mfe_r": mfe_r, "mae_r": mae_r},
+        )
+    return reasons
 
 
 def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
@@ -715,6 +886,83 @@ def _score_label(outcome: TradeOutcome) -> str:
     return "terminal_mark_to_market"
 
 
+def _failure_reason_summary(
+    outcomes: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    buckets: dict[str, dict[str, object]] = {}
+    realized_by_key: dict[str, list[float]] = {}
+    mfe_by_key: dict[str, list[float]] = {}
+    mae_by_key: dict[str, list[float]] = {}
+    for outcome in outcomes:
+        reasons = outcome.get("failure_reasons")
+        if not isinstance(reasons, list) or not reasons:
+            continue
+        primary = str(outcome.get("primary_failure_reason", ""))
+        realized = _number_or_none(outcome.get("realized_r"))
+        mfe = _number_or_none(outcome.get("mfe_r"))
+        mae = _number_or_none(outcome.get("mae_r"))
+        for raw_reason in reasons:
+            if not isinstance(raw_reason, Mapping):
+                continue
+            key = str(raw_reason.get("key", ""))
+            if not key:
+                continue
+            label, advice = FAILURE_REASON_DEFS.get(
+                key,
+                (str(raw_reason.get("label_ja", key)), str(raw_reason.get("advice_ja", ""))),
+            )
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "key": key,
+                    "label_ja": label,
+                    "advice_ja": advice,
+                    "count": 0,
+                    "primary_count": 0,
+                },
+            )
+            bucket["count"] = _int(bucket.get("count")) + 1
+            if key == primary:
+                bucket["primary_count"] = _int(bucket.get("primary_count")) + 1
+            if realized is not None:
+                realized_by_key.setdefault(key, []).append(realized)
+            if mfe is not None:
+                mfe_by_key.setdefault(key, []).append(mfe)
+            if mae is not None:
+                mae_by_key.setdefault(key, []).append(mae)
+
+    summary: list[dict[str, object]] = []
+    for key, bucket in buckets.items():
+        bucket["avg_realized_r"] = _round_mean(realized_by_key.get(key, []))
+        bucket["avg_mfe_r"] = _round_mean(mfe_by_key.get(key, []))
+        bucket["avg_mae_r"] = _round_mean(mae_by_key.get(key, []))
+        summary.append(bucket)
+    summary.sort(
+        key=lambda item: (
+            -_int(item.get("primary_count")),
+            -_int(item.get("count")),
+            str(item.get("key", "")),
+        )
+    )
+    return summary
+
+
+def _feature_float(features: Mapping[str, object], key: str) -> float | None:
+    return _number_or_none(features.get(key))
+
+
+def _rating_against_direction(value: float | None, direction: str) -> bool:
+    if value is None or direction not in ("long", "short"):
+        return False
+    return value <= -0.25 if direction == "long" else value >= 0.25
+
+
+def _round_mean(values: object) -> float | None:
+    if not isinstance(values, list) or not values:
+        return None
+    return round(sum(float(value) for value in values) / len(values), 4)
+
+
 def _run_id(now: datetime, mode: str) -> str:
     compact = now.strftime("%Y%m%dT%H%M%SZ")
     digest = hashlib.sha256(f"{mode}|{now.isoformat()}".encode()).hexdigest()[:8]
@@ -772,3 +1020,8 @@ def _int_or_none(value: object) -> int | None:
     if isinstance(value, float):
         return int(value)
     return None
+
+
+def _int(value: object) -> int:
+    parsed = _int_or_none(value)
+    return parsed if parsed is not None else 0

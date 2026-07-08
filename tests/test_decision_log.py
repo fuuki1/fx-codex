@@ -175,3 +175,74 @@ def test_score_decision_events_uses_tp_sl_mfe_mae(tmp_path) -> None:
     assert outcome["mfe_r"] == 1.8
     assert outcome["mae_r"] == 0.0
     assert outcome["decision_id"] == events[0]["decision_id"]
+
+
+def test_score_decision_events_classifies_failure_reasons() -> None:
+    plan = _plan()
+    plan.conviction = 82
+    plan.tf_score = 0.6
+    plan.news_score = -0.5
+    plan.data_quality = 0.6
+    plan.features.update(
+        {
+            "rating_4h": -0.6,
+            "rating_1d": -0.4,
+            "rsi_1h": 70.0,
+            "adx_1h": 15.0,
+            "tf_agreement": 0.25,
+        }
+    )
+    events = decision_log.build_timeframe_decision_events(
+        {"USDJPY": [plan]},
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+    )
+    price_rows = [
+        {
+            "ts": "2026-07-08T08:15:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 149.5,
+            "high": 150.2,
+            "low": 149.4,
+        },
+        {
+            "ts": "2026-07-08T08:30:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 149.6,
+            "high": 149.8,
+            "low": 149.3,
+        },
+        {
+            "ts": "2026-07-08T09:00:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 149.7,
+            "high": 149.9,
+            "low": 149.5,
+        },
+    ]
+
+    report = decision_log.score_decision_events(events, price_entries=price_rows, now=NOW)
+    outcome = report["outcomes"][0]
+    keys = {reason["key"] for reason in outcome["failure_reasons"]}
+
+    assert outcome["score_label"] == "sl_hit"
+    assert outcome["primary_failure_reason"] == "sl_first"
+    assert {
+        "sl_first",
+        "adverse_excursion_dominant",
+        "weak_favorable_excursion",
+        "large_adverse_excursion",
+        "confidence_overreach",
+        "htf_against_4h",
+        "htf_against_1d",
+        "rsi_extreme_follow",
+        "tech_news_conflict",
+        "range_trend_call",
+        "weak_tf_agreement",
+        "low_data_quality",
+    } <= keys
+    assert report["failure_reason_summary"][0]["key"] == "sl_first"
