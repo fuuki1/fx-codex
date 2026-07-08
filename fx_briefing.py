@@ -992,6 +992,10 @@ def main(argv: list[str] | None = None) -> int:
                         now=now,
                     )
                 )
+                # 自動停止をこの実行のプランへ即時反映する。実行冒頭の
+                # レジストリから作った注入器のままだと、いま停止した
+                # ポリシーのTP/SLが今回のプランに最後まで適用されてしまう
+                target_r_adjuster = make_approved_tp_sl_adjuster(registry)
                 for paused in paused_policies:
                     fetch_warnings.append(
                         "承認済みTP/SLを自動停止: "
