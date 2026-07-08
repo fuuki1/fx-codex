@@ -148,6 +148,24 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
     assert horizons == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
 
 
+def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, capsys) -> None:
+    tf_journal, tf_learning = patched_paths
+    with (
+        mock.patch.object(fx_briefing, "load_webhook_url", side_effect=AssertionError),
+        mock.patch.object(fx_briefing, "post_to_discord", side_effect=AssertionError),
+    ):
+        rc = _run(
+            ["--per-timeframe", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+        )
+
+    assert rc == 0
+    assert tf_journal.exists()
+    assert tf_learning.exists()
+    out = capsys.readouterr().out
+    assert "Discord送信なし" in out
+
+
 def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
     """既存の時間足別ジャーナルがあれば学習が働き、学習ファイルが書かれる。"""
     tf_journal, tf_learning = patched_paths

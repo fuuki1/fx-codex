@@ -590,6 +590,14 @@ def _run_per_timeframe(
         print(json.dumps(payload["embeds"], ensure_ascii=False, indent=2))
         return 0
 
+    if args.no_discord:
+        print(
+            f"時間足別ブリーフィングを記録しました(Discord送信なし) "
+            f"({', '.join(symbols)} | ニュース{len(items)}件 | "
+            f"イベント{len(events_48h)}件 | {analysis.engine})"
+        )
+        return 0
+
     webhook_url = load_webhook_url()
     if not webhook_url:
         print(
@@ -784,6 +792,11 @@ def main(argv: list[str] | None = None) -> int:
         help="ヘルスチェックで最低サンプル数未満を失敗扱いにする",
     )
     parser.add_argument("--dry-run", action="store_true", help="Discordに送信せず内容を表示する")
+    parser.add_argument(
+        "--no-discord",
+        action="store_true",
+        help="Discordには送信せず、判断ジャーナル・学習ファイルなどのローカル保存だけ行う",
+    )
     args = parser.parse_args(argv)
 
     lifecycle_actions = [
@@ -1084,6 +1097,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(payload["content"])
         print(json.dumps(payload["embeds"], ensure_ascii=False, indent=2))
+        return 0
+
+    if args.no_discord:
+        print(
+            f"ブリーフィングを記録しました(Discord送信なし) "
+            f"({', '.join(symbols)} | ニュース{len(items)}件 | "
+            f"イベント{len(events_48h)}件 | {analysis.engine})"
+        )
         return 0
 
     webhook_url = load_webhook_url()
