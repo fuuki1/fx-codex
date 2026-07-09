@@ -79,6 +79,7 @@ from fx_intel import (
     committee,
     decision_feedback,
     decision_log,
+    decision_pipeline,
     journal,
     learning,
     macro,
@@ -142,6 +143,23 @@ def ml_needs_retrain(
     if trained.tzinfo is None:
         trained = trained.replace(tzinfo=UTC)
     return (now - trained) >= timedelta(days=max_age_days)
+
+
+def _realized_expectancy_r(summary: dict | None, symbol: str, direction: str) -> float | None:
+    """summarize_expectancy の結果から (symbol, direction) の実測期待Rを引く。
+
+    trade_outcome.summarize_expectancy() は by_symbol_direction に
+    "SYMBOL:direction" キーで ExpectancyStats(dict) を持つ。方向が long/short
+    以外(見送り等)や、該当セルが無い/期待R未確定なら None を返し、
+    チェックリスト側は確信度からの理論値へフォールバックする。
+    """
+    if not summary or direction not in ("long", "short"):
+        return None
+    cell = (summary.get("by_symbol_direction") or {}).get(f"{symbol}:{direction}")
+    if not isinstance(cell, dict):
+        return None
+    value = cell.get("expectancy_r")
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def load_webhook_url() -> str | None:
@@ -1231,27 +1249,40 @@ def main(argv: list[str] | None = None) -> int:
     for symbol in symbols:
         base, quote = calendar.symbol_currencies(symbol)
         windows = calendar.risk_windows(events, {base, quote})
-        plans.append(
-            committee.deliberate(
-                symbol,
-                tech_map[symbol],
-                analysis.currencies,
-                windows,
-                items,
-                now=now,
-                atr_multiple=atr_multiple,
-                calendar_ok=calendar_ok,
-                tech_weight=profile.tech_weight,
-                news_weight=profile.news_weight,
-                conviction_factor=profile.conviction_factor(symbol),
-                condition_adjuster=profile.condition_adjustment,
-                expectancy_adjuster=expectancy_adjuster,
-                target_r_adjuster=target_r_adjuster,
-                macro_snapshot=macro_snapshot,
-                ml_artifact=ml_artifact if not args.no_ml else None,
-                stages=stages,
-            )
+        plan = committee.deliberate(
+            symbol,
+            tech_map[symbol],
+            analysis.currencies,
+            windows,
+            items,
+            now=now,
+            atr_multiple=atr_multiple,
+            calendar_ok=calendar_ok,
+            tech_weight=profile.tech_weight,
+            news_weight=profile.news_weight,
+            conviction_factor=profile.conviction_factor(symbol),
+            condition_adjuster=profile.condition_adjustment,
+            expectancy_adjuster=expectancy_adjuster,
+            target_r_adjuster=target_r_adjuster,
+            macro_snapshot=macro_snapshot,
+            ml_artifact=ml_artifact if not args.no_ml else None,
+            stages=stages,
         )
+        # 発注前9段チェックリスト: 完成した判断を順序付きゲートに写像し、
+        # スプレッド/執行コスト控除/ポジションサイズを付ける(表示・記録用)。
+        realized_r = _realized_expectancy_r(
+            trade_expectancy_summary if not args.no_trade_expectancy else None,
+            symbol,
+            plan.direction,
+        )
+        checklist = decision_pipeline.build_checklist(
+            plan,
+            tech_map[symbol],
+            now=now,
+            realized_expectancy_r=realized_r,
+        )
+        plan.checklist = checklist.to_dict()
+        plans.append(plan)
 
     # 10. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
     journal_note = ""

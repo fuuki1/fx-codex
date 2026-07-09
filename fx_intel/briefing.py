@@ -145,6 +145,10 @@ class TradePlan:
     interval_summary: str = ""
     ma_note: str = ""
     target_policy: dict[str, object] = field(default_factory=dict)
+    # 発注前9段チェックリスト(decision_pipeline.build_checklist の結果)。
+    # {"steps": [...], "net_expected_r": ..., "position_units": ...} の辞書。
+    # 空なら未算出。表示・ジャーナル記録に使う(判断そのものには影響しない)。
+    checklist: dict[str, object] = field(default_factory=dict)
 
     @property
     def direction_ja(self) -> str:
@@ -559,6 +563,42 @@ def _events_lines(events: Sequence[EconomicEvent], limit: int = 8) -> str:
     return "\n".join(lines)
 
 
+_CHECK_EMOJI = {"ok": "✅", "warn": "⚠️", "block": "⛔", "skip": "➖"}
+
+
+def _checklist_field(plan: TradePlan) -> dict | None:
+    """発注前9段チェックリストをDiscordの1フィールドに整形。
+
+    plan.checklist が空(未算出)なら None を返し、フィールドを足さない。
+    各ステップは「絵文字 番号. 項目 — 理由」の1行。純期待R/ポジションサイズは
+    末尾にまとめて添える。
+    """
+    checklist = plan.checklist or {}
+    steps = checklist.get("steps") or []
+    if not steps:
+        return None
+    lines = []
+    for step in steps:
+        emoji = _CHECK_EMOJI.get(str(step.get("status")), "•")
+        head = f"{emoji} {step.get('order')}. {step.get('label_ja')}"
+        note = step.get("note")
+        lines.append(f"{head} — {note}" if note else head)
+    footer_bits = []
+    net_r = checklist.get("net_expected_r")
+    if isinstance(net_r, (int, float)):
+        footer_bits.append(f"執行コスト控除後の純期待 **{net_r:+.2f}R**")
+    units = checklist.get("position_units")
+    if isinstance(units, (int, float)):
+        footer_bits.append(f"想定サイズ {units:,.0f}通貨単位")
+    if footer_bits:
+        lines.append("— " + " / ".join(footer_bits))
+    return {
+        "name": "🧭 発注前チェックリスト(9段)",
+        "value": "\n".join(lines)[:1024],
+        "inline": False,
+    }
+
+
 def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
     color = {
         "long": COLOR_LONG,
@@ -627,6 +667,9 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
                 "inline": False,
             }
         )
+    checklist_field = _checklist_field(plan)
+    if checklist_field is not None:
+        fields.append(checklist_field)
     if plan.warnings:
         fields.append({"name": "⚠️ 注意点", "value": "\n".join(plan.warnings), "inline": False})
     if plan.headlines:
