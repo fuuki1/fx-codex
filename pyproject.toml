@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 fx-backtester = "fx_backtester.cli:main"
+dcm = "dukascopy_cftc_model.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -28,7 +29,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # プロジェクト名(fx-codex)とパッケージ名が一致しないため明示指定が必要
-packages = ["fx_backtester", "fx_intel"]
+packages = ["fx_backtester", "fx_intel", "dukascopy_cftc_model"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

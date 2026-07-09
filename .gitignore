@@ -34,3 +34,7 @@ data_qa.csv
 walk_forward_summary.csv
 deep-research-report*.md
 
+# dukascopy_cftc_model の取得データ・レポート成果物(実データ・再生成可能)。
+# Dukascopy価格CSV / CFTC COT CSV / レポートJSON。コードは追跡するがデータは追跡しない。
+data/
+
