@@ -40,6 +40,10 @@ FAILURE_REASON_DEFS: dict[str, tuple[str, str]] = {
         "経路品質不足",
         "high/low付き価格系列を増やしてTP/SL先着の信頼度を上げる",
     ),
+    "close_only_price_path": (
+        "closeのみの価格経路",
+        "high/low付き価格系列を保存してTP/SL先着判定を改善する",
+    ),
     "ambiguous_intrabar_touch": (
         "同一足内でTP/SL順序が曖昧",
         "より短い足またはtickに近い経路で再採点する",
@@ -112,6 +116,7 @@ def build_timeframe_decision_events(
     timeframe_learning: object | None = None,
     tp_sl_learning: object | None = None,
     maximization_profile: object | None = None,
+    decision_feedback_profile: object | None = None,
     expectancy_summaries: Mapping[str, Mapping[str, object]] | None = None,
     source: str = "fx_briefing",
 ) -> list[dict[str, object]]:
@@ -160,6 +165,7 @@ def build_timeframe_decision_events(
                     timeframe_learning=timeframe_learning,
                     tp_sl_learning=tp_sl_learning,
                     maximization_profile=maximization_profile,
+                    decision_feedback_profile=decision_feedback_profile,
                     expectancy_summaries=expectancy_summaries or {},
                 ),
                 "audit": _audit_flags(plan),
@@ -180,6 +186,7 @@ def build_fusion_decision_events(
     calendar_ok: bool = True,
     learning_profile: object | None = None,
     trade_expectancy_summary: Mapping[str, object] | None = None,
+    decision_feedback_profile: object | None = None,
     ml_artifact: object | None = None,
     promotion_state: object | None = None,
     source: str = "fx_briefing",
@@ -216,6 +223,12 @@ def build_fusion_decision_events(
             "learning_context": {
                 "directional_learning": _learned_profile_snapshot(learning_profile, symbol),
                 "trade_expectancy_summary": trade_expectancy_summary,
+                "decision_feedback": _decision_feedback_context(
+                    decision_feedback_profile,
+                    symbol,
+                    "fusion",
+                    direction,
+                ),
                 "ml": _ml_artifact_snapshot(ml_artifact),
                 "promotion": _promotion_snapshot(promotion_state),
             },
@@ -327,6 +340,7 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "data_quality": decision.get("data_quality"),
         "features": decision.get("features", {}),
         "components": decision.get("components", []),
+        "learning_context": event.get("learning_context", {}),
     }
     return _json_ready_dict(entry)
 
@@ -397,6 +411,7 @@ def score_decision_events(
                     "score_method": SCORING_METHOD,
                     "score_label": _score_label(outcome),
                     "score_hit": outcome.realized_r is not None and outcome.realized_r > 0,
+                    "learning_context": meta.get("learning_context", {}),
                     "failure_reasons": failure_reasons,
                     "primary_failure_reason": (
                         failure_reasons[0]["key"] if failure_reasons else None
@@ -472,6 +487,8 @@ def classify_failure_reasons(
         add("ambiguous_intrabar_touch", {"first_touch": outcome.first_touch})
     if outcome.first_touch == "sl":
         add("sl_first", {"first_touch_ts": outcome.first_touch_ts})
+    if "close_only_path" in flags:
+        add("close_only_price_path", {"path_source": outcome.path_source})
 
     mfe_r = outcome.mfe_r
     mae_r = outcome.mae_r
@@ -602,6 +619,7 @@ def _timeframe_learning_context(
     timeframe_learning: object | None,
     tp_sl_learning: object | None,
     maximization_profile: object | None,
+    decision_feedback_profile: object | None,
     expectancy_summaries: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
     max_cells: dict[str, object] = {}
@@ -627,6 +645,12 @@ def _timeframe_learning_context(
             "active_cell": active_cell,
             "direction_cells": max_cells,
         },
+        "decision_feedback": _decision_feedback_context(
+            decision_feedback_profile,
+            symbol,
+            timeframe,
+            direction,
+        ),
         "timeframe_expectancy_summary": expectancy_summaries.get(timeframe),
     }
 
@@ -670,6 +694,18 @@ def _learned_profile_snapshot(
         "condition_factors": dict(getattr(profile, "condition_factors", {}) or {}),
         "notes_ja": list(getattr(profile, "notes_ja", []) or []),
     }
+
+
+def _decision_feedback_context(
+    profile: object | None,
+    symbol: str,
+    timeframe: str,
+    direction: str,
+) -> dict[str, object] | None:
+    if profile is None or not hasattr(profile, "cell_for"):
+        return None
+    cell = profile.cell_for(symbol, timeframe, direction)
+    return cell.to_dict() if cell is not None and hasattr(cell, "to_dict") else None
 
 
 def _market_context(
@@ -721,6 +757,11 @@ def _technical_context(tech: object | None) -> dict[str, object] | None:
                 "sell": getattr(view, "sell", None),
                 "neutral": getattr(view, "neutral", None),
                 "close": _number_or_none(getattr(view, "close", None)),
+                "high": _number_or_none(getattr(view, "high", None)),
+                "low": _number_or_none(getattr(view, "low", None)),
+                "bid": _number_or_none(getattr(view, "bid", None)),
+                "ask": _number_or_none(getattr(view, "ask", None)),
+                "spread": _number_or_none(getattr(view, "spread", None)),
                 "rsi": _number_or_none(getattr(view, "rsi", None)),
                 "macd": _number_or_none(getattr(view, "macd", None)),
                 "macd_signal": _number_or_none(getattr(view, "macd_signal", None)),

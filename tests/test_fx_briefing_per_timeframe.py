@@ -68,6 +68,10 @@ def _approved_tp_registry(path) -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.75,
+            "delta_expectancy_r": 1.75,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
         "approval",
@@ -102,6 +106,7 @@ def patched_paths(tmp_path):
     decision_log = tmp_path / "briefing_decisions.jsonl"
     decision_latest = tmp_path / "briefing_decisions_latest.json"
     decision_outcomes = tmp_path / "briefing_decision_outcomes.json"
+    decision_feedback = tmp_path / "briefing_decision_feedback.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", tf_journal),
         mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", tf_prices),
@@ -111,6 +116,7 @@ def patched_paths(tmp_path):
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LOG_PATH", decision_log),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LATEST_PATH", decision_latest),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_OUTCOMES_PATH", decision_outcomes),
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_FEEDBACK_PATH", decision_feedback),
     ):
         yield tf_journal, tf_learning
 
@@ -175,6 +181,7 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_LATEST_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
+    assert fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.exists()
     decision_rows = [
         json.loads(line)
         for line in fx_briefing.DEFAULT_DECISION_LOG_PATH.read_text(encoding="utf-8").splitlines()
@@ -188,6 +195,8 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     )
     assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
     assert set(outcome_report["metrics"]) >= {"first_touch", "mfe_r", "mae_r"}
+    feedback = json.loads(fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.read_text(encoding="utf-8"))
+    assert "cells" in feedback
     out = capsys.readouterr().out
     assert "Discord送信なし" in out
 

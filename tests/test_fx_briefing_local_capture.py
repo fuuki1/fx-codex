@@ -61,6 +61,7 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     decision_log_path = tmp_path / "briefing_decisions.jsonl"
     decision_latest_path = tmp_path / "briefing_decisions_latest.json"
     decision_outcomes_path = tmp_path / "briefing_decision_outcomes.json"
+    decision_feedback_path = tmp_path / "briefing_decision_feedback.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
         mock.patch.object(fx_briefing, "DEFAULT_LEARNING_PATH", learning_path),
@@ -68,6 +69,7 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LOG_PATH", decision_log_path),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LATEST_PATH", decision_latest_path),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_OUTCOMES_PATH", decision_outcomes_path),
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_FEEDBACK_PATH", decision_feedback_path),
         mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
         mock.patch("fx_intel.calendar.fetch_calendar", return_value=([], [])),
         mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
@@ -94,15 +96,18 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert decision_log_path.exists()
     assert decision_latest_path.exists()
     assert decision_outcomes_path.exists()
+    assert decision_feedback_path.exists()
     rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
     decision_rows = [
         json.loads(line) for line in decision_log_path.read_text().splitlines() if line.strip()
     ]
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
     outcome_report = json.loads(decision_outcomes_path.read_text(encoding="utf-8"))
+    feedback = json.loads(decision_feedback_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
     assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
     assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
+    assert "cells" in feedback
     assert "evaluated" in profile
     assert "Discord送信なし" in capsys.readouterr().out
 
@@ -116,7 +121,16 @@ def _approved_overall_policy_registry(path, candidate_id: str) -> None:
         "tp_sl_variant_paper_test",
         "TP1=0.75R / TP2=1.5Rをpaper検証",
         "期待R改善",
-        {"target1_r": 0.75, "target2_r": 1.5, "scope": "overall", "key": ""},
+        {
+            "target1_r": 0.75,
+            "target2_r": 1.5,
+            "scope": "overall",
+            "key": "",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.75,
+            "delta_expectancy_r": 1.75,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+        },
         "paper",
         "approval",
     )

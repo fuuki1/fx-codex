@@ -32,6 +32,11 @@ ML_FILE = "ml_model.json"
 PROMOTION_FILE = "promotion_state.json"
 TRADE_MONITOR_FILE = "trade_outcome_monitor.json"
 TRADE_REGISTRY_FILE = "trade_improvement_candidates.json"
+DECISION_LOG_FILE = "briefing_decisions.jsonl"
+DECISION_LATEST_FILE = "briefing_decisions_latest.json"
+DECISION_OUTCOMES_FILE = "briefing_decision_outcomes.json"
+DECISION_FEEDBACK_FILE = "briefing_decision_feedback.json"
+DECISION_MONITOR_FILE = "decision_expectancy_monitor.json"
 BRIEFING_RUN_LOG_FILE = "fx_briefing.log"
 TF_BRIEFING_RUN_LOG_FILE = "fx_briefing_tf.log"
 TF_SNAPSHOT_RUN_LOG_FILE = "fx_tf_snapshot.log"
@@ -41,6 +46,7 @@ TF_LEARNING_FILE = "briefing_tf_learning.json"
 # 5分ごとの価格スナップショット(fx_tf_snapshot.py)。短い足の採点窓に入る
 # 将来価格を密に供給する価格専用系列。採点の将来価格解決に使う(判断は無い)。
 TF_PRICES_FILE = "briefing_tf_prices.jsonl"
+TF_PRICES_STALE_MINUTES = 15
 _TIMEFRAME_ORDER = {"15m": 0, "1h": 1, "4h": 2, "1d": 3}
 
 # 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
@@ -223,6 +229,7 @@ def _ops_status(
         _runtime_log_status(log_dir, TF_BRIEFING_RUN_LOG_FILE, "時間足別判断ログ", now),
         _runtime_log_status(log_dir, TF_SNAPSHOT_RUN_LOG_FILE, "価格スナップショットログ", now),
     ]
+    tf_prices_status = _file_status_with_age(log_dir / TF_PRICES_FILE, now)
     file_exists = {name: bool(info.get("exists")) for name, info in files.items()}
     alerts: list[dict[str, str]] = []
 
@@ -240,6 +247,27 @@ def _ops_status(
                 "severity": "warn",
                 "message_ja": "時間足別採点用の5分価格系列が未作成です",
                 "action_ja": "python3 tools/learning_capture.py が1回分の価格系列も同時に保存します",
+            }
+        )
+    else:
+        price_age = tf_prices_status.get("age_minutes")
+        if isinstance(price_age, (int, float)) and price_age > TF_PRICES_STALE_MINUTES:
+            alerts.append(
+                {
+                    "severity": "fail",
+                    "message_ja": "時間足別価格スナップショットがstaleです",
+                    "action_ja": (
+                        f"最終更新から約{int(price_age)}分経過。"
+                        "./fx_tf_snapshot_loop.sh を復旧してください"
+                    ),
+                }
+            )
+    if file_exists.get(DECISION_LOG_FILE) and not file_exists.get(DECISION_MONITOR_FILE):
+        alerts.append(
+            {
+                "severity": "warn",
+                "message_ja": "完全判断ログの期待R監視JSONが未作成です",
+                "action_ja": "python3 tools/decision_expectancy_monitor.py を実行するとTP/SL/MFE/MAE期待Rを更新できます",
             }
         )
     if not file_exists.get(LEARNING_FILE) and not file_exists.get(TF_LEARNING_FILE):
@@ -294,6 +322,7 @@ def _ops_status(
         "status": status,
         "processes": processes,
         "runtime_logs": runtime_logs,
+        "tf_prices": tf_prices_status,
         "signals": {
             "has_any_journal": file_exists.get(JOURNAL_FILE, False)
             or file_exists.get(TF_JOURNAL_FILE, False),
@@ -802,6 +831,72 @@ def _trade_monitor_summary(
     }
 
 
+def _decision_monitor_summary(
+    monitor: dict[str, Any],
+    feedback: dict[str, Any],
+) -> dict[str, Any]:
+    summary = monitor.get("summary") if isinstance(monitor.get("summary"), dict) else {}
+    overall = summary.get("overall") if isinstance(summary.get("overall"), dict) else {}
+    counts = summary.get("action_counts") if isinstance(summary.get("action_counts"), dict) else {}
+    profile = monitor.get("profile") if isinstance(monitor.get("profile"), dict) else feedback
+    raw_cells = profile.get("cells") if isinstance(profile, dict) else {}
+    if not isinstance(raw_cells, dict):
+        raw_cells = {}
+    cells = [dict(row) for row in raw_cells.values() if isinstance(row, dict)]
+    rank = {"avoid": 0, "quality_guard": 1, "dampen": 2, "hold": 3, "collect_samples": 4}
+    actionable = [
+        row for row in cells if str(row.get("action")) in {"avoid", "dampen", "quality_guard"}
+    ]
+    actionable.sort(
+        key=lambda row: (
+            rank.get(str(row.get("action")), 9),
+            _number(row.get("expectancy_r")) if _number(row.get("expectancy_r")) is not None else 99,
+            -int(row.get("tradable", 0) or 0),
+            str(row.get("symbol", "")),
+        )
+    )
+    worst_cells = summary.get("worst_cells") if isinstance(summary.get("worst_cells"), list) else []
+    failures = (
+        summary.get("failure_reason_summary")
+        if isinstance(summary.get("failure_reason_summary"), list)
+        else []
+    )
+    tradable_zero = (
+        summary.get("tradable_zero_reasons")
+        if isinstance(summary.get("tradable_zero_reasons"), dict)
+        else {}
+    )
+    model_delta = (
+        summary.get("model_expectancy_delta")
+        if isinstance(summary.get("model_expectancy_delta"), dict)
+        else {}
+    )
+    price_health = (
+        summary.get("price_health") if isinstance(summary.get("price_health"), dict) else {}
+    )
+    performance = (
+        summary.get("performance") if isinstance(summary.get("performance"), dict) else {}
+    )
+    return {
+        "generated_at": monitor.get("generated_at") or feedback.get("generated_at"),
+        "status": monitor.get("status") or "unknown",
+        "exit_code": int(monitor.get("exit_code", 0) or 0),
+        "overall": dict(overall),
+        "performance": dict(performance),
+        "tradable_zero_reasons": dict(tradable_zero),
+        "model_expectancy_delta": dict(model_delta),
+        "price_health": dict(price_health),
+        "counts": dict(counts),
+        "decision_events": int(summary.get("decision_events", 0) or 0),
+        "scored_outcomes": int(summary.get("scored_outcomes", 0) or 0),
+        "actionable_cells": actionable[:10],
+        "worst_cells": [dict(row) for row in worst_cells[:10] if isinstance(row, dict)],
+        "failure_reason_summary": [dict(row) for row in failures[:10] if isinstance(row, dict)],
+        "alerts": _list_from_payload(monitor, "alerts")[:10],
+        "findings": _list_from_payload(monitor, "findings")[:20],
+    }
+
+
 def build_state(
     log_dir: Path,
     *,
@@ -815,6 +910,11 @@ def build_state(
     promotion_path = log_dir / PROMOTION_FILE
     trade_monitor_path = log_dir / TRADE_MONITOR_FILE
     trade_registry_path = log_dir / TRADE_REGISTRY_FILE
+    decision_log_path = log_dir / DECISION_LOG_FILE
+    decision_latest_path = log_dir / DECISION_LATEST_FILE
+    decision_outcomes_path = log_dir / DECISION_OUTCOMES_FILE
+    decision_feedback_path = log_dir / DECISION_FEEDBACK_FILE
+    decision_monitor_path = log_dir / DECISION_MONITOR_FILE
     tf_journal_path = log_dir / TF_JOURNAL_FILE
     tf_learning_path = log_dir / TF_LEARNING_FILE
     tf_prices_path = log_dir / TF_PRICES_FILE
@@ -830,6 +930,8 @@ def build_state(
     promotion = _load_json(promotion_path)
     trade_monitor = _load_json(trade_monitor_path)
     trade_registry = _load_json(trade_registry_path)
+    decision_feedback = _load_json(decision_feedback_path)
+    decision_monitor = _load_json(decision_monitor_path)
     # 融合1判断行(24h)と時間足別行(各主ホライズン)を同じ採点器で評価する。
     # _evaluate_journal は行ごとに timeframe/horizon_hours を見て採点する。
     # 価格スナップショット行は将来価格系列にだけ寄与する(direction 無しなので
@@ -846,6 +948,11 @@ def build_state(
         PROMOTION_FILE: _file_status(promotion_path),
         TRADE_MONITOR_FILE: _file_status(trade_monitor_path),
         TRADE_REGISTRY_FILE: _file_status(trade_registry_path),
+        DECISION_LOG_FILE: _file_status(decision_log_path),
+        DECISION_LATEST_FILE: _file_status(decision_latest_path),
+        DECISION_OUTCOMES_FILE: _file_status(decision_outcomes_path),
+        DECISION_FEEDBACK_FILE: _file_status(decision_feedback_path),
+        DECISION_MONITOR_FILE: _file_status(decision_monitor_path),
         TF_JOURNAL_FILE: _file_status(tf_journal_path),
         TF_LEARNING_FILE: _file_status(tf_learning_path),
         TF_PRICES_FILE: _file_status(tf_prices_path),
@@ -865,6 +972,7 @@ def build_state(
         "ml": _ml_summary(ml),
         "promotion": _promotion_summary(promotion),
         "trade_monitor": _trade_monitor_summary(trade_monitor, trade_registry),
+        "decision_monitor": _decision_monitor_summary(decision_monitor, decision_feedback),
     }
 
 

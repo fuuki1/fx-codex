@@ -54,6 +54,12 @@ class IntervalView:
     sell: int
     neutral: int
     close: float | None = None
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    spread: float | None = None
     rsi: float | None = None
     macd: float | None = None
     macd_signal: float | None = None
@@ -139,6 +145,21 @@ class PairTechnicals:
         view = self.views.get(interval)
         return view.close if view else None
 
+    def price_snapshot(self, interval: str = "1h") -> dict[str, float] | None:
+        view = self.views.get(interval)
+        if view is None or view.close is None:
+            return None
+        snapshot = {
+            "close": view.close,
+            "open": view.open,
+            "high": view.high,
+            "low": view.low,
+            "bid": view.bid,
+            "ask": view.ask,
+            "spread": view.spread,
+        }
+        return {key: value for key, value in snapshot.items() if value is not None}
+
     def atr(self, interval: str = "1h") -> float | None:
         view = self.views.get(interval)
         return view.atr if view else None
@@ -152,16 +173,40 @@ def _to_float(value: object) -> float | None:
     return result
 
 
+def _indicator_float(indicators: dict, *keys: str) -> float | None:
+    for key in keys:
+        value = _to_float(indicators.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _spread(bid: float | None, ask: float | None, fallback: float | None) -> float | None:
+    if fallback is not None:
+        return fallback
+    if bid is None or ask is None:
+        return None
+    return abs(ask - bid)
+
+
 def build_interval_view(
     interval: str, summary: dict, indicators: dict, fast: int, slow: int
 ) -> IntervalView:
+    bid = _indicator_float(indicators, "bid", "Bid")
+    ask = _indicator_float(indicators, "ask", "Ask")
     return IntervalView(
         interval=interval,
         recommendation=str(summary.get("RECOMMENDATION", "NEUTRAL")),
         buy=int(summary.get("BUY", 0)),
         sell=int(summary.get("SELL", 0)),
         neutral=int(summary.get("NEUTRAL", 0)),
-        close=_to_float(indicators.get("close")),
+        close=_indicator_float(indicators, "close", "Close"),
+        open=_indicator_float(indicators, "open", "Open"),
+        high=_indicator_float(indicators, "high", "High"),
+        low=_indicator_float(indicators, "low", "Low"),
+        bid=bid,
+        ask=ask,
+        spread=_spread(bid, ask, _indicator_float(indicators, "spread", "Spread")),
         rsi=_to_float(indicators.get("RSI")),
         macd=_to_float(indicators.get("MACD.macd")),
         macd_signal=_to_float(indicators.get("MACD.signal")),

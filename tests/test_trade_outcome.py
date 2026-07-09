@@ -347,6 +347,34 @@ def test_improvement_candidate_approval_requires_paper_ready_and_is_preserved() 
     assert refreshed["approved_count"] == 1
 
 
+def test_tp_sl_candidate_approval_requires_expectancy_improvement_evidence() -> None:
+    candidate = to.TradeImprovementCandidate(
+        "weak-tp-candidate",
+        "TP/SL候補",
+        "overall",
+        "high",
+        "tp_sl_variant_paper_test",
+        "TP1=0.75R / TP2=1.5Rをpaper検証",
+        "改善根拠なし",
+        {"target1_r": 0.75, "target2_r": 1.5, "scope": "overall", "key": ""},
+        "paper",
+        "approval",
+    )
+    registry = to.update_improvement_registry(None, [candidate], now=NOW)
+    registry = to.update_improvement_registry(registry, [candidate], now=NOW + timedelta(hours=1))
+
+    unchanged, result = to.set_improvement_candidate_approval(
+        registry,
+        candidate.candidate_id,
+        "approved",
+        actor="tester",
+        now=NOW + timedelta(hours=2),
+    )
+
+    assert result["status"] == "not_improving"
+    assert unchanged["candidates"][candidate.candidate_id]["stage"] == "paper_ready"
+
+
 def test_select_approved_target_policy_prefers_specific_approved_candidate() -> None:
     overall_candidate = to.TradeImprovementCandidate(
         "overall-tp",
@@ -361,6 +389,10 @@ def test_select_approved_target_policy_prefers_specific_approved_candidate() -> 
             "target2_r": 1.6,
             "scope": "overall",
             "key": "",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.3,
+            "delta_expectancy_r": 1.3,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
         "approval",
@@ -378,6 +410,10 @@ def test_select_approved_target_policy_prefers_specific_approved_candidate() -> 
             "target2_r": 1.5,
             "scope": "by_symbol_direction",
             "key": "USDJPY:long",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.4,
+            "delta_expectancy_r": 1.4,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
         "approval",
@@ -429,6 +465,10 @@ def test_auto_pause_underperforming_approved_target_policy() -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.75,
+            "delta_expectancy_r": 1.75,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
         "approval",
@@ -485,6 +525,10 @@ def test_resume_auto_paused_candidate_restores_approved_policy() -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.75,
+            "delta_expectancy_r": 1.75,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
         "approval",
@@ -595,6 +639,10 @@ def test_resume_trade_candidate_cli_updates_auto_paused_registry(tmp_path) -> No
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
+            "baseline_expectancy_r": -1.0,
+            "candidate_expectancy_r": 0.75,
+            "delta_expectancy_r": 1.75,
+            "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
         "approval",

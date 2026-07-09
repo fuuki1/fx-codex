@@ -7,9 +7,11 @@
 永久に得られず、学習が回らない。
 
 このスクリプトは判断・Discord通知とは切り離し、TradingView から各時間足の
-現在終値だけを5分ごとに取得して専用の価格系列 logs/briefing_tf_prices.jsonl へ
-追記する。fx_briefing の時間足別採点はこの密な価格系列を判断ジャーナルと結合して
-将来価格を解決するため、15m/1h/4h/1d の全時間足が採点可能になる。
+現在価格スナップショットを5分ごとに取得して専用の価格系列
+logs/briefing_tf_prices.jsonl へ追記する。close に加え、取得できる場合は
+open/high/low/bid/ask/spread も保存する。fx_briefing の時間足別採点はこの密な
+価格系列を判断ジャーナルと結合して将来価格を解決するため、15m/1h/4h/1d の
+全時間足が採点可能になる。
 
 判断ロジック・学習・センチメント・カレンダーは一切動かさない(価格取得のみ)。
 ネットワーク失敗時もログを残して正常終了し、5分ループを止めない。
@@ -50,6 +52,18 @@ def collect_closes(
     }
 
 
+def collect_price_snapshots(
+    tech_map: dict[str, technicals.PairTechnicals],
+    intervals=technicals.DEFAULT_INTERVALS,
+) -> dict[str, dict[str, dict[str, float] | None]]:
+    """{symbol: {timeframe: price snapshot}} を組む(OHLC/bid/ask/spread対応)。"""
+
+    return {
+        symbol: {interval: tech.price_snapshot(interval) for interval in intervals}
+        for symbol, tech in tech_map.items()
+    }
+
+
 def append_snapshot(path: str | Path, rows: list[dict]) -> None:
     """価格スナップショット行を JSONL へ追記する(1点1行、price_history が読める形)。"""
     target = Path(path)
@@ -76,8 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     for warning in warnings:
         print(f"[warn] {warning}", file=sys.stderr)
 
-    closes_by_interval = collect_closes(tech_map)
-    rows = price_history.snapshot_entries(closes_by_interval, now=now)
+    snapshots_by_interval = collect_price_snapshots(tech_map)
+    rows = price_history.snapshot_entries(snapshots_by_interval, now=now)
     if not rows:
         # 全時間足の取得に失敗しても異常終了しない(ループを止めないため)
         print("[warn] 価格スナップショットを1点も取得できませんでした", file=sys.stderr)

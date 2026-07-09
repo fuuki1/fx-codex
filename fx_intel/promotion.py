@@ -52,6 +52,11 @@ PROMOTE_MIN_SAMPLES = 40  # 自己相関間引き後の実効採点数
 PROMOTE_MIN_HIT_RATE = 0.52  # 方向的中率の下限
 PROMOTE_MIN_EXPECTANCY = 0.02  # ATR換算の1トレード期待値の下限
 PROMOTE_MAX_PVALUE = 0.10  # 「偶然50%超」の確率がこれ以下なら有意
+PROMOTE_MIN_HIT_RATE_IMPROVEMENT = 0.005
+PROMOTE_MIN_EXPECTANCY_IMPROVEMENT = 0.01
+PROMOTE_MIN_PVALUE_IMPROVEMENT = 0.01
+PROMOTE_MAX_HIT_RATE_REGRESSION = 0.001
+PROMOTE_MAX_EXPECTANCY_REGRESSION = 0.001
 
 # 降格(paper→shadow)のトリガ。ヒステリシスで昇格閾値より緩くし、
 # 昇格と降格を往復するフラッピングを防ぐ
@@ -101,6 +106,70 @@ class MemberPerformance:
         """paperからの降格が必要な劣化状態か。"""
         rate = self.hit_rate
         return self.evaluated >= DEMOTE_MIN_SAMPLES and rate is not None and rate < DEMOTE_HIT_RATE
+
+    def improves_over(self, previous: MemberPerformance | None) -> tuple[bool, list[str]]:
+        """前回評価より改善しているか。(可否, 不足理由)。
+
+        昇格は絶対値の合格だけでなく、直近評価からの改善が確認できる時だけ許可する。
+        初回評価は比較対象がないため、昇格ではなくベースライン保存に留める。
+        """
+
+        reasons: list[str] = []
+        if previous is None or previous.evaluated <= 0:
+            return False, ["改善比較用の前回実績がありません"]
+        if self.evaluated < previous.evaluated:
+            reasons.append(f"採点数が前回より減少({self.evaluated}<{previous.evaluated})")
+
+        rate = self.hit_rate
+        previous_rate = previous.hit_rate
+        if rate is not None and previous_rate is not None:
+            if rate < previous_rate - PROMOTE_MAX_HIT_RATE_REGRESSION:
+                reasons.append(f"的中率が前回比で悪化({rate:.1%}<{previous_rate:.1%})")
+        if self.expectancy_atr is not None and previous.expectancy_atr is not None:
+            if self.expectancy_atr < previous.expectancy_atr - PROMOTE_MAX_EXPECTANCY_REGRESSION:
+                reasons.append(
+                    "期待値が前回比で悪化"
+                    f"({self.expectancy_atr:+.3f}<{previous.expectancy_atr:+.3f})"
+                )
+
+        improved_signals: list[str] = []
+        if rate is not None and previous_rate is not None:
+            if rate - previous_rate >= PROMOTE_MIN_HIT_RATE_IMPROVEMENT:
+                improved_signals.append("的中率改善")
+        if self.expectancy_atr is not None and previous.expectancy_atr is not None:
+            if self.expectancy_atr - previous.expectancy_atr >= PROMOTE_MIN_EXPECTANCY_IMPROVEMENT:
+                improved_signals.append("期待値改善")
+        if self.p_value is not None and previous.p_value is not None:
+            if previous.p_value - self.p_value >= PROMOTE_MIN_PVALUE_IMPROVEMENT:
+                improved_signals.append("有意性改善")
+
+        if not improved_signals:
+            reasons.append("前回比で昇格に使える改善がありません")
+        return not reasons, reasons
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "member": self.member,
+            "evaluated": self.evaluated,
+            "hits": self.hits,
+            "hit_rate": self.hit_rate,
+            "expectancy_atr": self.expectancy_atr,
+            "p_value": self.p_value,
+        }
+
+    @classmethod
+    def from_mapping(cls, member: str, payload: object) -> MemberPerformance | None:
+        if not isinstance(payload, Mapping):
+            return None
+        evaluated = _int(payload.get("evaluated"))
+        hits = _int(payload.get("hits"))
+        return cls(
+            member=member,
+            evaluated=evaluated,
+            hits=hits,
+            expectancy_atr=_float(payload.get("expectancy_atr")),
+            p_value=_float(payload.get("p_value")),
+        )
 
 
 def _one_sided_binomial_pvalue(hits: int, n: int, p0: float = 0.5) -> float:
@@ -250,6 +319,7 @@ class PromotionState:
     updated_at: str = ""
     history: list[dict] = field(default_factory=list)
     notes_ja: list[str] = field(default_factory=list)
+    last_performance: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def stage_of(self, member: str) -> str:
         return self.stages.get(member, "shadow")
@@ -298,10 +368,15 @@ def update_stages(
     """
     now = now or datetime.now(UTC)
     notes: list[str] = []
+    previous = {
+        member: MemberPerformance.from_mapping(member, state.last_performance.get(member))
+        for member in MEMBERS
+    }
     for member in MEMBERS:
         perf = performances.get(member) or MemberPerformance(member=member)
         stage = state.stage_of(member)
         ok, reasons = perf.meets_promotion()
+        improving, improvement_reasons = perf.improves_over(previous.get(member))
         rate = perf.hit_rate
         rate_ja = f"{rate:.0%}" if rate is not None else "—"
         summary = (
@@ -310,21 +385,34 @@ def update_stages(
         )
 
         if stage == "shadow":
-            if ok:
-                _transition(state, member, "paper", "昇格条件を満たした", now)
+            if ok and improving:
+                _transition(state, member, "paper", "昇格条件を満たし前回比でも改善", now)
                 notes.append(f"⬆️ {member} を paper へ昇格({summary})")
+            elif ok:
+                notes.append(
+                    f"⏳ {member} は shadow 継続 — 昇格条件OKだが改善確認未達: "
+                    + " / ".join(improvement_reasons)
+                )
             else:
                 notes.append(f"⏳ {member} は shadow 継続 — " + " / ".join(reasons))
         elif stage == "paper":
             if perf.warrants_demotion():
                 _transition(state, member, "shadow", f"的中率劣化({rate_ja})による自動降格", now)
                 notes.append(f"⬇️ {member} を shadow へ降格({summary})")
-            elif ok and member in require_live_ack:
-                _transition(state, member, "live", "昇格条件+人間承認による live 昇格", now)
+            elif ok and improving and member in require_live_ack:
+                _transition(
+                    state,
+                    member,
+                    "live",
+                    "昇格条件+前回比改善+人間承認による live 昇格",
+                    now,
+                )
                 notes.append(f"🚀 {member} を live へ昇格(承認済み, {summary})")
             elif member in require_live_ack:
+                hold_reasons = reasons if not ok else improvement_reasons
                 notes.append(
-                    f"⛔ {member} の live 承認あり、but 昇格条件未達で保留 — " + " / ".join(reasons)
+                    f"⛔ {member} の live 承認あり、but 昇格条件未達で保留 — "
+                    + " / ".join(hold_reasons)
                 )
             else:
                 notes.append(f"✅ {member} は paper 継続({summary})")
@@ -336,6 +424,7 @@ def update_stages(
                 notes.append(f"⬇️ {member} を live から paper へ降格({summary})")
             else:
                 notes.append(f"✅ {member} は live 継続({summary})")
+        state.last_performance[member] = perf.to_dict()
 
     state.updated_at = now.isoformat()
     state.notes_ja = notes
@@ -344,6 +433,22 @@ def update_stages(
 
 def _fmt(value: float | None) -> str:
     return f"{value:+.3f}" if value is not None else "—"
+
+
+def _float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
 
 
 def summary_ja(state: PromotionState) -> str:
@@ -371,10 +476,17 @@ def load_state(path: str | Path) -> PromotionState:
         stage = raw_stages.get(member) if isinstance(raw_stages, Mapping) else None
         stages[member] = stage if stage in STAGES else "shadow"
     history = payload.get("history", [])
+    raw_performance = payload.get("last_performance")
+    last_performance = raw_performance if isinstance(raw_performance, dict) else {}
     return PromotionState(
         stages=stages,
         updated_at=str(payload.get("updated_at", "")),
         history=[h for h in history if isinstance(h, dict)][-200:],  # 履歴は直近200件に制限
+        last_performance={
+            member: dict(value)
+            for member, value in last_performance.items()
+            if member in MEMBERS and isinstance(value, Mapping)
+        },
     )
 
 
@@ -386,6 +498,9 @@ def save_state(state: PromotionState, path: str | Path) -> None:
         "updated_at": state.updated_at,
         "history": state.history[-200:],
         "notes_ja": state.notes_ja,
+        "last_performance": {
+            member: dict(state.last_performance.get(member, {})) for member in MEMBERS
+        },
     }
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

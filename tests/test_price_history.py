@@ -182,6 +182,40 @@ def test_snapshot_entries_skips_missing_closes() -> None:
     assert [r["timeframe"] for r in rows] == ["4h"]
 
 
+def test_snapshot_entries_preserves_ohlc_bid_ask_spread() -> None:
+    rows = ph.snapshot_entries(
+        {
+            "USDJPY": {
+                "1h": {
+                    "close": 157.0,
+                    "open": 156.8,
+                    "high": 157.2,
+                    "low": 156.7,
+                    "bid": 156.99,
+                    "ask": 157.01,
+                    "spread": 0.02,
+                }
+            }
+        },
+        now=T0,
+    )
+
+    assert rows == [
+        {
+            "ts": T0.isoformat(),
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 157.0,
+            "open": 156.8,
+            "high": 157.2,
+            "low": 156.7,
+            "bid": 156.99,
+            "ask": 157.01,
+            "spread": 0.02,
+        }
+    ]
+
+
 def test_snapshot_entries_feed_into_series() -> None:
     """スナップショット行は build_close_series が読める形になっている。"""
     rows = ph.snapshot_entries({"USDJPY": {"1h": 157.0}}, now=T0)

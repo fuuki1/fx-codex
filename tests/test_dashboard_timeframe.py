@@ -185,6 +185,60 @@ def test_build_state_includes_trade_outcome_monitor(server, tmp_path) -> None:
     assert trade["recent_events"][0]["event_type"] == "auto_paused"
 
 
+def test_build_state_includes_decision_expectancy_monitor(server, tmp_path) -> None:
+    monitor = {
+        "generated_at": START.isoformat(),
+        "status": "fail",
+        "exit_code": 1,
+        "summary": {
+            "decision_events": 25,
+            "scored_outcomes": 25,
+            "overall": {"expectancy_r": -1.0, "profit_factor_r": 0.0, "tradable": 25},
+            "action_counts": {"avoid": 1},
+            "failure_reason_summary": [
+                {"key": "sl_first", "label_ja": "SL先着", "count": 25, "primary_count": 25}
+            ],
+            "worst_cells": [
+                {
+                    "symbol": "USDJPY",
+                    "timeframe": "1h",
+                    "direction": "long",
+                    "tradable": 25,
+                    "expectancy_r": -1.0,
+                    "action": "avoid",
+                }
+            ],
+        },
+        "profile": {
+            "cells": {
+                "USDJPY|1h|long": {
+                    "symbol": "USDJPY",
+                    "timeframe": "1h",
+                    "direction": "long",
+                    "tradable": 25,
+                    "expectancy_r": -1.0,
+                    "sl_rate": 1.0,
+                    "factor": 0.45,
+                    "action": "avoid",
+                }
+            }
+        },
+    }
+    (tmp_path / "decision_expectancy_monitor.json").write_text(
+        json.dumps(monitor),
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+    decision = state["decision_monitor"]
+
+    assert decision["status"] == "fail"
+    assert decision["overall"]["expectancy_r"] == -1.0
+    assert decision["scored_outcomes"] == 25
+    assert decision["actionable_cells"][0]["action"] == "avoid"
+    assert decision["failure_reason_summary"][0]["key"] == "sl_first"
+
+
 def test_build_state_uses_timeframe_learning_when_fusion_learning_missing(
     server,
     tmp_path,

@@ -449,6 +449,7 @@ small {
 }
 
 .condition-item.info,
+.condition-item.pending,
 .condition-item.warn {
   border-left: 4px solid var(--amber);
 }

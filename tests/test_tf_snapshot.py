@@ -66,6 +66,35 @@ def test_collect_closes_reads_each_interval_close() -> None:
     assert closes["USDJPY"]["4h"] is None
 
 
+def test_collect_price_snapshots_reads_ohlc_bid_ask_spread() -> None:
+    tech = PairTechnicals(symbol="USDJPY")
+    tech.views["1h"] = IntervalView(
+        "1h",
+        "BUY",
+        5,
+        1,
+        2,
+        close=150.0,
+        high=150.2,
+        low=149.8,
+        bid=149.99,
+        ask=150.01,
+        spread=0.02,
+    )
+
+    snapshots = fx_tf_snapshot.collect_price_snapshots({"USDJPY": tech})
+
+    assert snapshots["USDJPY"]["1h"] == {
+        "close": 150.0,
+        "high": 150.2,
+        "low": 149.8,
+        "bid": 149.99,
+        "ask": 150.01,
+        "spread": 0.02,
+    }
+    assert snapshots["USDJPY"]["15m"] is None
+
+
 def test_append_snapshot_writes_jsonl(tmp_path) -> None:
     path = tmp_path / "prices.jsonl"
     rows = price_history.snapshot_entries({"USDJPY": {"1h": 157.0, "4h": 157.2}}, now=START)

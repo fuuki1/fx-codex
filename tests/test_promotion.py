@@ -58,14 +58,37 @@ def test_binomial_pvalue_sanity() -> None:
     assert _one_sided_binomial_pvalue(0, 0) == 1.0
 
 
-def test_good_signal_promotes_shadow_to_paper() -> None:
+def test_good_signal_promotes_shadow_to_paper_only_after_improvement() -> None:
+    baseline = MemberPerformance(
+        member="ml",
+        evaluated=90,
+        hits=52,
+        expectancy_atr=0.05,
+        p_value=0.08,
+    )
+    improved = MemberPerformance(
+        member="ml",
+        evaluated=100,
+        hits=62,
+        expectancy_atr=0.20,
+        p_value=0.01,
+    )
+    state = PromotionState()
+    update_stages(state, {"ml": baseline}, now=NOW)
+    assert state.stage_of("ml") == "shadow"
+    update_stages(state, {"ml": improved}, now=NOW + timedelta(hours=1))
+    assert state.stage_of("ml") == "paper"
+
+
+def test_good_signal_without_previous_improvement_stays_shadow() -> None:
     entries = _journal_with_signal(500, hit_prob=0.72, seed=1)
     perf = evaluate_member("ml", entries, now=NOW)
     ok, reasons = perf.meets_promotion()
     assert ok, reasons
     state = PromotionState()
     update_stages(state, {"ml": perf}, now=NOW)
-    assert state.stage_of("ml") == "paper"
+    assert state.stage_of("ml") == "shadow"
+    assert state.last_performance["ml"]["evaluated"] == perf.evaluated
 
 
 def test_weak_signal_stays_in_shadow() -> None:
@@ -86,11 +109,19 @@ def test_degraded_paper_member_auto_demotes() -> None:
 
 def test_live_requires_human_ack() -> None:
     good = MemberPerformance(member="ml", evaluated=100, hits=60, expectancy_atr=0.3, p_value=0.01)
+    prior = MemberPerformance(member="ml", evaluated=80, hits=44, expectancy_atr=0.08, p_value=0.08)
     # 承認なしではpaperのまま
-    state = PromotionState(stages={"macro": "shadow", "ml": "paper"})
+    state = PromotionState(
+        stages={"macro": "shadow", "ml": "paper"},
+        last_performance={"ml": prior.to_dict()},
+    )
     update_stages(state, {"ml": good}, now=NOW)
     assert state.stage_of("ml") == "paper"
     # 承認ありでliveへ
+    state = PromotionState(
+        stages={"macro": "shadow", "ml": "paper"},
+        last_performance={"ml": prior.to_dict()},
+    )
     update_stages(state, {"ml": good}, now=NOW, require_live_ack=["ml"])
     assert state.stage_of("ml") == "live"
 
@@ -111,6 +142,7 @@ def test_state_roundtrip(tmp_path) -> None:
     save_state(state, path)
     loaded = load_state(path)
     assert loaded.stages == state.stages
+    assert loaded.last_performance == state.last_performance
 
 
 def test_load_unknown_stage_resets_to_shadow(tmp_path) -> None:
@@ -123,6 +155,7 @@ def test_load_unknown_stage_resets_to_shadow(tmp_path) -> None:
 
 def test_history_records_transitions() -> None:
     good = MemberPerformance(member="ml", evaluated=100, hits=60, expectancy_atr=0.3, p_value=0.01)
-    state = PromotionState()
+    prior = MemberPerformance(member="ml", evaluated=80, hits=44, expectancy_atr=0.08, p_value=0.08)
+    state = PromotionState(last_performance={"ml": prior.to_dict()})
     update_stages(state, {"ml": good}, now=NOW)
     assert any(h["member"] == "ml" and h["to"] == "paper" for h in state.history)

@@ -956,6 +956,7 @@ def set_improvement_candidate_approval(
     """改善候補を人間承認/却下/再開する。
 
     approved は paper_ready のみ、resumed は auto_paused のみ許可する。
+    TP/SL候補は、期待Rが現行比で改善している証跡がある場合だけ昇格できる。
     """
     generated_at = _utc(now or datetime.now(UTC)).isoformat()
     records = _registry_records(registry)
@@ -1005,6 +1006,16 @@ def set_improvement_candidate_approval(
             }
         )
         return _registry_payload(records, generated_at), result
+    if decision in {"approved", "resumed"}:
+        improvement_ok, improvement_reason = _approval_improvement_gate(record)
+        if not improvement_ok:
+            result.update(
+                {
+                    "status": "not_improving",
+                    "message_ja": improvement_reason,
+                }
+            )
+            return _registry_payload(records, generated_at), result
 
     updated = dict(record)
     updated["stage"] = "approved" if decision == "resumed" else decision
@@ -2274,6 +2285,31 @@ def _confidence_label_from_int(conviction: int) -> str:
 
 def _candidate_stage(priority: str, seen_count: int) -> str:
     return "paper_ready" if seen_count >= READY_SEEN_BY_PRIORITY.get(priority, 3) else "watch"
+
+
+def _approval_improvement_gate(record: Mapping[str, object]) -> tuple[bool, str]:
+    if record.get("action_type") != "tp_sl_variant_paper_test":
+        return True, ""
+    proposed = record.get("proposed_change")
+    if not isinstance(proposed, Mapping):
+        return False, "TP/SL候補の改善根拠がないため昇格できません"
+    delta = _stat_float(proposed, "delta_expectancy_r")
+    candidate = _stat_float(proposed, "candidate_expectancy_r")
+    min_delta = _stat_float(proposed, "min_expected_improvement_r")
+    if min_delta is None:
+        min_delta = MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R
+    if delta is None:
+        return False, "TP/SL候補の期待R改善幅が未記録のため昇格できません"
+    if delta < min_delta:
+        return (
+            False,
+            f"TP/SL候補の期待R改善幅が不足しています({delta:+.2f}R<{min_delta:+.2f}R)",
+        )
+    if candidate is None:
+        return False, "TP/SL候補の候補期待Rが未記録のため昇格できません"
+    if candidate <= 0:
+        return False, f"TP/SL候補の候補期待Rが非正です({candidate:+.2f}R)"
+    return True, ""
 
 
 def _candidate_id(finding: Mapping[str, object], index: int) -> str:

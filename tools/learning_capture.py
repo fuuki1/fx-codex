@@ -65,6 +65,16 @@ def build_steps(args: argparse.Namespace) -> list[CaptureStep]:
                 (0, 1),
             )
         )
+    if not args.skip_decision_monitor:
+        steps.append(
+            CaptureStep(
+                "decision-expectancy-monitor",
+                [python, "tools/decision_expectancy_monitor.py", "--quiet"],
+                # 完全判断ログも初期状態ではサンプル不足や期待R悪化で exit=1 になり得る。
+                # 監視JSONを書けていればログ収集自体は続行できる。
+                (0, 1),
+            )
+        )
     return steps
 
 
@@ -102,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-fusion", action="store_true")
     parser.add_argument("--skip-timeframe", action="store_true")
     parser.add_argument("--skip-trade-monitor", action="store_true")
+    parser.add_argument("--skip-decision-monitor", action="store_true")
     parser.add_argument(
         "--keep-going",
         action="store_true",

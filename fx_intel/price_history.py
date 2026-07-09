@@ -129,28 +129,63 @@ def resolve_future_close(
 
 
 def snapshot_entries(
-    closes_by_interval: Mapping[str, Mapping[str, float | None]],
+    closes_by_interval: Mapping[str, Mapping[str, float | Mapping[str, object] | None]],
     now: datetime | None = None,
 ) -> list[dict]:
     """現在スナップショットを、ジャーナル系列に足せる最新点の形に変換する。
 
-    closes_by_interval は {symbol: {timeframe: close}}。今回の実行で
-    TradingView が返した各時間足の現在終値を、build_close_series が読める
-    エントリ(ts/symbol/timeframe/close)に変換して返す。採点前にこれを
-    履歴へ連結すると、直前に成熟した判断を今回の価格で採点できる。
+    closes_by_interval は {symbol: {timeframe: close}} または
+    {symbol: {timeframe: {close, open, high, low, bid, ask, spread}}}。
+    今回の実行で TradingView が返した各時間足の現在価格を、
+    build_close_series と TP/SL 経路採点が読めるエントリに変換して返す。
+    high/low があれば TP/SL 先着判定の品質が上がり、bid/ask/spread は
+    後続の運用監視で約定コストを見積もるために残す。
     """
     now = now or datetime.now(UTC)
     stamp = now.isoformat()
     rows: list[dict] = []
     for symbol, intervals in closes_by_interval.items():
-        for timeframe, close in intervals.items():
-            if isinstance(close, (int, float)) and not isinstance(close, bool):
-                rows.append(
-                    {
-                        "ts": stamp,
-                        "symbol": str(symbol),
-                        "timeframe": str(timeframe),
-                        "close": float(close),
-                    }
-                )
+        for timeframe, snapshot in intervals.items():
+            row = _snapshot_row(stamp, str(symbol), str(timeframe), snapshot)
+            if row is not None:
+                rows.append(row)
     return rows
+
+
+def _snapshot_row(
+    stamp: str,
+    symbol: str,
+    timeframe: str,
+    snapshot: float | Mapping[str, object] | None,
+) -> dict | None:
+    if isinstance(snapshot, (int, float)) and not isinstance(snapshot, bool):
+        return {
+            "ts": stamp,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "close": float(snapshot),
+        }
+    if not isinstance(snapshot, Mapping):
+        return None
+    close = _number(snapshot.get("close"))
+    if close is None:
+        return None
+    row: dict[str, object] = {
+        "ts": stamp,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "close": close,
+    }
+    for key in ("open", "high", "low", "bid", "ask", "spread"):
+        value = _number(snapshot.get(key))
+        if value is not None:
+            row[key] = value
+    return row
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None

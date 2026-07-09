@@ -180,6 +180,33 @@
 
         <article class="panel wide">
           <div class="panel-head">
+            <h2>判断期待R監視</h2>
+            <span id="decisionMonitorUpdated" class="subtle">未生成</span>
+          </div>
+          <div class="trade-grid">
+            <div class="trade-status">
+              <span>health</span>
+              <strong id="decisionHealth">unknown</strong>
+              <small id="decisionExpectancy">期待R --</small>
+              <small id="decisionCounts">scored 0 / cells 0</small>
+            </div>
+            <div>
+              <h3>見送り・減衰セル</h3>
+              <div id="decisionActionList" class="condition-list"></div>
+            </div>
+            <div>
+              <h3>失敗理由</h3>
+              <div id="decisionFailureList" class="condition-list"></div>
+            </div>
+          </div>
+          <div class="panel-subsection">
+            <h3>悪化セル</h3>
+            <div id="decisionWorstCells" class="condition-list"></div>
+          </div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
             <h2>確信度キャリブレーション</h2>
             <span class="subtle">conviction bins</span>
           </div>

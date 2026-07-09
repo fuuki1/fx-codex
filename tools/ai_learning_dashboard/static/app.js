@@ -7,6 +7,7 @@ const LEARNING_FILE = "briefing_learning.json";
 const TF_JOURNAL_FILE = "briefing_tf_journal.jsonl";
 const TF_LEARNING_FILE = "briefing_tf_learning.json";
 const ML_FILE = "ml_model.json";
+const DECISION_MONITOR_FILE = "decision_expectancy_monitor.json";
 
 const $ = (id) => document.getElementById(id);
 
@@ -479,6 +480,91 @@ function renderTradeMonitor(data) {
   });
 }
 
+function renderDecisionMonitor(data) {
+  const decision = data.decision_monitor || {};
+  const overall = decision.overall || {};
+  const performance = decision.performance || {};
+  const modelDelta = decision.model_expectancy_delta || {};
+  const counts = decision.counts || {};
+  const expectancy = num(overall.expectancy_r);
+  const profitFactor = num(overall.profit_factor_r);
+  const netR = num(performance.net_R);
+  const deltaExpected = num(modelDelta.delta_expected_R);
+  const cellCount = Object.values(counts).reduce((total, value) => total + Number(value || 0), 0);
+
+  setText("decisionMonitorUpdated", shortDate(decision.generated_at));
+  setText("decisionHealth", decision.status || "unknown");
+  setText(
+    "decisionExpectancy",
+    `期待R ${signedR(expectancy)} / net ${signedR(netR)} / Δ ${signedR(deltaExpected)} / PF ${
+      profitFactor === null ? "--" : profitFactor.toFixed(2)
+    }`,
+  );
+  setText(
+    "decisionCounts",
+    `events ${decision.decision_events || 0} / scored ${decision.scored_outcomes || 0} / cells ${cellCount}`,
+  );
+
+  const actions = $("decisionActionList");
+  actions.replaceChildren();
+  const actionable = decision.actionable_cells || [];
+  if (!actionable.length) {
+    actions.appendChild(empty("見送り・減衰セルはまだありません"));
+  }
+  actionable.slice(0, 8).forEach((row) => {
+    const action = row.action || "--";
+    const tone = action === "avoid" ? "red-text" : "amber-text";
+    const label = `${row.symbol || "--"} ${row.timeframe || "--"} ${row.direction || "--"} / ${action}`;
+    const sl = pct(num(row.sl_rate));
+    const factor = num(row.factor);
+    actions.appendChild(
+      tradeItem(
+        label,
+        `期待R ${signedR(num(row.expectancy_r))} / SL ${sl} / n=${row.tradable || 0}${
+          factor === null ? "" : ` / ×${factor.toFixed(2)}`
+        }`,
+        tone,
+      ),
+    );
+  });
+
+  const failures = $("decisionFailureList");
+  failures.replaceChildren();
+  const zeroReasons = decision.tradable_zero_reasons?.reasons || [];
+  const reasons = [...(decision.failure_reason_summary || []), ...zeroReasons];
+  if (!reasons.length) {
+    failures.appendChild(empty("失敗理由はまだ分類されていません"));
+  }
+  reasons.slice(0, 8).forEach((row) => {
+    failures.appendChild(
+      tradeItem(
+        row.label_ja || row.key || "--",
+        `count ${row.count || 0}${
+          row.primary_count === undefined ? "" : ` / primary ${row.primary_count || 0}`
+        }`,
+        row.pending ? "ok" : "amber-text",
+      ),
+    );
+  });
+
+  const worst = $("decisionWorstCells");
+  worst.replaceChildren();
+  const worstCells = decision.worst_cells || [];
+  if (!worstCells.length) {
+    worst.appendChild(empty("期待Rが悪化した成熟セルはまだありません"));
+  }
+  worstCells.slice(0, 8).forEach((row) => {
+    const tone = num(row.expectancy_r) !== null && num(row.expectancy_r) <= 0 ? "red-text" : "";
+    worst.appendChild(
+      tradeItem(
+        `${row.symbol || "--"} ${row.timeframe || "--"} ${row.direction || "--"}`,
+        `期待R ${signedR(num(row.expectancy_r))} / MFE ${signedR(num(row.avg_mfe_r))} / MAE ${signedR(num(row.avg_mae_r))} / n=${row.tradable || 0}`,
+        tone,
+      ),
+    );
+  });
+}
+
 function renderBins(data) {
   const target = $("binBars");
   target.replaceChildren();
@@ -606,6 +692,7 @@ function render(data) {
   renderTimeframeBars(data);
   renderOps(data);
   renderTradeMonitor(data);
+  renderDecisionMonitor(data);
   renderBins(data);
   renderMl(data);
   renderConditions(data);

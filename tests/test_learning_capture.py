@@ -33,6 +33,8 @@ def test_build_steps_use_no_discord_for_briefing_runs() -> None:
     assert "--symbols" in commands["timeframe-price-snapshot"]
     monitor = next(step for step in steps if step.name == "trade-outcome-monitor")
     assert monitor.allowed_exit_codes == (0, 1)
+    decision_monitor = next(step for step in steps if step.name == "decision-expectancy-monitor")
+    assert decision_monitor.allowed_exit_codes == (0, 1)
 
 
 def test_build_steps_can_skip_network_heavy_briefing_parts() -> None:
@@ -43,4 +45,7 @@ def test_build_steps_can_skip_network_heavy_briefing_parts() -> None:
 
     steps = module.build_steps(args)
 
-    assert [step.name for step in steps] == ["trade-outcome-monitor"]
+    assert [step.name for step in steps] == [
+        "trade-outcome-monitor",
+        "decision-expectancy-monitor",
+    ]

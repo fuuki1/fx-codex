@@ -27,6 +27,7 @@ http://127.0.0.1:8765/
 
 ```bash
 python3 tools/trade_outcome_monitor.py
+python3 tools/decision_expectancy_monitor.py
 ```
 
 学習ログをDiscord送信なしで作り始める場合:
@@ -42,6 +43,8 @@ python3 tools/learning_capture.py
 判断ログ、時間足別価格スナップショット、学習プロファイル、各実行ログの更新時刻を
 読み取り専用で確認します。Discord送信ループは自動起動しません。
 
+ループ確認と復旧手順は `docs/FX_AI_OPERATIONS.md` にまとめています。
+
 ## 読み取るファイル
 
 - `logs/briefing_journal.jsonl`
@@ -50,6 +53,10 @@ python3 tools/learning_capture.py
 - `logs/promotion_state.json`
 - `logs/trade_outcome_monitor.json`
 - `logs/trade_improvement_candidates.json`
+- `logs/briefing_decisions.jsonl`
+- `logs/briefing_decision_outcomes.json`
+- `logs/briefing_decision_feedback.json`
+- `logs/decision_expectancy_monitor.json`
 - `logs/briefing_tf_journal.jsonl`
 - `logs/briefing_tf_learning.json`
 - `logs/briefing_tf_prices.jsonl`
