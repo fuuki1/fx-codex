@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.snapshot</string>
+  <!-- 5分毎に価格スナップショットを1回実行(while-trueループではなくlaunchdが周期を管理)。
+       run_exclusive.pyの排他ロックで手動起動やcronとの二重実行を防ぐ。
+       秘密情報はplistに置かない(.envから実行時に読む)。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string><string>fx-snapshot</string>
+    <string>--locks-dir</string><string>__FX_ROOT__/logs/locks</string>
+    <string>--</string>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/fx_tf_snapshot.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/snapshot.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/snapshot.err.log</string>
+</dict>
+</plist>

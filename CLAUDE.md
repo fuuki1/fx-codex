@@ -81,9 +81,13 @@ technicals + news + macro + ml → 委員会 deliberate() → 複合スコア
 - **Mac miniへのデプロイはファイル単位rsync禁止**。依存漏れで本番が落ちた事故歴あり。
   `git checkout origin/main -- trader/` で全体を揃えてから `docker compose build`
 - `trader/app/market_calendar.py` の休場カレンダーは2024-2027収録。**毎年更新必須**
-- ブリーフィング運用は2本立て: 判断=毎時（`fx_briefing_loop.sh`）、価格系列=5分ごと（`fx_tf_snapshot_loop.sh`）。
-  **snapshotループが止まると学習層全体がデータ飢餓になる**（昇格ゲートが0件で足止め→委員が永久にshadow）
-- launchd/cronはTCC制限で`~/Desktop`を読めないため、ループはターミナルから手動起動
+- ブリーフィング運用は2本立て: 判断=毎時:10、価格系列=5分ごと。
+  **価格スナップショットが止まると学習層全体がデータ飢餓になる**（昇格ゲートが0件で足止め→委員が永久にshadow）
+- 収集はlaunchd常駐サービス（`com.fx-codex.snapshot`/`briefing`/`health`）で運用する。
+  手順・閾値・rollbackは [docs/OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md)。
+  手動の`fx_*_loop.sh`起動は暫定手段（排他ロックで多重実行は防がれるが常用しない）
+- 本番の収集データはMac mini `~/srv/fx-codex/logs/` が正。開発機の`logs/`は手動実験の残骸で鮮度を信用しない
+- launchd/cronはTCC制限で`~/Desktop`配下を読めない（開発機で常駐させない理由）
 
 ## 開発ワークフロー
 
