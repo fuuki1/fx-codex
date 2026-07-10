@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, UTC
 import importlib.util
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -181,10 +182,14 @@ def test_plist_template_renders_to_valid_xml(template, tmp_path):
     assert "WEBHOOK" not in rendered and "API_KEY" not in rendered
 
 
+_ZSH = shutil.which("zsh")  # CI(ubuntu)にはzshが無いためスキップ。macOS実機で検証する
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
 def test_install_script_dry_run_makes_no_changes(tmp_path):
     """--dry-runはplist生成内容の表示だけで、LaunchAgentsやlaunchctlに触れない。"""
     result = subprocess.run(
-        ["/bin/zsh", str(_ROOT / "scripts" / "install_launchd.sh"), "--dry-run"],
+        [_ZSH, str(_ROOT / "scripts" / "install_launchd.sh"), "--dry-run"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -198,6 +203,7 @@ def test_install_script_dry_run_makes_no_changes(tmp_path):
     assert "__FX_ROOT__" not in result.stdout
 
 
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
 def test_shell_scripts_parse(tmp_path):
     for script in (
         "install_launchd.sh",
@@ -207,7 +213,7 @@ def test_shell_scripts_parse(tmp_path):
         "fx_briefing_once.sh",
     ):
         result = subprocess.run(
-            ["/bin/zsh", "-n", str(_ROOT / "scripts" / script)],
+            [_ZSH, "-n", str(_ROOT / "scripts" / script)],
             capture_output=True,
             text=True,
             timeout=10,
