@@ -380,9 +380,7 @@ def feedback_findings(
         severity = (
             STATUS_PENDING
             if pending_cell
-            else STATUS_FAIL
-            if cell.block or cell.action == "avoid"
-            else STATUS_WARN
+            else STATUS_FAIL if cell.block or cell.action == "avoid" else STATUS_WARN
         )
         findings.append(
             {
@@ -402,9 +400,7 @@ def feedback_findings(
                 "avg_mfe_r": cell.avg_mfe_r,
                 "avg_mae_r": cell.avg_mae_r,
                 "high_severity_rate": cell.high_severity_rate,
-                "top_failure_reasons": [
-                    reason.to_dict() for reason in cell.failure_reasons[:3]
-                ],
+                "top_failure_reasons": [reason.to_dict() for reason in cell.failure_reasons[:3]],
                 "message_ja": (
                     f"{_cell_label(symbol, timeframe, direction)}: 主ホライズン未成熟のためpending"
                     if pending_cell
@@ -530,8 +526,11 @@ def _derive_cell(
         for row in rows
         if bool(row.get("tradable")) and _float(row.get("realized_r")) is not None
     ]
-    r_values = [_float(row.get("realized_r")) for row in tradable_rows]
-    r_values = [value for value in r_values if value is not None]
+    r_values = [
+        value
+        for value in (_float(row.get("realized_r")) for row in tradable_rows)
+        if value is not None
+    ]
     wins = sum(1 for value in r_values if value > 0)
     losses = sum(1 for value in r_values if value < 0)
     unscored = sum(1 for row in rows if _float(row.get("realized_r")) is None)
@@ -540,10 +539,12 @@ def _derive_cell(
         for row in rows
         if _float(row.get("realized_r")) is not None and not bool(row.get("tradable"))
     )
-    mfe_values = [_float(row.get("mfe_r")) for row in tradable_rows]
-    mae_values = [_float(row.get("mae_r")) for row in tradable_rows]
-    mfe_values = [value for value in mfe_values if value is not None]
-    mae_values = [value for value in mae_values if value is not None]
+    mfe_values = [
+        value for value in (_float(row.get("mfe_r")) for row in tradable_rows) if value is not None
+    ]
+    mae_values = [
+        value for value in (_float(row.get("mae_r")) for row in tradable_rows) if value is not None
+    ]
     sl_count = sum(1 for row in tradable_rows if row.get("first_touch") == "sl")
     tp_count = sum(1 for row in tradable_rows if row.get("first_touch") in {"tp1", "tp2"})
     reason_stats = _reason_stats(rows)
@@ -919,7 +920,7 @@ def _performance_summary(report: Mapping[str, object]) -> dict[str, object]:
 
 
 def _model_expectancy_delta(report: Mapping[str, object]) -> dict[str, object]:
-    buckets = {"baseline_model": [], "learning_model": []}
+    buckets: dict[str, list[float]] = {"baseline_model": [], "learning_model": []}
     for row in _iter_outcomes(report):
         realized = _float(row.get("realized_r"))
         if realized is None or not bool(row.get("tradable")):

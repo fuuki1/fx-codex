@@ -158,7 +158,9 @@ def _print_summary(result: Mapping[str, Any]) -> None:
         return
     summary = monitor.get("summary") if isinstance(monitor.get("summary"), Mapping) else {}
     overall = summary.get("overall") if isinstance(summary.get("overall"), Mapping) else {}
-    counts = summary.get("action_counts") if isinstance(summary.get("action_counts"), Mapping) else {}
+    counts = (
+        summary.get("action_counts") if isinstance(summary.get("action_counts"), Mapping) else {}
+    )
     price_health = (
         summary.get("price_health") if isinstance(summary.get("price_health"), Mapping) else {}
     )
