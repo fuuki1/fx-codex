@@ -26,8 +26,6 @@ from typing import Any
 import requests
 from tradingview_ta import Analysis, get_multiple_analysis
 
-import params_gate
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
 DEFAULT_INTERVALS = ["15m", "1h", "4h", "1d"]
@@ -61,25 +59,11 @@ def load_webhook_url() -> str | None:
 
 
 def load_strategy_windows() -> tuple[int, int]:
-    """params_gate を通した MA 窓を返す。不合格なら既定値(20/100)で継続する。
+    """テクニカル判定に使う MA クロスの窓（fast, slow）を返す。
 
-    ライブ戦略と同じゲートを共有し、検証されていないパラメータに基づく目線を
-    表示しないようにする。"""
-    params_path = PROJECT_ROOT / "strategy_params.json"
-    fast, slow = 20, 100
-    if not params_path.exists():
-        return fast, slow
-    params, errors = params_gate.load_validated_params(params_path)
-    if errors or params is None:
-        print(
-            "[warn] strategy_params.json が検証ゲートに不合格のため既定値"
-            f"(MA {fast}/{slow})で継続: " + "; ".join(errors),
-            file=sys.stderr,
-        )
-        return fast, slow
-    fast = int(params.get("fast_window", fast))
-    slow = int(params.get("slow_window", slow))
-    return fast, slow
+    自動売買を行わず分析通知に専念するため発注戦略パラメータは持たず、
+    保守的な固定値（MA 20/100）で目線を判定する。"""
+    return 20, 100
 
 
 def ma_cross_state(indicators: dict, fast_window: int, slow_window: int) -> tuple[str | None, str]:

@@ -11,7 +11,6 @@ import pytest
 import fx_briefing
 from fx_intel.calendar import EconomicEvent
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
-from fx_intel.signal_board import SystemStatus
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel import trade_outcome as to
 
@@ -135,6 +134,14 @@ def _run(argv, capsys, calendar_result=None):
     return rc
 
 
+def test_promote_live_flag_is_rejected_before_any_network_call(capsys) -> None:
+    with pytest.raises(SystemExit) as error:
+        fx_briefing.main(["--promote-live", "ml", "--dry-run"])
+
+    assert error.value.code == 2
+    assert "--promote-live is disabled" in capsys.readouterr().err
+
+
 def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
     rc = _run(["--per-timeframe", "--dry-run", "--no-macro", "--symbols", "USDJPY"], capsys)
     assert rc == 0
@@ -146,35 +153,24 @@ def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
 
 
 def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
-    with mock.patch(
-        "fx_intel.signal_board.probe_system_status",
-        return_value=SystemStatus(
-            False,
-            "自動執行停止：executorのハートビートを確認できません",
-            "分析は継続していますが、自動発注はできません。",
-        ),
-    ):
-        rc = _run(
-            ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
-            capsys,
-        )
+    rc = _run(
+        ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
+        capsys,
+    )
     assert rc == 0
     out = capsys.readouterr().out
     assert "FXシグナルボード" in out
-    assert "システム状態" in out
+    # 自動売買を行わないため発注経路の死活監視は表示しない
+    assert "システム状態" not in out
     assert "データ品質" in out
     assert "マクロ・センチメント概況" not in out
 
 
 def test_signal_board_records_its_own_five_minute_price_series(patched_paths, capsys) -> None:
-    with mock.patch(
-        "fx_intel.signal_board.probe_system_status",
-        return_value=SystemStatus(True, "自動執行：稼働中", "発注経路は正常です。"),
-    ):
-        rc = _run(
-            ["--signal-board", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
-            capsys,
-        )
+    rc = _run(
+        ["--signal-board", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
+        capsys,
+    )
 
     assert rc == 0
     rows = [

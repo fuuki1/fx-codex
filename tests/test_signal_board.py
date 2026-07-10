@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime, UTC
-from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
 
 from fx_intel.macro import CotReport, MacroSeries, MacroSnapshot, SeriesPoint
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.signal_board import (
     DataQuality,
-    SystemStatus,
     assess_data_quality,
     build_signal_board_payload,
-    find_trader_dir,
-    probe_system_status,
     rank_candidates,
 )
 from fx_intel.technicals import IntervalView, PairTechnicals
@@ -111,11 +105,6 @@ def test_board_matches_requested_single_message_shape() -> None:
         plans,
         analysis,
         tech_map,
-        SystemStatus(
-            False,
-            "自動執行停止：executorのハートビートを確認できません",
-            "分析は継続していますが、自動発注はできません。",
-        ),
         DataQuality("正常", "正常", "正常", "注意｜広義ドル指数の最終観測 07/02"),
         now=NOW,
     )
@@ -124,6 +113,9 @@ def test_board_matches_requested_single_message_shape() -> None:
     assert "embeds" not in payload
     content = payload["content"]
     assert "📊 FXシグナルボード｜07/10 12:10 JST" in content
+    # 自動売買は行わないため発注経路の死活監視は表示しない
+    assert "システム状態" not in content
+    assert "自動執行" not in content
     assert "新規エントリー候補：なし" in content
     assert content.index("1位 GBPUSD 4h") < content.index("2位 EURUSD 15m")
     assert content.index("2位 EURUSD 15m") < content.index("3位 USDJPY 15m")
@@ -171,41 +163,3 @@ def test_macro_staleness_is_shown_with_last_observation() -> None:
     )
     assert quality.macro == "注意｜広義ドル指数の最終観測 07/02"
     assert quality.has_warning
-
-
-def test_system_probe_marks_only_executor_stale() -> None:
-    output = "\n".join(
-        [
-            "webhook",
-            str(NOW.timestamp()),
-            "risk",
-            str(NOW.timestamp()),
-            "executor",
-            str(NOW.timestamp() - 181),
-        ]
-    )
-    with mock.patch(
-        "fx_intel.signal_board.subprocess.run",
-        return_value=SimpleNamespace(stdout=output),
-    ):
-        status = probe_system_status(Path("/tmp/trader"), now=NOW)
-    assert not status.execution_available
-    assert status.summary == "自動執行停止：executorのハートビートを確認できません"
-
-
-def test_system_probe_is_fail_safe_when_docker_is_unavailable() -> None:
-    with mock.patch(
-        "fx_intel.signal_board.subprocess.run",
-        side_effect=OSError("docker missing"),
-    ):
-        status = probe_system_status(Path("/tmp/trader"), now=NOW)
-    assert not status.execution_available
-    assert "取引基盤" in status.summary
-
-
-def test_find_trader_dir_supports_mac_mini_sibling_layout(tmp_path: Path) -> None:
-    project_root = tmp_path / "fx-codex"
-    project_root.mkdir()
-    (tmp_path / "docker-compose.yml").write_text("services: {}", encoding="utf-8")
-    with mock.patch.dict("os.environ", {}, clear=True):
-        assert find_trader_dir(project_root) == tmp_path

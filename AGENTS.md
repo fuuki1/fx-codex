@@ -6,10 +6,11 @@ Build a reproducible FX research and decision-support system. Optimize for point
 
 ## Important paths
 
-- `fx_backtester/`: research engine, labels, validation, execution, risk, governance.
+- `fx_backtester/`: research engine, labels, validation, simulated execution, risk, governance.
 - `fx_intel/`: briefing, macro/news inputs, learning, decision journals.
-- `trader/`: isolated paper execution stack and its own toolchain.
-- `tools/`, `scripts/`, `ops/`: monitoring and local launchd operations.
+- `tools/`, `scripts/`, `ops/`: monitoring and local launchd operations (analysis→Discord services).
+
+The system is **analysis-only**: it produces a Discord signal board and never sends real orders. The former `trader/` order-execution stack and the strategy-parameter optimization pipeline (`auto_optimize.py` / `promote_params.py` / `params_gate.py` / `strategy_params.json`) were removed on 2026-07-10; do not attempt to recreate or reference them.
 - `docs/`, `reports/`, `runs/`: protocols, evidence, and immutable run artifacts.
 - `.codex/skills/`: repeatable audit, validation, promotion, and incident workflows.
 
@@ -20,16 +21,7 @@ Run from the repository root:
 ```bash
 .venv/bin/ruff check .
 .venv/bin/black --check .
-.venv/bin/mypy fx_backtester fx_intel
-.venv/bin/pytest -q
-```
-
-The `trader/` stack is checked separately:
-
-```bash
-cd trader
-.venv/bin/ruff check .
-.venv/bin/mypy app
+.venv/bin/mypy fx_backtester fx_intel *.py
 .venv/bin/pytest -q
 ```
 
@@ -37,7 +29,7 @@ Dry-run the briefing with `.venv/bin/python fx_briefing.py --signal-board --dry-
 
 ## Non-negotiable safety rules
 
-- Keep `TRADING_MODE=paper` and `ALLOW_LIVE=0`. Never enable limited-live/live or mutate Mac mini processes without explicit human approval.
+- The system is analysis-only and must never place real orders. Do not add a live/broker execution path, and never mutate Mac mini processes without explicit human approval. If order execution is ever reintroduced, it must be a separate component gated behind multi-stage risk checks and explicit human sign-off.
 - Preserve dirty worktrees, user files, journals, and runtime data. Do not reset, delete, initialize, or silently rewrite them.
 - Use aware UTC internally. Record event, publication, availability, ingestion, source, revision, hash, run, and writer metadata when known. Reject ambiguous DST and future as-of matches.
 - Fit transforms, features, thresholds, models, and calibrators only inside their permitted train/tune/calibration windows. Use purging, embargo, a separate test, and a one-time lockbox. Never use random splits for temporal claims.

@@ -7,7 +7,9 @@
 - Thresholds are configurable mandate choices with a written rationale, not universal constants.
 - Prediction, outcome, evaluation and transition events are append-only and linked; original predictions are never edited.
 - Automatic retraining may create a research challenger only. It cannot promote itself or enable live.
-- This implementation permits `research → validated → shadow → paper`; `limited_live` and `live` are rejected.
+- The governance library permits adjacent records `research → validated → shadow → paper`; `limited_live` and `live` are rejected. The current repository has no broker paper stack, so this is a policy state model, not an available execution path.
+
+These are policy and library contracts, not a statement that the current model has reached any stage. There is no authoritative end-to-end promotion service yet; caller-supplied evidence must be bound to independently verified artifacts before it can support a transition.
 
 ## Registry record
 
@@ -51,4 +53,4 @@ Unmatured labels produce `human_review`, not a clean performance bill. Data drif
 
 Every transition event records UTC timestamp, model, from/to stage, actor, reason and the full gate report. Demotion records the trigger and target. Rollback restores the previous hashed artifact and paper config, then re-runs data freshness, registry integrity, dry-run prediction and reconciliation checks before resuming.
 
-No operator should use `--force` to turn warnings or incomplete evidence into a deployment approval. `promote_params.py --force` is not an institutional model-promotion path.
+No operator should turn warnings, skipped checks or incomplete evidence into a promotion approval by overriding a gate. Committee stage evaluation (`fx_intel/promotion.py`) is a legacy decision component, not an authoritative deployment approval service. There is no candidate-promotion `--force` shortcut; the former deployment path and broker execution stack were removed on 2026-07-10. The system is analysis-only, and any future rollback override must be separately scoped to restoring a previously approved paper artifact—not approving a new candidate.

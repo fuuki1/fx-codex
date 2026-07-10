@@ -1,8 +1,10 @@
 """5分ごとの単一Discord通知「FXシグナルボード」を生成する。
 
-時間足別判断から通貨ペアごとの代表候補を1件だけ選び、エントリー適性、
-システム状態、データ品質を1通のプレーンテキストへ集約する。Discordの通知を
+時間足別判断から通貨ペアごとの代表候補を1件だけ選び、エントリー適性と
+データ品質を1通のプレーンテキストへ集約する。Discordの通知を
 複数embedへ分散させず、スマートフォンでも現在の判断を一読できる形にする。
+このシステムは自動売買を行わず分析→通知に専念するため、発注経路の
+死活監視は表示しない。
 """
 
 from __future__ import annotations
@@ -10,9 +12,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, UTC
-import os
-from pathlib import Path
-import subprocess
 
 from .briefing import JST, format_price
 from .calendar import symbol_currencies
@@ -22,18 +21,7 @@ from .technicals import PairTechnicals
 from .timeframe import TimeframePlan
 
 DISCORD_CONTENT_LIMIT = 2000
-HEARTBEAT_STALE_SECONDS = 180
-CORE_EXECUTION_SERVICES = ("webhook", "risk", "executor")
 TIMEFRAME_ORDER = ("15m", "1h", "4h", "1d")
-
-
-@dataclass(frozen=True)
-class SystemStatus:
-    """ボードに表示する自動執行経路の状態。"""
-
-    execution_available: bool
-    summary: str
-    detail: str
 
 
 @dataclass(frozen=True)
@@ -65,101 +53,6 @@ class EntryAssessment:
 class RankedCandidate:
     plan: TimeframePlan
     assessment: EntryAssessment
-
-
-def find_trader_dir(project_root: Path) -> Path:
-    """開発機のサブディレクトリ構成とMac miniの兄弟構成を両方解決する。"""
-
-    override = os.environ.get("SIGNAL_BOARD_TRADER_DIR", "").strip()
-    if override:
-        return Path(override).expanduser()
-    candidates = (project_root / "trader", project_root.parent)
-    return next(
-        (candidate for candidate in candidates if (candidate / "docker-compose.yml").exists()),
-        candidates[0],
-    )
-
-
-def _parse_heartbeat_output(output: str) -> dict[str, float]:
-    """redis-cli --raw HGETALL の交互行を時刻辞書へ変換する。"""
-
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    beats: dict[str, float] = {}
-    for index in range(0, len(lines) - 1, 2):
-        try:
-            beats[lines[index]] = float(lines[index + 1])
-        except ValueError:
-            continue
-    return beats
-
-
-def probe_system_status(
-    trader_dir: Path,
-    *,
-    now: datetime | None = None,
-    timeout_seconds: float = 8.0,
-) -> SystemStatus:
-    """Docker内Redisのハートビートから自動執行経路をfail-safe判定する。
-
-    取得不能は「正常」と推測せず停止扱いにする。通知プロセス自体は分析を継続
-    できるため、その旨をdetailに明記する。
-    """
-
-    now = now or datetime.now(UTC)
-    compose_path = trader_dir / "docker-compose.yml"
-    command = [
-        "docker",
-        "compose",
-        "-f",
-        str(compose_path),
-        "exec",
-        "-T",
-        "redis",
-        "redis-cli",
-        "--raw",
-        "HGETALL",
-        "heartbeats",
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=trader_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        beats = _parse_heartbeat_output(completed.stdout)
-    except (OSError, subprocess.SubprocessError):
-        return SystemStatus(
-            execution_available=False,
-            summary="自動執行停止：取引基盤のハートビートを確認できません",
-            detail="分析は継続していますが、自動発注はできません。",
-        )
-
-    stale: list[str] = []
-    now_epoch = now.timestamp()
-    for service in CORE_EXECUTION_SERVICES:
-        timestamp = beats.get(service)
-        if timestamp is None or now_epoch - timestamp > HEARTBEAT_STALE_SECONDS:
-            stale.append(service)
-
-    if not stale:
-        return SystemStatus(
-            execution_available=True,
-            summary="自動執行：稼働中",
-            detail="webhook・risk・executorのハートビートは正常です。",
-        )
-
-    if stale == ["executor"]:
-        reason = "executorのハートビートを確認できません"
-    else:
-        reason = f"{ '・'.join(stale) }のハートビートを確認できません"
-    return SystemStatus(
-        execution_available=False,
-        summary=f"自動執行停止：{reason}",
-        detail="分析は継続していますが、自動発注はできません。",
-    )
 
 
 def assess_data_quality(
@@ -398,7 +291,6 @@ def build_signal_board_payload(
     plans_by_symbol: Mapping[str, Sequence[TimeframePlan]],
     analysis: MarketAnalysis,
     tech_map: Mapping[str, PairTechnicals],
-    system_status: SystemStatus,
     data_quality: DataQuality,
     *,
     now: datetime | None = None,
@@ -413,16 +305,11 @@ def build_signal_board_payload(
         if item.assessment.is_candidate
     ]
     candidate_text = "、".join(entry_candidates) if entry_candidates else "なし"
-    system_icon = "✅" if system_status.execution_available else "🚨"
     quality_icon = "⚠️" if data_quality.has_warning else "✅"
 
     header = "\n".join(
         [
             f"📊 FXシグナルボード｜{now.astimezone(JST):%m/%d %H:%M} JST",
-            "",
-            f"{system_icon} システム状態",
-            system_status.summary,
-            system_status.detail,
             "",
             f"{quality_icon} データ品質",
             f"テクニカル：{data_quality.technical}",

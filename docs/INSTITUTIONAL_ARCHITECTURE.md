@@ -20,30 +20,32 @@ flowchart LR
     L --> M["Champion/challenger registry\nhuman promotion/demotion"]
 ```
 
-The research path never directly enables live. `TRADING_MODE=paper`, `ALLOW_LIVE=0`, governance stage checks and the isolated `trader/` stack are independent barriers.
+The research path never enables live trading — the system performs analysis only and never sends real orders (the `trader/` execution stack was removed on 2026-07-10; see [SYSTEM_OVERVIEW](../SYSTEM_OVERVIEW.md)). Governance stage checks and the fail-closed data-quality / risk vetoes remain independent barriers, and "execution" throughout this document means the backtester's simulated fills (`fx_backtester/execution.py`), not a broker connection.
+
+This diagram is the **target control plane**, not a claim that every box is connected end to end. The table below separates implemented primitives from their current integration status. Until the missing connections are completed and independently evidenced, the repository remains research-only.
 
 ## Module ownership
 
-| Concern | Current implementation | Contract |
+| Concern | Implemented primitive | Current connection status |
 |---|---|---|
-| PIT envelope/as-of/data QA | `fx_backtester/point_in_time.py` | Aware UTC; availability precedes prediction; immutable hash; fail-closed quality report |
-| Snapshot single writer | `fx_intel/price_history.py`, `tools/run_exclusive.py` | OS advisory lock, 5-minute natural key, idempotent replay, conflicting writer rejection |
-| Freshness/gaps | `tools/data_freshness_monitor.py`, `tools/journal_gap_audit.py`, `ops/freshness_targets.json` | Source-specific age and journal evidence; nonzero failure exit |
-| Labels | `fx_backtester/labeling.py` | Next-open default; volatility barriers; stop-first ambiguity; gap stop; first-touch MFE/MAE; net R; label end |
-| Temporal validation | `fx_backtester/time_series_validation.py`, `walk_forward.py` | Label-aware purge, embargo, anchored/rolling, CPCV, non-overlapping tests, one-time lockbox |
-| Overfitting/uncertainty | `overfitting.py`, `statistical_validation.py`, `trial_log.py` | Complete trial family; aligned matrices; PBO, DSR/PSR, MTRL, block CI/permutation, Holm, stability |
-| Calibration/no-trade | `calibration.py`, `fx_intel/ml.py`, `decision_pipeline.py` | Train/tune/calibration/test/lockbox separation; Platt/isotonic/beta; uncalibrated or uncertain edge cannot pass |
-| Cost stress | `stress.py`, `execution.py`, `engine.py` | Full engine rerun at observed/1.5×/2×/3×; costs influence size, fills and exits |
-| Portfolio risk | `risk.py`, `engine.py`, `governance.py` | Total gross-notional leverage, currency exposure, loss/DD locks, non-overridable veto |
-| Registry/drift | `governance.py`, `drift.py` | Missing evidence fails; adjacent human transitions; PIT/CI/PBO/DSR/calibration/cost gates; no automatic live |
-| Reproducibility | `artifacts.py` | Commit/dirty state, input/output hashes, seed, windows, costs, environment and source ledger |
-| Paper operations | `trader/`, `scripts/`, `ops/launchd/` | Separate toolchain; one scheduled writer; freshness status; explicit host migration/rollback |
+| PIT envelope/as-of/data QA | `fx_backtester/point_in_time.py`: aware UTC, normalized legal availability, content hash and strict quality checks | **Partial.** The primary briefing/backtest loaders do not yet materialize all macro, COT, news and price inputs through this envelope; revision replay is incomplete. |
+| Snapshot single writer | `fx_intel/price_history.py`, `tools/run_exclusive.py`: OS advisory lock, 5-minute natural key, idempotent replay and conflicting-writer rejection | **Connected for price snapshots only.** Decision, timeframe and other JSONL journals do not yet share this transactional/single-writer contract. |
+| Freshness/gaps | `tools/data_freshness_monitor.py`, `tools/journal_gap_audit.py`, `fx_intel/freshness.py` | **Connected to canonical briefing when `--require-freshness` is used.** Missing, malformed, future, stale, warning or critical evidence vetoes decisions. Historical contamination still needs migration. |
+| Labels | `fx_backtester/labeling.py`: next-open, volatility barriers, stop-first ambiguity, gap stop, first-touch MFE/MAE, net R and label end | **Library only.** It is not yet the sole label path for the legacy outcome learner or briefing ML. |
+| Temporal validation | `fx_backtester/time_series_validation.py`, `walk_forward.py`: label-aware purge, embargo, anchored/rolling and CPCV | **Library only.** No promotion-grade orchestrator binds splits, all trials and artifacts; the lockbox-open marker is process-local rather than durable governance state. |
+| Overfitting/uncertainty | `overfitting.py`, `statistical_validation.py`, `trial_log.py` | **Primitive available.** PBO requires a complete aligned trial-return family; skipped/invalid evidence fails promotion, but the legacy reporting path is not authoritative. |
+| Calibration/no-trade | `calibration.py`, `fx_intel/ml.py`, `decision_pipeline.py` | **Partial.** Five temporal windows and calibration/null/AUC checks exist; production-grade uncertainty, label lineage and end-to-end evidence binding remain incomplete. |
+| Cost stress | `stress.py`, `execution.py`, `engine.py` | **Library available.** Promotion evidence must use full reruns; older post-hoc commercial sensitivity is descriptive and inadmissible for this gate. |
+| Portfolio risk | `risk.py`, `engine.py`, `governance.py` | **Connected in the backtester.** Entry and marked-to-market gross leverage, currency exposure, loss/DD locks and non-overridable vetoes are simulated; no broker connection exists. |
+| Registry/drift | `governance.py`, `drift.py` | **Library/partial integration.** Missing evidence fails and mature-label/schema checks abstain, but no durable authoritative registry service is connected end to end. |
+| Reproducibility | `artifacts.py` | **Partial.** Deterministic runs record commit/dirty state, hashes, seed, costs and environment; ML split/lockbox/trial lineage needs a dedicated manifest. |
+| Notification operations | `fx_briefing.py`, `scripts/`, `ops/launchd/` | **Prepared, not deployed by this audit.** Canonical launchd topology and freshness vetoes are encoded; the observed Mac mini state requires controlled migration. |
 
 ## Storage model
 
 Raw source records are logically immutable. A record’s descriptive time is distinct from first legal availability and actual ingestion. Corrections are new records linked by source ID/revision, not history rewrites. Derived features and labels reference content hashes and versions.
 
-JSONL remains the current vertical slice for low-volume append-only journals. It is protected by `flock`, natural keys and conflict detection. Promotion-grade scale should move to SQLite WAL or an append/event database with unique constraints and transactions; the JSONL files should then become export artifacts, not concurrent primary storage.
+JSONL remains the current vertical slice for low-volume append-only journals. **Only the price-snapshot path currently has the full `flock` + natural-key + conflict-detection contract.** Other decision/timeframe/outcome journals still use independent append paths and therefore remain a promotion blocker under concurrent writers. Promotion-grade scale should move all authoritative journals to SQLite WAL or an append/event database with unique constraints and transactions; JSONL should then become an export artifact, not a concurrent primary store.
 
 Prediction, label/outcome, order/fill and evaluation are separate event types linked by IDs. A later outcome must not mutate the original prediction.
 
@@ -51,7 +53,7 @@ Prediction, label/outcome, order/fill and evaluation are separate event types li
 
 | Problem | Option A | Option B | Selected and trade-off |
 |---|---|---|---|
-| Concurrent journals | Keep plain append and deduplicate later | OS lock + natural key now; migrate to transactional DB | **B**. It prevents new corruption immediately and preserves existing format. Reads are O(n) and legacy contamination still needs a controlled migration. |
+| Concurrent journals | Keep plain append and deduplicate later | OS lock + natural key now; migrate to transactional DB | **B as the target; partially delivered.** Price snapshots implement it. Remaining decision journals and legacy contamination require controlled migration before promotion evidence is admissible. |
 | Purging | Fixed row-count gap | Purge by each sample’s `label_end_time` plus embargo | **B**. Multi-horizon labels make row-count purges unsafe. Requires correct label-end metadata. |
 | Calibration | Fit Platt on the same validation/test used for early stopping | Separate train/tune/calibration/test/lockbox; compare Platt/isotonic/beta only on a later selection set | **B**. Removes the observed triple-use leakage. Costs samples and delays readiness. |
 | Cost stress | Subtract estimated cost from existing trades | Re-run sizing, entries, stops and exits under scaled costs | **B** for promotion evidence. Post-hoc attribution remains descriptive only. Full reruns are slower and require source bars. |

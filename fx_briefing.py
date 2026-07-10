@@ -71,7 +71,6 @@ from pathlib import Path
 
 import requests
 
-import params_gate
 from fx_intel import (
     briefing,
     calendar,
@@ -149,20 +148,32 @@ def ml_needs_retrain(
 
 
 def _realized_expectancy_r(summary: dict | None, symbol: str, direction: str) -> float | None:
-    """summarize_expectancy の結果から (symbol, direction) の実測期待Rを引く。
+    """Return promotion-grade net OOS expectancy evidence for one cell.
 
-    trade_outcome.summarize_expectancy() は by_symbol_direction に
-    "SYMBOL:direction" キーで ExpectancyStats(dict) を持つ。方向が long/short
-    以外(見送り等)や、該当セルが無い/期待R未確定なら None を返し、
-    チェックリスト側は確信度からの理論値へフォールバックする。
+    The current descriptive trade-outcome summary lacks independent-test, CI,
+    label-version, and full net-cost provenance, so its naked mean is not accepted.
+    A future producer must explicitly satisfy this typed evidence contract; absence
+    of any field returns None and the downstream checklist remains fail-closed.
     """
     if not summary or direction not in ("long", "short"):
         return None
     cell = (summary.get("by_symbol_direction") or {}).get(f"{symbol}:{direction}")
     if not isinstance(cell, dict):
         return None
+    if not (
+        cell.get("evidence_schema") == 2
+        and cell.get("sample_ok") is True
+        and cell.get("net_of_costs") is True
+        and cell.get("independent_test") is True
+        and isinstance(cell.get("label_version"), str)
+        and bool(cell.get("label_version"))
+    ):
+        return None
+    ci_lower = cell.get("expectancy_r_ci_lower")
+    if not isinstance(ci_lower, (int, float)) or isinstance(ci_lower, bool) or ci_lower <= 0:
+        return None
     value = cell.get("expectancy_r")
-    return float(value) if isinstance(value, (int, float)) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def load_webhook_url() -> str | None:
@@ -181,31 +192,15 @@ def load_webhook_url() -> str | None:
 
 
 def load_strategy_params() -> tuple[int, int, float, str | None]:
-    """strategy_params.json から (fast, slow, atr_multiple, warning) を読む。
+    """テクニカル分析用の MA 窓と ATR 倍率を返す。
 
-    params_gate を通し、来歴の無い/過剰適合の疑いがあるパラメータは採用しない。
-    ライブ戦略（trader/app/strategy.py）と同じゲートを共有し、検証されていない
-    パラメータに基づくブリーフィングを出さないようにする。ゲートに落ちた場合は
-    保守的な既定値で継続し、warning を返して通知本文にも明示する。
+    このシステムは自動売買を行わず分析→Discord通知に専念するため、
+    発注戦略の最適化パラメータ（strategy_params.json）は持たない。
+    テクニカル委員が使う MA クロスの窓と SL/TP 距離の ATR 倍率は、
+    保守的な固定値（MA 20/100・ATR×2.5）で運用する。
+    戻り値は互換のため (fast, slow, atr_multiple, warning) の4要素を保つ。
     """
-    params_path = PROJECT_ROOT / "strategy_params.json"
-    fast, slow, atr_multiple = 20, 100, briefing.DEFAULT_ATR_MULTIPLE
-    if not params_path.exists():
-        return fast, slow, atr_multiple, None
-
-    params, errors = params_gate.load_validated_params(params_path)
-    if errors or params is None:
-        warning = (
-            "strategy_params.json が検証ゲートに不合格のため既定値"
-            f"(MA {fast}/{slow}, ATR×{atr_multiple})で継続: " + "; ".join(errors)
-        )
-        print(f"[warn] {warning}", file=sys.stderr)
-        return fast, slow, atr_multiple, warning
-
-    fast = int(params.get("fast_window", fast))
-    slow = int(params.get("slow_window", slow))
-    atr_multiple = float(params.get("atr_multiple", atr_multiple))
-    return fast, slow, atr_multiple, None
+    return 20, 100, briefing.DEFAULT_ATR_MULTIPLE, None
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
@@ -770,9 +765,6 @@ def _run_per_timeframe(
             fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
     if args.signal_board:
-        system_status = signal_board.probe_system_status(
-            signal_board.find_trader_dir(PROJECT_ROOT), now=now
-        )
         data_quality = signal_board.assess_data_quality(
             plans_by_symbol,
             news_warnings=news_warnings,
@@ -784,7 +776,6 @@ def _run_per_timeframe(
             plans_by_symbol,
             analysis,
             tech_map,
-            system_status,
             data_quality,
             now=now,
         )
