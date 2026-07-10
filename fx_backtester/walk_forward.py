@@ -93,6 +93,11 @@ class WalkForwardValidator:
             raise ValueError("Not enough bars for requested walk-forward windows")
 
         step = self.config.step_bars or self.config.test_bars
+        if step < self.config.test_bars:
+            raise ValueError(
+                "step_bars must be >= test_bars; overlapping test folds are not an "
+                "independent out-of-sample evaluation"
+            )
         folds: list[WalkForwardFold] = []
         selected_test_results: list[BacktestResult] = []
         fold_number = 1
@@ -139,9 +144,9 @@ class WalkForwardValidator:
                     best_train_result = result
 
             if best_params is None or best_train_result is None:
-                best_params = combinations[0]
-                best_train_result = self.engine_factory(self.strategy_cls(**best_params)).run(
-                    train_data
+                raise ValueError(
+                    f"fold {fold_number} has no eligible parameter set with at least "
+                    f"{self.config.min_train_trades} training trades"
                 )
 
             test_result = self.engine_factory(self.strategy_cls(**best_params)).run(test_data)

@@ -41,7 +41,7 @@ monitor（死活監視・日次通知）            reconcile（起動時/定期
 ## ミッションクリティカルの要点
 - **冪等発注**: webhook で idem を Redis に記録 + executor が `processed_orders`（PK=idem）で二重発注を防止。
 - **クラッシュ復旧**: Redis Streams を成功時のみ ACK、`XAUTOCLAIM` で宙づりを回収、N 回失敗は dead-letter へ。
-- **自動 Kill switch**: 日次損失超過 / 連続発注エラーで自動 ON ＋ Discord 通知。Redis 不通時は発注停止（fail-safe）。
+- **自動 Kill switch**: 日次損失超過 / 連続発注エラーで自動 ON。Redis 不通時は発注停止（fail-safe）。異常は常にログへ残し、`DISCORD_NOTIFICATION_MODE=all` の場合だけ個別Discord通知も行う。
 - **二重ガード**: `live` でも `ALLOW_LIVE=1` が無ければ発注しない。
 - **監視**: 各サービスがハートビートを打ち、monitor が「停止」だけでなく「ハング」も検知。
 - **常時稼働**: docker `restart: always` + healthcheck + launchd watchdog（120 秒ごと）+ 日次 DB バックアップ。

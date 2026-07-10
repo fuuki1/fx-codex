@@ -491,13 +491,22 @@ class BacktestEngine:
                 row,
                 conversion_rates,
             )
+            estimated_fill_price = self.execution.fill_price(
+                order.symbol,
+                expected_price,
+                order.side,
+                row,
+            )
             units, adjusted_stop_distance, initial_risk = self.risk.position_size(
                 order.symbol,
                 equity,
-                expected_price,
+                estimated_fill_price,
                 float(order.stop_distance or 0.0),
                 extra_risk_per_unit_usd=extra_risk,
                 extra_risk_usd=self.execution.round_trip_fixed_fee_floor_usd(),
+                current_gross_notional_usd=self._gross_notional_usd(
+                    positions, last_prices, conversion_rates
+                ),
                 conversion_rates=conversion_rates,
             )
             if units <= 0 or initial_risk <= 0:
@@ -506,7 +515,7 @@ class BacktestEngine:
                 order.symbol,
                 order.side,
                 units,
-                expected_price,
+                estimated_fill_price,
                 equity,
                 positions,
                 last_prices,
@@ -780,6 +789,22 @@ class BacktestEngine:
                 conversion_rates,
             )
         return exposures
+
+    def _gross_notional_usd(
+        self,
+        positions: dict[str, Position],
+        last_prices: dict[str, float],
+        conversion_rates: dict[str, float],
+    ) -> float:
+        return sum(
+            notional_usd(
+                symbol,
+                position.units,
+                last_prices.get(symbol, position.entry_price),
+                conversion_rates,
+            )
+            for symbol, position in positions.items()
+        )
 
     def _add_currency_exposure(
         self,

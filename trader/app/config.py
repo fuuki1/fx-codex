@@ -118,6 +118,9 @@ class Settings(BaseSettings):
 
     # ---- 通知 -------------------------------------------------------------
     discord_webhook_url: str = ""
+    # signal_board: 個別アラートはログだけに残し、5分ごとのFXシグナルボードへ集約。
+    # all: 従来どおり個別アラート・日次サマリもDiscordへ送る。
+    discord_notification_mode: Literal["all", "signal_board"] = "signal_board"
     notify_throttle_sec: int = 300
 
     # ---- ログ -------------------------------------------------------------

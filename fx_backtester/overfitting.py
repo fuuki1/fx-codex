@@ -195,7 +195,8 @@ def probability_of_backtest_overfitting(
     """CSCV による PBO(Probability of Backtest Overfitting)。
 
     matrix: 時刻×試行のリターン行列(trial_log.TrialLogger.returns_matrix() の出力)。
-            欠測(NaN)は「その時点でポジション無し」として0リターン扱いにする。
+            各列は同じ評価時刻を完全に共有する必要がある。欠測を「ポジション無し」
+            と推測して0埋めすると、異なるfoldや期間の試行を混ぜるため拒否する。
 
     PBO は「ISで最良に見えた試行が、OOSでは全試行の中央値未満に沈む確率」。
     0.5 なら IS の順位に OOS 予測力が全く無い(=完全にノイズ選択)ことを意味し、
@@ -208,7 +209,12 @@ def probability_of_backtest_overfitting(
     if matrix is None or matrix.empty:
         raise ValueError("リターン行列が空")
     values = matrix.to_numpy(dtype=float)
-    values = np.where(np.isfinite(values), values, 0.0)
+    if not bool(np.isfinite(values).all()):
+        missing = int((~np.isfinite(values)).sum())
+        raise ValueError(
+            f"リターン行列に欠測または非有限値が{missing}件ある。"
+            "同一期間の完全な試行だけでPBOを計算すること"
+        )
     n_obs, n_trials = values.shape
     if n_trials < 2:
         raise ValueError(f"試行が{n_trials}件ではPBOを計算できない(2件以上必要)")

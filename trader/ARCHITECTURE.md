@@ -44,7 +44,7 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
         ▼ Stream "orders"
 ③ executor.py（Consumer Group "exec"）
   └ KillSwitch 再確認 → 本番二重ガード → 冪等claim(processed_orders) → IBKR 発注
-  └ fills 記録 → commissionReport で realized_pnl 更新 → Discord 通知
+  └ fills 記録 → commissionReport で realized_pnl 更新 → 異常ログ（任意で個別Discord通知）
   └ 起動時 reconcile（取りこぼし/未完了の検知）
 
 ⑥ monitor.py（並行）: 60秒ごとに health + ハートビート鮮度。毎朝7時(JST)に日次サマリ
@@ -56,7 +56,7 @@ TradingView アラート ─HTTPS POST→ [ngrok] ─→ ① webhook.py
 | `pool()` / `db_execute` / `db_query` | psycopg_pool による接続プール |
 | `r()` | Redis クライアント（タイムアウト・再接続付き） |
 | `log_event(kind, payload)` | events テーブルへ記録（best-effort） |
-| `notify(text, key=, throttle=)` | Discord 通知（同一 key をスロットル） |
+| `notify(text, key=, throttle=)` | 異常ログ。`all` モードのみDiscord通知（同一 key をスロットル） |
 | `kill_switch_on` / `set_kill_switch` | Kill switch（Redis 不通時は ON 扱い=fail-safe） |
 | `heartbeat` / `read_heartbeats` | サービス生存（鮮度）報告 |
 | `ensure_group` / `publish` / `consume` | Redis Streams（XAUTOCLAIM 回収・dead-letter 退避） |

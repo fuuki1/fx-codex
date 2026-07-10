@@ -1,0 +1,4 @@
+interface:
+  display_name: "FX Repository Audit"
+  short_description: "Audit FX repository operations safely"
+  default_prompt: "Use $fx-repo-audit to audit this repository and return an evidence-backed report."

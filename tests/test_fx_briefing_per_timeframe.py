@@ -11,6 +11,7 @@ import pytest
 import fx_briefing
 from fx_intel.calendar import EconomicEvent
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
+from fx_intel.signal_board import SystemStatus
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel import trade_outcome as to
 
@@ -142,6 +143,47 @@ def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
     # embed JSON に4時間足のフィールドが出る
     assert "15分足" in out and "日足" in out
     assert "主ホライズン15分後" in out
+
+
+def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
+    with mock.patch(
+        "fx_intel.signal_board.probe_system_status",
+        return_value=SystemStatus(
+            False,
+            "自動執行停止：executorのハートビートを確認できません",
+            "分析は継続していますが、自動発注はできません。",
+        ),
+    ):
+        rc = _run(
+            ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+        )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FXシグナルボード" in out
+    assert "システム状態" in out
+    assert "データ品質" in out
+    assert "マクロ・センチメント概況" not in out
+
+
+def test_signal_board_records_its_own_five_minute_price_series(patched_paths, capsys) -> None:
+    with mock.patch(
+        "fx_intel.signal_board.probe_system_status",
+        return_value=SystemStatus(True, "自動執行：稼働中", "発注経路は正常です。"),
+    ):
+        rc = _run(
+            ["--signal-board", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+        )
+
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in fx_briefing.DEFAULT_TF_PRICES_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["timeframe"] for row in rows} == {"15m", "1h", "4h", "1d"}
+    assert all("direction" not in row for row in rows)
 
 
 def test_per_timeframe_dry_run_does_not_write_journal(patched_paths, capsys) -> None:

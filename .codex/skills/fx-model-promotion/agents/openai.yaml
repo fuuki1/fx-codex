@@ -1,0 +1,4 @@
+interface:
+  display_name: "FX Model Promotion"
+  short_description: "Evaluate fail-closed FX model promotion"
+  default_prompt: "Use $fx-model-promotion to evaluate this candidate with fail-closed promotion gates."

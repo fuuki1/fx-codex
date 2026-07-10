@@ -271,6 +271,8 @@ def build_trade_plan(
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
     tech_weight: float = TECH_WEIGHT,
     news_weight: float = NEWS_WEIGHT,
     conviction_factor: float = 1.0,
@@ -285,6 +287,9 @@ def build_trade_plan(
 
     calendar_ok=False は経済指標カレンダーが取得できず、イベントリスクを
     確認できていない状態。警戒窓判定が機能しないため確信度に上限を掛ける。
+
+    operational_data_ok=False は独立鮮度モニターの欠落・stale・warning・critical
+    を表し、方向スコアに関係なく新規リスクを neutral へ落とす。
 
     now がFX市場の休場中(週末クローズ)の場合、テクニカルの価格は最終取引
     時点のstale値なので、方向判断を出さず direction="closed" に固定する。
@@ -400,6 +405,11 @@ def build_trade_plan(
             f"確信度を{CALENDAR_UNKNOWN_CONVICTION_CAP}以下に制限"
         )
         conviction = min(conviction, CALENDAR_UNKNOWN_CONVICTION_CAP)
+    if not operational_data_ok:
+        warnings.append(
+            "⛔ 運用データ鮮度ゲート: "
+            + (operational_data_reason or "正常性を証明できないため新規判断を停止")
+        )
 
     conflict = (
         tech_score * news_score < 0 and min(abs(tech_score), abs(news_score)) >= CONFLICT_THRESHOLD
@@ -411,7 +421,10 @@ def build_trade_plan(
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if not is_market_open(now):
+    if not operational_data_ok:
+        direction = "neutral"
+        conviction = 0
+    elif not is_market_open(now):
         direction = "closed"
         conviction = 0
         warnings.append(
@@ -574,7 +587,10 @@ def _checklist_field(plan: TradePlan) -> dict | None:
     末尾にまとめて添える。
     """
     checklist = plan.checklist or {}
-    steps = checklist.get("steps") or []
+    raw_steps = checklist.get("steps")
+    if not isinstance(raw_steps, Sequence) or isinstance(raw_steps, str | bytes):
+        return None
+    steps = [step for step in raw_steps if isinstance(step, Mapping)]
     if not steps:
         return None
     lines = []

@@ -126,6 +126,23 @@ def test_weekend_forces_closed_on_every_timeframe() -> None:
     assert all(p.conviction == 0 for p in plans)
 
 
+def test_operational_freshness_veto_forces_every_timeframe_neutral() -> None:
+    plans = build_timeframe_plans(
+        "USDJPY",
+        _all_up_tech(),
+        {},
+        [],
+        [],
+        now=OPEN_NOW,
+        operational_data_ok=False,
+        operational_data_reason="price writer stale",
+    )
+
+    assert all(plan.direction == "neutral" for plan in plans)
+    assert all(plan.conviction == 0 for plan in plans)
+    assert all(any("price writer stale" in warning for warning in plan.warnings) for plan in plans)
+
+
 def test_missing_timeframe_is_neutral_not_crash() -> None:
     tech = PairTechnicals(symbol="USDJPY")  # views 空 = 全時間足取得失敗
     plan = build_timeframe_plan("USDJPY", "1h", tech, {}, [], [], now=OPEN_NOW)

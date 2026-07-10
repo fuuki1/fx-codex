@@ -11,8 +11,7 @@ mkdir -p logs
 while true; do
   .venv/bin/python fx_tf_snapshot.py >> logs/fx_tf_snapshot.log 2>&1
   now=$(date +%s)
-  # 次の5分境界(00/05/10…分)へ寄せる。毎時:10の回は判断ループ(fx_briefing_loop.sh)と
-  # 重なるが、こちらは価格取得のみの軽い処理なので同時に走っても実害はない。
+  # 次の5分境界(00/05/10…分)へ寄せる。別のprice writerとの併走は禁止。
   next=$(( (now / 300 + 1) * 300 ))
   sleep $(( next - now ))
 done

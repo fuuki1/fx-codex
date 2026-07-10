@@ -25,7 +25,7 @@ make kill-status
 
 ## 3. 監視とアラート
 - `monitor` が 60 秒ごとに webhook `/health` / DB / Redis / 各サービスのハートビート鮮度を確認。
-- 異常は Discord へ通知（`common.notify` が同一内容を `NOTIFY_THROTTLE_SEC` 秒抑制してアラート嵐を防ぐ）。
+- 異常は常にログへ記録する。既定の `DISCORD_NOTIFICATION_MODE=signal_board` では個別送信せず5分ボードへ集約し、`all` の場合だけ `common.notify` がDiscordへ送る。
 - 毎朝 7 時（JST）に日次サマリ（約定件数 / 実現損益 / Kill switch / モード）。
 - launchd `com.trader.supervisor`（120 秒ごと）が compose を up に保ち、unhealthy/exited を自動再起動。
 
@@ -66,7 +66,7 @@ make ps
 **各段階で中止条件を決め、満たさなければ前段に戻る。**
 
 1. **paper で安定運用**（IB Gateway 4002, `TRADING_MODE=paper`）
-   - [ ] 監視・Discord 通知・日次サマリが届く
+   - [ ] 5分ごとのFXシグナルボードにシステム状態が反映される
    - [ ] webhook→risk→executor→fills まで events に相関 ID（idem）で追える
    - [ ] Kill switch（手動・日次損失自動・連続エラー自動）が効く
    - [ ] 障害注入（redis/executor 停止→復旧、reconcile 差異検知、watchdog 再起動）を確認

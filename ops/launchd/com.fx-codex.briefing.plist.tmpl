@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.briefing</string>
+  <!-- 毎時:10に融合+時間足別の2モードを順番に1回実行(scripts/fx_briefing_once.sh)。
+       旧com.fx-codex.briefing.hourly(per-timeframeのみ)を置き換える。
+       RunAtLoadは付けない: インストール直後の余計なジャーナル行を作らない。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string><string>fx-briefing</string>
+    <string>--locks-dir</string><string>__FX_ROOT__/logs/locks</string>
+    <string>--</string>
+    <string>/bin/zsh</string>
+    <string>__FX_ROOT__/scripts/fx_briefing_once.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Minute</key><integer>10</integer>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/briefing.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/briefing.err.log</string>
+</dict>
+</plist>
+

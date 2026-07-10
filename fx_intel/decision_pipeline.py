@@ -102,6 +102,8 @@ class DecisionChecklist:
     net_expected_r: float | None = None  # スプレッド+スリッページ控除後
     execution_cost_r: float | None = None  # 控除したコスト(R換算)
     position_units: float | None = None  # ポジションサイズ(通貨単位/ロット)
+    expectancy_source: str = ""
+    probability_calibrated: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -123,6 +125,8 @@ class DecisionChecklist:
             "net_expected_r": self.net_expected_r,
             "execution_cost_r": self.execution_cost_r,
             "position_units": self.position_units,
+            "expectancy_source": self.expectancy_source,
+            "probability_calibrated": self.probability_calibrated,
             "steps": [step.to_dict() for step in self.steps],
         }
 
@@ -199,6 +203,9 @@ def build_checklist(
     account_balance: float | None = None,
     slippage_spreads: float = DEFAULT_SLIPPAGE_SPREADS,
     realized_expectancy_r: float | None = None,
+    calibrated_win_probability: float | None = None,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
 ) -> DecisionChecklist:
     """完成した TradePlan を 9ステップのチェックリストへ写像する。
 
@@ -371,7 +378,18 @@ def build_checklist(
         (w for w in plan.warnings if "イベント" in w or "カレンダー" in w),
         "",
     )
-    if plan.direction == "standby":
+    if not operational_data_ok:
+        steps.append(
+            CheckStep(
+                6,
+                "event",
+                "ニュース・金利・イベント確認",
+                "block",
+                "運用データ鮮度ゲート: "
+                + (operational_data_reason or "正常性を証明できず新規リスク停止"),
+            )
+        )
+    elif plan.direction == "standby":
         steps.append(
             CheckStep(
                 6,
@@ -399,13 +417,27 @@ def build_checklist(
     if realized_expectancy_r is not None:
         expected_r = round(realized_expectancy_r, 3)
         exp_src = "実測(TP/SL履歴)"
+        expectancy_valid = True
+    elif calibrated_win_probability is not None and directional:
+        if not 0.0 <= calibrated_win_probability <= 1.0:
+            raise ValueError("calibrated_win_probability must be in [0, 1]")
+        expected_r = round(
+            calibrated_win_probability * target1_r - (1.0 - calibrated_win_probability),
+            3,
+        )
+        exp_src = "分離期間で較正済み確率"
+        expectancy_valid = True
+        checklist.probability_calibrated = True
     elif directional:
         expected_r = estimate_expected_r(plan.direction, plan.conviction, target1_r)
-        exp_src = "確信度からの理論値"
+        exp_src = "未較正の確信度ヒューリスティック(参考値)"
+        expectancy_valid = False
     else:
         expected_r = None
         exp_src = ""
+        expectancy_valid = False
     checklist.expected_r = expected_r
+    checklist.expectancy_source = exp_src
     if not directional:
         steps.append(
             CheckStep(
@@ -414,6 +446,16 @@ def build_checklist(
         )
     elif expected_r is None:
         steps.append(CheckStep(7, "expectancy", "期待値計算", "warn", "期待値を算出できず"))
+    elif not expectancy_valid:
+        steps.append(
+            CheckStep(
+                7,
+                "expectancy",
+                "期待値計算",
+                "block",
+                f"期待{expected_r:+.2f}R({exp_src}) — 未較正値を発注ゲートへ使用不可",
+            )
+        )
     elif expected_r <= 0:
         steps.append(
             CheckStep(
@@ -439,14 +481,14 @@ def build_checklist(
             )
         )
     elif cost_r is None:
-        checklist.net_expected_r = expected_r
+        checklist.net_expected_r = None
         steps.append(
             CheckStep(
                 8,
                 "execution_cost",
                 "執行コスト控除",
-                "warn",
-                "スプレッド/SL距離不明でコストを控除できず(粗い期待値のまま)",
+                "block",
+                "スプレッド/SL距離不明でコストを控除できないため発注不可",
             )
         )
     else:
@@ -532,9 +574,12 @@ def run_pipeline(
     account_balance: float | None = None,
     slippage_spreads: float = DEFAULT_SLIPPAGE_SPREADS,
     realized_expectancy_r: float | None = None,
+    calibrated_win_probability: float | None = None,
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
     extra_components: Sequence[ScoreComponent] = (),
     expectancy_adjuster: Callable[[str, str, int], tuple[float, str, bool]] | None = None,
     target_r_adjuster: TargetRAdjuster | None = None,
@@ -555,6 +600,8 @@ def run_pipeline(
         atr_multiple=atr_multiple,
         risk_pct=risk_pct,
         calendar_ok=calendar_ok,
+        operational_data_ok=operational_data_ok,
+        operational_data_reason=operational_data_reason,
         extra_components=extra_components,
         expectancy_adjuster=expectancy_adjuster,
         target_r_adjuster=target_r_adjuster,
@@ -567,6 +614,9 @@ def run_pipeline(
         account_balance=account_balance,
         slippage_spreads=slippage_spreads,
         realized_expectancy_r=realized_expectancy_r,
+        calibrated_win_probability=calibrated_win_probability,
+        operational_data_ok=operational_data_ok,
+        operational_data_reason=operational_data_reason,
     )
     return plan, checklist
 

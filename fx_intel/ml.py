@@ -45,7 +45,7 @@ from .gbm import (
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 方向依存(判断方向の符号を掛ける)特徴量と方向非依存の特徴量
 FEATURE_NAMES: tuple[str, ...] = (
@@ -65,9 +65,13 @@ FEATURE_NAMES: tuple[str, ...] = (
 MIN_TRAIN_ROWS = 150  # 間引き後の採点済みサンプルがこれ未満なら学習しない
 MIN_CLASS_ROWS = 30  # hit/missの各クラスの最低数
 THIN_MIN_GAP_HOURS = 4.0  # 同一ペアの学習サンプル間の最低間隔
-VALID_FRACTION = 0.2  # 末尾20%を検証に使う(時系列順)
 EMBARGO_HOURS = 72.0  # 学習/検証境界の除外幅(評価ホライズン24h+週末+余裕)
-MIN_VALID_ROWS = 30
+TRAIN_FRACTION = 0.50
+TUNE_FRACTION = 0.15
+CALIBRATION_FRACTION = 0.10
+TEST_FRACTION = 0.15
+LOCKBOX_FRACTION = 0.10
+MIN_PARTITION_ROWS = 30
 # スキルゲート: 検証Brierが基準率予測をこの相対割合以上改善しないと使わない。
 # 数値誤差やノイズへの過学習でわずかに勝っただけのモデルを弾く安全マージン。
 # ミッションクリティカル用途では「勝ったかもしれない」を「有効」と扱わない
@@ -203,6 +207,12 @@ class MLArtifact:
     trained_at: str = ""
     n_train: int = 0
     n_valid: int = 0
+    n_tune: int = 0
+    n_calibration: int = 0
+    n_test: int = 0
+    n_lockbox: int = 0
+    lockbox_evaluated: bool = False
+    partition_windows: dict[str, dict[str, object]] = field(default_factory=dict)
     base_rate: float = 0.5
     medians: dict[str, float] = field(default_factory=dict)
     val_logloss: float | None = None
@@ -249,7 +259,8 @@ class MLArtifact:
             return "MLモデル未学習"
         status = "有効" if self.usable else "無効(スキルゲート不合格)"
         parts = [
-            f"MLモデル[{status}] 学習{self.n_train}件/検証{self.n_valid}件",
+            f"MLモデル[{status}] 学習{self.n_train}件/調整{self.n_tune}件/"
+            f"較正{self.n_calibration}件/test{self.n_test}件/lockbox保留{self.n_lockbox}件",
         ]
         if self.val_brier is not None and self.baseline_brier is not None:
             parts.append(f"Brier {self.val_brier:.3f}(基準率予測 {self.baseline_brier:.3f})")
@@ -285,57 +296,73 @@ def train_artifact(
         )
         return artifact
 
-    # 時系列分割: 末尾を検証にし、境界のエンバーゴで評価窓のリークを防ぐ
+    # train/tune/calibration/test/lockbox を完全分離する。同時刻の複数ペアは
+    # 同じpartitionへ置き、各境界の学習側末尾を72時間embargoする。
     order = sorted(range(len(rows)), key=lambda i: stamps[i])
     rows = [rows[i] for i in order]
     labels = [labels[i] for i in order]
     stamps = [stamps[i] for i in order]
-    split = max(1, int(len(rows) * (1.0 - VALID_FRACTION)))
-    valid_start_ts = stamps[split]
-    embargo_cut = valid_start_ts - timedelta(hours=EMBARGO_HOURS)
-    train_idx = [i for i in range(split) if stamps[i] < embargo_cut]
-    valid_idx = list(range(split, len(rows)))
-    if len(valid_idx) < MIN_VALID_ROWS:
-        artifact.reasons.append(f"検証サンプル不足({len(valid_idx)}件 < {MIN_VALID_ROWS}件)")
-        return artifact
-    if len(train_idx) < min_train_rows // 2:
-        artifact.reasons.append(f"エンバーゴ適用後の学習サンプル不足({len(train_idx)}件)")
-        return artifact
+    partitions = _temporal_partitions(stamps)
+    for name in ("train", "tune", "calibration", "test", "lockbox"):
+        if len(partitions[name]) < MIN_PARTITION_ROWS:
+            artifact.reasons.append(
+                f"{name}サンプル不足({len(partitions[name])}件 < {MIN_PARTITION_ROWS}件)"
+            )
+            return artifact
+        if len({labels[index] for index in partitions[name]}) < 2:
+            artifact.reasons.append(f"{name}セットが単一クラス")
+            return artifact
+
+    train_idx = partitions["train"]
+    tune_idx = partitions["tune"]
+    calibration_idx = partitions["calibration"]
+    test_idx = partitions["test"]
+    lockbox_idx = partitions["lockbox"]
 
     medians = compute_medians([rows[i] for i in train_idx])
     x_train = [vectorize(rows[i], medians) for i in train_idx]
     y_train = [labels[i] for i in train_idx]
-    x_valid = [vectorize(rows[i], medians) for i in valid_idx]
-    y_valid = [labels[i] for i in valid_idx]
-    if len(set(y_train)) < 2 or len(set(y_valid)) < 2:
-        artifact.reasons.append("学習または検証セットが単一クラス")
-        return artifact
+    x_tune = [vectorize(rows[i], medians) for i in tune_idx]
+    y_tune = [labels[i] for i in tune_idx]
+    x_calibration = [vectorize(rows[i], medians) for i in calibration_idx]
+    y_calibration = [labels[i] for i in calibration_idx]
+    x_test = [vectorize(rows[i], medians) for i in test_idx]
+    y_test = [labels[i] for i in test_idx]
 
     model = GradientBoostingClassifier(seed=seed)
-    model.fit(x_train, y_train, x_valid, y_valid)
+    model.fit(x_train, y_train, x_tune, y_tune)
 
-    margins = [model.predict_margin(row) for row in x_valid]
-    calibration = platt_calibrate(margins, y_valid)
-    probs = [calibration.apply(m) for m in margins]
+    calibration_margins = [model.predict_margin(row) for row in x_calibration]
+    calibration = platt_calibrate(calibration_margins, y_calibration)
+    test_margins = [model.predict_margin(row) for row in x_test]
+    probs = [calibration.apply(margin) for margin in test_margins]
     base_rate = sum(y_train) / len(y_train)
-    baseline = [base_rate] * len(y_valid)
+    baseline = [base_rate] * len(y_test)
 
     artifact.n_train = len(x_train)
-    artifact.n_valid = len(x_valid)
+    artifact.n_valid = len(x_test)  # schema-1 reader/display compatibility
+    artifact.n_tune = len(x_tune)
+    artifact.n_calibration = len(x_calibration)
+    artifact.n_test = len(x_test)
+    artifact.n_lockbox = len(lockbox_idx)
+    artifact.lockbox_evaluated = False
+    artifact.partition_windows = {
+        name: _partition_window(stamps, indices) for name, indices in partitions.items()
+    }
     artifact.base_rate = round(base_rate, 4)
     artifact.medians = medians
     artifact.model = model
     artifact.calibration = calibration
-    artifact.val_logloss = round(log_loss(y_valid, probs), 6)
-    artifact.baseline_logloss = round(log_loss(y_valid, baseline), 6)
-    artifact.val_brier = round(brier_score(y_valid, probs), 6)
-    artifact.baseline_brier = round(brier_score(y_valid, baseline), 6)
+    artifact.val_logloss = round(log_loss(y_test, probs), 6)
+    artifact.baseline_logloss = round(log_loss(y_test, baseline), 6)
+    artifact.val_brier = round(brier_score(y_test, probs), 6)
+    artifact.baseline_brier = round(brier_score(y_test, baseline), 6)
     artifact.importance_by_name = {
         FEATURE_NAMES[index]: round(gain, 4)
         for index, gain in sorted(model.feature_importance_.items(), key=lambda kv: -kv[1])
     }
 
-    # スキルゲート: 基準率予測をBrier/loglossの両方で、かつ有意なマージンで
+    # testスキルゲート: 基準率予測をBrier/loglossの両方で、かつ有意なマージンで
     # 上回るモデルだけを usable にする。誤差レベルの改善は「勝った」扱いしない
     brier_gain = (artifact.baseline_brier - artifact.val_brier) / artifact.baseline_brier
     logloss_better = artifact.val_logloss < artifact.baseline_logloss
@@ -351,6 +378,41 @@ def train_artifact(
     return artifact
 
 
+def _temporal_partitions(stamps: Sequence[datetime]) -> dict[str, list[int]]:
+    fractions = (
+        TRAIN_FRACTION,
+        TRAIN_FRACTION + TUNE_FRACTION,
+        TRAIN_FRACTION + TUNE_FRACTION + CALIBRATION_FRACTION,
+        TRAIN_FRACTION + TUNE_FRACTION + CALIBRATION_FRACTION + TEST_FRACTION,
+    )
+    boundaries = [0]
+    for fraction in fractions:
+        boundary = min(len(stamps) - 1, max(1, int(len(stamps) * fraction)))
+        while boundary < len(stamps) and stamps[boundary] == stamps[boundary - 1]:
+            boundary += 1
+        boundaries.append(boundary)
+    boundaries.append(len(stamps))
+    names = ("train", "tune", "calibration", "test", "lockbox")
+    partitions: dict[str, list[int]] = {}
+    embargo = timedelta(hours=EMBARGO_HOURS)
+    for offset, name in enumerate(names):
+        start, stop = boundaries[offset], boundaries[offset + 1]
+        indices = list(range(start, stop))
+        if name != "lockbox":
+            next_start = stamps[stop]
+            indices = [index for index in indices if stamps[index] < next_start - embargo]
+        partitions[name] = indices
+    return partitions
+
+
+def _partition_window(stamps: Sequence[datetime], indices: Sequence[int]) -> dict[str, object]:
+    return {
+        "rows": len(indices),
+        "start": stamps[indices[0]].isoformat(),
+        "end": stamps[indices[-1]].isoformat(),
+    }
+
+
 # ---------------------------------------------------------------- 保存/読込
 
 
@@ -360,6 +422,12 @@ def save_artifact(artifact: MLArtifact, path: str | Path) -> None:
         "trained_at": artifact.trained_at,
         "n_train": artifact.n_train,
         "n_valid": artifact.n_valid,
+        "n_tune": artifact.n_tune,
+        "n_calibration": artifact.n_calibration,
+        "n_test": artifact.n_test,
+        "n_lockbox": artifact.n_lockbox,
+        "lockbox_evaluated": artifact.lockbox_evaluated,
+        "partition_windows": artifact.partition_windows,
         "base_rate": artifact.base_rate,
         "feature_names": list(FEATURE_NAMES),
         "medians": artifact.medians,
@@ -402,6 +470,15 @@ def load_artifact(path: str | Path) -> MLArtifact:
             trained_at=str(payload.get("trained_at", "")),
             n_train=int(payload.get("n_train", 0)),
             n_valid=int(payload.get("n_valid", 0)),
+            n_tune=int(payload.get("n_tune", 0)),
+            n_calibration=int(payload.get("n_calibration", 0)),
+            n_test=int(payload.get("n_test", 0)),
+            n_lockbox=int(payload.get("n_lockbox", 0)),
+            lockbox_evaluated=bool(payload.get("lockbox_evaluated", False)),
+            partition_windows={
+                str(name): dict(window)
+                for name, window in dict(payload.get("partition_windows", {})).items()
+            },
             base_rate=float(payload.get("base_rate", 0.5)),
             medians={str(k): float(v) for k, v in dict(payload.get("medians", {})).items()},
             val_logloss=_maybe_float(metrics.get("val_logloss")),

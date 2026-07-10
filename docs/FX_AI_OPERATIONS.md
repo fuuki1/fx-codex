@@ -8,8 +8,7 @@
 cd /Users/takahashifuuki/Desktop/fx-codex
 
 ps -axo pid=,command= | rg 'fx_briefing_loop|fx_tf_snapshot_loop|ai_learning_dashboard'
-tail -n 80 logs/fx_briefing.log
-tail -n 80 logs/fx_briefing_tf.log
+tail -n 80 logs/fx_signal_board.log
 tail -n 80 logs/fx_tf_snapshot.log
 tail -n 5 logs/briefing_tf_prices.jsonl
 ```
@@ -48,7 +47,7 @@ python3 tools/decision_expectancy_monitor.py --price-stale-minutes none  # stale
 
 ## 3. 復旧手順
 
-価格スナップショットが止まっている場合:
+シグナルボードを止めたまま価格スナップショットだけ継続する場合:
 
 ```bash
 cd /Users/takahashifuuki/Desktop/fx-codex
@@ -61,6 +60,13 @@ Discord配信込みのブリーフィングループが必要な場合:
 ```bash
 ./fx_briefing_loop.sh >> logs/fx_briefing_supervisor.log 2>&1 &
 ```
+
+このループは5分ごとにFXシグナルボードを1通だけ送ります。旧ループが残っている環境では
+`tv_notify_loop.sh` と旧版 `fx_briefing_loop.sh` のプロセスを停止してから、新版を1つだけ
+起動してください。取引スタックの `.env` は
+`DISCORD_NOTIFICATION_MODE=signal_board`（未指定時も既定値は同じ）にします。
+シグナルボード自身が `logs/briefing_tf_prices.jsonl` も更新するため、通常は
+`fx_tf_snapshot_loop.sh` を同時起動する必要はありません。
 
 復旧後に学習・監視ファイルを更新します。
 

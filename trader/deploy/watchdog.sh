@@ -2,13 +2,14 @@
 # Mac mini 常駐ウォッチドッグ。launchd から 120 秒ごとに起動される（短命プロセス）。
 #  - Docker が動いていなければ起動を促す
 #  - `docker compose up -d` で全サービスを冪等に起動
-#  - unhealthy / exited を検出したら再起動し Discord 通知
+#  - unhealthy / exited を検出したら再起動し、allモードだけDiscord通知
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1   # -> trader/
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
 notify() {
+  [ "${DISCORD_NOTIFICATION_MODE:-signal_board}" = "all" ] || return 0
   [ -n "${DISCORD_WEBHOOK_URL:-}" ] || return 0
   local payload
   payload=$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$1")

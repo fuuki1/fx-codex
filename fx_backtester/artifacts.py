@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -55,9 +57,16 @@ def write_backtest_run_artifacts(
     qa_report = validate_price_data(data, qa_config)
     qa_report.to_csv(qa_path, index=False)
 
+    created_at = datetime.now(UTC)
+    repository_root = Path(__file__).resolve().parents[1]
+    source_ledger = repository_root / "docs" / "research" / "SOURCE_LEDGER.md"
+    data_start = min(frame.index.min() for frame in data.values()) if data else None
+    data_end = max(frame.index.max() for frame in data.values()) if data else None
     manifest = {
-        "schema_version": 1,
-        "created_at_utc": datetime.now(UTC).isoformat(),
+        "schema_version": 2,
+        "experiment_id": f"{destination.name}-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}",
+        "created_at_utc": created_at.isoformat(),
+        "git": _git_provenance(repository_root),
         "package": {
             "name": "fx_backtester",
             "version": fx_backtester.__version__,
@@ -71,9 +80,31 @@ def write_backtest_run_artifacts(
             "name": strategy_name,
             "params": strategy_params,
         },
+        "random_seed": _find_seed(strategy_params),
+        "versions": {
+            "dataset": [_file_fingerprint(path) for path in data_paths],
+            "features": "strategy-defined; no standalone feature artifact",
+            "labels": "trade-log-v1",
+            "model": strategy_name,
+        },
+        "windows": {
+            "data_start": _json_timestamp(data_start),
+            "data_end": _json_timestamp(data_end),
+            "train": None,
+            "tune": None,
+            "calibration": None,
+            "test": None,
+            "lockbox": None,
+            "note": "Deterministic backtest run; ML promotion requires a separate five-way manifest.",
+        },
+        "cost_assumptions": _to_jsonable(config.execution),
         "inputs": {
             "data": [_file_fingerprint(path) for path in data_paths],
             "events": _file_fingerprint(events_path) if events_path else None,
+            "dependency_definition": _file_fingerprint(str(repository_root / "pyproject.toml")),
+            "source_ledger": (
+                _file_fingerprint(str(source_ledger)) if source_ledger.exists() else None
+            ),
         },
         "outputs": {
             "trade_log": str(trade_log_path),
@@ -81,6 +112,13 @@ def write_backtest_run_artifacts(
             "metrics": str(metrics_path),
             "config": str(config_path),
             "data_qa": str(qa_path),
+        },
+        "output_fingerprints": {
+            "trade_log": _file_fingerprint(str(trade_log_path)),
+            "equity_curve": _file_fingerprint(str(equity_path)),
+            "metrics": _file_fingerprint(str(metrics_path)),
+            "config": _file_fingerprint(str(config_path)),
+            "data_qa": _file_fingerprint(str(qa_path)),
         },
         "quality_gates": {
             "qa_passed": bool(qa_report["passed"].all()) if not qa_report.empty else False,
@@ -196,3 +234,47 @@ def _json_safe(values: dict[str, Any]) -> dict[str, Any]:
         else:
             output[key] = value
     return output
+
+
+def _git_provenance(repository_root: Path) -> dict[str, Any]:
+    try:
+        commit = _git_output(repository_root, "rev-parse", "HEAD")
+        branch = _git_output(repository_root, "branch", "--show-current")
+        status = _git_output(repository_root, "status", "--porcelain")
+    except (OSError, subprocess.CalledProcessError) as error:
+        return {"available": False, "error": str(error)}
+    return {
+        "available": True,
+        "commit": commit,
+        "branch": branch,
+        "dirty_worktree": bool(status),
+        "status_porcelain": status.splitlines(),
+    }
+
+
+def _git_output(repository_root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", *arguments],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _find_seed(values: Mapping[str, Any]) -> int | None:
+    for key, value in values.items():
+        if "seed" in str(key).lower() and isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, Mapping):
+            nested = _find_seed(value)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _json_timestamp(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).isoformat()

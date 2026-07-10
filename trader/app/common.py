@@ -123,14 +123,17 @@ def log_event(kind: str, payload: dict[str, Any]) -> None:
 
 
 # ============================================================================
-# 通知（Discord）— スロットル付き
+# 通知イベント（ログ＋任意のDiscord）— スロットル付き
 # ============================================================================
 def notify(text: str, *, key: str | None = None, throttle: bool = True) -> None:
-    """Discord へ通知。同一 key（無ければ本文）は notify_throttle_sec 内は再送しない。
+    """常にログへ記録し、allモードではDiscordへも通知する。
 
-    アラート嵐（同じ障害で毎秒通知）を防ぐのが目的。通知の成否に関わらず必ずログは残す。
+    同一 key（無ければ本文）はnotify_throttle_sec内の再送を抑止する。
     """
     log.warning("NOTIFY: %s", text, **log_extra(notify_key=key))
+    if settings.discord_notification_mode == "signal_board":
+        log.info("discord notification suppressed by signal_board mode")
+        return
     url = settings.discord_webhook_url
     if not url:
         return

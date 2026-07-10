@@ -2,9 +2,9 @@
 
 時間足別モード(fx_briefing.py --per-timeframe)の自己採点は、各判断を
 「記録時刻 + その足の主ホライズン」時点の実勢価格と突き合わせる。将来価格は
-ジャーナルの後続エントリ(源A)から取るが、判断ジャーナルは毎時しか追記されない
-ため、短い足(特に 15m: 主ホライズン15分)は採点窓[9,21分]に入る点が
-永久に得られず、学習が回らない。
+ジャーナルの後続エントリ(源A)から取る。通常のFXシグナルボード運用では判断と価格が
+5分ごとに記録されるためこの補助スクリプトは不要だが、Discord通知を止めたまま
+学習用価格だけを継続収集したい場合に使う。
 
 このスクリプトは判断・Discord通知とは切り離し、TradingView から各時間足の
 現在価格スナップショットを5分ごとに取得して専用の価格系列
@@ -34,7 +34,7 @@ from pathlib import Path
 from fx_intel import price_history, technicals
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_SYMBOLS = ["USDJPY", "EURUSD"]
+DEFAULT_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY"]
 # fx_briefing._run_per_timeframe が採点入力に結合する価格専用系列。
 # 判断ジャーナル(briefing_tf_journal.jsonl)とは別ファイルにして、
 # 価格行(direction 無し)が判断行と混ざらないようにする。
@@ -66,11 +66,7 @@ def collect_price_snapshots(
 
 def append_snapshot(path: str | Path, rows: list[dict]) -> None:
     """価格スナップショット行を JSONL へ追記する(1点1行、price_history が読める形)。"""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    price_history.append_snapshot_entries(path, rows)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,13 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
-    now = datetime.now(UTC)
-
     tech_map, warnings = technicals.fetch_pair_technicals(symbols)
     for warning in warnings:
         print(f"[warn] {warning}", file=sys.stderr)
 
     snapshots_by_interval = collect_price_snapshots(tech_map)
+    # Acquisition completion is the earliest instant this process can use the
+    # snapshot. Timestamping before the network call would create false PIT history.
+    now = datetime.now(UTC)
     rows = price_history.snapshot_entries(snapshots_by_interval, now=now)
     if not rows:
         # 全時間足の取得に失敗しても異常終了しない(ループを止めないため)

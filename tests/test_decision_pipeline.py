@@ -128,6 +128,7 @@ def test_clean_long_passes_all_nine_steps() -> None:
         [],
         now=OPEN,
         account_balance=1_000_000,
+        calibrated_win_probability=0.62,
     )
     assert plan.direction == "long"
     # 9ステップが順番どおり
@@ -183,7 +184,14 @@ def test_wide_spread_makes_net_expectancy_negative_or_blocks() -> None:
 def test_no_balance_still_ok_at_sizing() -> None:
     # 残高未指定でも、リスク%方針として ok(発注側で確定)。
     plan, checklist = run_pipeline(
-        "USDJPY", _bullish_tech(), _scores(), [], [], now=OPEN, account_balance=None
+        "USDJPY",
+        _bullish_tech(),
+        _scores(),
+        [],
+        [],
+        now=OPEN,
+        account_balance=None,
+        calibrated_win_probability=0.62,
     )
     if plan.direction == "long":
         size_step = _step(checklist, "position_size")
@@ -205,6 +213,48 @@ def test_realized_expectancy_overrides_theoretical() -> None:
     exp = _step(checklist, "expectancy")
     assert exp.status == "block"
     assert checklist.expected_r == -0.3
+
+
+def test_uncalibrated_conviction_cannot_pass_expectancy_gate() -> None:
+    _, checklist = run_pipeline("USDJPY", _bullish_tech(), _scores(), [], [], now=OPEN)
+
+    assert _step(checklist, "expectancy").status == "block"
+    assert not checklist.probability_calibrated
+    assert "未較正" in checklist.expectancy_source
+
+
+def test_missing_spread_blocks_cost_gate_instead_of_assuming_zero_cost() -> None:
+    _, checklist = run_pipeline(
+        "USDJPY",
+        _bullish_tech(spread=None),
+        _scores(),
+        [],
+        [],
+        now=OPEN,
+        calibrated_win_probability=0.62,
+    )
+
+    assert _step(checklist, "execution_cost").status == "block"
+    assert checklist.net_expected_r is None
+
+
+def test_operational_freshness_veto_forces_neutral_and_blocks_checklist() -> None:
+    plan, checklist = run_pipeline(
+        "USDJPY",
+        _bullish_tech(),
+        _scores(),
+        [],
+        [],
+        now=OPEN,
+        calibrated_win_probability=0.62,
+        operational_data_ok=False,
+        operational_data_reason="freshness report stale",
+    )
+
+    assert plan.direction == "neutral"
+    assert plan.conviction == 0
+    assert _step(checklist, "event").status == "block"
+    assert "freshness report stale" in _step(checklist, "event").note
 
 
 def test_checklist_serialization_roundtrip() -> None:

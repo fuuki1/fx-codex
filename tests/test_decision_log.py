@@ -172,7 +172,9 @@ def test_score_decision_events_uses_tp_sl_mfe_mae(tmp_path) -> None:
     assert outcome["score_label"] == "tp_hit"
     assert outcome["first_touch"] == "tp1"
     assert outcome["realized_r"] == 1.0
-    assert outcome["mfe_r"] == 1.8
+    # Excursions are measured only while the trade is open; the later bar must
+    # not improve MFE after TP1 has already closed the position.
+    assert outcome["mfe_r"] == 1.2
     assert outcome["mae_r"] == 0.0
     assert outcome["decision_id"] == events[0]["decision_id"]
 

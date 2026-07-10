@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "comment_ja": "データ鮮度監視の対象と閾値。expected_interval_secondsは書込み側の実際の周期(snapshot=5分ループ/journal=毎時:10のブリーフィング)から導出。warn/criticalの根拠: snapshotは3周期欠け=15分でWARNING、45分(9周期)でCRITICAL。journalは1周期スキップ許容で2時間WARNING、6時間(週末クローズ中も書込みは継続するため休場例外なし)でCRITICAL。learning/promotionはブリーフィング成功の副産物なのでwarnのみ(criticalはジャーナル側が担当)。",
+  "cooldown_seconds": 21600,
+  "targets": [
+    {
+      "name": "tf_price_snapshot",
+      "path": "logs/briefing_tf_prices.jsonl",
+      "kind": "jsonl",
+      "expected_interval_seconds": 300,
+      "warn_after_seconds": 900,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "scripts/status_fx_services.sh で com.fx-codex.snapshot を確認し、必要なら scripts/restart_fx_services.sh を実行"
+    },
+    {
+      "name": "tf_journal",
+      "path": "logs/briefing_tf_journal.jsonl",
+      "kind": "jsonl",
+      "expected_interval_seconds": 3600,
+      "warn_after_seconds": 7200,
+      "critical_after_seconds": 21600,
+      "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を restart"
+    },
+    {
+      "name": "fusion_journal",
+      "path": "logs/briefing_journal.jsonl",
+      "kind": "jsonl",
+      "expected_interval_seconds": 3600,
+      "warn_after_seconds": 7200,
+      "critical_after_seconds": 21600,
+      "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を restart"
+    },
+    {
+      "name": "learning_profile",
+      "path": "logs/briefing_tf_learning.json",
+      "kind": "json",
+      "expected_interval_seconds": 3600,
+      "warn_after_seconds": 10800,
+      "critical_after_seconds": null,
+      "manual_action_ja": "ブリーフィング自体が動いているのに学習が更新されない場合はfx_briefing.pyの--no-learning指定やプロファイル破損を確認"
+    },
+    {
+      "name": "promotion_state",
+      "path": "logs/promotion_state.json",
+      "kind": "json",
+      "expected_interval_seconds": 3600,
+      "warn_after_seconds": 10800,
+      "critical_after_seconds": null,
+      "manual_action_ja": "ブリーフィングログでpromotion採点のエラーを確認"
+    }
+  ]
+}
+

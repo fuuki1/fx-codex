@@ -850,7 +850,11 @@ def _decision_monitor_summary(
     actionable.sort(
         key=lambda row: (
             rank.get(str(row.get("action")), 9),
-            _number(row.get("expectancy_r")) if _number(row.get("expectancy_r")) is not None else 99,
+            (
+                _number(row.get("expectancy_r"))
+                if _number(row.get("expectancy_r")) is not None
+                else 99
+            ),
             -int(row.get("tradable", 0) or 0),
             str(row.get("symbol", "")),
         )
@@ -874,9 +878,7 @@ def _decision_monitor_summary(
     price_health = (
         summary.get("price_health") if isinstance(summary.get("price_health"), dict) else {}
     )
-    performance = (
-        summary.get("performance") if isinstance(summary.get("performance"), dict) else {}
-    )
+    performance = summary.get("performance") if isinstance(summary.get("performance"), dict) else {}
     return {
         "generated_at": monitor.get("generated_at") or feedback.get("generated_at"),
         "status": monitor.get("status") or "unknown",

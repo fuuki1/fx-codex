@@ -108,6 +108,13 @@ def test_train_artifact_learns_usable_model() -> None:
     assert art.usable, art.reasons
     assert art.val_brier is not None and art.baseline_brier is not None
     assert art.val_brier < art.baseline_brier
+    assert art.n_tune >= 30
+    assert art.n_calibration >= 30
+    assert art.n_test >= 30
+    assert art.n_lockbox >= 30
+    assert not art.lockbox_evaluated
+    assert set(art.partition_windows) == {"train", "tune", "calibration", "test", "lockbox"}
+    assert art.partition_windows["calibration"]["end"] < art.partition_windows["test"]["start"]
 
 
 def test_train_artifact_rejects_noise() -> None:

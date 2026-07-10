@@ -52,6 +52,11 @@ STATUS_FAIL = "fail"
 CONFIDENCE_BINS = ((0, 25), (25, 50), (50, 75), (75, 101))
 READY_SEEN_BY_PRIORITY = {"high": 2, "medium": 3, "low": 5}
 APPROVAL_PRESERVED_STAGES = {"approved", "rejected", "auto_paused"}
+TRUSTED_POST_PREDICTION_OHLC_SCOPES = {
+    "closed_bar_after_prediction",
+    "lower_timeframe_closed_bar",
+    "post_prediction_interval",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,8 @@ class PricePathPoint:
     close: float
     high: float | None = None
     low: float | None = None
+    range_scope: str = ""
+    rejected_range: bool = False
 
     @property
     def has_range(self) -> bool:
@@ -454,22 +461,26 @@ def evaluate_trade_outcomes(
         tp2_r_value = _target_r(direction, entry_price, risk_distance, target2, default=2.0)
         terminal = future[-1]
         terminal_ts, terminal_price = terminal.ts, terminal.close
-        mfe = max(_favorable_move(direction, entry_price, point) for point in future)
-        mae = max(0.0, max(_adverse_move(direction, entry_price, point) for point in future))
         terminal_r = _signed_move(direction, entry_price, terminal_price) / risk_distance
         first_touch = "none"
         first_touch_ts = None
         tp1_hit = tp2_hit = sl_hit = False
         ambiguous_intrabar = False
+        active_path: list[PricePathPoint] = []
         for point in future:
+            active_path.append(point)
             touch = _touch(direction, point, stop, target1, target2)
             tp1_hit = tp1_hit or touch in ("tp1", "tp2", "ambiguous_sl_tp")
             tp2_hit = tp2_hit or touch == "tp2"
             sl_hit = sl_hit or touch in ("sl", "ambiguous_sl_tp")
             ambiguous_intrabar = ambiguous_intrabar or touch == "ambiguous_sl_tp"
-            if first_touch == "none" and touch != "none":
+            if touch != "none":
                 first_touch = touch
                 first_touch_ts = point.ts.isoformat()
+                break
+
+        mfe = max(_favorable_move(direction, entry_price, point) for point in active_path)
+        mae = max(0.0, max(_adverse_move(direction, entry_price, point) for point in active_path))
 
         realized_r = _realized_r(first_touch, terminal_r, tp1_r_value, tp2_r_value)
         quality, flags, path_source = _path_quality(ts, future, horizon_hours, min_path_points)
@@ -2112,9 +2123,12 @@ def _price_path_point(ts: datetime, entry: Mapping[str, object]) -> PricePathPoi
     low = _float(entry.get("low"))
     if high is None or low is None:
         return PricePathPoint(ts, close)
+    scope = str(entry.get("ohlc_scope", "")).strip()
+    if scope not in TRUSTED_POST_PREDICTION_OHLC_SCOPES:
+        return PricePathPoint(ts, close, range_scope=scope, rejected_range=True)
     normalized_high = max(high, low, close)
     normalized_low = min(high, low, close)
-    return PricePathPoint(ts, close, normalized_high, normalized_low)
+    return PricePathPoint(ts, close, normalized_high, normalized_low, range_scope=scope)
 
 
 def _target_policy_meta(entry: Mapping[str, object]) -> tuple[str | None, str, str]:
@@ -2160,6 +2174,8 @@ def _path_quality(
     point_ratio = min(1.0, points / POINTS_FOR_FULL_DENSITY)
     range_points = sum(1 for point in future if point.has_range)
     range_ratio = range_points / points if points else 0.0
+    if any(point.rejected_range for point in future):
+        flags.append("untrusted_forming_ohlc_ignored")
     if range_ratio <= 0:
         path_source = "close"
         flags.append("close_only_path")

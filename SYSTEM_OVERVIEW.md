@@ -42,7 +42,7 @@ TradingView Alert
  └──────────┘
       │
  ┌──────────┐
- │ monitor  │ 死活監視・日次サマリ → Discord
+ │ monitor  │ 死活監視・日次サマリ → ログ（状態は5分ボードへ集約）
  └──────────┘
 ```
 
@@ -57,7 +57,7 @@ TradingView Alert
 | `strategy` | 自作MAクロス戦略を60秒ごとに評価 | `trader/app/strategy.py` |
 | `risk` | 発注前のリスクフィルタ（6段階チェック） | `trader/app/risk.py` |
 | `executor` | IBKRへの実発注、ブラケット注文組み立て | `trader/app/executor.py` |
-| `monitor` | 死活監視、Discordアラート、日次サマリ | `trader/app/monitor.py` |
+| `monitor` | 死活監視、異常ログ、日次サマリ | `trader/app/monitor.py` |
 | `ngrok` | webhookをHTTPS公開（TradingView Webhook受信用） | `ngrok/ngrok` |
 
 ### 1-1. シグナル受信 (`webhook.py`)
@@ -86,7 +86,7 @@ TradingView Alert
 2. **数量上限** — `MAX_POSITION_QTY`超過を却下
 3. **ストップロス必須** — `stop_price`/`stop_distance`が無いシグナルは却下（決済シグナルは免除）
 4. **取引時間帯** — `ENFORCE_SESSION`時、`within_session()`外なら却下
-5. **日次損失** — 当日実現損益が`MAX_DAILY_LOSS_JPY`を超過したら**自動でKill switchをON**にしてDiscord通知＋却下
+5. **日次損失** — 当日実現損益が`MAX_DAILY_LOSS_JPY`を超過したら**自動でKill switchをON**にして記録＋却下
 6. **発注レート** — `MAX_ORDERS_PER_MIN`をRedis上のスライディングウィンドウで制限
 
 通過したシグナルのみ`orders` Streamへpublish。
@@ -106,8 +106,8 @@ TradingView Alert
 ### 1-5. 死活監視 (`monitor.py`)
 
 - 60秒ごとに (1) webhookの`/health` (2) DB (3) Redis (4) 各サービスのハートビート鮮度（180秒超で停止扱い＝プロセスは生きているがループが止まっている状態を検知）をチェック。
-- 異常があればDiscordへ通知（`common.notify`のスロットルでアラート嵐を防止）。
-- 毎朝7時(JST)に日次サマリ（約定件数・実現損益・Kill switch状態・trading_mode）をDiscordへ送信。送信済みフラグをRedisで1日1回に制御。
+- 異常は`common.notify`で必ずログへ記録。既定の`DISCORD_NOTIFICATION_MODE=signal_board`では個別Discord送信を抑止し、5分ボードのシステム状態へ集約する（`all`で従来の個別送信に戻せる）。
+- 毎朝7時(JST)に日次サマリ（約定件数・実現損益・Kill switch状態・trading_mode）を生成。`signal_board`モードではログのみ、`all`ではDiscordへも送る。
 
 ### 1-6. 自律最適化エンジン (Mac mini側、`trader/optimize/auto_optimize.py`)
 
@@ -187,7 +187,7 @@ python3 promote_params.py --rollback
 
 ## 3. 分析・通知システム (`fx_intel/`, ルート直下スクリプト)
 
-Mac miniで**手動起動**するとDiscordに分析結果を通知する2つの独立したツール。
+Mac miniで**手動起動**し、Discordへは5分ごとのFXシグナルボードだけを通知する。
 （`launchd`/`cron`はmacOSのTCC制限で`~/Desktop`配下を読めないため自動起動不可。ターミナルから直接起動する運用。）
 
 ### 3-1. `tv_discord_notify.py` — シンプル版
@@ -199,7 +199,7 @@ Mac miniで**手動起動**するとDiscordに分析結果を通知する2つの
   ```bash
   cd ~/trader/fx-codex && ../tv-notify-venv/bin/python tv_discord_notify.py
   ```
-- 定期実行: `tv_notify_loop.sh`（毎時5分）
+- 定期実行は廃止。`tv_notify_loop.sh` はDiscordへ送らず終了する（通知重複防止）。
 
 ### 3-2. `fx_briefing.py` + `fx_intel/` — 統合版（上位互換）
 
@@ -234,10 +234,10 @@ fx_intel/calendar.py       (実績で委員を段階昇格)
 - **チャート状態×方向別の学習** (同`learning.py`): 判断時に`briefing._extract_features`が特徴量（`rsi_1h`/`adx_1h`/`ma_gap_atr`=MA乖離のATR換算/`atr_pct`=ボラ/`tf_agreement`=時間足一致度/`news_count`）をTradePlanに記録→ジャーナルへ保存。学習側は「売られすぎ圏(35未満)」「全時間足一致」「高ボラ(0.25%以上)」など相場用語の固定バケットを、さらにロング/ショート別に分けたセル単位で的中率を集計する（同じ状態でも向きで成績が非対称になるため。例: RSI買われすぎ圏はロングでは外しやすいがショートは当たる）。セルごとに12件以上かつ的中率45%未満なら減衰係数（×0.7〜1.0）を付与。新規判断時は方向確定後に`LearnedProfile.condition_adjustment(features, direction)`が現在の状態×方向と突き合わせ、苦手なセルに該当したら確信度を減衰して理由を注意点に明示する（複数該当時は最悪の1条件のみ適用し過剰減衰を防ぐ。neutral/standby/closedでは照合しない）。学習メモには「👍 当たりやすい/⚠️ 苦手なチャート状態」として全体的中率±10pt以上のセルを「バケット×方向」表記で表示。方向で分けるぶんセルあたりのサンプルは半分になるため発動は遅くなるが、向きの非対称性を混ぜた誤った減衰を防ぐことを優先する。
 - 副産物として`research_pack/upcoming_events.csv`（最新スナップショット、毎回上書き）と`research_pack/event_history.csv`（**追記アーカイブ**）を出力。いずれも`fx_backtester`の`--events`にそのまま渡せる形式で、**ライブのイベント回避とバックテストのイベント回避が同じデータソースを共有**する設計。
 - `event_history.csv`は実行のたびに未観測のイベント・改定分（時刻変更やforecast確定）だけを`recorded_at`付きで追記する簡易point-in-time記録。運用を続けるほど過去期間の実カレンダーが蓄積され、バックテストでのイベント回避再生に使えるようになる（`--no-event-archive`で無効化）。
-- 定期実行: `fx_briefing_loop.sh`（毎時10分。`tv_notify_loop.sh`の毎時5分と5分ずらして負荷分散）。毎時、**融合1判断モードと時間足別モード（`--per-timeframe`）の2通**を連続送信する（片方が失敗しても他方は実行）。時間足別の採点には`fx_tf_snapshot_loop.sh`（5分ごとの価格スナップショット）を併走させる（下記）。
+- 定期実行: `fx_briefing_loop.sh`。5分境界（00/05/10…分）ごとに時間足別分析を行い、**上位3候補・システム状態・データ品質をまとめた「FXシグナルボード」1通だけ**を送信する。判断ジャーナルも5分ごとに更新されるため、通知ループ稼働中は短い足の採点系列を自身で供給する。`fx_tf_snapshot_loop.sh`は通知を止めて学習用価格だけ収集するときの補助として残す。
 - **ML学習・昇格の運用**: `--train-ml`でジャーナルからGBDTを再学習(週次程度で十分)。委員の昇格はブリーフィング実行のたびに自動採点され、`--promote-live macro ml`を付けたときだけ条件を満たす委員をliveへ昇格承認する。`--no-macro`/`--no-ml`で個別の委員を無効化できる。追加ファイル: `logs/macro_cache.json`(マクロTTLキャッシュ)、`logs/ml_model.json`(学習済みモデル+来歴)、`logs/promotion_state.json`(委員の段階)。
 - **時間足別モード** (`--per-timeframe`、`fx_intel/timeframe.py` + `price_history.py` + `tf_learning.py` + `tf_briefing.py`): 融合1判断の代わりに15m/1h/4h/1dを**独立したアナリスト**として判断し、**時間足別の主ホライズン**で自己採点する（15m→15分後 / 1h→1時間後 / 4h→4時間後 / 1d→24時間後。補助ホライズンは観測専用で学習には不使用）。学習は融合モードと同じコア（重み再推定・キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier）を`(通貨ペア × 時間足)`セル単位で適用し、`logs/briefing_tf_learning.json`へ保存。融合モードとはジャーナル・学習ファイルを分離しているので両モードは干渉しない。読み取り専用ダッシュボード(`tools/ai_learning_dashboard`)は両ジャーナルを各主ホライズンで採点し、時間足別の的中率も表示する。
-  - **将来価格の調達（5分スナップショット + 2本立て運用）**: TradingViewスキャナーは現在値しか返せないため、記録から主ホライズン後の実勢価格は後続の終値から取る。ところが判断ジャーナル`logs/briefing_tf_journal.jsonl`は毎時しか追記されないので、短い足（特に15m: 採点窓9〜21分）は後続点が窓に入らず**永久に採点できない**。これを解消するのが`fx_tf_snapshot.py`（+`fx_tf_snapshot_loop.sh`、5分ごと）で、各時間足の現在終値だけを`logs/briefing_tf_prices.jsonl`へ追記する（価格取得のみ・判断/学習/通知なし）。`fx_briefing --per-timeframe`は採点時にこの密な価格系列と今回の現在価格を判断ジャーナルへ結合し、**15m/1h/4h/1dのすべてを採点可能**にする。価格行は`direction`を持たないので採点対象は増やさず将来価格系列だけを密にする。外部履歴OHLC（yfinance/OANDA等）を差し込む注入口も用意。つまり運用は「判断=毎時（`fx_briefing_loop.sh`）」「価格採点用の系列=5分ごと（`fx_tf_snapshot_loop.sh`）」の2本立て。
+  - **将来価格の調達（5分系列）**: TradingViewスキャナーは現在値しか返さないため、主ホライズン後の実勢価格は後続の終値から取る。シグナルボード運用では`fx_briefing_loop.sh`が判断と価格を5分ごとに記録するので、15m/1h/4h/1dを採点できる。Discordを止めた状態で価格系列だけ維持するときは`fx_tf_snapshot.py`（+`fx_tf_snapshot_loop.sh`）を使う。
 - **依存の据え置き**: 新モジュール(analyst/macro/gbm/ml/committee/promotion/timeframe/price_history/tf_learning/tf_briefing)は追加のサードパーティ依存を一切増やさない。macro.pyの取得はrequestsのみ、GBDT・学習・昇格・分析エンジン・時間足別レイヤは標準ライブラリだけで動く。Mac miniの軽量venvへrsyncするだけで移設できる。
 - テスト(`tests/test_fx_intel.py`ほか`test_analyst`/`test_macro`/`test_gbm`/`test_ml`/`test_committee`/`test_promotion`、時間足別は`test_timeframe`/`test_price_history`/`test_tf_learning`/`test_tf_snapshot`/`test_tf_briefing`/`test_fx_briefing_per_timeframe`/`test_dashboard_timeframe`)はネットワーク不要で完結する設計（マクロ取得はキャッシュ事前投入でオフライン検証、将来価格取得は注入モックで検証）。
 

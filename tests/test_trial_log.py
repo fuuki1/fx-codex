@@ -175,3 +175,16 @@ def test_walk_forward_logs_all_train_trials_and_selected_tests() -> None:
     assert all(t["selected"] for t in test_trials)
     # 学習試行はリターン行列の列になる
     assert logger.returns_matrix().shape[1] == len(train_trials)
+
+
+def test_walk_forward_rejects_overlapping_test_folds() -> None:
+    validator = WalkForwardValidator(
+        FixedStopLongStrategy,
+        {"stop_distance": [0.01]},
+        lambda strategy: BacktestEngine(strategy),
+        WalkForwardConfig(train_bars=20, test_bars=10, step_bars=5),
+    )
+    index = pd.date_range("2024-01-01", periods=40, freq="h")
+    frame = pd.DataFrame({"open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0}, index=index)
+    with pytest.raises(ValueError, match="overlapping test folds"):
+        validator.run({"EURUSD": frame})

@@ -69,20 +69,23 @@ tests/
   方向付きで学習メモに一覧表示されます
 
 ```bash
-.venv/bin/python fx_briefing.py --dry-run        # 送信せず内容確認
+.venv/bin/python fx_briefing.py --signal-board --dry-run --symbols GBPUSD EURUSD USDJPY
+                                                   # 5分ボードを送信せず内容確認
 .venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ・学習ファイルだけ更新
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
 python3 tools/learning_capture.py                # Discord送信なしで融合/時間足別/価格系列を1回収集
-./fx_briefing_loop.sh &                          # 毎時10分に自動送信(融合＋時間足別の2通)
+./fx_briefing_loop.sh &                          # 5分ごとにFXシグナルボードを1通だけ送信
 ```
 
 `--dry-run` は表示確認用でログを保存しません。学習を進めたいがDiscordへ送信したくない場合は
 `--no-discord`、または `tools/learning_capture.py` を使います。
 
-`fx_briefing_loop.sh` は毎時、**融合1判断モード（本命：委員会・ML・昇格ゲートあり）と
-時間足別モード（`--per-timeframe`）の2通**を連続送信します。時間足別の採点を回すには、
-別途 `fx_tf_snapshot_loop.sh`（5分ごとの価格記録）も起動してください（下記）。
+`fx_briefing_loop.sh` は5分境界（00/05/10…分）ごとに、**上位3候補・エントリー適性・
+executorを含む発注経路の状態・4層のデータ品質を1通へまとめたFXシグナルボード**だけを
+送ります。旧 `tv_notify_loop.sh` は廃止済みです。取引スタックも既定の
+`DISCORD_NOTIFICATION_MODE=signal_board` では個別アラートをログだけに残すため、Discordに
+届く定期・障害通知はこのボードへ集約されます。
 
 ### 時間足別モード (`--per-timeframe`)
 
@@ -97,9 +100,8 @@ python3 tools/learning_capture.py                # Discord送信なしで融合/
   「観測」で、学習には主ホライズンのみを使います(多重検定の回避)。
 - **将来価格の調達(5分スナップショット)**: TradingView スキャナーは現在値しか
   返さないため、記録から主ホライズン後の実勢価格を後続の終値から取ります。ただし
-  判断ジャーナル `logs/briefing_tf_journal.jsonl` は毎時しか追記されないため、
-  短い足(特に 15m: 採点窓 9〜21分)は後続点が得られず永久に採点されません。
-  そこで **`fx_tf_snapshot.py` が5分ごとに各時間足の現在終値だけを
+  シグナルボード運用では判断ジャーナル自体が5分ごとに追記されるため、短い足も採点可能
+  です。通知を止めたまま学習だけ継続する場合は、**`fx_tf_snapshot.py` が5分ごとに各時間足の現在終値だけを
   `logs/briefing_tf_prices.jsonl` へ記録**し、採点時にこの密な価格系列を判断
   ジャーナルと結合します。これで **15m / 1h / 4h / 1d のすべてが採点可能**に
   なります。外部の履歴OHLC(yfinance/OANDA 等)を差し込む注入口も用意しています
@@ -115,14 +117,12 @@ python3 tools/learning_capture.py                # Discord送信なしで融合/
 ```bash
 .venv/bin/python fx_briefing.py --per-timeframe --dry-run   # 時間足別の内容確認
 .venv/bin/python fx_briefing.py --per-timeframe             # Discordへ送信
-./fx_tf_snapshot_loop.sh &                                  # 5分ごとに価格を記録(採点用)
+./fx_tf_snapshot_loop.sh &                                  # 通知停止中の価格記録だけを行う場合
 ```
 
-時間足別モードで全時間足を学習させるには、判断と価格採点用の系列の**2本立て**が必要です。
-判断は `fx_briefing_loop.sh` が毎時 `--per-timeframe` を自動送信するので、追加で
-起動するのは価格スナップショットループ(`fx_tf_snapshot_loop.sh`、5分ごと)だけです。
-価格スナップショットは価格取得のみ(判断・学習・Discord通知はしない)なので API 負荷は
-軽く、Discord は毎時のままです(手動で単発確認したいときは上のコマンドを使います)。
+`fx_briefing_loop.sh` は判断と同時に価格専用系列も5分ごとに保存するため、通常運用では
+`fx_tf_snapshot_loop.sh` の併走は不要です。Discord通知だけを止め、学習用価格の収集を
+継続したい場合に限り価格スナップショットループを使います。
 
 ### MFE/MAE/TP/SL期待値監視ランナー
 

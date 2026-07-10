@@ -1,0 +1,4 @@
+interface:
+  display_name: "FX Source Verification"
+  short_description: "Verify FX research against primary sources"
+  default_prompt: "Use $fx-research-source-verification to verify these claims and update the source ledger."

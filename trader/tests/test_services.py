@@ -9,6 +9,7 @@ def test_notify_throttle(fake_redis, monkeypatch):
 
     calls: list[int] = []
     monkeypatch.setattr(common.settings, "discord_webhook_url", "http://example/wh")
+    monkeypatch.setattr(common.settings, "discord_notification_mode", "all")
     monkeypatch.setattr(common.httpx, "post", lambda *a, **k: calls.append(1))
 
     common.notify("hello", key="k1")
@@ -17,6 +18,19 @@ def test_notify_throttle(fake_redis, monkeypatch):
 
     common.notify("urgent", throttle=False)  # 抑制なし
     assert len(calls) == 2
+
+
+def test_notify_is_logged_but_not_posted_in_signal_board_mode(fake_redis, monkeypatch):
+    import common
+
+    calls: list[int] = []
+    monkeypatch.setattr(common.settings, "discord_webhook_url", "http://example/wh")
+    monkeypatch.setattr(common.settings, "discord_notification_mode", "signal_board")
+    monkeypatch.setattr(common.httpx, "post", lambda *a, **k: calls.append(1))
+
+    common.notify("executor down", key="executor")
+
+    assert calls == []
 
 
 def test_kill_switch_fail_safe(monkeypatch):

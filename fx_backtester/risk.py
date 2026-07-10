@@ -179,6 +179,7 @@ class RiskManager:
         stop_distance: float,
         extra_risk_per_unit_usd: float = 0.0,
         extra_risk_usd: float = 0.0,
+        current_gross_notional_usd: float = 0.0,
         conversion_rates: dict[str, float] | None = None,
     ) -> tuple[float, float, float]:
         """Return units, adjusted stop distance, and initial risk in USD.
@@ -207,7 +208,11 @@ class RiskManager:
         units = (risk_budget - fixed_risk) / total_risk_per_unit
 
         notional_per_unit = notional_usd(symbol, 1.0, entry_price, conversion_rates)
-        max_units_by_leverage = equity * self.config.max_leverage / notional_per_unit
+        remaining_notional = max(
+            0.0,
+            equity * self.config.max_leverage - max(current_gross_notional_usd, 0.0),
+        )
+        max_units_by_leverage = remaining_notional / notional_per_unit
         units = min(units, max_units_by_leverage)
         if self.config.max_position_units is not None:
             units = min(units, self.config.max_position_units)
