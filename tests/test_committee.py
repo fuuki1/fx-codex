@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, UTC
+from datetime import date, datetime, timedelta, UTC
 
 from fx_intel.committee import deliberate, macro_opinion, ml_opinion
 from fx_intel.macro import CotReport, MacroSnapshot
@@ -41,9 +41,38 @@ def _scores() -> dict[str, CurrencySentiment]:
 
 
 def _macro_snapshot() -> MacroSnapshot:
-    snap = MacroSnapshot(fetched_at=NOW)
-    snap.cot["USD"] = CotReport("USD", date(2026, 6, 30), net_position=50000, open_interest=200000)
-    snap.cot["JPY"] = CotReport("JPY", date(2026, 6, 30), net_position=-40000, open_interest=200000)
+    snap = MacroSnapshot(
+        fetched_at=NOW,
+        cot_evidence={
+            "status": "ok",
+            "usable": True,
+            "dataset_id": "b" * 64,
+            "prediction_time": NOW.isoformat(),
+            "record_hashes": ["a" * 64, "c" * 64],
+        },
+    )
+    common = {
+        "available_time": NOW - timedelta(hours=1),
+        "content_hash": "a" * 64,
+        "dataset_id": "b" * 64,
+        "data_quality_flags": ("publication_time_attested_locally",),
+    }
+    snap.cot["USD"] = CotReport(
+        "USD",
+        date(2026, 6, 30),
+        net_position=50000,
+        open_interest=200000,
+        source_record_id="source-USD",
+        **common,
+    )
+    snap.cot["JPY"] = CotReport(
+        "JPY",
+        date(2026, 6, 30),
+        net_position=-40000,
+        open_interest=200000,
+        source_record_id="source-JPY",
+        **common,
+    )
     return snap
 
 

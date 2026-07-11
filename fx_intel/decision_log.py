@@ -113,6 +113,7 @@ def build_timeframe_decision_events(
     events_48h: Sequence[object] = (),
     fetch_warnings: Sequence[str] = (),
     calendar_ok: bool = True,
+    macro_snapshot: object | None = None,
     timeframe_learning: object | None = None,
     tp_sl_learning: object | None = None,
     maximization_profile: object | None = None,
@@ -130,6 +131,7 @@ def build_timeframe_decision_events(
         events_48h=events_48h,
         fetch_warnings=fetch_warnings,
         calendar_ok=calendar_ok,
+        macro_snapshot=macro_snapshot,
     )
     events: list[dict[str, object]] = []
     for symbol, plans in plans_by_symbol.items():
@@ -184,6 +186,7 @@ def build_fusion_decision_events(
     events_48h: Sequence[object] = (),
     fetch_warnings: Sequence[str] = (),
     calendar_ok: bool = True,
+    macro_snapshot: object | None = None,
     learning_profile: object | None = None,
     trade_expectancy_summary: Mapping[str, object] | None = None,
     decision_feedback_profile: object | None = None,
@@ -201,6 +204,7 @@ def build_fusion_decision_events(
         events_48h=events_48h,
         fetch_warnings=fetch_warnings,
         calendar_ok=calendar_ok,
+        macro_snapshot=macro_snapshot,
     )
     events: list[dict[str, object]] = []
     for index, plan in enumerate(plans):
@@ -715,6 +719,7 @@ def _market_context(
     events_48h: Sequence[object],
     fetch_warnings: Sequence[str],
     calendar_ok: bool,
+    macro_snapshot: object | None,
 ) -> dict[str, object]:
     currencies = getattr(analysis, "currencies", {}) or {}
     return {
@@ -724,6 +729,7 @@ def _market_context(
         "summary": getattr(analysis, "summary", ""),
         "calendar_ok": bool(calendar_ok),
         "fetch_warnings": list(fetch_warnings),
+        "macro_evidence": _macro_evidence_context(macro_snapshot),
         "currency_sentiment": {
             str(currency): _currency_sentiment(sentiment)
             for currency, sentiment in dict(currencies).items()
@@ -732,6 +738,31 @@ def _market_context(
         "news_items": [_news_item(item) for item in news_items],
         "event_count_48h": len(events_48h),
         "events_48h": [_event_item(event) for event in events_48h],
+    }
+
+
+def _macro_evidence_context(snapshot: object | None) -> dict[str, object] | None:
+    if snapshot is None:
+        return None
+    evidence = getattr(snapshot, "cot_evidence", None)
+    reports = getattr(snapshot, "cot", {}) or {}
+    cot_rows: dict[str, object] = {}
+    if isinstance(reports, Mapping):
+        for currency, report in reports.items():
+            available = getattr(report, "available_time", None)
+            report_date = getattr(report, "report_date", None)
+            cot_rows[str(currency)] = {
+                "report_date": _iso(report_date) or None,
+                "available_time": _iso(available) or None,
+                "source_record_id": getattr(report, "source_record_id", ""),
+                "content_hash": getattr(report, "content_hash", ""),
+                "dataset_id": getattr(report, "dataset_id", ""),
+                "data_quality_flags": list(getattr(report, "data_quality_flags", ()) or ()),
+            }
+    return {
+        "cot_evidence": dict(evidence) if isinstance(evidence, Mapping) else None,
+        "cot_reports": cot_rows,
+        "scope": "COT-only evidence; does not attest FRED or system-wide PIT integrity",
     }
 
 

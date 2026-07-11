@@ -106,7 +106,7 @@ fx_intel/technicals.py     (TV 4時間足     │
 fx_intel/analyst.py        (自前分析エンジン) │  委員会が重み付き平均で
   (Claude非依存の既定)                       ├─▶ 複合スコア ─▶ リスク
 fx_intel/macro.py        マクロ委員 ─────────┤    (fx_intel/          オフィサー
-  (COT・DXY・VIX・金利)       (非影響shadow固定)   │     committee.py)     (決定論ゲート)
+  (任意PIT COT・DXY・VIX・金利) (非影響shadow固定)  │     committee.py)     (決定論ゲート)
                          ML委員 ────────────┘         │                 │
 fx_intel/ml.py             (GBDT確率モデル)            │                 ▼
   (gbm.py＝依存ゼロGBDT)                                │         方向・確信度・SL/TP
@@ -119,7 +119,7 @@ fx_intel/calendar.py       (legacy実績をshadow診断)
 - **複数AI委員会** (`fx_intel/committee.py`): 役割の異なる4委員が意見を出し、シンセサイザーが重み付き平均で複合スコアを作り、**リスクオフィサー(`build_trade_plan`の決定論ゲート=休場・イベント窓・データ品質・確信度上限)が常に拒否権を持つ**。「アナリストの総意をリスク管理者が却下できる」機関投資家デスクの構造をコードで表現。追加委員が居なければ従来のtech55%/news45%合成と完全一致(後方互換)。
 - **自前分析エンジン** (`fx_intel/analyst.py`): 「Claude級の分析AIを外部API非依存で」の要件に対する回答。汎用LLMは再現できないが、FXヘッドライン解釈という狭タスクに特化した決定論エンジンを実装。**否定の理解**(「rules out rate hike」は反転)・**ヘッジ割引**(「may/speculation」は×0.7)・**強調増幅**(「sharply/soars」は×1.3)・**鮮度減衰**(半減期12時間)・**ソース信頼度**・**テーマ抽出**(政策/インフレ/雇用/景気/地政学)・**合意度×物量の確信度**を備え、実効スコア=バイアス×確信度でClaude経路と同じ契約。同じ入力から必ず同じ判断=監査可能。
 - **センチメント序列** (`fx_intel/sentiment.py`): Claude API(`ANTHROPIC_API_KEY`があれば上乗せ) → **自前分析エンジン(既定)**。旧来の単純語彙カウントは比較検証用に`score_headlines_lexicon`として残置。
-- **マクロデータ層** (`fx_intel/macro.py`): 現行取得はcurrent-only FRED graph CSV（米10年・2年金利、VIX、広義ドル指数）とCFTC Legacy Futures Onlyの公開proxyで、TTL/staleness判定を持つ。Stooqは定数/パーサ候補で現行snapshot取得には未接続である。いずれもrevision/first-ingestionを再生できず、promotion-grade PITデータではない。詳細は[Source ledger](docs/research/SOURCE_LEDGER.md)を参照する。
+- **マクロデータ層** (`fx_intel/macro.py` + `cot_pit.py`): FRED graph CSV（米10年・2年金利、VIX、広義ドル指数）はcurrent-onlyで、revision/first-ingestionを再生できない。legacy CFTC TTL parserも診断用に残るが、canonical briefingは`include_cot=False`で切断し、`--cot-pit-dataset`で明示された監査済みresearch artifactだけをoptional COT入力としてas-of読込する。COT artifactはconfigured-code raw pages、CFTC row ID、local observed revisions、local release sidecarを保持するが、外部認証・accepted licence・実corpus・配備はなく常にpromotion-ineligibleである。Stooqは定数/パーサ候補で現行snapshot取得には未接続。詳細は[Source ledger](docs/research/SOURCE_LEDGER.md)を参照する。
 - **GBDT確率モデル** (`fx_intel/gbm.py` + `fx_intel/ml.py`): 依存ゼロの純Python実装。採点済みジャーナルをtrain/tune/calibration/test/未開封lockboxへ時系列分割し、境界前側へ72時間embargoを置く。Platt較正はcalibrationだけでfitし、testではcalibration基準率に対するBrier/logloss改善、AUC 0.55以上、非空特徴重要度を要求する。`usable=False`は委員会に参加しない。ただしlegacy outcome labelとPITデータのend-to-end接続は未完了で、institutional validationの証拠ではない。
 - **legacy委員診断** (`fx_intel/promotion.py`): マクロ/ML委員の簡易サンプル数・的中率・ATR proxy期待値・二項片側p値を表示するが、24時間ラベル重複、PIT未証明journal、独立holdout/コスト欠如のため昇格根拠に使わない。このresearch buildでは委員を非影響の**shadow**へ固定し、保存済みpaper/live/未知状態もshadowへfail closedする。
   - institutionalな`research → validated → shadow → paper`の方針/証拠ゲートは`fx_backtester/governance.py`に別実装されているが、現在はend-to-end orchestrationへ未接続である。`--promote-live`は明示的に無効で、発注権限は存在しない。

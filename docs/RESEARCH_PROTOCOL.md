@@ -4,6 +4,8 @@
 
 This is the required protocol, not evidence that a candidate has completed it. `pit_dataset.py` now creates a content-addressed, raw-preserving research dataset artifact, and `research_experiment.py` binds precomputed development/test rows, five temporal partitions, an expected aligned tune trial list, fixed calibration, descriptive test diagnostics and declared cost reruns. Lockbox `label/net_r` values are forbidden in the prepared artifact and may be attached only after an experiment-ID-keyed shared local claim succeeds. This remains an evidence binder—not a promotion-grade trainer/orchestrator. It cannot attest how predictions/stress results were produced, independent trial pre-registration, audited feature joins, global one-time custody or non-inspection by the outcome provider. All affected promotion fields remain `None`; the manifest denies promotion.
 
+`cot_pit.py` supplies one CFTC Legacy source-specific vertical slice: configured-code count-bounded raw capture, locally observed row revisions, versioned local release sidecars, exact raw replay and typed as-of loading. This is a tested manual library/CLI boundary, not evidence of a real prospective corpus, trusted release custody, accepted licensing, end-to-end feature correctness or promotion readiness. It remains optional and `promotion_eligible=false`.
+
 ## 1. Pre-registration
 
 Before looking at test/lockbox results, record:
@@ -29,6 +31,8 @@ Changing any selection choice after seeing test results converts that test into 
 5. Mark free/scanner/legacy data as research-only where historical availability cannot be proven.
 6. Do not use files in `runs/data/` for promotion until a source, license, acquisition time, transformation lineage and hash are attached.
 7. Keep envelope integrity distinct from feature-join integrity. A dataset with zero envelope violations must not be reported as zero point-in-time feature violations until the actual as-of feature graph is audited.
+8. For COT only, admit an artifact after `audit_cot_pit_dataset` succeeds. Resolve observation and release revisions separately at prediction time; require every configured/required currency on the latest eligible report date, include any prior-position record in availability/provenance, and require typed `status=ok` with coverage/freshness. Unavailable, invalid, incomplete or stale states contribute no COT feature; a previously observed source ID disappearing without a tombstone contract fails materialization.
+9. Never backdate a historical COT row to its report date. Use the latest applicable observation ingestion/validation and release-evidence capture/declared-release boundary. A locally hashed schedule or notice sidecar is not an external timestamp, signature, content-authenticity check or licence opinion. Count-bounded pages are not an atomic upstream snapshot.
 
 ## 3. Label contract
 
@@ -90,6 +94,8 @@ Report period/pair/regime/session contributions and concentration. Improvement r
 ## 9. Reproducibility record
 
 Every experiment stores: experiment ID; commit/dirty state; dataset/source/version/hash; feature/label/model versions; hyperparameters; seed; train/tune/calibration/test/lockbox windows; costs; environment/dependency definition; all metrics/trials/artifacts; source-ledger version; creation time. The current research binder additionally records why `point_in_time_violations`, test isolation, lockbox non-reuse and operational incidents are unavailable instead of coercing them to zero/false.
+
+COT-backed decisions additionally record the audited COT dataset ID and used observation/release record hashes. This provenance is COT-only; it does not attest FRED or the complete feature graph.
 
 ## 10. Required review
 

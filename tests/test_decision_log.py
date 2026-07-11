@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 import json
+from types import SimpleNamespace
 
 from fx_intel import decision_log, learning, maximization, tf_learning, tp_sl_learning
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
@@ -100,11 +101,29 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
         cells={("USDJPY", "1h", "long"): max_cell},
     )
 
+    macro_snapshot = SimpleNamespace(
+        cot_evidence={
+            "status": "ok",
+            "dataset_id": "b" * 64,
+            "prediction_time": NOW.isoformat(),
+        },
+        cot={
+            "JPY": SimpleNamespace(
+                report_date="2026-07-07",
+                available_time=NOW,
+                source_record_id="source-JPY",
+                content_hash="a" * 64,
+                dataset_id="b" * 64,
+                data_quality_flags=("publication_time_attested_locally",),
+            )
+        },
+    )
     events = decision_log.build_timeframe_decision_events(
         {"USDJPY": [_plan()]},
         now=NOW,
         analysis=_analysis(),
         tech_map={"USDJPY": _tech()},
+        macro_snapshot=macro_snapshot,
         timeframe_learning=tf_learn,
         tp_sl_learning=tp_sl,
         maximization_profile=max_profile,
@@ -118,6 +137,10 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
     assert event["audit"]["scoring_ready"] is True
     assert event["technical_context"]["views"]["1h"]["atr"] == 0.2
     assert event["market_context"]["currency_sentiment"]["USD"]["score"] == 0.3
+    macro_evidence = event["market_context"]["macro_evidence"]
+    assert macro_evidence["cot_evidence"]["dataset_id"] == "b" * 64
+    assert macro_evidence["cot_reports"]["JPY"]["source_record_id"] == "source-JPY"
+    assert "COT-only" in macro_evidence["scope"]
     assert event["learning_context"]["timeframe_learning"]["evaluated"] == 12
     assert event["learning_context"]["tp_sl_learning"]["evaluated"] == 30
     assert event["learning_context"]["maximization"]["active_cell"]["action"] == "boost"

@@ -29,7 +29,13 @@ The stacked `codex/research-experiment-manifest` work adds two research-only bou
 - `pit_dataset.py` preserves raw bytes, canonical PIT records, source declarations and transform/code provenance in a create-only content-addressed directory, then reconstructs every bound field during audit. It explicitly separates zero envelope-temporal violations from **unavailable feature as-of-join evidence** and always records `promotion_eligible=false`.
 - `research_experiment.py` binds one-pair/one-horizon precomputed development/test rows, the exact five-way split, an expected aligned tune trial list, selected candidate/model declarations, one fixed calibration method, descriptive inference and four declared cost-stress rows. Prepared lockbox outcomes must be null. Evaluation claims the experiment ID in a shared local store before reading supplied outcomes; crash, partial result and duplicate-directory claims fail closed within that namespace.
 
-These artifacts improve traceability and failure behavior, not model evidence. Predictions, trial-space declarations and stress rows are supplied after the fact, primary source adapters remain disconnected, and a local claim store cannot prove global custody or outcome-provider non-inspection. Consequently PIT/future-feature integrity, trial completeness, every performance/cost metric, test isolation, global once and lockbox non-reuse remain `None` in `PromotionEvidence`; no registry transition is attempted.
+These artifacts improve traceability and failure behavior, not model evidence. Predictions, trial-space declarations and stress rows are supplied after the fact, most primary source adapters remain disconnected, and a local claim store cannot prove global custody or outcome-provider non-inspection. Consequently PIT/future-feature integrity, trial completeness, every performance/cost metric, test isolation, global once and lockbox non-reuse remain `None` in `PromotionEvidence`; no registry transition is attempted.
+
+### COT PIT follow-on addendum
+
+The later stacked COT work adds one narrow, source-specific, research-only CFTC Legacy Futures Only vertical slice. For the configured contract codes it brackets stable-ordered pagination with start/end filtered counts, preserves exact response bytes and completion metadata, quarantines HTTP/schema/pagination/order failures, versions observed row changes by stable CFTC ID, binds operator-supplied release evidence to versioned local sidecars, exactly replays normalized records from raw evidence, and performs a typed observation/release as-of join. A manual operator CLI separates capture, attestation, materialization, audit and as-of reads. Canonical briefing uses COT only when `--cot-pit-dataset` names an audited artifact; otherwise legacy TTL COT remains disconnected. Decision records retain the COT dataset ID and used record hashes.
+
+No real prospective corpus, periodic capture scheduler, accepted licence, authenticated release notice, external signature/trusted timestamp or Mac mini deployment is evidenced. URI syntax is restricted to HTTPS CFTC hosts, but local sidecar bytes and declared time are not externally authenticated. Stable counts do not create an atomic upstream snapshot, and revisions are known only after local observation. The artifact remains `promotion_eligible=false`; it does not attest FRED, prices, calendar/news/scanner inputs, the backtest feature graph or system-wide PIT. The audit decision, maturity scores and model-performance score therefore do not change.
 
 ## Observed operating and data state
 
@@ -63,14 +69,14 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 
 ### Critical — unresolved
 
-1. **No promotion-admissible dataset.** A research-only content-addressed PIT artifact now exists, but primary price/macro/COT/news/scanner ingestion is not materialized through it with externally attested availability, revision lineage and source contracts.
+1. **No promotion-admissible dataset.** A research-only content-addressed PIT artifact and one optional COT-specific adapter now exist, but COT release trust remains local and unlicensed/unattested; primary price/FRED/calendar/news/scanner/backtest feature ingestion is still not uniformly materialized with externally attested availability, revision lineage and accepted source contracts.
 2. **No authoritative end-to-end validation run.** The new evidence binder recomputes precomputed inputs and deliberately denies promotion; it does not own the trainer, feature as-of graph, label generation or cost-rerun call graph and therefore cannot attest test/lockbox isolation.
 3. **No valid performance evidence.** Synthetic diagnostics do not establish edge; real journals are stale/duplicated/incomplete, outcomes are unscored, PBO is unavailable and the only positive synthetic baseline has 11 trades and fails cost/statistical gates.
 4. **Observed operating state is not migration-ready.** The Mac mini snapshot showed stale/duplicate data, a broken scheduled command and ambiguous process ownership. Paper/live safety assertions and reconciliation were not executed during this read-only audit.
 
 ### High — unresolved or partial
 
-1. **PIT integration is partial.** Availability now fails closed against actual ingestion, but FRED uses current `fredgraph.csv`, macro/COT/news revision replay is incomplete, and the main CLI/briefing loaders are not uniformly PIT-backed.
+1. **PIT integration is partial.** The COT slice now has raw revision replay, a typed as-of loader and optional canonical briefing consumption. Its release trust is local, while FRED remains current `fredgraph.csv` and price/calendar/news/scanner/backtest paths are not uniformly PIT-backed.
 2. **Journaling is not uniformly transactional.** Price snapshots have lock/natural-key/conflict checks; decision, timeframe and outcome append paths do not yet share that contract.
 3. **Lockbox/governance state is only locally scoped.** Prepared artifacts now exclude outcome columns and a shared claim store rejects duplicate copies of the same experiment ID, but the outcome provider/store is not an independent custodian and there is no external timestamp/signature or approval service.
 4. **Legacy reports are not authoritative.** Older commercial-readiness cost sensitivity is post-hoc. Only full-engine reruns may support a cost gate.
@@ -80,7 +86,7 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 
 ### Medium — unresolved
 
-1. Source-specific parsers still need durable raw-response archives, schema-drift alarms, release validation and duplicate/revision policies.
+1. Source-specific parsers other than the narrow COT slice still need durable raw-response archives, schema-drift alarms, release validation and duplicate/revision policies. The COT slice itself still needs prospective operation, upstream schema monitoring and externally authenticated release custody.
 2. Direct critical operations notification and signal-board summaries need separate credentials and deployment verification; documentation alone is not evidence.
 3. The Python environment can run tests, but `.venv/bin/python -m pip` raises an internal pip import error. `requirements.lock` has exact versions but no hashes, so the runbook's `--require-hashes` migration gate intentionally stops until a reviewed hash-pinned lock is produced and a clean venv passes `pip check`.
 4. Missing-feature/performance drift now abstains safely, but production thresholds, label maturity and rollback behavior need real shadow evidence.
@@ -92,10 +98,12 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 - `PointInTimeRecord` normalizes legal availability to no earlier than declared publication, revision, actual ingestion and validation completion; null required times, future as-of joins and ambiguous equal-availability feature keys are rejected.
 - Payloads are canonicalized and frozen; unordered/non-JSON payloads are rejected and supplied hashes must equal a recomputed content hash. Strict QA checks timezone, future metadata, run/writer identity, flags, schema, ordering, source keys and hash shape.
 - `pit_dataset.py` copies raw inputs into a content-addressed store, writes canonical order-independent records, retains valid delayed-ingestion revision sequences and detects record/raw/manifest tampering, wrong entry types, symlinks and malformed/deep JSON without leaking parser exceptions.
+- `cot_pit.py` adds complete count-bounded stable pagination for configured CFTC codes, exact response envelopes, quarantine, CFTC-ID revision materialization, versioned local release records, source-specific raw replay, typed as-of states and positive evidence binding at `fresh_cot`; canonical briefing removes legacy COT fallback.
+- COT completeness is not an atomic source snapshot, local release evidence is not externally authenticated, and no production corpus or accepted licence exists. Its success cannot be generalized to FRED or the feature graph.
 - Technical and briefing capture timestamps are taken after acquisition rather than before a network request.
 - Source documentation now distinguishes the actual CFTC Legacy `6dca-aqww`, current-only FRED CSV, Stooq/RSS/FairEconomy and unofficial scanner paths from target vendor contracts.
 
-These changes close a concrete ingestion-time leakage path. They do not yet implement full two-stage revision materialization or connect every loader.
+These changes close concrete ingestion-time leakage paths and implement a two-record observation/release join for COT only. They do not connect every loader or prove system-wide feature availability.
 
 ### Labels, validation and inference
 
@@ -143,6 +151,7 @@ Three independent domain reviews were performed and their adverse findings were 
 | Quant/risk/ML | Skipped PBO/DSR, prevalence-shift usability, weak one-sample expectancy, missing drift columns, interval inconsistency, entry-only leverage, stale pending orders, early-ending symbols and non-independent legacy auto-promotion | Fail-closed controls plus a declared-trial research binder and outcome-withholding shared local claim now exist. All unattested performance fields remain unavailable; authoritative training/test custody is open. |
 | PIT artifact red team | Missing ingestion, duplicate as-of keys, manifest type/parser bypass, revision clock conflation, empty provenance/future metadata and overclaimed source verification | Reproductions were converted to fail-closed tests; source status was weakened to `declared_verified`. Reviewer verdict: shippable for research-only use, never for promotion evidence. |
 | Experiment binder red team | Prepared plaintext lockbox outcomes; directory-local double-open; unbound candidate/trial/stress declarations; reverse/future chronology; audit `OverflowError`; machine-path identity | All reproductions now fail closed; final re-review found no P0/P1. Unattested performance fields remain `None`; global custody and authoritative call graphs remain explicit blockers. Verdict: ship only as a research/descriptive binder. |
+| COT PIT adapter red team | Legacy parser could pass without positive evidence; release claims were initially in-memory; raw replay/pagination completeness and later evidence revisions were missing; schedule revisions, disappearing rows, mixed report weeks and prior-position provenance could be backdated or underbound | Observation and release records are versioned separately; exact raw replay, stable order/URI/timeline checks, local sidecar/evidence hash binding, early-known schedule revisions, latest-report alignment, row-disappearance rejection, derived-value availability/hashes and positive artifact/record-hash gates were added with adversarial fake-session tests. Remaining limits—local custody, same-count mutation, licence and absent real corpus—are explicit. Verdict: optional research-only input, never promotion evidence. |
 | Repository/operations | Contradictory Mac mini topology, rollback causing two writers, unsafe `git add -A`, alert-only freshness, hidden wrapper failures, stale status, centralized notification and no migration evidence | Canonical topology, safe migration/rollback rules, freshness veto/status and direct-notification design documented/prepared. Remote migration and journal-wide locking remain open. |
 | Repository/operations follow-up | `--no-notify` consumed notification state; failed sends could suppress retry; manual expectancy command was a second writer; status/restart missed direct/cron/legacy writers; uninstall and Docker checks failed open | Notification state/retry, manual procedure, writer detection, preflight restart, install/uninstall and Docker assertions were corrected and regression-tested. Mac mini deployment remains deliberately unperformed. |
 
@@ -152,8 +161,8 @@ Score meaning: 0 = absent/evaluation unavailable; 1 = ad hoc; 2 = coded and test
 
 | Required axis | Initial | Final | Evidence and ceiling |
 |---|---:|---:|---|
-| Data integrity | 1 | 2 | Raw-preserving content-addressed PIT artifacts and locked/idempotent price capture improve contracts; no promotion-admissible dataset |
-| Point-in-time integrity | 1 | 2 | UTC/as-of/availability/validation/hash checks and tamper audit exist; feature-join proof, external attestations and primary loaders remain incomplete |
+| Data integrity | 1 | 2 | Raw-preserving content-addressed PIT artifacts, a COT-specific replay adapter and locked/idempotent price capture improve contracts; no promotion-admissible dataset |
+| Point-in-time integrity | 1 | 2 | UTC/as-of/availability/validation/hash checks, tamper audit and one COT observation/release join exist; system-wide feature proof, external attestations and remaining primary loaders are incomplete |
 | Label quality | 1 | 2 | Next-open triple barrier, gaps, stop-first, MFE/MAE and net R are tested; no real PIT label corpus |
 | Validation rigor | 1 | 2 | An expected-ID aligned precomputed trial binder joins partitions/calibration/descriptive inference; independent pre-registration and the authoritative trainer/label/as-of/cost call graph remain absent |
 | Model performance | 0 | 0 | Real performance is evaluation-unavailable; synthetic baselines fail sample, confidence and cost gates |
@@ -169,7 +178,7 @@ Unweighted evidence score moves from **0.92/5 to 1.83/5**. The increase is proce
 
 | Dimension | Initial state | Final state | Promotion effect |
 |---|---|---|---|
-| PIT/data validity | Ambiguous availability; mutable evidence; inconsistent source claims | Stronger immutable primitive and source ledger | Partial only; no admissible dataset |
+| PIT/data validity | Ambiguous availability; mutable evidence; inconsistent source claims | Stronger immutable primitive/source ledger plus one optional COT replay/as-of slice | Partial only; no admissible dataset or system-wide proof |
 | Leakage-resistant research | Legacy split/reuse risks; weak statistical evidence handling | Label-aware splits, calibration and inference primitives | Partial only; no orchestrated experiment |
 | Decision fail-closed behavior | Missing/stale/cost/uncertainty evidence could degrade softly | Freshness, cost, calibration, drift and risk vetoes hardened | Safer research/shadow behavior |
 | Concurrency/operations | Duplicate writers, stale logs, hidden failures | Price-writer lock and canonical launchd/runbook prepared | Not deployed; other journals remain unsafe |
@@ -201,13 +210,22 @@ Follow-on checks on the stacked research-artifact worktree:
 - shell syntax by each script shebang and `git diff --check`: passed.
 - Focused PIT/point-in-time set: **31 passed**; focused experiment/time-series set: **19 passed**.
 
+COT PIT follow-on checks on the next stacked worktree:
+
+- `pytest -q`: **558 passed, 1 skipped** in 15.95 seconds.
+- `ruff check .`: passed.
+- `black --check .`: 126 files unchanged.
+- `mypy fx_backtester fx_intel *.py tools/cot_pit_pipeline.py`: 68 source files, no issues.
+- shell syntax by each script shebang and `git diff --check`: passed.
+- Focused COT API/operator CLI set: **35 passed**. These are fake-session and temporary-artifact tests; they do not prove a live endpoint capture, release-evidence authenticity, a production corpus or deployment.
+
 ## Exit criteria for the next stage
 
 Before `validated` can be considered:
 
 1. Complete human diff review, record the final artifact/dependency hashes, and do not infer commit scope from subject lines alone.
 2. Migrate the Mac mini using the runbook with pre-state evidence, paper-safe assertions, one writer, freshness/gap checks and rollback evidence; do not enable live.
-3. Connect primary immutable raw/PIT source adapters with contractual timestamps, revisions, first ingestion, licenses and external attestations; quarantine current contaminated journals. Do not relabel the research-only artifact as admissible evidence.
+3. Operate the COT adapter prospectively under authenticated/licensed release capture, external attestations, one-writer retention and monitoring; connect the remaining primary immutable raw/PIT source adapters with contractual timestamps, revisions and first ingestion. Quarantine current contaminated journals and do not relabel any research-only artifact as admissible evidence.
 4. Replace the precomputed evidence boundary with one authoritative call graph that owns feature as-of joins, labels, training/tune selection, fixed calibration, test opening and full cost reruns; place the one-time lockbox under independent custody.
 5. Run a pre-registered real-data experiment with adequate effective samples, positive net-R confidence lower bound, acceptable PBO/DSR/calibration/coverage/tails and no major incidents.
 6. Obtain independent reproduction and named human approval for an adjacent transition only.

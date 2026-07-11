@@ -64,6 +64,46 @@ zero-write確認は正規runtimeと分離したcopyで行う。
 `DISCORD_OPS_WEBHOOK_URL`が未設定で分析Webhookへのfallbackも失敗する場合、通知到達は保証されない。
 そのため`status_fx_services.sh`、launchd stderr、`freshness_report.json`の確認を移行完了条件に含める。
 
+### 0-3. COT PITは手動research境界（未配備）
+
+`fx_briefing.py --cot-pit-dataset <artifact>`は既存artifactを監査してas-of読込するだけで、CFTC取得、release evidence作成、materialize、更新は行わない。省略時はlegacy TTL COTへfallbackせず、COTを判断入力から除外する。invalid/unavailable/incomplete/staleもCOTだけを除外してtyped warningを残し、現状ではbriefing全体を停止しない。
+
+`scripts/fx_briefing_once.sh`とlaunchd plistはこのoptionを渡していないため、§0の正規構成ではCOTは意図的に無効である。COT用の承認済み定期取得service、single-writer規則、release-evidence取得手順、retention/backup、freshness monitor、Mac mini配備、実prospective corpusは存在しない。明示的な人手レビューなしにplist/cron/既存Mac mini serviceへ接続してはならない。
+
+手動research用CLIは次の5操作を分離する。`attest`は実行時UTCをevidence取得時刻として記録し、遡及指定を許さない。`materialize`は現在のGit HEAD/dirty状態を自動記録する。入力探索や「latest」選択はせず、すべてのpathを明示する。
+
+```bash
+# 1. configured contract codesのcount-bounded raw capture（network read + local create）
+.venv/bin/python tools/cot_pit_pipeline.py capture \
+  --capture-root "$HOME/fx-codex-research/cot/captures"
+
+# 2. 運用者が別途保存・確認したCFTC release/schedule bytesをlocal sidecarへ結合
+#    released-atは公式情報をtimezone付きISO-8601で転記する。
+.venv/bin/python tools/cot_pit_pipeline.py attest \
+  --output "$HOME/fx-codex-research/cot/release-2026-07-07.json" \
+  --evidence "$HOME/fx-codex-research/cot/release-2026-07-07.html" \
+  --report-date 2026-07-07 \
+  --basis scheduled \
+  --released-at 2026-07-10T15:30:00-04:00 \
+  --evidence-uri 'https://www.cftc.gov/MarketReports/CommitmentsofTraders/ReleaseSchedule/index.htm'
+
+# 3. capture/sidecar/evidenceを明示してresearch-only artifactをcreate-only materialize
+.venv/bin/python tools/cot_pit_pipeline.py materialize \
+  --root "$HOME/fx-codex-research/cot/artifacts" \
+  --capture '<capture-bundle.json>' \
+  --release '<release-sidecar.json>' '<exact-evidence-file>'
+
+# 4. source-specific raw replay audit（read-only）
+.venv/bin/python tools/cot_pit_pipeline.py audit '<dataset-directory>'
+
+# 5. 指定時刻のtyped state確認（read-only。ok以外はexit 1）
+.venv/bin/python tools/cot_pit_pipeline.py as-of '<dataset-directory>' \
+  --prediction-time 2026-07-11T00:00:00Z \
+  --required-currencies JPY USD
+```
+
+このCLIの成功は、CFTC-host URI構文、local bytes/hash/time結合、取得bundleと正規化recordの再構成を検査したという意味に限る。evidence内容・実公表時刻・外部署名/trusted timestamp・ライセンスを認証せず、start/end count一致も同件数の途中改定を排除できない。artifactは常に`research_only`かつ`promotion_eligible=false`であり、FREDやfeature graph全体のPIT、予測性能、情報優位性を証明しない。
+
 ## 1. インストール / 確認 / 再起動 / 撤去
 
 以下は§2の証跡取得、SHA検証、競合writer停止、安全assertionを完了した後にだけ使う。

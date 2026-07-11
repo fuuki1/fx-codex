@@ -34,8 +34,9 @@
 8. 複数AI委員会(fx_intel/committee.py) — テクニカル/ニュース/マクロ/MLの
    4委員が意見を出し、複合スコアを重み付き平均で合成。リスクオフィサー
    (build_trade_planの決定論ゲート)が常に拒否権を持つ。
-9. マクロデータ層(fx_intel/macro.py) — COT・米金利・VIX・ドル指数を
-   TTLキャッシュ+staleness品質ゲート付きで取得。リスクレジームを実データ判定。
+9. マクロデータ層(fx_intel/macro.py / cot_pit.py) — 金利・VIX・ドル指数は
+   current-only TTL、COTは明示された監査済みresearch artifactだけをas-of読込。
+   legacy TTL COTへはfallbackしない。
 10. ML確率モデル(fx_intel/gbm.py + ml.py) — 依存ゼロのGBDTでジャーナルから
     P(hit|状態,方向)を学習。自己相関間引き・時系列split+エンバーゴ・較正・
     スキルゲート付き。--train-ml で強制再学習。モデルが無い/7日以上古い場合は
@@ -130,6 +131,53 @@ DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
 # ガードが早期returnするため、データが足りないうちは実質ノーコスト)
 ML_RETRAIN_DAYS = 7.0
+
+
+def _attach_cot_pit_dataset(
+    snapshot: macro.MacroSnapshot,
+    dataset_path: Path | None,
+    *,
+    prediction_time: datetime,
+) -> None:
+    """Attach only audited, release-attested COT rows available at prediction time."""
+
+    if prediction_time.tzinfo is None:
+        raise ValueError("COT prediction_time must be timezone-aware")
+    snapshot.cot = {}
+    if dataset_path is None:
+        snapshot.cot_evidence = {
+            "status": "disabled",
+            "prediction_time": prediction_time.astimezone(UTC).isoformat(),
+            "usable": False,
+        }
+        snapshot.warnings.append(
+            "COT PIT dataset未指定: legacy current-snapshot COTは判断入力から除外"
+        )
+        return
+    # Keep the normal notification runtime independent from fx_backtester.  The
+    # shared PIT artifact dependency is loaded only when this research-only input
+    # is explicitly selected.
+    from fx_intel import cot_pit
+
+    try:
+        result = cot_pit.load_cot_as_of(dataset_path, prediction_time)
+    except cot_pit.COTPITError as error:
+        snapshot.cot_evidence = {
+            "status": "invalid",
+            "prediction_time": prediction_time.astimezone(UTC).isoformat(),
+            "errors": [str(error)],
+            "usable": False,
+        }
+        snapshot.warnings.append(f"COT PIT dataset監査失敗のためCOTを除外: {error}")
+        return
+    snapshot.cot_evidence = result.to_dict()
+    if not result.usable:
+        detail = "; ".join((*result.errors, *result.warnings[:1]))
+        snapshot.warnings.append(
+            f"COT PIT status={result.status} のためCOTを除外" + (f": {detail}" if detail else "")
+        )
+        return
+    snapshot.cot = dict(result.reports)
 
 
 def ml_needs_retrain(
@@ -736,6 +784,7 @@ def _run_per_timeframe(
                 events_48h=events_48h,
                 fetch_warnings=fetch_warnings,
                 calendar_ok=calendar_ok,
+                macro_snapshot=macro_snapshot,
                 timeframe_learning=tf_learn if not args.no_learning else None,
                 tp_sl_learning=tp_sl_learn,
                 maximization_profile=max_profile,
@@ -877,6 +926,12 @@ def main(argv: list[str] | None = None) -> int:
         "--no-macro",
         action="store_true",
         help="マクロデータ(COT・金利・VIX・ドル指数)の取得と委員を使わない",
+    )
+    parser.add_argument(
+        "--cot-pit-dataset",
+        type=Path,
+        default=None,
+        help="監査済みCFTC COT PIT artifactディレクトリ。未指定時はlegacy COTを使用しない",
     )
     parser.add_argument(
         "--no-ml",
@@ -1159,10 +1214,20 @@ def main(argv: list[str] | None = None) -> int:
     items, news_warnings = news.fetch_news_for_symbols(symbols, hours_back=args.hours_back)
     fetch_warnings.extend(news_warnings)
 
-    # 3. マクロデータ(COT・金利・VIX・ドル指数)。レジーム判定とマクロ委員に使う
+    # 3. マクロデータ。FRED系は現行snapshot、COTは明示された監査済みPIT artifact
+    # だけをprediction timeでas-of読込みする。legacy current snapshotは使わない。
     macro_snapshot = None
     if not args.no_macro:
-        macro_snapshot = macro.fetch_macro_snapshot(DEFAULT_MACRO_CACHE, now=now)
+        macro_snapshot = macro.fetch_macro_snapshot(
+            DEFAULT_MACRO_CACHE,
+            now=now,
+            include_cot=False,
+        )
+        _attach_cot_pit_dataset(
+            macro_snapshot,
+            args.cot_pit_dataset,
+            prediction_time=now,
+        )
         fetch_warnings.extend(macro_snapshot.warnings)
 
     # 4. センチメント分析(Claude API → 自前分析エンジン。レジームはマクロ実データ優先)
@@ -1389,6 +1454,7 @@ def main(argv: list[str] | None = None) -> int:
                     events_48h=events_48h,
                     fetch_warnings=fetch_warnings,
                     calendar_ok=calendar_ok,
+                    macro_snapshot=macro_snapshot,
                     learning_profile=profile if not args.no_learning else None,
                     trade_expectancy_summary=(
                         trade_expectancy_summary if not args.no_trade_expectancy else None

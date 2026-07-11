@@ -13,6 +13,7 @@ from fx_backtester.pit_dataset import (
     SourceLineage,
     audit_pit_dataset,
     dataset_hash_from_manifest,
+    load_pit_dataset_records,
     materialize_pit_dataset,
 )
 from fx_backtester.point_in_time import PointInTimeRecord
@@ -126,6 +127,18 @@ def test_materialization_is_order_independent_and_content_addressed(tmp_path: Pa
     assert first.records_path.read_bytes() == second.records_path.read_bytes()
     assert first.manifest_path.read_bytes() == second.manifest_path.read_bytes()
     assert dataset_hash_from_manifest(first.directory) == first.dataset_id
+    assert [record.source_record_id for record in load_pit_dataset_records(first.directory)] == [
+        "first",
+        "second",
+    ]
+
+
+def test_record_loader_reaudits_before_returning_rows(tmp_path: Path) -> None:
+    artifact = _materialize(tmp_path)
+    artifact.records_path.write_bytes(artifact.records_path.read_bytes() + b"{}\n")
+
+    with pytest.raises(PITDatasetError, match="audit failed"):
+        load_pit_dataset_records(artifact.directory)
 
 
 def test_manifest_binds_raw_lineage_transform_and_time_bounds(tmp_path: Path) -> None:

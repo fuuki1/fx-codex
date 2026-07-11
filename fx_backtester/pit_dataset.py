@@ -403,6 +403,31 @@ def dataset_hash_from_manifest(dataset_dir: str | Path) -> str:
     return dataset_id
 
 
+def load_pit_dataset_records(dataset_dir: str | Path) -> tuple[PointInTimeRecord, ...]:
+    """Return records from a fully re-audited PIT artifact.
+
+    The audit is deliberately repeated at the read boundary.  The records file is
+    then read once, checked against the audited manifest digest, and parsed from
+    those exact bytes so a caller cannot accidentally consume an unaudited copy.
+    This is still a local-filesystem trust boundary, not an external signature or
+    immutable object-store guarantee.
+    """
+
+    audit = audit_pit_dataset(dataset_dir)
+    if not audit.passed:
+        raise PITDatasetError(f"PIT dataset audit failed: {'; '.join(audit.errors)}")
+    directory = Path(dataset_dir).expanduser().resolve()
+    records_path = directory / "records.jsonl"
+    try:
+        raw = records_path.read_bytes()
+        expected = audit.manifest["structural_integrity"]["records_sha256"]
+    except (OSError, KeyError, TypeError) as error:
+        raise PITDatasetError(f"cannot load audited records: {error}") from error
+    if not isinstance(expected, str) or _digest(raw) != expected:
+        raise PITDatasetError("records.jsonl changed after PIT dataset audit")
+    return _records_from_bytes(raw)
+
+
 def _prepare_records(
     records: Iterable[PointInTimeRecord], created_at: datetime
 ) -> tuple[tuple[PointInTimeRecord, ...], dict[str, Any], bytes]:
@@ -634,7 +659,10 @@ def _build_manifest(dataset_id: str, identity: Mapping[str, Any]) -> dict[str, A
 def _records_from_artifact(path: Path) -> tuple[PointInTimeRecord, ...]:
     if not path.is_file():
         raise PITDatasetError("records.jsonl is missing")
-    raw = path.read_bytes()
+    return _records_from_bytes(path.read_bytes())
+
+
+def _records_from_bytes(raw: bytes) -> tuple[PointInTimeRecord, ...]:
     if not raw:
         raise PITDatasetError("records.jsonl is empty")
     if not raw.endswith(b"\n"):
@@ -902,5 +930,6 @@ __all__ = [
     "SourceLineage",
     "audit_pit_dataset",
     "dataset_hash_from_manifest",
+    "load_pit_dataset_records",
     "materialize_pit_dataset",
 ]
