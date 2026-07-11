@@ -148,7 +148,9 @@ def test_promote_live_flag_is_rejected_before_any_network_call(capsys) -> None:
         fx_briefing.main(["--promote-live", "ml", "--dry-run"])
 
     assert error.value.code == 2
-    assert "--promote-live is disabled" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "--promote-live is disabled" in error
+    assert "research/shadow only" in error
 
 
 def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:

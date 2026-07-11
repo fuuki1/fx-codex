@@ -1034,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     if args.promote_live is not None:
-        parser.error("--promote-live is disabled; research may promote only through paper")
+        parser.error("--promote-live is disabled; this build is research/shadow only")
     if args.signal_board:
         args.per_timeframe = True
 
