@@ -9,10 +9,10 @@ Build a reproducible FX research and decision-support system. Optimize for point
 - `fx_backtester/`: research engine, labels, validation, simulated execution, risk, governance.
 - `fx_intel/`: briefing, macro/news inputs, learning, decision journals.
 - `tools/`, `scripts/`, `ops/`: monitoring and local launchd operations (analysis→Discord services).
-
-The system is **analysis-only**: it produces a Discord signal board and never sends real orders. The former `trader/` order-execution stack and the strategy-parameter optimization pipeline (`auto_optimize.py` / `promote_params.py` / `params_gate.py` / `strategy_params.json`) were removed on 2026-07-10; do not attempt to recreate or reference them.
 - `docs/`, `reports/`, `runs/`: protocols, evidence, and immutable run artifacts.
 - `.codex/skills/`: repeatable audit, validation, promotion, and incident workflows.
+
+The system is **analysis-only**: it produces a Discord signal board and never sends real orders. The former `trader/` order-execution stack and the strategy-parameter optimization pipeline (`auto_optimize.py` / `promote_params.py` / `params_gate.py` / `strategy_params.json`) were removed on 2026-07-10; do not attempt to recreate or reference them.
 
 ## Setup and checks
 
