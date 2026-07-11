@@ -54,6 +54,22 @@ def _analysis():
     )
 
 
+@pytest.fixture(autouse=True)
+def _market_always_open():
+    """市場を常にオープン扱いに固定する(テストの実行曜日依存を排除)。
+
+    fx_briefing.main は datetime.now の実時刻で is_market_open を判定するため、
+    週末に実行すると全時間足が「休場」standbyへ倒れ、方向判断に依存する検証
+    (承認済みTP/SL・期待値ガード等)が実行日によって失敗する。ネットワークを
+    全モックした決定論テストなので、市場状態も固定する。
+    """
+    with (
+        mock.patch("fx_intel.timeframe.is_market_open", return_value=True),
+        mock.patch("fx_intel.briefing.is_market_open", return_value=True),
+    ):
+        yield
+
+
 def _approved_tp_registry(path) -> None:
     candidate = to.TradeImprovementCandidate(
         "approved-overall-tp",
