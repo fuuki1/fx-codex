@@ -101,6 +101,10 @@ def test_five_way_partition_separates_calibration_test_and_lockbox() -> None:
         assert max(label_end[list(left)]) < min(prediction[list(right)])
     assert partitions.lockbox_size == 12
     assert not partitions.lockbox_opened
+    assert len(partitions.lockbox_commitment) == 64
+    assert partitions.audit()["lockbox_commitment_sha256"] == partitions.lockbox_commitment
+    assert len(partitions.withheld_lockbox_positions) == partitions.lockbox_size
+    assert not partitions.lockbox_opened
 
 
 def test_lockbox_requires_selection_complete_and_can_be_opened_only_once() -> None:

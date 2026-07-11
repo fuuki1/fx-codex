@@ -60,7 +60,8 @@ class PointInTimeRecord:
 
     ``event_time`` is what the observation describes. ``available_time`` is the
     first instant this system could actually use it, so it is normalized to the
-    latest of declared availability, publication, revision, and ingestion.
+    latest of declared availability, publication, revision, ingestion, and
+    validation completion.
     ``ingested_time`` records when this system received it. Scheduled events may
     have an event time in the future, so no ordering is imposed between event and
     availability time.
@@ -75,6 +76,7 @@ class PointInTimeRecord:
     published_time: datetime | None = None
     source_time: datetime | None = None
     revision_time: datetime | None = None
+    validated_time: datetime | None = None
     schema_version: int = 1
     content_hash: str = ""
     run_id: str = ""
@@ -83,6 +85,9 @@ class PointInTimeRecord:
     data_quality_flags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        for name in ("event_time", "available_time", "ingested_time"):
+            if getattr(self, name) is None:
+                raise PointInTimeError(f"{name} must be non-null")
         for name in (
             "event_time",
             "available_time",
@@ -90,14 +95,23 @@ class PointInTimeRecord:
             "published_time",
             "source_time",
             "revision_time",
+            "validated_time",
         ):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, utc_datetime(value, field_name=name))
-        if not self.source.strip():
-            raise PointInTimeError("source must be non-empty")
-        if not self.source_record_id.strip():
-            raise PointInTimeError("source_record_id must be non-empty")
+        for name in ("source", "source_record_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise PointInTimeError(f"{name} must be a non-empty string")
+            object.__setattr__(self, name, value.strip())
+        for name in ("run_id", "writer_id", "model_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise PointInTimeError(f"{name} must be a string")
+            object.__setattr__(self, name, value.strip())
+        if not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool):
+            raise PointInTimeError("schema_version must be an integer")
         if self.schema_version < 1:
             raise PointInTimeError("schema_version must be >= 1")
         effective_availability = max(
@@ -107,6 +121,7 @@ class PointInTimeRecord:
                 self.ingested_time,
                 self.published_time,
                 self.revision_time,
+                self.validated_time,
             )
             if timestamp is not None
         )
@@ -123,16 +138,14 @@ class PointInTimeRecord:
             raise PointInTimeError("content_hash must be a lowercase SHA-256 hex digest")
         object.__setattr__(self, "payload", _freeze_json(canonical_payload))
         object.__setattr__(self, "content_hash", digest)
-        object.__setattr__(
-            self,
-            "data_quality_flags",
-            tuple(
-                dict.fromkeys(
-                    [str(flag) for flag in self.data_quality_flags if str(flag)]
-                    + (["availability_normalized_to_actual_use"] if availability_was_raised else [])
-                )
-            ),
-        )
+        if not isinstance(self.data_quality_flags, (list, tuple)) or any(
+            not isinstance(flag, str) for flag in self.data_quality_flags
+        ):
+            raise PointInTimeError("data_quality_flags must contain only strings")
+        normalized_flags = {flag.strip() for flag in self.data_quality_flags if flag.strip()}
+        if availability_was_raised:
+            normalized_flags.add("availability_normalized_to_actual_use")
+        object.__setattr__(self, "data_quality_flags", tuple(sorted(normalized_flags)))
 
     def to_dict(self) -> dict[str, Any]:
         return _json_ready({item.name: getattr(self, item.name) for item in fields(self)})
@@ -170,10 +183,13 @@ def point_in_time_asof_join(
     # Raw feature tables sometimes carry the source's nominal release time in
     # available_time. Actual use cannot precede our ingestion (or a later revision),
     # so normalize before sorting/joining rather than trusting that declaration.
-    for boundary in ("published_time", "ingested_time", "revision_time"):
+    for boundary in ("published_time", "ingested_time", "revision_time", "validated_time"):
         if boundary in right:
             right[boundary] = _utc_series(right[boundary], boundary)
             right[available_time] = right[[available_time, boundary]].max(axis=1)
+    feature_key = [*by_columns, available_time]
+    if bool(right.duplicated(feature_key, keep=False).any()):
+        raise PointInTimeError(f"ambiguous duplicate feature availability key: {feature_key}")
     left["__pit_order"] = np.arange(len(left), dtype=int)
 
     left_sort = [prediction_time, *by_columns]
@@ -421,7 +437,7 @@ def evaluate_price_quality(
         if missing_metadata:
             add("point_in_time_metadata_missing", is_critical=True)
         else:
-            required_non_null = sorted(metadata - {"data_quality_flags"})
+            required_non_null = sorted(metadata)
             null_metadata = {
                 column: int(frame[column].isna().sum())
                 for column in required_non_null
@@ -432,7 +448,7 @@ def evaluate_price_quality(
                 add("point_in_time_metadata_null", is_critical=True)
 
             timestamp_columns = ["event_time", "available_time", "ingested_time"]
-            for optional in ("published_time", "revision_time"):
+            for optional in ("published_time", "revision_time", "validated_time"):
                 if optional in frame:
                     timestamp_columns.append(optional)
             parsed_timestamps: dict[str, pd.Series] = {}
@@ -446,18 +462,53 @@ def evaluate_price_quality(
                     (parsed_timestamps["available_time"] < parsed_timestamps["ingested_time"]).any()
                 ):
                     add("available_before_ingestion", is_critical=True)
-            for boundary in ("published_time", "revision_time"):
+            for boundary in ("published_time", "revision_time", "validated_time"):
                 if {"available_time", boundary} <= parsed_timestamps.keys() and bool(
                     (parsed_timestamps["available_time"] < parsed_timestamps[boundary]).any()
                 ):
                     add(f"available_before_{boundary}", is_critical=True)
 
-            source = frame["source"].astype(str).str.strip()
-            source_ids = frame["source_record_id"].astype(str).str.strip()
-            if bool(source.eq("").any()) or bool(source_ids.eq("").any()):
+            future_boundary = pd.Timestamp(now_utc + limits.max_future_skew)
+            future_metadata_counts = {
+                column: int((parsed_timestamps[column] > future_boundary).sum())
+                for column in ("available_time", "ingested_time", "validated_time")
+                if column in parsed_timestamps
+                and bool((parsed_timestamps[column] > future_boundary).any())
+            }
+            metrics["future_metadata_counts"] = future_metadata_counts
+            if future_metadata_counts:
+                add("point_in_time_future_metadata", is_critical=True)
+
+            identity_columns = ("source", "source_record_id", "run_id", "writer_id")
+            empty_identity = {
+                column: int(frame[column].astype(str).str.strip().eq("").sum())
+                for column in identity_columns
+                if bool(frame[column].astype(str).str.strip().eq("").any())
+            }
+            metrics["empty_identity_counts"] = empty_identity
+            if empty_identity:
                 add("point_in_time_identity_empty", is_critical=True)
-            if bool(source_ids.duplicated().any()):
+            duplicate_source_keys = frame.duplicated(["source", "source_record_id"], keep=False)
+            metrics["duplicate_source_record_key_count"] = int(duplicate_source_keys.sum())
+            if bool(duplicate_source_keys.any()):
                 add("duplicate_source_record_id", is_critical=True)
+
+            valid_schema = frame["schema_version"].map(
+                lambda value: isinstance(value, (int, np.integer))
+                and not isinstance(value, (bool, np.bool_))
+                and int(value) >= 1
+            )
+            metrics["invalid_schema_version_count"] = int((~valid_schema).sum())
+            if not bool(valid_schema.all()):
+                add("invalid_schema_version", is_critical=True)
+
+            valid_flags = frame["data_quality_flags"].map(
+                lambda value: isinstance(value, (list, tuple))
+                and all(isinstance(flag, str) for flag in value)
+            )
+            metrics["invalid_data_quality_flags_count"] = int((~valid_flags).sum())
+            if not bool(valid_flags.all()):
+                add("invalid_data_quality_flags", is_critical=True)
 
             hashes = frame["content_hash"].astype(str)
             valid_hashes = hashes.str.fullmatch(r"[0-9a-f]{64}", na=False)
@@ -484,18 +535,26 @@ def _spread_series(frame: pd.DataFrame) -> pd.Series | None:
 
 def _json_ready(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
+        if any(not isinstance(key, str) for key in value):
+            raise PointInTimeError("JSON object keys must be strings")
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, set):
+        raise PointInTimeError("sets are unordered and cannot be serialized canonically")
+    if isinstance(value, (list, tuple)):
         return [_json_ready(item) for item in value]
     if isinstance(value, (datetime, pd.Timestamp)):
         return utc_datetime(value, field_name="timestamp").isoformat()
     if isinstance(value, np.integer):
         return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
     if isinstance(value, np.floating):
         value = float(value)
     if isinstance(value, float) and not np.isfinite(value):
         raise PointInTimeError("non-finite values cannot be hashed or serialized")
-    return value
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise PointInTimeError(f"unsupported JSON value type: {type(value).__name__}")
 
 
 def _freeze_json(value: Any) -> Any:

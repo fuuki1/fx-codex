@@ -4,7 +4,7 @@
 
 ```mermaid
 flowchart LR
-    A["Immutable raw observations\nevent/published/available/ingested/revision"] --> B["PIT as-of layer\nUTC, hashes, lineage"]
+    A["Immutable raw observations\nevent/published/available/ingested/revision/validated"] --> B["PIT as-of layer\nUTC, hashes, lineage"]
     B --> C{"Data-quality veto"}
     C -- fail --> N["No trade + alert"]
     C -- pass --> D["Feature snapshots\nfit inside split"]
@@ -28,22 +28,24 @@ This diagram is the **target control plane**, not a claim that every box is conn
 
 | Concern | Implemented primitive | Current connection status |
 |---|---|---|
-| PIT envelope/as-of/data QA | `fx_backtester/point_in_time.py`: aware UTC, normalized legal availability, content hash and strict quality checks | **Partial.** The primary briefing/backtest loaders do not yet materialize all macro, COT, news and price inputs through this envelope; revision replay is incomplete. |
+| PIT envelope/as-of/data QA | `fx_backtester/point_in_time.py`, `pit_dataset.py`: aware UTC, normalized legal availability including validation completion, canonical content-addressed records, preserved raw inputs, create-only materialization and a recomputing audit | **Partial/research-only.** The artifact is locally tamper-evident and always `promotion_eligible=false`. Primary briefing/backtest loaders do not yet materialize all sources through it; feature as-of joins, source attestations and revision replay remain incomplete. |
 | Snapshot single writer | `fx_intel/price_history.py`, `tools/run_exclusive.py`: OS advisory lock, 5-minute natural key, idempotent replay and conflicting-writer rejection | **Connected for price snapshots only.** Decision, timeframe and other JSONL journals do not yet share this transactional/single-writer contract. |
 | Freshness/gaps | `tools/data_freshness_monitor.py`, `tools/journal_gap_audit.py`, `fx_intel/freshness.py` | **Connected to canonical briefing when `--require-freshness` is used.** Missing, malformed, future, stale, warning or critical evidence vetoes decisions. Historical contamination still needs migration. |
 | Labels | `fx_backtester/labeling.py`: next-open, volatility barriers, stop-first ambiguity, gap stop, first-touch MFE/MAE, net R and label end | **Library only.** It is not yet the sole label path for the legacy outcome learner or briefing ML. |
-| Temporal validation | `fx_backtester/time_series_validation.py`, `walk_forward.py`: label-aware purge, embargo, anchored/rolling and CPCV | **Library only.** No promotion-grade orchestrator binds splits, all trials and artifacts; the lockbox-open marker is process-local rather than durable governance state. |
+| Temporal validation | `fx_backtester/time_series_validation.py`, `walk_forward.py`, `research_experiment.py`: label-aware purge/embargo, five partitions, a lockbox-position commitment, withheld outcome columns and an experiment-ID-keyed shared local claim store | **Partial research binder.** The binder checks an expected aligned tune trial list, binds selected candidate/model hashes across declarations, fits one fixed calibrator on calibration, recomputes descriptive test metrics and denies promotion. Independent trial pre-registration, trainer/test isolation, engine reruns and global lockbox custody remain unattested, so their `PromotionEvidence` fields stay `None`. |
 | Overfitting/uncertainty | `overfitting.py`, `statistical_validation.py`, `trial_log.py` | **Primitive available.** PBO requires a complete aligned trial-return family; skipped/invalid evidence fails promotion, but the legacy reporting path is not authoritative. |
 | Calibration/no-trade | `calibration.py`, `fx_intel/ml.py`, `decision_pipeline.py` | **Partial.** Five temporal windows and calibration/null/AUC checks exist; production-grade uncertainty, label lineage and end-to-end evidence binding remain incomplete. |
 | Cost stress | `stress.py`, `execution.py`, `engine.py` | **Library available.** Promotion evidence must use full reruns; older post-hoc commercial sensitivity is descriptive and inadmissible for this gate. |
 | Portfolio risk | `risk.py`, `engine.py`, `governance.py` | **Connected in the backtester.** Entry and marked-to-market gross leverage, currency exposure, loss/DD locks and non-overridable vetoes are simulated; no broker connection exists. |
 | Registry/drift | `governance.py`, `drift.py` | **Library/partial integration.** Missing evidence fails and mature-label/schema checks abstain, but no durable authoritative registry service is connected end to end. |
-| Reproducibility | `artifacts.py` | **Partial.** Deterministic runs record commit/dirty state, hashes, seed, costs and environment; ML split/lockbox/trial lineage needs a dedicated manifest. |
+| Reproducibility | `artifacts.py`, `pit_dataset.py`, `research_experiment.py` | **Partial.** Dataset/raw/trial/evaluation/stress inputs, code state, fixed calibration, partitions, metrics and promotion failures are content-bound and re-audited. The experiment binder is deliberately research-only and still lacks an authoritative trainer/label/as-of/cost call graph, external timestamp/signature and portable dependency image. |
 | Notification operations | `fx_briefing.py`, `scripts/`, `ops/launchd/` | **Prepared, not deployed by this audit.** Canonical launchd topology and freshness vetoes are encoded; the observed Mac mini state requires controlled migration. |
 
 ## Storage model
 
 Raw source records are logically immutable. A record’s descriptive time is distinct from first legal availability and actual ingestion. Corrections are new records linked by source ID/revision, not history rewrites. Derived features and labels reference content hashes and versions.
+
+`pit_dataset.py` is the current artifact boundary: it copies raw bytes into a SHA-256-addressed `raw/` store, writes canonical sorted records and reconstructs the identity during audit. Its `dataset_id` hashes the complete artifact identity (records, raw lineage, transform, code and creation metadata), while `identity.records.sha256` is the pure canonical-record stream digest. A local attacker able to rewrite every file and directory name remains outside this threat model; external signing/object lock is still required for independent immutability.
 
 JSONL remains the current vertical slice for low-volume append-only journals. **Only the price-snapshot path currently has the full `flock` + natural-key + conflict-detection contract.** Other decision/timeframe/outcome journals still use independent append paths and therefore remain a promotion blocker under concurrent writers. Promotion-grade scale should move all authoritative journals to SQLite WAL or an append/event database with unique constraints and transactions; JSONL should then become an export artifact, not a concurrent primary store.
 

@@ -8,6 +8,8 @@ entire label interval ends before the next evaluation interval begins.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -266,6 +268,23 @@ class ModelPartitions:
     def lockbox_opened(self) -> bool:
         return self._lockbox_opened
 
+    @property
+    def lockbox_commitment(self) -> str:
+        """Commit to withheld row positions without exposing outcomes."""
+
+        encoded = json.dumps(list(self._lockbox), separators=(",", ":")).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def withheld_lockbox_positions(self) -> tuple[int, ...]:
+        """Return positions solely so outcome columns can be withheld at rest.
+
+        Positions and prediction inputs are not secret. ``open_lockbox`` remains
+        the guard for attaching/evaluating the externally held outcomes.
+        """
+
+        return self._lockbox
+
     def open_lockbox(self, *, selection_complete: bool, purpose: str) -> tuple[int, ...]:
         if not selection_complete:
             raise TemporalLeakageError(
@@ -286,6 +305,7 @@ class ModelPartitions:
             "calibration_rows": len(self.calibration),
             "test_rows": len(self.test),
             "lockbox_rows": len(self._lockbox),
+            "lockbox_commitment_sha256": self.lockbox_commitment,
             "lockbox_opened": self._lockbox_opened,
             "lockbox_purpose": self._lockbox_purpose,
         }

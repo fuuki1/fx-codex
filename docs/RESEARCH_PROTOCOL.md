@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-This is the required protocol, not evidence that a candidate has completed it. The repository contains many individual controls, but no single promotion-grade orchestrator currently binds PIT materialization, labels, five temporal partitions, the complete trial family, calibration, full cost reruns, a durable one-time lockbox and governance approval into one verified run. The legacy CLI/report paths must not be treated as equivalent. Missing orchestration or evidence means `evaluation unavailable` and promotion denied.
+This is the required protocol, not evidence that a candidate has completed it. `pit_dataset.py` now creates a content-addressed, raw-preserving research dataset artifact, and `research_experiment.py` binds precomputed development/test rows, five temporal partitions, an expected aligned tune trial list, fixed calibration, descriptive test diagnostics and declared cost reruns. Lockbox `label/net_r` values are forbidden in the prepared artifact and may be attached only after an experiment-ID-keyed shared local claim succeeds. This remains an evidence binder—not a promotion-grade trainer/orchestrator. It cannot attest how predictions/stress results were produced, independent trial pre-registration, audited feature joins, global one-time custody or non-inspection by the outcome provider. All affected promotion fields remain `None`; the manifest denies promotion.
 
 ## 1. Pre-registration
 
@@ -22,12 +22,13 @@ Changing any selection choice after seeing test results converts that test into 
 
 ## 2. Data acceptance
 
-1. Hash and preserve raw data.
+1. Hash and preserve raw data. `materialize_pit_dataset` is the research-only canonical artifact path; successful local audit is necessary but not sufficient for promotion.
 2. Require aware UTC and source-specific event/publication/availability/ingestion/revision metadata.
 3. Run `evaluate_price_quality` and source-specific release checks. No future as-of match is permitted.
 4. Quantify duplicates, gaps, staleness, OHLC, quotes/spreads, volume, source disagreement and writer ownership.
 5. Mark free/scanner/legacy data as research-only where historical availability cannot be proven.
 6. Do not use files in `runs/data/` for promotion until a source, license, acquisition time, transformation lineage and hash are attached.
+7. Keep envelope integrity distinct from feature-join integrity. A dataset with zero envelope violations must not be reported as zero point-in-time feature violations until the actual as-of feature graph is audited.
 
 ## 3. Label contract
 
@@ -46,6 +47,8 @@ Use `chronological_model_partitions`:
 3. calibration: fixed calibrator fit;
 4. test: one ordinary evaluation after choices freeze;
 5. lockbox: one final governance evaluation, then permanently marked opened.
+
+`research_experiment.py` supplies only a local procedural approximation of the last boundary. The prepared artifact records prediction inputs and a position commitment but requires lockbox `label/net_r` to be null. Evaluation creates and fsyncs an exclusive marker in a configured shared local claim store before it reads supplied outcomes, persists those outcomes in that store only after the claim, and then calls the process-local open guard. A crash after the marker consumes that local claim, and an identical artifact in another directory cannot claim the same experiment ID in the same store. This still does not prove global one-time custody or provider non-inspection, so both governance fields remain unavailable.
 
 For strategy stability, run anchored and rolling purged walk-forward plus CPCV-like robustness. Training labels must end before an evaluation window; embargo adds an extra gap. Test folds may not overlap for independent aggregate claims.
 
@@ -86,7 +89,7 @@ Report period/pair/regime/session contributions and concentration. Improvement r
 
 ## 9. Reproducibility record
 
-Every experiment stores: experiment ID; commit/dirty state; dataset/source/version/hash; feature/label/model versions; hyperparameters; seed; train/tune/calibration/test/lockbox windows; costs; environment/dependency definition; all metrics/trials/artifacts; source-ledger version; creation time.
+Every experiment stores: experiment ID; commit/dirty state; dataset/source/version/hash; feature/label/model versions; hyperparameters; seed; train/tune/calibration/test/lockbox windows; costs; environment/dependency definition; all metrics/trials/artifacts; source-ledger version; creation time. The current research binder additionally records why `point_in_time_violations`, test isolation, lockbox non-reuse and operational incidents are unavailable instead of coercing them to zero/false.
 
 ## 10. Required review
 

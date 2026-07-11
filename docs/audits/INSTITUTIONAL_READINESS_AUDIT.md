@@ -22,6 +22,15 @@ This is a process/readiness assessment, not investment advice or a profitability
 
 The branch is a review candidate, not a release or trading artifact. Reconciliation removed the behind-main condition, but GitHub review/CI, a reproducible environment, deployment evidence and performance evidence remain separate gates. User-owned work was preserved; no hard reset, destructive checkout or stash drop was used.
 
+### Follow-on research artifact addendum
+
+The stacked `codex/research-experiment-manifest` work adds two research-only boundaries without changing the decision above:
+
+- `pit_dataset.py` preserves raw bytes, canonical PIT records, source declarations and transform/code provenance in a create-only content-addressed directory, then reconstructs every bound field during audit. It explicitly separates zero envelope-temporal violations from **unavailable feature as-of-join evidence** and always records `promotion_eligible=false`.
+- `research_experiment.py` binds one-pair/one-horizon precomputed development/test rows, the exact five-way split, an expected aligned tune trial list, selected candidate/model declarations, one fixed calibration method, descriptive inference and four declared cost-stress rows. Prepared lockbox outcomes must be null. Evaluation claims the experiment ID in a shared local store before reading supplied outcomes; crash, partial result and duplicate-directory claims fail closed within that namespace.
+
+These artifacts improve traceability and failure behavior, not model evidence. Predictions, trial-space declarations and stress rows are supplied after the fact, primary source adapters remain disconnected, and a local claim store cannot prove global custody or outcome-provider non-inspection. Consequently PIT/future-feature integrity, trial completeness, every performance/cost metric, test isolation, global once and lockbox non-reuse remain `None` in `PromotionEvidence`; no registry transition is attempted.
+
 ## Observed operating and data state
 
 ### Local evidence snapshot
@@ -54,8 +63,8 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 
 ### Critical — unresolved
 
-1. **No promotion-admissible dataset.** Primary price/macro/COT/news/scanner ingestion is not fully materialized through immutable point-in-time records with legal availability, first ingestion, revision lineage and source contracts.
-2. **No end-to-end validation run.** The new label, temporal split, calibration, statistical, stress and governance components are not bound by one authoritative orchestrator and independently verified manifest.
+1. **No promotion-admissible dataset.** A research-only content-addressed PIT artifact now exists, but primary price/macro/COT/news/scanner ingestion is not materialized through it with externally attested availability, revision lineage and source contracts.
+2. **No authoritative end-to-end validation run.** The new evidence binder recomputes precomputed inputs and deliberately denies promotion; it does not own the trainer, feature as-of graph, label generation or cost-rerun call graph and therefore cannot attest test/lockbox isolation.
 3. **No valid performance evidence.** Synthetic diagnostics do not establish edge; real journals are stale/duplicated/incomplete, outcomes are unscored, PBO is unavailable and the only positive synthetic baseline has 11 trades and fails cost/statistical gates.
 4. **Observed operating state is not migration-ready.** The Mac mini snapshot showed stale/duplicate data, a broken scheduled command and ambiguous process ownership. Paper/live safety assertions and reconciliation were not executed during this read-only audit.
 
@@ -63,7 +72,7 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 
 1. **PIT integration is partial.** Availability now fails closed against actual ingestion, but FRED uses current `fredgraph.csv`, macro/COT/news revision replay is incomplete, and the main CLI/briefing loaders are not uniformly PIT-backed.
 2. **Journaling is not uniformly transactional.** Price snapshots have lock/natural-key/conflict checks; decision, timeframe and outcome append paths do not yet share that contract.
-3. **Lockbox/governance state is not durable.** A process-local one-time marker and caller-supplied evidence are insufficient for independent approval.
+3. **Lockbox/governance state is only locally scoped.** Prepared artifacts now exclude outcome columns and a shared claim store rejects duplicate copies of the same experiment ID, but the outcome provider/store is not an independent custodian and there is no external timestamp/signature or approval service.
 4. **Legacy reports are not authoritative.** Older commercial-readiness cost sensitivity is post-hoc. Only full-engine reruns may support a cost gate.
 5. **Market microstructure fidelity is insufficient.** Static spread/slippage proxies omit historical bid/ask, depth, latency, rejection, partial fills, venue/broker state, financing and source disagreement.
 6. **Data advantage is absent.** Public/retail observations—Legacy COT proxies, current-only FRED downloads, Stooq, RSS and an unofficial TradingView scanner—are not proprietary order flow or an institutional information moat.
@@ -80,8 +89,9 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 
 ### Data integrity and time semantics
 
-- `PointInTimeRecord` normalizes legal availability to no earlier than declared publication, revision and actual ingestion; future as-of joins are rejected.
-- Payloads are canonicalized and frozen; supplied hashes must equal a recomputed content hash. Strict QA checks timezone, metadata, ordering, identity, duplicates and hash shape.
+- `PointInTimeRecord` normalizes legal availability to no earlier than declared publication, revision, actual ingestion and validation completion; null required times, future as-of joins and ambiguous equal-availability feature keys are rejected.
+- Payloads are canonicalized and frozen; unordered/non-JSON payloads are rejected and supplied hashes must equal a recomputed content hash. Strict QA checks timezone, future metadata, run/writer identity, flags, schema, ordering, source keys and hash shape.
+- `pit_dataset.py` copies raw inputs into a content-addressed store, writes canonical order-independent records, retains valid delayed-ingestion revision sequences and detects record/raw/manifest tampering, wrong entry types, symlinks and malformed/deep JSON without leaking parser exceptions.
 - Technical and briefing capture timestamps are taken after acquisition rather than before a network request.
 - Source documentation now distinguishes the actual CFTC Legacy `6dca-aqww`, current-only FRED CSV, Stooq/RSS/FairEconomy and unofficial scanner paths from target vendor contracts.
 
@@ -94,7 +104,7 @@ These changes close a concrete ingestion-time leakage path. They do not yet impl
 - PSR, DSR, PBO input checks, MTRL, block-bootstrap CI, block sign tests, Holm adjustment and stability diagnostics are available.
 - Overlapping test folds and non-finite overfitting evidence fail closed.
 
-The components pass unit tests but are not yet a completed institutional experiment pipeline.
+The research experiment binder now connects a precomputed vertical slice and a shared local lockbox claim. It validates exact expected tune IDs/timestamps/columns, selected candidate/model declarations and cross-file stress context; withholds prepared outcomes; fits only the fixed calibrator on calibration; and recomputes descriptive test/lockbox metrics deterministically. Because independent trial registration, trainer/engine artifacts and global custody are absent, those descriptive values are never copied into promotion evidence.
 
 ### Calibration, drift and decision safety
 
@@ -129,8 +139,10 @@ Three independent domain reviews were performed and their adverse findings were 
 
 | Review | Key challenge | Resolution status |
 |---|---|---|
-| Data/macro/PIT | Ingestion later than nominal release could leak; payload/hash mutable; capture time preceded fetch; source ledger overstated FRED/COT/TradingView semantics; legacy evaluator accepted future/naive timestamps | Ingestion/hash/capture defects fixed, ledger corrected, and legacy evaluation now rejects naive/future rows. Revision replay and primary-loader integration remain open. |
-| Quant/risk/ML | Skipped PBO/DSR, prevalence-shift usability, weak one-sample expectancy, missing drift columns, interval inconsistency, entry-only leverage, stale pending orders, early-ending symbols and non-independent legacy auto-promotion | Fail-closed ML/drift/expectancy and engine controls added; legacy members are shadow-only. Durable lockbox, complete trials and end-to-end governance remain open. |
+| Data/macro/PIT | Ingestion later than nominal release could leak; payload/hash mutable; capture time preceded fetch; source ledger overstated FRED/COT/TradingView semantics; legacy evaluator accepted future/naive timestamps | Ingestion/hash/capture defects fixed; raw-preserving PIT artifacts and strict audit added. Source adapters, external attestations and primary-loader integration remain open. |
+| Quant/risk/ML | Skipped PBO/DSR, prevalence-shift usability, weak one-sample expectancy, missing drift columns, interval inconsistency, entry-only leverage, stale pending orders, early-ending symbols and non-independent legacy auto-promotion | Fail-closed controls plus a declared-trial research binder and outcome-withholding shared local claim now exist. All unattested performance fields remain unavailable; authoritative training/test custody is open. |
+| PIT artifact red team | Missing ingestion, duplicate as-of keys, manifest type/parser bypass, revision clock conflation, empty provenance/future metadata and overclaimed source verification | Reproductions were converted to fail-closed tests; source status was weakened to `declared_verified`. Reviewer verdict: shippable for research-only use, never for promotion evidence. |
+| Experiment binder red team | Prepared plaintext lockbox outcomes; directory-local double-open; unbound candidate/trial/stress declarations; reverse/future chronology; audit `OverflowError`; machine-path identity | All reproductions now fail closed; final re-review found no P0/P1. Unattested performance fields remain `None`; global custody and authoritative call graphs remain explicit blockers. Verdict: ship only as a research/descriptive binder. |
 | Repository/operations | Contradictory Mac mini topology, rollback causing two writers, unsafe `git add -A`, alert-only freshness, hidden wrapper failures, stale status, centralized notification and no migration evidence | Canonical topology, safe migration/rollback rules, freshness veto/status and direct-notification design documented/prepared. Remote migration and journal-wide locking remain open. |
 | Repository/operations follow-up | `--no-notify` consumed notification state; failed sends could suppress retry; manual expectancy command was a second writer; status/restart missed direct/cron/legacy writers; uninstall and Docker checks failed open | Notification state/retry, manual procedure, writer detection, preflight restart, install/uninstall and Docker assertions were corrected and regression-tested. Mac mini deployment remains deliberately unperformed. |
 
@@ -140,17 +152,17 @@ Score meaning: 0 = absent/evaluation unavailable; 1 = ad hoc; 2 = coded and test
 
 | Required axis | Initial | Final | Evidence and ceiling |
 |---|---:|---:|---|
-| Data integrity | 1 | 2 | `point_in_time.py` and locked/idempotent price capture improve contracts; no promotion-admissible dataset |
-| Point-in-time integrity | 1 | 2 | UTC/as-of/availability/hash checks exist; revisions and primary loaders remain incomplete |
+| Data integrity | 1 | 2 | Raw-preserving content-addressed PIT artifacts and locked/idempotent price capture improve contracts; no promotion-admissible dataset |
+| Point-in-time integrity | 1 | 2 | UTC/as-of/availability/validation/hash checks and tamper audit exist; feature-join proof, external attestations and primary loaders remain incomplete |
 | Label quality | 1 | 2 | Next-open triple barrier, gaps, stop-first, MFE/MAE and net R are tested; no real PIT label corpus |
-| Validation rigor | 1 | 2 | Purge/embargo, chronological partitions, CPCV-like and statistical checks exist; no authoritative orchestrator/trial matrix |
+| Validation rigor | 1 | 2 | An expected-ID aligned precomputed trial binder joins partitions/calibration/descriptive inference; independent pre-registration and the authoritative trainer/label/as-of/cost call graph remain absent |
 | Model performance | 0 | 0 | Real performance is evaluation-unavailable; synthetic baselines fail sample, confidence and cost gates |
 | Probability calibration | 1 | 2 | Separate calibration partition and Brier/log-loss/AUC gates exist; no mature real-data reliability evidence |
 | Execution reproducibility | 1 | 2 | Next-open fills, costs, gaps, TTL and per-symbol closure are deterministic; no broker/venue replay |
 | Risk management | 1 | 2 | Data/risk vetoes, leverage latch and exposure controls are tested; no paper execution reconciliation |
-| Reproducibility | 1 | 2 | Seeds, hashes, artifacts and benchmark manifest improved; local pip is broken and the lock lacks hashes |
+| Reproducibility | 1 | 2 | Dataset/experiment identities, seeds, hashes, manifests and deterministic lockbox results improved; precomputed provenance, local pip and unhashed dependencies cap maturity |
 | Monitoring | 1 | 2 | Freshness veto, retry/state semantics and drift checks are tested; Mac mini deployment is unverified |
-| Governance | 1 | 2 | Evidence schema, shadow-only legacy path and promotion policy exist; lockbox/approval is not durable/end-to-end |
+| Governance | 1 | 2 | Evidence schema, mandatory denials, withheld outcomes and a shared local claim exist; global once/non-reuse, independent custody/approval and end-to-end attestations do not |
 | Operational safety | 1 | 2 | Single-writer launchd design, fail-closed install/restart/uninstall and rollback exist; migration was not executed |
 
 Unweighted evidence score moves from **0.92/5 to 1.83/5**. The increase is process-control maturity only; model performance remains 0/5 and prevents any stage promotion.
@@ -169,7 +181,7 @@ Process-control maturity improved. Data-edge, statistical-evidence and deploymen
 
 ## Verification
 
-Final local checks on code HEAD `c84bd76` plus the audit/report worktree:
+Baseline PR #26 checks on code HEAD `c84bd76` plus the original audit/report worktree:
 
 - `pytest -q`: **489 passed, 1 skipped** in 14.66 seconds.
 - `ruff check .`: passed.
@@ -180,14 +192,23 @@ Final local checks on code HEAD `c84bd76` plus the audit/report worktree:
 - Deterministic synthetic base and 1×/1.5×/2×/3× full-engine cost reruns completed; see [institutional benchmark](../../reports/institutional_benchmark_20260711.md).
 - GitHub Actions run `29134903400` failed only on the same two mypy findings reproduced locally. The focused finite-float normalization fix is in `5693d44`; current-head run `29135088717` then passed on Python 3.11 and 3.12.
 
+Follow-on checks on the stacked research-artifact worktree:
+
+- `pytest -q`: **520 passed, 1 skipped** in 14.50 seconds.
+- `ruff check .`: passed.
+- `black --check .`: 122 files unchanged.
+- `mypy fx_backtester fx_intel *.py`: 66 source files, no issues.
+- shell syntax by each script shebang and `git diff --check`: passed.
+- Focused PIT/point-in-time set: **31 passed**; focused experiment/time-series set: **19 passed**.
+
 ## Exit criteria for the next stage
 
 Before `validated` can be considered:
 
 1. Complete human diff review, record the final artifact/dependency hashes, and do not infer commit scope from subject lines alone.
 2. Migrate the Mac mini using the runbook with pre-state evidence, paper-safe assertions, one writer, freshness/gap checks and rollback evidence; do not enable live.
-3. Materialize immutable raw and PIT datasets with contractual timestamps, revisions, first ingestion, licenses and hashes; quarantine current contaminated journals.
-4. Connect one label path, five chronological partitions, a complete aligned trial ledger, calibration, full cost stress and a durable one-time lockbox to an authoritative manifest.
+3. Connect primary immutable raw/PIT source adapters with contractual timestamps, revisions, first ingestion, licenses and external attestations; quarantine current contaminated journals. Do not relabel the research-only artifact as admissible evidence.
+4. Replace the precomputed evidence boundary with one authoritative call graph that owns feature as-of joins, labels, training/tune selection, fixed calibration, test opening and full cost reruns; place the one-time lockbox under independent custody.
 5. Run a pre-registered real-data experiment with adequate effective samples, positive net-R confidence lower bound, acceptable PBO/DSR/calibration/coverage/tails and no major incidents.
 6. Obtain independent reproduction and named human approval for an adjacent transition only.
 

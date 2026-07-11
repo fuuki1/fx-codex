@@ -98,6 +98,50 @@ def test_naive_timestamp_is_rejected_and_availability_never_precedes_actual_use(
     )
     assert record.available_time == datetime(2024, 1, 3, tzinfo=UTC)
 
+    with pytest.raises(PointInTimeError, match="ingested_time must be non-null"):
+        PointInTimeRecord(
+            event_time=datetime(2024, 1, 1, tzinfo=UTC),
+            available_time=datetime(2024, 1, 2, tzinfo=UTC),
+            ingested_time=None,  # type: ignore[arg-type]
+            source="test",
+            source_record_id="missing-ingestion",
+        )
+
+
+def test_validation_completion_raises_effective_availability() -> None:
+    record = PointInTimeRecord(
+        event_time=datetime(2024, 1, 1, tzinfo=UTC),
+        available_time=datetime(2024, 1, 2, tzinfo=UTC),
+        ingested_time=datetime(2024, 1, 2, tzinfo=UTC),
+        validated_time=datetime(2024, 1, 2, 3, tzinfo=UTC),
+        source="test",
+        source_record_id="validated",
+    )
+
+    assert record.available_time == datetime(2024, 1, 2, 3, tzinfo=UTC)
+    assert "availability_normalized_to_actual_use" in record.data_quality_flags
+
+
+def test_non_json_or_unordered_payload_types_are_rejected() -> None:
+    common = {
+        "event_time": datetime(2024, 1, 1, tzinfo=UTC),
+        "available_time": datetime(2024, 1, 2, tzinfo=UTC),
+        "ingested_time": datetime(2024, 1, 2, tzinfo=UTC),
+        "source": "test",
+        "source_record_id": "invalid-json",
+    }
+
+    with pytest.raises(PointInTimeError, match="sets are unordered"):
+        PointInTimeRecord(payload={"values": {1, 2}}, **common)
+    with pytest.raises(PointInTimeError, match="keys must be strings"):
+        PointInTimeRecord(payload={1: "value"}, **common)
+    with pytest.raises(PointInTimeError, match="unsupported JSON value type"):
+        PointInTimeRecord(payload={"value": object()}, **common)
+    with pytest.raises(PointInTimeError, match="data_quality_flags"):
+        PointInTimeRecord(data_quality_flags=(object(),), **common)  # type: ignore[arg-type]
+    with pytest.raises(PointInTimeError, match="schema_version"):
+        PointInTimeRecord(schema_version=True, **common)  # type: ignore[arg-type]
+
 
 def test_explicit_dst_offset_converts_without_guessing() -> None:
     first_ambiguous_hour = utc_datetime(
@@ -150,6 +194,19 @@ def test_backward_asof_join_leaves_future_only_feature_unmatched() -> None:
     assert pd.isna(joined.loc[0, "value"])
 
 
+def test_backward_asof_join_rejects_ambiguous_equal_availability() -> None:
+    observations = pd.DataFrame({"prediction_time": [_utc("2024-01-01 09:01")]})
+    features = pd.DataFrame(
+        {
+            "available_time": [_utc("2024-01-01 09:00"), _utc("2024-01-01 09:00")],
+            "value": [1.0, 2.0],
+        }
+    )
+
+    with pytest.raises(PointInTimeError, match="ambiguous duplicate"):
+        point_in_time_asof_join(observations, features)
+
+
 def test_backward_asof_join_uses_actual_ingestion_not_nominal_release() -> None:
     observations = pd.DataFrame(
         {"prediction_time": [_utc("2024-01-01 15:30"), _utc("2024-01-01 16:01")]}
@@ -159,6 +216,26 @@ def test_backward_asof_join_uses_actual_ingestion_not_nominal_release() -> None:
             "available_time": [_utc("2024-01-01 15:00")],
             "published_time": [_utc("2024-01-01 15:00")],
             "ingested_time": [_utc("2024-01-01 16:00")],
+            "value": [7.0],
+        }
+    )
+
+    joined = point_in_time_asof_join(observations, features)
+
+    assert pd.isna(joined.loc[0, "value"])
+    assert joined.loc[1, "value"] == 7.0
+    assert joined.loc[1, "available_time"] == _utc("2024-01-01 16:00")
+
+
+def test_backward_asof_join_waits_for_validation_completion() -> None:
+    observations = pd.DataFrame(
+        {"prediction_time": [_utc("2024-01-01 15:30"), _utc("2024-01-01 16:01")]}
+    )
+    features = pd.DataFrame(
+        {
+            "available_time": [_utc("2024-01-01 15:00")],
+            "ingested_time": [_utc("2024-01-01 15:01")],
+            "validated_time": [_utc("2024-01-01 16:00")],
             "value": [7.0],
         }
     )
@@ -264,3 +341,32 @@ def test_strict_pit_quality_rejects_null_identity_time_and_hash_metadata() -> No
     assert "point_in_time_metadata_null" in report.critical_flags
     assert "point_in_time_timestamp_invalid" in report.critical_flags
     assert "invalid_content_hash" in report.critical_flags
+
+
+def test_strict_pit_quality_rejects_empty_provenance_invalid_flags_and_future_metadata() -> None:
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=2, freq="h")
+    frame = _prices(index)
+    frame["event_time"] = index
+    frame["available_time"] = pd.Timestamp("2030-01-01T00:00:00Z")
+    frame["ingested_time"] = pd.Timestamp("2030-01-01T00:00:00Z")
+    frame["source"] = "vendor"
+    frame["source_record_id"] = ["one", "two"]
+    frame["schema_version"] = 1
+    frame["content_hash"] = "a" * 64
+    frame["run_id"] = ""
+    frame["writer_id"] = ""
+    frame["data_quality_flags"] = None
+
+    report = evaluate_price_quality(
+        frame,
+        now=datetime(2024, 1, 1, 1, tzinfo=UTC),
+        thresholds=PriceQualityThresholds(require_point_in_time_metadata=True),
+    )
+
+    assert not report.passed
+    assert {
+        "point_in_time_metadata_null",
+        "point_in_time_identity_empty",
+        "invalid_data_quality_flags",
+        "point_in_time_future_metadata",
+    }.issubset(report.critical_flags)
