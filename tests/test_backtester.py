@@ -311,6 +311,78 @@ def test_daily_loss_stop_prevents_more_entries() -> None:
     assert bool(result.equity_curve.iloc[-1]["daily_locked"]) is True
 
 
+def test_each_symbol_closes_on_its_own_last_available_bar() -> None:
+    index = pd.date_range("2024-01-01 00:00:00", periods=6, freq="h")
+
+    def frame(selected_index: pd.DatetimeIndex) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"open": 1.0, "high": 1.001, "low": 0.999, "close": 1.0},
+            index=selected_index,
+        )
+
+    result = BacktestEngine(
+        AlwaysLongStrategy(),
+        BacktestConfig(execution=_zero_cost_config()),
+    ).run({"EURUSD": frame(index[:3]), "GBPUSD": frame(index)})
+
+    exits = result.trades.set_index("symbol")["exit_time"]
+    assert exits["EURUSD"] == index[2]
+    assert exits["GBPUSD"] == index[-1]
+    reasons = result.trades.set_index("symbol")["exit_reason"]
+    assert reasons["EURUSD"] == "end_of_symbol_data"
+    assert reasons["GBPUSD"] == "end_of_backtest"
+    assert result.equity_curve.iloc[-1]["open_positions"] == 0
+
+
+def test_stale_pending_open_order_expires_before_distant_next_bar() -> None:
+    index = pd.DatetimeIndex(
+        [pd.Timestamp("2024-01-01 00:00:00"), pd.Timestamp("2024-01-03 00:00:00")]
+    )
+    data = {
+        "EURUSD": pd.DataFrame(
+            {"open": 1.0, "high": 1.001, "low": 0.999, "close": 1.0},
+            index=index,
+        )
+    }
+    config = BacktestConfig(
+        execution=_zero_cost_config(), pending_open_order_ttl=pd.Timedelta(hours=12)
+    )
+
+    result = BacktestEngine(AlwaysLongStrategy(), config).run(data)
+
+    assert result.trades.empty
+    assert result.equity_curve["open_positions"].eq(0).all()
+
+
+def test_mark_to_market_gross_leverage_breach_locks_and_closes_portfolio() -> None:
+    index = pd.date_range("2024-01-01 00:00:00", periods=5, freq="h")
+    data = {
+        "EURUSD": pd.DataFrame(
+            {
+                "open": [1.10, 1.10, 0.90, 0.90, 0.90],
+                "high": [1.11, 1.11, 0.91, 0.91, 0.91],
+                "low": [1.09, 1.09, 0.89, 0.89, 0.89],
+                "close": [1.10, 1.10, 0.90, 0.90, 0.90],
+            },
+            index=index,
+        )
+    }
+    config = BacktestConfig(
+        risk=RiskConfig(
+            risk_per_trade_pct=1.0,
+            risk_cap_pct=1.0,
+            max_daily_loss_pct=1.0,
+            max_leverage=2.0,
+        ),
+        execution=_zero_cost_config(),
+    )
+
+    result = BacktestEngine(SymbolOnlyLongStrategy("EURUSD", stop_distance=0.5), config).run(data)
+
+    assert "gross_leverage_breach" in result.trades["exit_reason"].tolist()
+    assert bool(result.equity_curve.iloc[-1]["risk_locked"])
+
+
 def test_no_trade_window_blocks_new_entries() -> None:
     index = pd.date_range("2024-01-01 00:00:00", periods=3, freq="h")
     data = {

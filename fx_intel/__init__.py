@@ -12,7 +12,7 @@
 7.  gbm         — 依存ゼロの勾配ブースティング決定木(確率モデルの基盤)
 8.  ml          — ジャーナルからGBDT確率モデルを学習する時系列パイプライン
 9.  committee   — tech/news/macro/MLの委員会オーケストレータ
-10. promotion   — 委員の shadow→paper→live 昇格ゲート
+10. promotion   — 委員のlegacy実績診断（research buildはshadow固定）
 11. briefing    — 上記を融合したトレードプラン生成とDiscord配信
 12. journal     — 判断の記録と方向的中率の自己検証
 13. learning    — 履歴の相互採点による重み・確信度の自己調整

@@ -262,18 +262,14 @@ def evaluate(
             should_notify = True  # 悪化は即通知
         elif result.status == previous.status:
             last_at = _parse_ts(previous.last_notified_at)
-            if (
-                previous.last_notified_status == result.status
-                and last_at is not None
-                and (now - last_at).total_seconds() >= cooldown_seconds
-            ):
+            if previous.last_notified_status != result.status:
+                should_notify = True  # 前回の通知が未送信/失敗なら次周期に再試行
+            elif last_at is not None and (now - last_at).total_seconds() >= cooldown_seconds:
                 should_notify = True  # 同一状態の継続はcooldown後に再通知
         # 改善方向(crit→warn)は通知しない(recoveryまで待つ)
 
         if should_notify:
             notifications.append(_build_notification(severity, result, state, previous, host, now))
-            state.last_notified_status = severity if severity != "recovery" else STATUS_OK
-            state.last_notified_at = now.isoformat()
         new_states[result.name] = state
     return new_states, notifications
 
@@ -448,6 +444,12 @@ def run_monitor(
             sent.append(
                 {"target": notification.target, "severity": notification.severity, "sent": ok}
             )
+            if ok:
+                state = new_states[notification.target]
+                state.last_notified_status = (
+                    notification.severity if notification.severity != "recovery" else STATUS_OK
+                )
+                state.last_notified_at = now.isoformat()
 
     report: dict[str, object] = {
         "monitor_timestamp": now.isoformat(),
@@ -460,10 +462,14 @@ def run_monitor(
             default=STATUS_OK,
         ),
     }
-    atomic_write_json(
-        state_path,
-        {"updated_at": now.isoformat(), "targets": {k: v.to_dict() for k, v in new_states.items()}},
-    )
+    if notify:
+        atomic_write_json(
+            state_path,
+            {
+                "updated_at": now.isoformat(),
+                "targets": {k: v.to_dict() for k, v in new_states.items()},
+            },
+        )
     atomic_write_json(report_path, report)
     return report
 
@@ -474,7 +480,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--state", default=DEFAULT_STATE_PATH)
     parser.add_argument("--report", default=DEFAULT_REPORT_PATH)
-    parser.add_argument("--no-notify", action="store_true", help="通知せず判定と記録のみ")
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="通知せず判定とレポートだけ更新する（通知状態は変更しない）",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()

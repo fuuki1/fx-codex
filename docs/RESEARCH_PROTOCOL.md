@@ -1,5 +1,9 @@
 # FX research protocol
 
+## Implementation status
+
+This is the required protocol, not evidence that a candidate has completed it. The repository contains many individual controls, but no single promotion-grade orchestrator currently binds PIT materialization, labels, five temporal partitions, the complete trial family, calibration, full cost reruns, a durable one-time lockbox and governance approval into one verified run. The legacy CLI/report paths must not be treated as equivalent. Missing orchestration or evidence means `evaluation unavailable` and promotion denied.
+
 ## 1. Pre-registration
 
 Before looking at test/lockbox results, record:

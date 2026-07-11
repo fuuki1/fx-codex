@@ -209,6 +209,34 @@ def test_discord_failure_does_not_crash_monitor(monitor, tmp_path):
     assert report["overall"] == "critical"
     assert report["notifications"][0]["sent"] is False  # 失敗を隠さず記録
 
+    succeeding = _Sender()
+    _run(monitor, tmp_path, config, succeeding, now=NOW + timedelta(minutes=5))
+    assert len(succeeding.sent) == 1  # 未送信状態はcooldownを待たず再試行
+
+
+def test_no_notify_does_not_consume_canonical_notification_state(monitor, tmp_path):
+    config = _write_config(tmp_path)
+    _touch_jsonl(tmp_path, age_seconds=60)
+    _run(monitor, tmp_path, config, _Sender(), now=NOW)
+    state_path = tmp_path / "logs" / "state.json"
+    before = state_path.read_bytes()
+
+    _touch_jsonl(tmp_path, age_seconds=1000)
+    report = monitor.run_monitor(
+        tmp_path,
+        config,
+        state_path,
+        tmp_path / "logs" / "report.json",
+        now=NOW + timedelta(minutes=5),
+        notify=False,
+    )
+
+    assert report["overall"] == "warning"
+    assert state_path.read_bytes() == before
+    sender = _Sender()
+    _run(monitor, tmp_path, config, sender, now=NOW + timedelta(minutes=10))
+    assert len(sender.sent) == 1
+
 
 def test_corrupt_state_file_recovers(monitor, tmp_path):
     config = _write_config(tmp_path)

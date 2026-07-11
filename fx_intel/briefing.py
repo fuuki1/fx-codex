@@ -768,7 +768,7 @@ def build_discord_payload(
     if promotion_note:
         macro_fields.append(
             {
-                "name": "🎖️ 委員の運用段階(shadow→paper→live)",
+                "name": "🎖️ 委員の運用段階(shadow固定)",
                 "value": promotion_note[:1024],
                 "inline": False,
             }

@@ -223,6 +223,12 @@ def _to_jsonable(value: Any) -> Any:
         return [_to_jsonable(item) for item in value]
     if isinstance(value, Path):
         return str(value)
+    # pandas の Timedelta/Timestamp は JSON エンコーダが扱えないため ISO 文字列へ。
+    # 例: BacktestConfig.pending_open_order_ttl (pd.Timedelta) を config.json へ書く。
+    if isinstance(value, (pd.Timedelta, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
     return value
 
 

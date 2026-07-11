@@ -42,6 +42,7 @@ class RiskManager:
         self._monthly_locked = False
         self._monthly_profit_locked = False
         self._hard_locked = False
+        self._leverage_locked = False
 
     @property
     def daily_locked(self) -> bool:
@@ -71,6 +72,7 @@ class RiskManager:
             or self._monthly_locked
             or self._monthly_profit_locked
             or self._hard_locked
+            or self._leverage_locked
         )
 
     def reset(self) -> None:
@@ -87,6 +89,7 @@ class RiskManager:
         self._monthly_locked = False
         self._monthly_profit_locked = False
         self._hard_locked = False
+        self._leverage_locked = False
 
     def on_bar(self, timestamp: Any, equity: float) -> None:
         normalized = pd.Timestamp(timestamp)
@@ -170,6 +173,13 @@ class RiskManager:
         if self.risk_locked:
             return False
         return equity > 0
+
+    def check_gross_leverage(self, gross_notional_usd: float, equity: float) -> bool:
+        """Latch the run when marked-to-market gross leverage exceeds its cap."""
+
+        if equity <= 0 or gross_notional_usd > equity * self.config.max_leverage:
+            self._leverage_locked = True
+        return self._leverage_locked
 
     def position_size(
         self,

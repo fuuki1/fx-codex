@@ -54,10 +54,18 @@ def test_macro_opinion_shadow_is_inactive() -> None:
     assert opinion.stage == "shadow"
 
 
-def test_macro_opinion_paper_is_active() -> None:
+def test_legacy_paper_stage_fails_closed_to_shadow() -> None:
     opinion = macro_opinion("USDJPY", _macro_snapshot(), stage="paper")
     assert opinion is not None
-    assert opinion.active
+    assert opinion.stage == "shadow"
+    assert not opinion.active
+
+
+def test_legacy_live_stage_fails_closed_to_shadow() -> None:
+    opinion = macro_opinion("USDJPY", _macro_snapshot(), stage="live")
+    assert opinion is not None
+    assert opinion.stage == "shadow"
+    assert not opinion.active
 
 
 def test_ml_opinion_none_when_unusable() -> None:
@@ -81,7 +89,7 @@ def test_shadow_member_recorded_but_not_in_composite() -> None:
     assert any("shadow" in note for note in plan.committee_notes)
 
 
-def test_paper_member_joins_composite() -> None:
+def test_legacy_paper_member_cannot_join_composite() -> None:
     shadow = deliberate(
         "USDJPY",
         _tech(),
@@ -102,9 +110,8 @@ def test_paper_member_joins_composite() -> None:
         macro_snapshot=_macro_snapshot(),
         stages={"macro": "paper"},
     )
-    assert "macro" in [c["key"] for c in paper.components]
-    # マクロがUSD/JPYロング方向なので、参加すると複合スコアが上がる
-    assert paper.composite >= shadow.composite
+    assert "macro" not in [c["key"] for c in paper.components]
+    assert paper.composite == shadow.composite
 
 
 def test_deliberate_without_extras_matches_build_trade_plan() -> None:

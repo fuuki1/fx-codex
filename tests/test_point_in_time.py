@@ -235,3 +235,32 @@ def test_missing_close_with_reference_data_reports_schema_failure_not_exception(
     )
 
     assert "missing_ohlc" in report.critical_flags
+
+
+def test_strict_pit_quality_rejects_null_identity_time_and_hash_metadata() -> None:
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=2, freq="h")
+    frame = _prices(index)
+    for column in (
+        "event_time",
+        "available_time",
+        "ingested_time",
+        "source",
+        "source_record_id",
+        "schema_version",
+        "content_hash",
+        "run_id",
+        "writer_id",
+    ):
+        frame[column] = None
+    frame["data_quality_flags"] = [[], []]
+
+    report = evaluate_price_quality(
+        frame,
+        now=datetime(2024, 1, 1, 1, 0, tzinfo=UTC),
+        thresholds=PriceQualityThresholds(require_point_in_time_metadata=True),
+    )
+
+    assert not report.passed
+    assert "point_in_time_metadata_null" in report.critical_flags
+    assert "point_in_time_timestamp_invalid" in report.critical_flags
+    assert "invalid_content_hash" in report.critical_flags

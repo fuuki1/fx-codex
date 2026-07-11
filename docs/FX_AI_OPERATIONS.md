@@ -1,86 +1,60 @@
 # FX分析AI 運用監視・復旧手順
 
-学習型AIの運用では、判断ログ、価格スナップショット、TP/SL/MFE/MAE採点、期待R監視が継続して回っている必要があります。ここでは停止確認と復旧だけを扱います。
+これは分析・学習データ収集の監視手順です。実注文経路はありません。判断ログ、価格スナップショット、TP/SL/MFE/MAE採点、期待R監視が継続していても、それだけでモデル検証や昇格を意味しません。Mac miniの移行・復旧・rollbackは、証跡と単一writerを定めた[Operations runbook](OPERATIONS_RUNBOOK.md)を優先します。
 
-## 1. ループ稼働状況の確認
+## 1. 正規サービスの確認
 
 ```bash
-cd /Users/takahashifuuki/Desktop/fx-codex
-
-ps -axo pid=,command= | rg 'fx_briefing_loop|fx_tf_snapshot_loop|ai_learning_dashboard'
-tail -n 80 logs/fx_signal_board.log
-tail -n 80 logs/fx_tf_snapshot.log
+cd /Users/fuuki/srv/fx-codex
+./scripts/status_fx_services.sh
+ps -axo pid=,command= | rg 'fx_briefing_loop|fx_tf_snapshot_loop|fx_briefing.py|fx_tf_snapshot.py'
+tail -n 80 logs/launchd/snapshot.err.log
+tail -n 80 logs/launchd/briefing.err.log
+tail -n 80 logs/launchd/health.err.log
 tail -n 5 logs/briefing_tf_prices.jsonl
 ```
 
-価格スナップショットの最終更新時刻は、以下で確認します。
+正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（毎時）、`com.fx-codex.health`（5分）です。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
 
-```bash
-python3 - <<'PY'
-from datetime import UTC, datetime
-from pathlib import Path
-path = Path("logs/briefing_tf_prices.jsonl")
-if not path.exists():
-    print("missing: logs/briefing_tf_prices.jsonl")
-else:
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-    age = (datetime.now(UTC) - mtime).total_seconds() / 60
-    print(f"mtime={mtime.isoformat()} age_minutes={age:.1f}")
-PY
-```
+開発機 `/Users/takahashifuuki/Desktop/fx-codex` は検証用であり、Mac miniの収集責務を代替しません。
 
 ## 2. 監視コマンド
 
 ```bash
-python3 tools/decision_expectancy_monitor.py
-python3 tools/trade_outcome_monitor.py
-python3 tools/maximization_monitor.py
-python3 tools/learning_capture.py --keep-going
+./scripts/status_fx_services.sh
+.venv/bin/python tools/data_freshness_monitor.py --root "$PWD" --no-notify \
+  --report /tmp/fx-codex-freshness-manual.json
+.venv/bin/python tools/journal_gap_audit.py logs/briefing_tf_prices.jsonl \
+  --expected-interval-hours 0.0833333333
 ```
 
-`decision_expectancy_monitor` は `logs/briefing_tf_prices.jsonl` の鮮度も確認します。既定では最終価格行が15分を超えて古い場合に `fail` です。
+`data_freshness_monitor --no-notify`は指定した一時reportだけを更新し、canonical notification state/reportを消費しません。`journal_gap_audit`は入力を変更しません。`decision_expectancy_monitor.py`、`learning_capture.py`とoutcome/feedback更新は書き込み処理なので、正規briefing稼働中の読み取り専用確認には使いません。
 
-```bash
-python3 tools/decision_expectancy_monitor.py --price-stale-minutes 15
-python3 tools/decision_expectancy_monitor.py --price-stale-minutes none  # stale監視だけ無効
-```
+鮮度監視を無効化した結果を運用判断に使ってはいけません。
 
 ## 3. 復旧手順
 
-シグナルボードを止めたまま価格スナップショットだけ継続する場合:
+手動ループを復旧手段として起動しません。正規launchdサービスが全てロード済みで、loop/direct/cron/別checkoutのwriter候補がないことを確認した場合だけ再起動します。正規launchd子が実行中ならdirect writer候補として見えるため、親PID/cwdを確認して完了を待ちます。
 
 ```bash
-cd /Users/takahashifuuki/Desktop/fx-codex
-mkdir -p logs
-./fx_tf_snapshot_loop.sh >> logs/fx_tf_snapshot_supervisor.log 2>&1 &
+cd /Users/fuuki/srv/fx-codex
+./scripts/status_fx_services.sh
+./scripts/restart_fx_services.sh
+./scripts/status_fx_services.sh
 ```
 
-Discord配信込みのブリーフィングループが必要な場合:
+`restart_fx_services.sh` は変更前に全labelを検証し、1サービスでも未ロード、またはwriter候補があれば何もkickstartせず非ゼロ終了します。未ロード、競合、stale、dirty/version driftがある場合は、その場で`install_launchd.sh`やraw loopを実行せず、Operations runbookのpre-state保存、paper-safe確認、commit SHA検証、dry-run、移行、post-check、rollback手順を実施します。
 
-```bash
-./fx_briefing_loop.sh >> logs/fx_briefing_supervisor.log 2>&1 &
-```
-
-このループは5分ごとにFXシグナルボードを1通だけ送ります。旧ループが残っている環境では
-`tv_notify_loop.sh` と旧版 `fx_briefing_loop.sh` のプロセスを停止してから、新版を1つだけ
-起動してください。取引スタックの `.env` は
-`DISCORD_NOTIFICATION_MODE=signal_board`（未指定時も既定値は同じ）にします。
-シグナルボード自身が `logs/briefing_tf_prices.jsonl` も更新するため、通常は
-`fx_tf_snapshot_loop.sh` を同時起動する必要はありません。
-
-復旧後に学習・監視ファイルを更新します。
-
-```bash
-python3 tools/learning_capture.py --keep-going
-python3 tools/decision_expectancy_monitor.py
-```
+復旧後も欠損を現在値で補間せず、gap/duplicate/time reversalを別レポートに残します。
 
 ## 4. status の読み方
 
-- `pass`: 価格系列、採点、期待R監視が運用可能。
-- `warn`: サンプル不足、成熟セル不足、品質警告など。運用は継続できるが監視対象。
+- `pass`: 対象チェックが通ったという意味だけで、モデル検証・収益性・昇格を保証しない。
+- `warn`: サンプル不足、成熟セル不足、品質警告など。鮮度レポートの`warning`は正規briefingで新規判断をhard vetoする。
 - `pending`: 24hなど主ホライズンがまだ未成熟。失敗ではなく、時間経過後に再採点。
 - `fail`: 価格系列 stale、採点不能、期待Rが非正でブロックなど。復旧または品質改善が必要。
+
+`scripts/status_fx_services.sh` は正常0、warning 1、critical/missing/競合2で終了します。終了コードを無視しないでください。
 
 ## 5. 重要な監視観点
 
@@ -89,4 +63,4 @@ python3 tools/decision_expectancy_monitor.py
 - `close_only_path` は high/low が無い価格経路で、TP/SL先着判定の品質不足。
 - `performance.net_R` と `performance.expected_R` で実現Rと期待Rを見る。
 - `model_expectancy_delta` で `baseline_model` と `learning_model` の expected_R 差分を見る。
-- 改善昇格は、既存の昇格ゲートが前回 performance より改善している場合だけ進める。
+- 改善候補は研究評価に留める。前回値より良い、または警告がないだけでは昇格しない。

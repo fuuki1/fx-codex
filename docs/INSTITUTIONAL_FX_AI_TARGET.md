@@ -6,7 +6,7 @@ This project targets an **institutional-grade research process (A)**: traceable 
 
 It does **not** possess an **institutional information advantage (B)** such as bank customer flow, prime-broker positioning, consolidated ECN depth, dealer axes, option-flow intelligence, or guaranteed low-latency venue data. Public COT, candles, scanner snapshots, news and volume fields are public observations or proxies. They must never be described as proprietary order flow.
 
-“Institutional-grade” is a stage earned by evidence, not a description of the current system or a model family. As of 2026-07-10, the code has stronger research controls but the available data and lockbox evidence cannot support a profitability or readiness claim.
+“Institutional-grade” is a stage earned by evidence, not a description of the current system or a model family. As of 2026-07-11, the code has stronger research controls but the available data and lockbox evidence cannot support a profitability or readiness claim.
 
 ## Target properties
 
@@ -34,7 +34,7 @@ A candidate may advance only when all applicable properties are evidenced:
 | Limited live | Small bounded live mandate | Outside this implementation; separately approved policy and operational authority required |
 | Live | Full approved mandate | Outside this implementation |
 
-The current implementation deliberately rejects the final two stages.
+The governance library deliberately rejects the final two stages. Although the policy type can represent `paper`, the local broker execution stack was removed on 2026-07-10, so paper operation is also currently unavailable; a stage name is not an execution capability.
 
 ## Primary objective and reporting hierarchy
 

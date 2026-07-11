@@ -34,6 +34,11 @@ class DriftPolicy:
     brier_demote_delta: float = 0.05
     log_loss_demote_delta: float = 0.10
     calibration_error_demote_delta: float = 0.05
+    min_mature_labels: int = 30
+
+    def __post_init__(self) -> None:
+        if self.min_mature_labels < 2:
+            raise ValueError("min_mature_labels must be at least 2")
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,19 @@ def data_drift_report(
     policy: DriftPolicy | None = None,
 ) -> DataDriftReport:
     settings = policy or DriftPolicy()
+    baseline_columns = set(baseline.columns)
+    current_columns = set(current.columns)
+    missing_columns = sorted(baseline_columns - current_columns)
+    unexpected_columns = sorted(current_columns - baseline_columns)
+    if missing_columns or unexpected_columns:
+        reasons = tuple(
+            [f"missing_features={','.join(map(str, missing_columns))}"] if missing_columns else []
+        ) + tuple(
+            [f"unexpected_features={','.join(map(str, unexpected_columns))}"]
+            if unexpected_columns
+            else []
+        )
+        return DataDriftReport((), None, "abstain", reasons)
     common = sorted(set(baseline.columns) & set(current.columns))
     if not common:
         raise ValueError("baseline and current data have no common features")
@@ -272,13 +290,35 @@ def performance_drift_report(
             action="human_review",
             reasons=("ground_truth_not_mature",),
         )
+    baseline_label_array = np.asarray(baseline_labels, dtype=int)
+    current_label_array = np.asarray(current_labels, dtype=int)
+    baseline_probability_array = np.asarray(baseline_probabilities, dtype=float)
+    current_probability_array = np.asarray(current_probabilities, dtype=float)
+    if len(baseline_label_array) != len(baseline_probability_array) or len(
+        current_label_array
+    ) != len(current_probability_array):
+        raise ValueError("performance label/probability lengths differ")
+    mature_count = min(len(baseline_label_array), len(current_label_array))
+    if mature_count < settings.min_mature_labels:
+        return PerformanceDriftReport(
+            labels_available=False,
+            baseline_metrics=None,
+            current_metrics=None,
+            brier_delta=None,
+            log_loss_delta=None,
+            calibration_error_delta=None,
+            baseline_expected_r=_optional_mean(baseline_returns_r),
+            current_expected_r=_optional_mean(current_returns_r),
+            action="human_review",
+            reasons=(f"insufficient_mature_labels:{mature_count}<{settings.min_mature_labels}",),
+        )
     baseline_report = calibration_metrics(
-        list(np.asarray(baseline_labels, dtype=int)),
-        list(np.asarray(baseline_probabilities, dtype=float)),
+        list(baseline_label_array),
+        list(baseline_probability_array),
     )
     current_report = calibration_metrics(
-        list(np.asarray(current_labels, dtype=int)),
-        list(np.asarray(current_probabilities, dtype=float)),
+        list(current_label_array),
+        list(current_probability_array),
     )
     brier_delta = current_report.brier - baseline_report.brier
     loss_delta = current_report.log_loss - baseline_report.log_loss

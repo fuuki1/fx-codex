@@ -52,6 +52,18 @@ def test_missing_rate_and_correlation_shift_are_visible() -> None:
     assert report.action == "abstain"
 
 
+def test_missing_or_unexpected_feature_schema_abstains_immediately() -> None:
+    baseline = _features()
+    current = baseline.drop(columns="momentum").assign(replacement=1.0)
+
+    report = data_drift_report(baseline, current)
+
+    assert report.action == "abstain"
+    assert report.features == ()
+    assert any("missing_features=momentum" in reason for reason in report.reasons)
+    assert any("unexpected_features=replacement" in reason for reason in report.reasons)
+
+
 def test_prediction_drift_tracks_abstention_and_probability_distribution() -> None:
     report = prediction_drift_report(
         np.full(100, 0.50),
@@ -71,6 +83,14 @@ def test_performance_drift_separates_unmatured_ground_truth() -> None:
     assert not report.labels_available
     assert report.action == "human_review"
     assert report.reasons == ("ground_truth_not_mature",)
+
+
+def test_one_mature_label_requires_human_review_instead_of_allow() -> None:
+    report = performance_drift_report([1], [0.8], [1], [0.8])
+
+    assert not report.labels_available
+    assert report.action == "human_review"
+    assert report.reasons == ("insufficient_mature_labels:1<30",)
 
 
 def test_performance_breakdown_demotes_model() -> None:

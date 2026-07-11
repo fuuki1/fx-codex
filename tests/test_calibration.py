@@ -134,6 +134,18 @@ def test_abstention_policy_trades_only_calibrated_positive_edge_with_low_uncerta
     assert abstention_rate([long, short, uncertain, unprofitable]) == pytest.approx(0.5)
 
 
+def test_abstention_rejects_probability_outside_reported_uncertainty_interval() -> None:
+    decision = AbstentionPolicy().decide(
+        0.99,
+        net_expected_r=0.5,
+        uncertainty_interval=(0.10, 0.20),
+        calibrated=True,
+    )
+
+    assert decision.action == "no_trade"
+    assert decision.reason == "probability_outside_uncertainty_interval"
+
+
 def test_wilson_interval_is_bounded_and_shrinks_with_more_observations() -> None:
     small = wilson_interval(7, 10)
     large = wilson_interval(700, 1000)

@@ -332,6 +332,10 @@ class AbstentionPolicy:
         lower, upper = uncertainty_interval
         if not all(isfinite(value) for value in (lower, upper)) or not 0 <= lower <= upper <= 1:
             return AbstentionDecision.no_trade(probability, "invalid_uncertainty_interval")
+        if not lower <= probability <= upper:
+            return AbstentionDecision.no_trade(
+                probability, "probability_outside_uncertainty_interval"
+            )
         if upper - lower > self.max_interval_width:
             return AbstentionDecision.no_trade(probability, "uncertainty_too_wide")
         if model_disagreement is not None:

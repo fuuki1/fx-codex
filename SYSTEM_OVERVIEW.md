@@ -106,13 +106,12 @@ fx_intel/technicals.py     (TV 4時間足     │
 fx_intel/analyst.py        (自前分析エンジン) │  委員会が重み付き平均で
   (Claude非依存の既定)                       ├─▶ 複合スコア ─▶ リスク
 fx_intel/macro.py        マクロ委員 ─────────┤    (fx_intel/          オフィサー
-  (COT・DXY・VIX・金利)       (shadow→paperの     │     committee.py)     (決定論ゲート)
-                                参加状態のみ)    │
+  (COT・DXY・VIX・金利)       (非影響shadow固定)   │     committee.py)     (決定論ゲート)
                          ML委員 ────────────┘         │                 │
 fx_intel/ml.py             (GBDT確率モデル)            │                 ▼
   (gbm.py＝依存ゼロGBDT)                                │         方向・確信度・SL/TP
       ▲                    fx_intel/promotion.py ──────┘
-fx_intel/calendar.py       (実績で委員を段階昇格)
+fx_intel/calendar.py       (legacy実績をshadow診断)
   (ForexFactory)
 ```
 
@@ -122,17 +121,17 @@ fx_intel/calendar.py       (実績で委員を段階昇格)
 - **センチメント序列** (`fx_intel/sentiment.py`): Claude API(`ANTHROPIC_API_KEY`があれば上乗せ) → **自前分析エンジン(既定)**。旧来の単純語彙カウントは比較検証用に`score_headlines_lexicon`として残置。
 - **マクロデータ層** (`fx_intel/macro.py`): 現行取得はcurrent-only FRED graph CSV（米10年・2年金利、VIX、広義ドル指数）とCFTC Legacy Futures Onlyの公開proxyで、TTL/staleness判定を持つ。Stooqは定数/パーサ候補で現行snapshot取得には未接続である。いずれもrevision/first-ingestionを再生できず、promotion-grade PITデータではない。詳細は[Source ledger](docs/research/SOURCE_LEDGER.md)を参照する。
 - **GBDT確率モデル** (`fx_intel/gbm.py` + `fx_intel/ml.py`): 依存ゼロの純Python実装。採点済みジャーナルをtrain/tune/calibration/test/未開封lockboxへ時系列分割し、境界前側へ72時間embargoを置く。Platt較正はcalibrationだけでfitし、testではcalibration基準率に対するBrier/logloss改善、AUC 0.55以上、非空特徴重要度を要求する。`usable=False`は委員会に参加しない。ただしlegacy outcome labelとPITデータのend-to-end接続は未完了で、institutional validationの証拠ではない。
-- **legacy委員参加状態** (`fx_intel/promotion.py`): マクロ/ML委員を**shadow**（記録のみ）から**paper**（Discord助言の複合スコアへ参加）へ切り替える簡易状態機械である。ジャーナルのサンプル数・的中率・ATR proxy期待値・二項片側p値を使うが、`validated`モデル段階を付与する権限はなく、institutional promotion evidenceではない。未知/旧`live`状態はshadowへfail closedし、Python APIもpaperを越えない。
+- **legacy委員診断** (`fx_intel/promotion.py`): マクロ/ML委員の簡易サンプル数・的中率・ATR proxy期待値・二項片側p値を表示するが、24時間ラベル重複、PIT未証明journal、独立holdout/コスト欠如のため昇格根拠に使わない。このresearch buildでは委員を非影響の**shadow**へ固定し、保存済みpaper/live/未知状態もshadowへfail closedする。
   - institutionalな`research → validated → shadow → paper`の方針/証拠ゲートは`fx_backtester/governance.py`に別実装されているが、現在はend-to-end orchestrationへ未接続である。`--promote-live`は明示的に無効で、発注権限は存在しない。
 - **経済指標カレンダー**: ForexFactory公開フィード(`nfs.faireconomy.media`)。429レート制限があるため`logs/calendar_cache.json`に**45分キャッシュ**。
 - **イベント回避ロジック**: 高影響イベントの**前120分/後180分**は新規エントリーを強制「様子見」（`research-max`プリセットと同じ窓）。
-- **自己学習ループ** (`fx_intel/journal.py` + `fx_intel/learning.py`): 毎回の判断を`logs/briefing_journal.jsonl`に記録し、実行のたびに履歴全体を相互採点（各判断を約24時間後・市場オープン時間換算の後続エントリの終値と突き合わせ。ATRの10%未満の小動きは判定除外）。そこから①テクニカル/ニュース単独の的中率で複合重みを再推定（シュリンク`n/(n+40)`、テクニカル35〜70%クランプ、20件未満は既定のまま）、②確信度帯別の的中率キャリブレーション、③的中率45%未満のペアの確信度減衰（×0.6〜1.0、8件以上で発動、減衰のみ）を導き、`logs/briefing_learning.json`へ保存して当日の分析に自動反映する。分析を重ねるほど自分の当たり外れから調整が効く設計（`--no-learning`で無効化、プロファイル破損時は既定値で継続）。
+- **legacy自己採点ループ** (`fx_intel/journal.py` + `fx_intel/learning.py`): 判断を`logs/briefing_journal.jsonl`へ記録し、約24時間後のterminal-price proxyで相互採点して、縮小付き重み、確信度帯、ペア/状態別の減衰候補を生成する。これは機構の説明であって改善効果の証拠ではない。現journalは疎・重複・非PITで、institutional label/validation pathへ未接続のため、昇格根拠に使わない。
 - **チャート状態×方向別の学習** (同`learning.py`): 判断時に`briefing._extract_features`が特徴量（`rsi_1h`/`adx_1h`/`ma_gap_atr`=MA乖離のATR換算/`atr_pct`=ボラ/`tf_agreement`=時間足一致度/`news_count`）をTradePlanに記録→ジャーナルへ保存。学習側は「売られすぎ圏(35未満)」「全時間足一致」「高ボラ(0.25%以上)」など相場用語の固定バケットを、さらにロング/ショート別に分けたセル単位で的中率を集計する（同じ状態でも向きで成績が非対称になるため）。セルごとに12件以上かつ的中率45%未満なら減衰係数（×0.7〜1.0）を付与。新規判断時は方向確定後に`LearnedProfile.condition_adjustment(features, direction)`が現在の状態×方向と突き合わせ、苦手なセルに該当したら確信度を減衰して理由を注意点に明示する。
-- 副産物として`research_pack/upcoming_events.csv`（最新スナップショット、毎回上書き）と`research_pack/event_history.csv`（**追記アーカイブ**）を出力。いずれも`fx_backtester`の`--events`にそのまま渡せる形式で、**分析時のイベント回避とバックテストのイベント回避が同じデータソースを共有**する設計。
-- **ML学習・昇格の運用**: `--train-ml`でジャーナルからGBDTを再学習(週次程度で十分)。委員の昇格はブリーフィング実行のたびに自動採点される。`--no-macro`/`--no-ml`で個別の委員を無効化できる。追加ファイル: `logs/macro_cache.json`(マクロTTLキャッシュ)、`logs/ml_model.json`(学習済みモデル+来歴)、`logs/promotion_state.json`(委員の段階)。
+- 副産物として`research_pack/upcoming_events.csv`（最新スナップショット、毎回上書き）と`research_pack/event_history.csv`（追記アーカイブ）を出力する。CSV形式は`fx_backtester --events`と互換だが、backtesterは`recorded_at`をas-of cutoffとして解釈しない。したがってrevision-aware PIT replayではなく、過去評価へそのまま渡すと後知恵改訂を混ぜ得る。
+- **ML学習・shadow診断**: `--train-ml`でジャーナルからGBDTを再学習でき、ブリーフィング実行時にlegacy参考指標を更新する。ただし委員はshadow固定で複合スコアへ入らない。`--no-macro`/`--no-ml`で個別の委員を無効化できる。追加ファイル: `logs/macro_cache.json`、`logs/ml_model.json`、`logs/promotion_state.json`。
 - **時間足別モード** (`--per-timeframe`、`fx_intel/timeframe.py` + `price_history.py` + `tf_learning.py` + `tf_briefing.py`): 融合1判断の代わりに15m/1h/4h/1dを**独立したアナリスト**として判断し、**時間足別の主ホライズン**で自己採点する（15m→15分後 / 1h→1時間後 / 4h→4時間後 / 1d→24時間後。補助ホライズンは観測専用で学習には不使用）。学習は融合モードと同じコア（重み再推定・キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier）を`(通貨ペア × 時間足)`セル単位で適用し、`logs/briefing_tf_learning.json`へ保存。融合モードとはジャーナル・学習ファイルを分離しているので両モードは干渉しない。読み取り専用ダッシュボード(`tools/ai_learning_dashboard`)は両ジャーナルを各主ホライズンで採点し、時間足別の的中率も表示する。
   - **将来価格の調達（5分系列）**: TradingViewスキャナーは現在値しか返さないため、主ホライズン後の実勢価格は後続の終値から取る。正規運用では`com.fx-codex.snapshot`だけが`fx_tf_snapshot.py`を5分ごとに起動し、`logs/briefing_tf_prices.jsonl`へ追記する。手動シグナルボードやraw loopをこの価格writerと併走させない。
-- **依存の据え置き**: 分析モジュール(analyst/macro/gbm/ml/committee/promotion/timeframe/price_history/tf_learning/tf_briefing)は追加のサードパーティ依存を一切増やさない。macro.pyの取得はrequestsのみ、GBDT・学習・昇格・分析エンジン・時間足別レイヤは標準ライブラリだけで動く。
+- **依存の据え置き**: 分析モジュール(analyst/macro/gbm/ml/committee/promotion/timeframe/price_history/tf_learning/tf_briefing)は追加のサードパーティ依存を一切増やさない。macro.pyの取得はrequestsのみ、GBDT・学習・shadow診断・分析エンジン・時間足別レイヤは標準ライブラリだけで動く。
 - テスト(`tests/test_fx_intel.py`ほか`test_analyst`/`test_macro`/`test_gbm`/`test_ml`/`test_committee`/`test_promotion`、時間足別は`test_timeframe`/`test_price_history`/`test_tf_learning`/`test_tf_snapshot`/`test_tf_briefing`/`test_fx_briefing_per_timeframe`/`test_dashboard_timeframe`)はネットワーク不要で完結する設計。
 
 ### FXシグナルボード（開発・一時確認専用）

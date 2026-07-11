@@ -16,7 +16,7 @@
 #   自動ログイン運用(再起動→自動ログイン→エージェント自動起動)を前提とする。
 # - plistへ秘密情報を書かない。Discord URLは実行時に.envから読まれる。
 # - 旧 com.fx-codex.briefing.hourly が居れば置き換え(bootout)する。
-# - 手動起動の fx_*_loop.sh が動いていれば警告する(自動killはしない)。
+# - 競合writer/loopを検知したらインストールを拒否する(自動killはしない)。
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +42,21 @@ if [ ! -x "$PYTHON" ]; then
   exit 1
 fi
 
+if [ "$DRY_RUN" != 1 ]; then
+  loops=$(pgrep -fl "fx_briefing_loop.sh|fx_tf_snapshot_loop.sh" || true)
+  direct_writers=$(pgrep -fl "[p]ython.*(fx_briefing.py|fx_tf_snapshot.py)" || true)
+  cron_writers=$(crontab -l 2>/dev/null | grep -E "fx_briefing.py|fx_tf_snapshot.py" || true)
+  if [ -n "$loops$direct_writers$cron_writers" ]; then
+    echo "ERROR: 競合する手動/cron writerを検知したためインストールを中止します。" >&2
+    [ -z "$loops" ] || echo "$loops" >&2
+    [ -z "$direct_writers" ] || echo "$direct_writers" >&2
+    [ -z "$cron_writers" ] || echo "$cron_writers" >&2
+    echo "人間が対象を確認・停止し、監査証跡を保存してから再実行してください。" >&2
+    exit 2
+  fi
+fi
+
+# 変更前に全テンプレートの存在を検証する。
 for label in $LABELS; do
   tmpl="$ROOT/ops/launchd/$label.plist.tmpl"
   if [ ! -f "$tmpl" ]; then
@@ -53,19 +68,6 @@ for label in $LABELS; do
     render "$tmpl"
     continue
   fi
-  mkdir -p "$AGENTS_DIR" "$ROOT/logs/launchd" "$ROOT/logs/locks"
-  target="$AGENTS_DIR/$label.plist"
-  render "$tmpl" > "$target"
-  if command -v plutil >/dev/null; then
-    plutil -lint -s "$target" || { echo "ERROR: plistが不正: $target" >&2; exit 1; }
-  fi
-  # 既にロード済みなら一旦bootout(置換のため)。未ロードのエラーは無視
-  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null
-  launchctl bootstrap "gui/$(id -u)" "$target" || {
-    echo "ERROR: bootstrap失敗: $label" >&2
-    exit 1
-  }
-  echo "installed: $label"
 done
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -73,25 +75,69 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-# 旧サービスの置き換え
+# legacy writerを新serviceより先に停止し、残存を検証する。
 for label in $LEGACY_LABELS; do
   if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
-    launchctl bootout "gui/$(id -u)/$label" && echo "legacy bootout: $label"
+    if ! launchctl bootout "gui/$(id -u)/$label"; then
+      echo "ERROR: legacy bootout失敗: $label" >&2
+      exit 2
+    fi
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      echo "ERROR: legacy serviceがbootout後も残存: $label" >&2
+      exit 2
+    fi
+    echo "legacy bootout: $label"
   fi
   if [ -f "$AGENTS_DIR/$label.plist" ]; then
-    mv "$AGENTS_DIR/$label.plist" "$AGENTS_DIR/$label.plist.disabled-$(date +%Y%m%d)"
-    echo "legacy plist退避: $label"
+    disabled="$AGENTS_DIR/$label.plist.disabled-$(date +%Y%m%d%H%M%S)"
+    if ! mv "$AGENTS_DIR/$label.plist" "$disabled"; then
+      echo "ERROR: legacy plistを退避できません: $label" >&2
+      exit 2
+    fi
+    echo "legacy plist退避: $disabled"
   fi
 done
 
-# 多重起動源の検知(自動killはしない: 人間が確認して止める)
-loops=$(pgrep -fl "fx_briefing_loop.sh|fx_tf_snapshot_loop.sh" || true)
-if [ -n "$loops" ]; then
-  echo ""
-  echo "⚠️  手動起動のループが動いています。launchdと二重実行になるため停止してください:"
-  echo "$loops"
-  echo "    停止コマンド: pkill -f 'fx_briefing_loop.sh|fx_tf_snapshot_loop.sh'"
-fi
+for label in $LABELS; do
+  tmpl="$ROOT/ops/launchd/$label.plist.tmpl"
+  mkdir -p "$AGENTS_DIR" "$ROOT/logs/launchd" "$ROOT/logs/locks"
+  target="$AGENTS_DIR/$label.plist"
+  candidate="$target.candidate.$$"
+  if ! render "$tmpl" > "$candidate"; then
+    rm -f "$candidate"
+    echo "ERROR: plist生成失敗: $label" >&2
+    exit 1
+  fi
+  if command -v plutil >/dev/null; then
+    plutil -lint -s "$candidate" || {
+      rm -f "$candidate"
+      echo "ERROR: plistが不正: $candidate" >&2
+      exit 1
+    }
+  fi
+  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    if ! launchctl bootout "gui/$(id -u)/$label"; then
+      rm -f "$candidate"
+      echo "ERROR: 既存serviceのbootout失敗: $label" >&2
+      exit 2
+    fi
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      rm -f "$candidate"
+      echo "ERROR: bootout後もserviceが残存: $label" >&2
+      exit 2
+    fi
+  fi
+  if ! mv "$candidate" "$target"; then
+    rm -f "$candidate"
+    echo "ERROR: plist配置失敗: $target" >&2
+    exit 1
+  fi
+  launchctl bootstrap "gui/$(id -u)" "$target" || {
+    echo "ERROR: bootstrap失敗: $label" >&2
+    exit 1
+  }
+  echo "installed: $label"
+done
 
 echo ""
 echo "完了。状態確認: ./scripts/status_fx_services.sh"

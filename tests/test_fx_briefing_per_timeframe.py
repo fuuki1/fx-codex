@@ -122,9 +122,18 @@ def patched_paths(tmp_path):
 
 
 def _run(argv, capsys, calendar_result=None):
-    """全ネットワーク経路をモックして fx_briefing.main を実行、payload を返す。"""
+    """全ネットワーク経路をモックして fx_briefing.main を実行、payload を返す。
+
+    ``fx_briefing.main`` は ``datetime.now`` から実時刻を取るため、テスト実行日が
+    週末だと ``is_market_open`` が False になり全時間足が「休場」へ倒れて方向判断
+    (と期待値ガード等の方向依存出力)が出なくなる。ネットワークを全モックした
+    決定論テストが実行曜日で挙動を変えないよう、市場は常にオープン扱いにする。
+    """
     calendar_result = calendar_result if calendar_result is not None else ([], [])
     with (
+        mock.patch("fx_intel.timeframe.is_market_open", return_value=True),
+        mock.patch("fx_intel.briefing.is_market_open", return_value=True),
+        mock.patch("fx_intel.decision_pipeline.is_market_open", return_value=True),
         mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
         mock.patch("fx_intel.calendar.fetch_calendar", return_value=calendar_result),
         mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
