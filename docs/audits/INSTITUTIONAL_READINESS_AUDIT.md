@@ -136,6 +136,25 @@ Three independent domain reviews were performed and their adverse findings were 
 
 ## Maturity before and after
 
+Score meaning: 0 = absent/evaluation unavailable; 1 = ad hoc; 2 = coded and tested but partial or undeployed; 3 = integrated research-grade; 4 = independently reproduced paper-grade; 5 = independently audited live-grade. Scores measure evidenced maturity, not ambition.
+
+| Required axis | Initial | Final | Evidence and ceiling |
+|---|---:|---:|---|
+| Data integrity | 1 | 2 | `point_in_time.py` and locked/idempotent price capture improve contracts; no promotion-admissible dataset |
+| Point-in-time integrity | 1 | 2 | UTC/as-of/availability/hash checks exist; revisions and primary loaders remain incomplete |
+| Label quality | 1 | 2 | Next-open triple barrier, gaps, stop-first, MFE/MAE and net R are tested; no real PIT label corpus |
+| Validation rigor | 1 | 2 | Purge/embargo, chronological partitions, CPCV-like and statistical checks exist; no authoritative orchestrator/trial matrix |
+| Model performance | 0 | 0 | Real performance is evaluation-unavailable; synthetic baselines fail sample, confidence and cost gates |
+| Probability calibration | 1 | 2 | Separate calibration partition and Brier/log-loss/AUC gates exist; no mature real-data reliability evidence |
+| Execution reproducibility | 1 | 2 | Next-open fills, costs, gaps, TTL and per-symbol closure are deterministic; no broker/venue replay |
+| Risk management | 1 | 2 | Data/risk vetoes, leverage latch and exposure controls are tested; no paper execution reconciliation |
+| Reproducibility | 1 | 2 | Seeds, hashes, artifacts and benchmark manifest improved; local pip is broken and the lock lacks hashes |
+| Monitoring | 1 | 2 | Freshness veto, retry/state semantics and drift checks are tested; Mac mini deployment is unverified |
+| Governance | 1 | 2 | Evidence schema, shadow-only legacy path and promotion policy exist; lockbox/approval is not durable/end-to-end |
+| Operational safety | 1 | 2 | Single-writer launchd design, fail-closed install/restart/uninstall and rollback exist; migration was not executed |
+
+Unweighted evidence score moves from **0.92/5 to 1.83/5**. The increase is process-control maturity only; model performance remains 0/5 and prevents any stage promotion.
+
 | Dimension | Initial state | Final state | Promotion effect |
 |---|---|---|---|
 | PIT/data validity | Ambiguous availability; mutable evidence; inconsistent source claims | Stronger immutable primitive and source ledger | Partial only; no admissible dataset |
