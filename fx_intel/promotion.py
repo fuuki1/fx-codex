@@ -166,45 +166,28 @@ def evaluate_member(
 
     # ペアごとの価格系列(将来価格の突き合わせ用)
     prices: dict[str, list[tuple[datetime, float]]] = {}
-    parsed: list[tuple[datetime, Mapping, str, float, float | None]] = []
+    parsed: list[tuple[datetime, str, float, float | None, float]] = []
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
         if ts is None or ts > now:
             continue
         symbol = str(entry.get("symbol", ""))
-        close = entry.get("close")
-        valid_close = (
-            isinstance(close, (int, float))
-            and not isinstance(close, bool)
-            and math.isfinite(float(close))
-        )
-        if valid_close:
-            prices.setdefault(symbol, []).append((ts, float(close)))
+        close_value = _finite_float(entry.get("close"))
+        if close_value is not None:
+            prices.setdefault(symbol, []).append((ts, close_value))
         features = entry.get("features")
-        opinion = features.get(feature_key) if isinstance(features, Mapping) else None
-        atr = entry.get("atr")
-        valid_opinion = (
-            isinstance(opinion, (int, float))
-            and not isinstance(opinion, bool)
-            and math.isfinite(float(opinion))
-        )
-        if valid_opinion and valid_close:
-            atr_value = (
-                float(atr)
-                if isinstance(atr, (int, float))
-                and not isinstance(atr, bool)
-                and math.isfinite(float(atr))
-                and atr > 0
-                else None
-            )
-            parsed.append((ts, entry, symbol, float(close), atr_value))
+        raw_opinion = features.get(feature_key) if isinstance(features, Mapping) else None
+        opinion_value = _finite_float(raw_opinion)
+        atr_value = _finite_float(entry.get("atr"))
+        if atr_value is not None and atr_value <= 0:
+            atr_value = None
+        if opinion_value is not None and close_value is not None:
+            parsed.append((ts, symbol, close_value, atr_value, opinion_value))
     for series in prices.values():
         series.sort(key=lambda point: point[0])
 
     scored: list[tuple[datetime, int, float]] = []  # (ts, hit(1/0), move_atr)
-    for ts, entry, symbol, entry_close, atr_value in parsed:
-        features = entry.get("features") or {}
-        opinion = float(features[feature_key])
+    for ts, symbol, entry_close, atr_value, opinion in parsed:
         if abs(opinion) < OPINION_ACTIVE_THRESHOLD:
             continue  # 中立票は方向判断していないので採点しない
         future_close = _future_close(prices.get(symbol, []), ts, horizon_hours, tolerance_hours)
@@ -373,6 +356,11 @@ def _float(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _finite_float(value: object) -> float | None:
+    parsed = _float(value)
+    return parsed if parsed is not None and math.isfinite(parsed) else None
 
 
 def _int(value: object) -> int:
