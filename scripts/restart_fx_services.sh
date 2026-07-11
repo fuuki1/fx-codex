@@ -9,4 +9,3 @@ for label in $LABELS; do
     echo "NOT LOADED: $label (scripts/install_launchd.sh を先に実行)"
   fi
 done
-

@@ -526,8 +526,10 @@ def _derive_cell(
         for row in rows
         if bool(row.get("tradable")) and _float(row.get("realized_r")) is not None
     ]
-    r_values: list[float] = [
-        value for row in tradable_rows if (value := _float(row.get("realized_r"))) is not None
+    r_values = [
+        value
+        for value in (_float(row.get("realized_r")) for row in tradable_rows)
+        if value is not None
     ]
     wins = sum(1 for value in r_values if value > 0)
     losses = sum(1 for value in r_values if value < 0)
@@ -537,11 +539,11 @@ def _derive_cell(
         for row in rows
         if _float(row.get("realized_r")) is not None and not bool(row.get("tradable"))
     )
-    mfe_values: list[float] = [
-        value for row in tradable_rows if (value := _float(row.get("mfe_r"))) is not None
+    mfe_values = [
+        value for value in (_float(row.get("mfe_r")) for row in tradable_rows) if value is not None
     ]
-    mae_values: list[float] = [
-        value for row in tradable_rows if (value := _float(row.get("mae_r"))) is not None
+    mae_values = [
+        value for value in (_float(row.get("mae_r")) for row in tradable_rows) if value is not None
     ]
     sl_count = sum(1 for row in tradable_rows if row.get("first_touch") == "sl")
     tp_count = sum(1 for row in tradable_rows if row.get("first_touch") in {"tp1", "tp2"})

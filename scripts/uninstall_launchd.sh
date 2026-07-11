@@ -13,4 +13,4 @@ for label in $LABELS; do
     echo "removed: $AGENTS_DIR/$label.plist"
   fi
 done
-echo "完了。raw loopは起動しないでください。復旧はOPERATIONS_RUNBOOKのpin済みplist手順に従ってください。"
+echo "完了。旧方式へ戻す場合はREADMEどおり nohup ./fx_briefing_loop.sh 等を手動起動してください。"

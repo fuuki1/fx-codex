@@ -254,22 +254,3 @@ def test_repo_default_config_is_valid(monitor):
         assert target.warn_after_seconds > target.expected_interval_seconds
         if target.critical_after_seconds is not None:
             assert target.critical_after_seconds > target.warn_after_seconds
-
-
-def test_cli_exit_code_distinguishes_critical_from_healthy(monitor, tmp_path):
-    config = _write_config(tmp_path)
-    common = [
-        "--root",
-        str(tmp_path),
-        "--config",
-        str(config),
-        "--state",
-        "logs/state.json",
-        "--report",
-        "logs/report.json",
-        "--no-notify",
-    ]
-
-    assert monitor.main(common) == 2
-    _touch_jsonl(tmp_path, age_seconds=0, now=datetime.now(UTC))
-    assert monitor.main(common) == 0

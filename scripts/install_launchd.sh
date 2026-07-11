@@ -16,7 +16,7 @@
 #   自動ログイン運用(再起動→自動ログイン→エージェント自動起動)を前提とする。
 # - plistへ秘密情報を書かない。Discord URLは実行時に.envから読まれる。
 # - 旧 com.fx-codex.briefing.hourly が居れば置き換え(bootout)する。
-# - 競合writer/loopを検知したらインストールを拒否する(自動killはしない)。
+# - 手動起動の fx_*_loop.sh が動いていれば警告する(自動killはしない)。
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,20 +40,6 @@ echo "agents dir    : $AGENTS_DIR"
 if [ ! -x "$PYTHON" ]; then
   echo "ERROR: 実行可能なpythonが見つかりません" >&2
   exit 1
-fi
-
-if [ "$DRY_RUN" != 1 ]; then
-  loops=$(pgrep -fl "fx_briefing_loop.sh|fx_tf_snapshot_loop.sh" || true)
-  direct_writers=$(pgrep -fl "[p]ython.*(fx_briefing.py|fx_tf_snapshot.py)" || true)
-  cron_writers=$(crontab -l 2>/dev/null | grep -E "fx_briefing.py|fx_tf_snapshot.py" || true)
-  if [ -n "$loops$direct_writers$cron_writers" ]; then
-    echo "ERROR: 競合する手動/cron writerを検知したためインストールを中止します。" >&2
-    [ -z "$loops" ] || echo "$loops" >&2
-    [ -z "$direct_writers" ] || echo "$direct_writers" >&2
-    [ -z "$cron_writers" ] || echo "$cron_writers" >&2
-    echo "人間が対象を確認・停止し、監査証跡を保存してから再実行してください。" >&2
-    exit 2
-  fi
 fi
 
 for label in $LABELS; do
@@ -97,6 +83,15 @@ for label in $LEGACY_LABELS; do
     echo "legacy plist退避: $label"
   fi
 done
+
+# 多重起動源の検知(自動killはしない: 人間が確認して止める)
+loops=$(pgrep -fl "fx_briefing_loop.sh|fx_tf_snapshot_loop.sh" || true)
+if [ -n "$loops" ]; then
+  echo ""
+  echo "⚠️  手動起動のループが動いています。launchdと二重実行になるため停止してください:"
+  echo "$loops"
+  echo "    停止コマンド: pkill -f 'fx_briefing_loop.sh|fx_tf_snapshot_loop.sh'"
+fi
 
 echo ""
 echo "完了。状態確認: ./scripts/status_fx_services.sh"

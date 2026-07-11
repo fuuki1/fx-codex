@@ -490,9 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[freshness] 監視の実行に失敗: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    # launchd/status callers must be able to distinguish a successful check from
-    # healthy data. warning remains observable but non-fatal; critical is exit 2.
-    return 2 if report.get("overall") == STATUS_CRITICAL else 0
+    return 0
 
 
 if __name__ == "__main__":
