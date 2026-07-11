@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -387,6 +388,115 @@ def test_install_keeps_existing_plist_when_bootout_fails(tmp_path):
     assert result.returncode == 2
     assert plist.read_text(encoding="utf-8") == "known-old-plist"
     assert "既存serviceのbootout失敗" in result.stderr
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_install_fails_closed_when_legacy_plist_cannot_be_disabled(tmp_path):
+    fake_bin = tmp_path / "bin"
+    agents = tmp_path / "Library" / "LaunchAgents"
+    fake_bin.mkdir()
+    agents.mkdir(parents=True)
+    legacy = agents / "com.fx-codex.briefing.hourly.plist"
+    legacy.write_text("legacy-writer", encoding="utf-8")
+    for name, body in {
+        "launchctl": "#!/bin/sh\nexit 1\n",
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "crontab": "#!/bin/sh\nexit 1\n",
+        "mv": "#!/bin/sh\nexit 1\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body, encoding="utf-8")
+        command.chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "install_launchd.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert legacy.read_text(encoding="utf-8") == "legacy-writer"
+    assert "legacy plistを退避できません" in result.stderr
+    assert "installed:" not in result.stdout
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_uninstall_keeps_legacy_plist_when_bootout_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    agents = tmp_path / "Library" / "LaunchAgents"
+    fake_bin.mkdir()
+    agents.mkdir(parents=True)
+    legacy = agents / "com.fx-codex.briefing.hourly.plist"
+    legacy.write_text("legacy-writer", encoding="utf-8")
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $*" in\n'
+        "  *print*com.fx-codex.briefing.hourly*) exit 0;;\n"
+        "  *bootout*com.fx-codex.briefing.hourly*) exit 1;;\n"
+        "  *) exit 1;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "uninstall_launchd.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert legacy.read_text(encoding="utf-8") == "legacy-writer"
+    assert "legacy bootout失敗" in result.stderr
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_status_script_treats_future_report_as_critical(tmp_path):
+    root = tmp_path / "repo"
+    scripts = root / "scripts"
+    logs = root / "logs"
+    fake_bin = tmp_path / "bin"
+    scripts.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    fake_bin.mkdir()
+    shutil.copy2(_ROOT / "scripts" / "status_fx_services.sh", scripts)
+    future = datetime.now(UTC) + timedelta(minutes=10)
+    (logs / "freshness_report.json").write_text(
+        json.dumps({"monitor_timestamp": future.isoformat(), "overall": "ok", "targets": []}),
+        encoding="utf-8",
+    )
+    for name, body in {
+        "launchctl": "#!/bin/sh\nexit 0\n",
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "crontab": "#!/bin/sh\nexit 1\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body, encoding="utf-8")
+        command.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "status_fx_services.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "freshness reportが未来時刻" in result.stdout
 
 
 # ------------------------------------------------------- ジャーナル監査
