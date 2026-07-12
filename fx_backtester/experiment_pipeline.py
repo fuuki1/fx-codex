@@ -1150,6 +1150,12 @@ def evaluate_lockbox(
 
     bundle = Path(evidence_dir)
     repo_root = Path(repository_root) if repository_root else Path(__file__).resolve().parents[1]
+    if (bundle / "lockbox_result.json").exists():
+        raise TypedFailure(
+            FailureReason.LOCKBOX_VIOLATION,
+            "this bundle already carries a lockbox result; single_use forbids another",
+            context={"evidence_dir": str(bundle)},
+        )
     hashes_path = bundle / "artifact_hashes.json"
     if not hashes_path.is_file():
         raise TypedFailure(
@@ -1192,7 +1198,8 @@ def evaluate_lockbox(
 
     frame = _load_symbol_frame(manifest, repo_root)
     _check_data_quality(manifest, frame)
-    if _normalized_dataset_hash(frame) != chain.get("normalized_dataset"):
+    normalized_hash = _normalized_dataset_hash(frame)
+    if normalized_hash != chain.get("normalized_dataset"):
         raise TypedFailure(
             FailureReason.HASH_MISMATCH,
             "normalized dataset no longer matches the recorded lineage",
@@ -1258,6 +1265,12 @@ def evaluate_lockbox(
             "replayed test predictions do not match the recorded lineage",
         )
 
+    # The recorded promotion evidence must agree with the replay before the
+    # single-use access is consumed; a bundle whose artifact_hashes.json was
+    # regenerated around edited numbers fails here instead of being trusted.
+    prior = json.loads((bundle / "promotion_decision.json").read_text(encoding="utf-8"))
+    _verify_prior_evidence(prior, manifest, state, normalized_hash, replayed_test)
+
     registry = LockboxRegistry(
         lockbox_registry_dir
         if lockbox_registry_dir is not None
@@ -1285,7 +1298,6 @@ def evaluate_lockbox(
         selected["short_threshold"],
     )
 
-    prior = json.loads((bundle / "promotion_decision.json").read_text(encoding="utf-8"))
     evidence = replace(
         PromotionEvidence(**prior["evidence"]),
         lockbox_evaluated_once=registry.state(manifest.experiment_id).evaluated_once,
@@ -1328,6 +1340,43 @@ def evaluate_lockbox(
         "promotion_failures": list(report.failures),
         "lockbox_result_path": str(bundle / "lockbox_result.json"),
     }
+
+
+def _verify_prior_evidence(
+    prior: Mapping[str, Any],
+    manifest: ExperimentManifest,
+    git_state: GitState,
+    normalized_hash: str,
+    replayed_test: Mapping[str, Any],
+) -> None:
+    """Cross-check recorded promotion evidence against the deterministic replay."""
+
+    evidence = prior.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise TypedFailure(
+            FailureReason.INCOMPLETE,
+            "promotion decision carries no evidence object",
+        )
+    replayed_returns = np.array([trade["net_r"] for trade in replayed_test["trades"]], dtype=float)
+    replayed_expectancy = float(replayed_returns.mean()) if replayed_returns.size else None
+    expectations: list[tuple[str, Any, Any]] = [
+        ("dataset_hash", evidence.get("dataset_hash"), normalized_hash),
+        ("git_commit", evidence.get("git_commit"), git_state.commit),
+        ("synthetic_data", evidence.get("synthetic_data"), manifest.data.synthetic),
+        ("net_expectancy_r", evidence.get("net_expectancy_r"), replayed_expectancy),
+        ("pair_count", evidence.get("pair_count"), 1),
+    ]
+    mismatched = [
+        {"field": name, "recorded": recorded, "replayed": replayed}
+        for name, recorded, replayed in expectations
+        if recorded != replayed
+    ]
+    if mismatched:
+        raise TypedFailure(
+            FailureReason.LINEAGE_BROKEN,
+            "recorded promotion evidence disagrees with the deterministic replay",
+            context={"mismatched": mismatched},
+        )
 
 
 def _utc_iso(now: datetime | None) -> str:

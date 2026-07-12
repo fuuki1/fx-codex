@@ -227,6 +227,40 @@ class TestGovernedEvaluation:
             _run(pipeline_setup, "out-changed")
         assert excinfo.value.reason is FailureReason.LOCKBOX_VIOLATION
 
+    def test_rehashed_evidence_edit_is_still_detected(self, pipeline_setup: dict[str, Any]) -> None:
+        """Editing recorded evidence AND regenerating artifact hashes must fail."""
+
+        import hashlib
+
+        result = _run(pipeline_setup)
+        decision_path = result.output_dir / "promotion_decision.json"
+        payload = json.loads(decision_path.read_text("utf-8"))
+        payload["evidence"]["net_expectancy_r"] = 9.99
+        decision_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", "utf-8")
+        hashes_path = result.output_dir / "artifact_hashes.json"
+        hashes = json.loads(hashes_path.read_text("utf-8"))
+        hashes["artifacts"]["promotion_decision.json"] = hashlib.sha256(
+            decision_path.read_bytes()
+        ).hexdigest()
+        hashes_path.write_text(json.dumps(hashes, indent=2, sort_keys=True) + "\n", "utf-8")
+        with pytest.raises(TypedFailure) as excinfo:
+            _evaluate(pipeline_setup, result.output_dir)
+        assert excinfo.value.reason is FailureReason.LINEAGE_BROKEN
+        registry = LockboxRegistry(pipeline_setup["tmp_path"] / "runs" / "lockbox_registry")
+        assert registry.state(result.experiment_id).evaluated_once is False
+
+    def test_registry_wipe_cannot_reopen_an_evaluated_bundle(
+        self, pipeline_setup: dict[str, Any]
+    ) -> None:
+        import shutil
+
+        result = _run(pipeline_setup)
+        _evaluate(pipeline_setup, result.output_dir)
+        shutil.rmtree(pipeline_setup["tmp_path"] / "runs" / "lockbox_registry")
+        with pytest.raises(TypedFailure) as excinfo:
+            _evaluate(pipeline_setup, result.output_dir)
+        assert excinfo.value.reason is FailureReason.LOCKBOX_VIOLATION
+
     def test_ledger_records_all_candidates_and_failures(
         self, pipeline_setup: dict[str, Any]
     ) -> None:
