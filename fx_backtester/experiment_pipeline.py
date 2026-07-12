@@ -24,7 +24,7 @@ import platform
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -45,8 +45,10 @@ from fx_backtester.experiment_manifest import (
     ModelCandidate,
     load_experiment_manifest,
     manifest_sha256,
+    parse_experiment_manifest,
 )
 from fx_backtester.failures import FailureReason, TypedFailure
+from fx_backtester.lockbox import LockboxRegistry, LockboxState, verify_lockbox_file
 from fx_backtester.governance import (
     PromotionEvidence,
     PromotionReport,
@@ -71,6 +73,7 @@ from fx_backtester.time_series_validation import (
     TemporalLeakageError,
     chronological_model_partitions,
 )
+from fx_backtester.trial_ledger import TrialLedger, TrialLedgerEntry
 
 PIPELINE_VERSION = "experiment_pipeline_v1"
 FEATURE_LEAKAGE_SAMPLES = 7
@@ -747,6 +750,8 @@ def run_experiment(
     output_root: str | Path,
     repository_root: str | Path | None = None,
     git_state: GitState | None = None,
+    trial_ledger_path: str | Path | None = None,
+    lockbox_registry_dir: str | Path | None = None,
     now: datetime | None = None,
 ) -> ExperimentRunResult:
     started_at = now or datetime.now(UTC)
@@ -757,6 +762,16 @@ def run_experiment(
     state = git_state or collect_git_state(repo_root)
     _verify_git_binding(manifest, state)
     environment = _verify_environment(manifest, repo_root)
+    ledger = TrialLedger(
+        trial_ledger_path
+        if trial_ledger_path is not None
+        else repo_root / "runs" / "trial_ledger.jsonl"
+    )
+    registry = LockboxRegistry(
+        lockbox_registry_dir
+        if lockbox_registry_dir is not None
+        else repo_root / "runs" / "lockbox_registry"
+    )
 
     lineage: list[dict[str, str]] = []
 
@@ -773,11 +788,25 @@ def run_experiment(
     normalized_hash = bind("normalized_dataset", _normalized_dataset_hash(frame))
 
     rows, dataset_summary = build_dataset_rows(manifest, frame)
-    bind("feature_dataset", _canonical_sha256([row["features"] for row in rows]))
-    bind("label_dataset", _canonical_sha256(rows))
+    feature_hash = bind("feature_dataset", _canonical_sha256([row["features"] for row in rows]))
+    label_hash = bind("label_dataset", _canonical_sha256(rows))
 
     partitions = _split_rows(manifest, rows)
-    bind("split", _canonical_sha256(partitions.audit()))
+    split_hash = bind("split", _canonical_sha256(partitions.audit()))
+
+    # The lockbox commitment is registered before any trial runs so that a
+    # frozen (already opened) experiment cannot be silently re-run or edited.
+    lockbox_inputs = [
+        {key: value for key, value in rows[index].items() if not _is_outcome_field(key)}
+        for index in partitions.withheld_lockbox_positions
+    ]
+    registry.register(
+        experiment_id=manifest.experiment_id,
+        manifest_sha256=manifest_hash,
+        commitment_sha256=partitions.lockbox_commitment,
+        inputs_sha256=_canonical_sha256(lockbox_inputs),
+        now=started_at,
+    )
 
     development = {
         name: [rows[index] for index in getattr(partitions, name)]
@@ -788,7 +817,23 @@ def run_experiment(
     trials, trial_records, tune_returns_matrix = _run_trials(
         manifest, development["train"], development["tune"]
     )
-    selected = _select_trial(manifest, trials)
+    lineage_hashes = {
+        "manifest_hash": manifest_hash,
+        "dataset_hash": normalized_hash,
+        "feature_hash": feature_hash,
+        "label_hash": label_hash,
+        "split_hash": split_hash,
+    }
+    try:
+        selected = _select_trial(manifest, trials)
+    except TypedFailure:
+        # Aborted selections still persist every attempted trial.
+        _persist_trials(ledger, manifest, state, lineage_hashes, trial_records, started_at)
+        raise
+    for record in trial_records:
+        record["selected"] = record["candidate_id"] == selected["candidate_id"]
+    _persist_trials(ledger, manifest, state, lineage_hashes, trial_records, started_at)
+    trial_count = _ledger_trial_count(ledger, manifest)
     selected_model: _TrainedModel = selected["model"]
     bind("trained_model", _canonical_sha256(selected_model.to_dict()))
 
@@ -836,14 +881,16 @@ def run_experiment(
     }
     bind("cost_stress", _canonical_sha256(stress_payload))
 
+    lockbox_state = registry.state(manifest.experiment_id)
     evidence = _promotion_evidence(
         manifest,
         state,
         normalized_hash,
-        trial_records,
+        trial_count,
         test_result,
         diagnostics,
         stress_rows,
+        lockbox_state,
     )
     report = evaluate_promotion(evidence, target_stage="validated")
     promotion_payload = {
@@ -875,6 +922,270 @@ def run_experiment(
         report=report,
     )
     return result
+
+
+def evaluate_lockbox(
+    evidence_dir: str | Path,
+    *,
+    purpose: str,
+    actor: str,
+    repository_root: str | Path | None = None,
+    git_state: GitState | None = None,
+    lockbox_registry_dir: str | Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """One-time governed lockbox evaluation for an existing evidence bundle.
+
+    Outcomes are never stored at rest: this function deterministically
+    recomputes the dataset, split, selected model, calibrator and test
+    predictions from the bundled manifest and verifies each against the
+    recorded lineage chain before the single-use access is claimed. Any
+    mismatch means the experiment drifted after registration and the lockbox
+    stays closed. Verification replays add no search breadth, so they are not
+    appended to the trial ledger; the access ledger records this event.
+    """
+
+    bundle = Path(evidence_dir)
+    repo_root = Path(repository_root) if repository_root else Path(__file__).resolve().parents[1]
+    hashes_path = bundle / "artifact_hashes.json"
+    if not hashes_path.is_file():
+        raise TypedFailure(
+            FailureReason.UNAVAILABLE,
+            "evidence bundle has no artifact_hashes.json",
+            context={"evidence_dir": str(bundle)},
+        )
+    artifacts = json.loads(hashes_path.read_text(encoding="utf-8"))["artifacts"]
+    for name in DETERMINISTIC_ARTIFACTS:
+        artifact_path = bundle / name
+        if not artifact_path.is_file():
+            raise TypedFailure(
+                FailureReason.UNAVAILABLE,
+                "evidence bundle artifact is missing",
+                context={"artifact": name},
+            )
+        observed = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        if observed != artifacts.get(name):
+            raise TypedFailure(
+                FailureReason.HASH_MISMATCH,
+                "evidence bundle artifact was modified after the run",
+                context={"artifact": name, "expected": artifacts.get(name), "observed": observed},
+            )
+
+    manifest = parse_experiment_manifest(
+        json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    )
+    manifest_hash = manifest_sha256(manifest)
+    state = git_state or collect_git_state(repo_root)
+    _verify_git_binding(manifest, state)
+
+    chain_entries = json.loads((bundle / "data_lineage.json").read_text(encoding="utf-8"))["chain"]
+    chain = {entry["artifact"]: entry["sha256"] for entry in chain_entries}
+    if chain.get("manifest") != manifest_hash:
+        raise TypedFailure(
+            FailureReason.LINEAGE_BROKEN,
+            "bundle manifest does not match the recorded lineage",
+            context={"expected": chain.get("manifest"), "observed": manifest_hash},
+        )
+
+    frame = _load_symbol_frame(manifest, repo_root)
+    _check_data_quality(manifest, frame)
+    if _normalized_dataset_hash(frame) != chain.get("normalized_dataset"):
+        raise TypedFailure(
+            FailureReason.HASH_MISMATCH,
+            "normalized dataset no longer matches the recorded lineage",
+        )
+    rows, _ = build_dataset_rows(manifest, frame)
+    if _canonical_sha256(rows) != chain.get("label_dataset"):
+        raise TypedFailure(
+            FailureReason.LINEAGE_BROKEN,
+            "label dataset recomputation does not match the recorded lineage",
+        )
+    partitions = _split_rows(manifest, rows)
+    if _canonical_sha256(partitions.audit()) != chain.get("split"):
+        raise TypedFailure(
+            FailureReason.LINEAGE_BROKEN,
+            "split recomputation does not match the recorded lineage",
+        )
+    lockbox_payload = verify_lockbox_file(
+        bundle / "lockbox.json", expected_sha256=artifacts["lockbox.json"]
+    )
+    if lockbox_payload.get("commitment_sha256") != partitions.lockbox_commitment:
+        raise TypedFailure(
+            FailureReason.HASH_MISMATCH,
+            "lockbox commitment does not match the recomputed partition",
+        )
+
+    development = {
+        name: [rows[index] for index in getattr(partitions, name)]
+        for name in ("train", "tune", "calibration", "test")
+    }
+    trials, _, _ = _run_trials(manifest, development["train"], development["tune"])
+    selected = _select_trial(manifest, trials)
+    evaluation = json.loads((bundle / "evaluation.json").read_text(encoding="utf-8"))
+    if selected["candidate_id"] != evaluation.get("selected_candidate_id"):
+        raise TypedFailure(
+            FailureReason.LINEAGE_BROKEN,
+            "deterministic replay selected a different candidate",
+            context={
+                "replayed": selected["candidate_id"],
+                "recorded": evaluation.get("selected_candidate_id"),
+            },
+        )
+    model: _TrainedModel = selected["model"]
+    if _canonical_sha256(model.to_dict()) != chain.get("trained_model"):
+        raise TypedFailure(
+            FailureReason.HASH_MISMATCH,
+            "replayed trained model does not match the recorded lineage",
+        )
+    calibrator, _ = _fit_calibration(manifest, selected, development["calibration"])
+    test_features, _ = _matrix(manifest, development["test"])
+    test_probabilities = np.asarray(
+        calibrator.predict(model.predict_probability(test_features).tolist()), dtype=float
+    )
+    replayed_test = _evaluate_decisions(
+        manifest,
+        development["test"],
+        test_probabilities,
+        selected["long_threshold"],
+        selected["short_threshold"],
+    )
+    if _canonical_sha256(replayed_test["trades"]) != chain.get("test_predictions"):
+        raise TypedFailure(
+            FailureReason.LINEAGE_BROKEN,
+            "replayed test predictions do not match the recorded lineage",
+        )
+
+    registry = LockboxRegistry(
+        lockbox_registry_dir
+        if lockbox_registry_dir is not None
+        else repo_root / "runs" / "lockbox_registry"
+    )
+    registry.claim_access(
+        experiment_id=manifest.experiment_id,
+        manifest_sha256=manifest_hash,
+        purpose=purpose,
+        actor=actor,
+        now=now,
+    )
+
+    lockbox_positions = partitions.open_lockbox(selection_complete=True, purpose=purpose)
+    lockbox_rows = [rows[index] for index in lockbox_positions]
+    lockbox_features, _ = _matrix(manifest, lockbox_rows)
+    lockbox_probabilities = np.asarray(
+        calibrator.predict(model.predict_probability(lockbox_features).tolist()), dtype=float
+    )
+    lockbox_result = _evaluate_decisions(
+        manifest,
+        lockbox_rows,
+        lockbox_probabilities,
+        selected["long_threshold"],
+        selected["short_threshold"],
+    )
+
+    prior = json.loads((bundle / "promotion_decision.json").read_text(encoding="utf-8"))
+    evidence = replace(
+        PromotionEvidence(**prior["evidence"]),
+        lockbox_evaluated_once=registry.state(manifest.experiment_id).evaluated_once,
+        lockbox_reused_for_selection=registry.state(manifest.experiment_id).reused_for_selection,
+    )
+    report = evaluate_promotion(evidence, target_stage="validated")
+
+    opened_at = _utc_iso(now)
+    result_payload = {
+        "experiment_id": manifest.experiment_id,
+        "opened_at": opened_at,
+        "purpose": purpose,
+        "actor": actor,
+        "manifest_sha256": manifest_hash,
+        "commitment_sha256": partitions.lockbox_commitment,
+        "metrics": lockbox_result["metrics"],
+        "trades": lockbox_result["trades"],
+        "consistency": "manifest, dataset, labels, split, model and test "
+        "predictions replayed to identical hashes before access",
+    }
+    _write_json(bundle / "lockbox_result.json", result_payload)
+    post_payload = {
+        "target_stage": report.target_stage,
+        "passed": report.passed,
+        "failures": list(report.failures),
+        "report": report.to_dict(),
+        "evidence": _json_ready(asdict(evidence)),
+        "lockbox_result_sha256": hashlib.sha256(
+            (bundle / "lockbox_result.json").read_bytes()
+        ).hexdigest(),
+    }
+    _write_json(bundle / "promotion_decision_post_lockbox.json", post_payload)
+    return {
+        "experiment_id": manifest.experiment_id,
+        "opened_at": opened_at,
+        "lockbox_metrics": lockbox_result["metrics"],
+        "promotion_passed": report.passed,
+        "promotion_failures": list(report.failures),
+        "lockbox_result_path": str(bundle / "lockbox_result.json"),
+    }
+
+
+def _utc_iso(now: datetime | None) -> str:
+    value = now or datetime.now(UTC)
+    if value.tzinfo is None:
+        raise TypedFailure(FailureReason.INVALID, "timestamps must be timezone-aware")
+    return value.astimezone(UTC).isoformat()
+
+
+def _persist_trials(
+    ledger: TrialLedger,
+    manifest: ExperimentManifest,
+    git_state: GitState,
+    lineage_hashes: Mapping[str, str],
+    trial_records: Sequence[Mapping[str, Any]],
+    started_at: datetime,
+) -> None:
+    """Append every attempted trial — including failures — to the durable ledger."""
+
+    run_nonce = started_at.isoformat()
+    for record in trial_records:
+        ledger.append(
+            TrialLedgerEntry(
+                trial_id=f"{record['trial_id']}:{run_nonce}",
+                experiment_id=manifest.experiment_id,
+                parent_trial_id=record["parent_trial_id"],
+                started_at=record["started_at"],
+                finished_at=record["finished_at"],
+                status=record["status"],
+                git_commit=git_state.commit,
+                manifest_hash=lineage_hashes["manifest_hash"],
+                dataset_hash=lineage_hashes["dataset_hash"],
+                feature_hash=lineage_hashes["feature_hash"],
+                label_hash=lineage_hashes["label_hash"],
+                split_hash=lineage_hashes["split_hash"],
+                model_family=record["model_family"],
+                hyperparameters=record["hyperparameters"],
+                seed=int(record["seed"]),
+                metrics=record["metrics"],
+                cost_metrics=None,
+                failure_reason=record["failure_reason"],
+                selected=bool(record["selected"]),
+                extra={"candidate_id": record["candidate_id"], "run_started_at": run_nonce},
+            )
+        )
+
+
+def _ledger_trial_count(ledger: TrialLedger, manifest: ExperimentManifest) -> int:
+    """Search breadth from the tamper-checked ledger; incomplete ledgers fail."""
+
+    ledger.verify()
+    entries = ledger.entries_for_experiment(manifest.experiment_id)
+    recorded = {str(entry.get("extra", {}).get("candidate_id", "")) for entry in entries}
+    declared = {candidate.candidate_id for candidate in manifest.models.candidates}
+    missing = sorted(declared - recorded)
+    if missing:
+        raise TypedFailure(
+            FailureReason.INCOMPLETE,
+            "trial ledger does not contain every declared candidate; "
+            "no performance claim is possible",
+            context={"experiment_id": manifest.experiment_id, "missing": missing},
+        )
+    return len(recorded)
 
 
 def _split_rows(manifest: ExperimentManifest, rows: Sequence[Mapping[str, Any]]) -> ModelPartitions:
@@ -1240,10 +1551,11 @@ def _promotion_evidence(
     manifest: ExperimentManifest,
     git_state: GitState,
     normalized_hash: str,
-    trial_records: Sequence[Mapping[str, Any]],
+    trial_count: int,
     test_result: Mapping[str, Any],
     diagnostics: Mapping[str, Any],
     stress_rows: Sequence[Mapping[str, Any]],
+    lockbox_state: LockboxState,
 ) -> PromotionEvidence:
     metrics = test_result["metrics"]
     statistics = diagnostics["statistics"]
@@ -1268,7 +1580,7 @@ def _promotion_evidence(
         synthetic_data=manifest.data.synthetic,
         point_in_time_violations=0,
         future_feature_violations=0,
-        trial_count=len(trial_records),
+        trial_count=trial_count,
         sample_count=int(guard["test_trade_count"]),
         net_expectancy_r=metrics.get("net_expectancy_r"),
         expectancy_ci_lower_r=stat_value("bootstrap_ci", "lower"),
@@ -1279,8 +1591,8 @@ def _promotion_evidence(
         cost_stress_2x_expectancy_r=stress_2x,
         regime_count=regime_count if regime_count else None,
         pair_count=1,
-        lockbox_evaluated_once=None,
-        lockbox_reused_for_selection=None,
+        lockbox_evaluated_once=lockbox_state.evaluated_once,
+        lockbox_reused_for_selection=lockbox_state.reused_for_selection,
         shadow_days=None,
         paper_days=None,
         major_operational_incidents=None,
@@ -1480,15 +1792,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser = subparsers.add_parser("run", help="run one experiment from a manifest")
     run_parser.add_argument("--experiment-manifest", required=True)
     run_parser.add_argument("--output-root", default="runs/experiments")
+    run_parser.add_argument("--trial-ledger", default=None)
+    run_parser.add_argument("--lockbox-registry", default=None)
+    lockbox_parser = subparsers.add_parser(
+        "evaluate-lockbox", help="single-use governed lockbox evaluation of a bundle"
+    )
+    lockbox_parser.add_argument("--evidence-dir", required=True)
+    lockbox_parser.add_argument("--purpose", required=True)
+    lockbox_parser.add_argument("--actor", required=True)
+    lockbox_parser.add_argument("--lockbox-registry", default=None)
     arguments = parser.parse_args(argv)
-    if arguments.command != "run":  # pragma: no cover - argparse enforces choices
-        parser.error("unknown command")
     try:
-        result = run_experiment(arguments.experiment_manifest, output_root=arguments.output_root)
+        if arguments.command == "run":
+            result = run_experiment(
+                arguments.experiment_manifest,
+                output_root=arguments.output_root,
+                trial_ledger_path=arguments.trial_ledger,
+                lockbox_registry_dir=arguments.lockbox_registry,
+            )
+            payload: dict[str, Any] = {"status": "completed", **result.summary}
+        else:
+            payload = {
+                "status": "completed",
+                **evaluate_lockbox(
+                    arguments.evidence_dir,
+                    purpose=arguments.purpose,
+                    actor=arguments.actor,
+                    lockbox_registry_dir=arguments.lockbox_registry,
+                ),
+            }
     except TypedFailure as failure:
         print(json.dumps({"status": "failed", **failure.to_dict()}, ensure_ascii=False))
         return 1
-    print(json.dumps({"status": "completed", **result.summary}, ensure_ascii=False))
+    print(json.dumps(_json_ready(payload), ensure_ascii=False))
     return 0
 
 

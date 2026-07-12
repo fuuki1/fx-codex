@@ -332,14 +332,16 @@ class TestPipelineRun:
         assert first.deterministic_result_sha256 == second.deterministic_result_sha256
         assert first.manifest_sha256 == second.manifest_sha256
 
-    def test_seed_change_changes_result_identity(self, experiment_setup: dict[str, Any]) -> None:
+    def test_seed_change_requires_new_experiment_and_changes_identity(
+        self, experiment_setup: dict[str, Any]
+    ) -> None:
         base = _run(experiment_setup, _write_manifest(experiment_setup), "out-a")
         reseeded_path = _write_manifest(
-            experiment_setup, name="manifest-b.json", models={"random_seed": 43}
+            experiment_setup,
+            name="manifest-b.json",
+            experiment_id="usdjpy-pipeline-selftest-seed43",
+            models={"random_seed": 43},
         )
-        payload = json.loads(reseeded_path.read_text("utf-8"))
-        payload["models"]["random_seed"] = 43
-        reseeded_path.write_text(json.dumps(payload), encoding="utf-8")
         reseeded = _run(experiment_setup, reseeded_path, "out-b")
         assert base.manifest_sha256 != reseeded.manifest_sha256
         assert base.deterministic_result_sha256 != reseeded.deterministic_result_sha256
