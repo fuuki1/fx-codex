@@ -1,0 +1,48 @@
+{
+  "chain": [
+    {
+      "artifact": "manifest",
+      "sha256": "6512700d6513f9ecbdc958ef31a66829dd03cab63abdf30ec57e8d7c032c7683"
+    },
+    {
+      "artifact": "raw:examples_sample_prices",
+      "sha256": "b93513ba74070117edc02f404d285670b13f53772ac4ce91a10c87b6c398e427"
+    },
+    {
+      "artifact": "normalized_dataset",
+      "sha256": "743971bc289d15f77754aabf40abf94cb21637f495adb34a6d02224f76919bcf"
+    },
+    {
+      "artifact": "feature_dataset",
+      "sha256": "aab05e9b7fadea50528442138a5939c1a956dccf0274ae1174b4fabe789a0efb"
+    },
+    {
+      "artifact": "label_dataset",
+      "sha256": "533c60beae1a5995d8b7930df1b83eeb7f2802e1c58875127c9aaa699b839d88"
+    },
+    {
+      "artifact": "split",
+      "sha256": "bfc7f953c7fa184cb6bbae0e07bfdb4cce7c05a4e039bd64701dc5076dd1263b"
+    },
+    {
+      "artifact": "trained_model",
+      "sha256": "8db9ccd886e182e0953ef792bcf33a21f0ea4183b7ef2599addc0eb40263f657"
+    },
+    {
+      "artifact": "test_predictions",
+      "sha256": "1e6a25ef115cabfc2e9ff44c510694802301b362e21a1d46437bec04230f9e1d"
+    },
+    {
+      "artifact": "evaluation",
+      "sha256": "ce48994e97962b815d00b7348d62a86a400b278a0dd3f4c6aa3b6be6da081423"
+    },
+    {
+      "artifact": "cost_stress",
+      "sha256": "a24420226db890b8abb7c7f2ec0a0d97c6f0c9a91312a967b3a081ea010ce77d"
+    },
+    {
+      "artifact": "promotion_decision",
+      "sha256": "c6523e4264d4e16b07aaf189f8c2e66673ff161052134bdd99e8d48e2d60954e"
+    }
+  ]
+}

@@ -1,0 +1,640 @@
+{
+  "actor": "codex/institutional-research-pipeline session (human review pending)",
+  "commitment_sha256": "9319482fcdc434485b0650ebee2f501082f08e4bd6711de2305acfd0a8360f68",
+  "consistency": "manifest, dataset, labels, split, model and test predictions replayed to identical hashes before access",
+  "experiment_id": "usdjpy-synthetic-infra-selftest-20260712",
+  "manifest_sha256": "6512700d6513f9ecbdc958ef31a66829dd03cab63abdf30ec57e8d7c032c7683",
+  "metrics": {
+    "abstention_rate": 0.0,
+    "cost_multiplier": 1.0,
+    "coverage": 1.0,
+    "max_drawdown_r": 84.63968185767227,
+    "median_net_r": -1.131546203160613,
+    "net_expectancy_r": -0.9618145665644579,
+    "profit_factor": 0.09959212733906309,
+    "rows": 88,
+    "sharpe_per_trade": -1.37415312065499,
+    "trade_count": 88,
+    "win_rate": 0.056818181818181816
+  },
+  "opened_at": "2026-07-12T05:13:42.945147+00:00",
+  "purpose": "final governance evaluation for the infrastructure self-test evidence bundle",
+  "trades": [
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1464494804807444,
+      "prediction_time": "2024-02-03T19:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1506304630409212,
+      "prediction_time": "2024-02-03T20:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1497052945036552,
+      "prediction_time": "2024-02-03T21:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1503990025649566,
+      "prediction_time": "2024-02-03T22:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1574730595138099,
+      "prediction_time": "2024-02-03T23:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1580012423192863,
+      "prediction_time": "2024-02-04T00:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.15854060081703,
+      "prediction_time": "2024-02-04T01:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1793929848649707,
+      "prediction_time": "2024-02-04T02:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1695177516712219,
+      "prediction_time": "2024-02-04T03:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1750646550060775,
+      "prediction_time": "2024-02-04T04:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.168356666283798,
+      "prediction_time": "2024-02-04T05:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.168481975013034,
+      "prediction_time": "2024-02-04T06:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1482222333976673,
+      "prediction_time": "2024-02-04T07:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1390310460501192,
+      "prediction_time": "2024-02-04T08:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1415370630011281,
+      "prediction_time": "2024-02-04T09:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.142509789378601,
+      "prediction_time": "2024-02-04T10:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.143931264762387,
+      "prediction_time": "2024-02-04T11:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1448232699597292,
+      "prediction_time": "2024-02-04T12:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.132159788346613,
+      "prediction_time": "2024-02-04T13:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.13047645902061,
+      "prediction_time": "2024-02-04T14:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1231083497750796,
+      "prediction_time": "2024-02-04T15:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": 1.8785806792334936,
+      "prediction_time": "2024-02-04T16:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1219707635993188,
+      "prediction_time": "2024-02-04T17:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1215710678197177,
+      "prediction_time": "2024-02-04T18:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": -1.121076614986015,
+      "prediction_time": "2024-02-04T19:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1219008567811992,
+      "prediction_time": "2024-02-04T20:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1149724191494628,
+      "prediction_time": "2024-02-04T21:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1072242914270582,
+      "prediction_time": "2024-02-04T22:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1076486135359351,
+      "prediction_time": "2024-02-04T23:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1011184332621022,
+      "prediction_time": "2024-02-05T00:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.101275372230125,
+      "prediction_time": "2024-02-05T01:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": -1.0970478643060262,
+      "prediction_time": "2024-02-05T02:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.0984315258753343,
+      "prediction_time": "2024-02-05T03:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.0986821639637092,
+      "prediction_time": "2024-02-05T04:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1013596457785457,
+      "prediction_time": "2024-02-05T05:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.0913328630497103,
+      "prediction_time": "2024-02-05T06:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": -1.0969143650605775,
+      "prediction_time": "2024-02-05T07:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.101553400725749,
+      "prediction_time": "2024-02-05T08:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 3,
+      "net_r": -1.1012928720809871,
+      "prediction_time": "2024-02-05T09:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": -1.1006499143926847,
+      "prediction_time": "2024-02-05T10:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.0999211016546961,
+      "prediction_time": "2024-02-05T11:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1005473105606938,
+      "prediction_time": "2024-02-05T12:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1158912693443634,
+      "prediction_time": "2024-02-05T13:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1158556805322999,
+      "prediction_time": "2024-02-05T14:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.11864180045185,
+      "prediction_time": "2024-02-05T15:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.124083052417486,
+      "prediction_time": "2024-02-05T16:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.12577355184607,
+      "prediction_time": "2024-02-05T17:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1158720463854497,
+      "prediction_time": "2024-02-05T18:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": 1.8803517790352142,
+      "prediction_time": "2024-02-05T19:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1163664212726276,
+      "prediction_time": "2024-02-05T20:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1120593219309227,
+      "prediction_time": "2024-02-05T21:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1168431551640678,
+      "prediction_time": "2024-02-05T22:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.117503719986415,
+      "prediction_time": "2024-02-05T23:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.122554802693612,
+      "prediction_time": "2024-02-06T00:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": 1.8785433872770994,
+      "prediction_time": "2024-02-06T01:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1230045867529708,
+      "prediction_time": "2024-02-06T02:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.122558459571162,
+      "prediction_time": "2024-02-06T03:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1217139842064228,
+      "prediction_time": "2024-02-06T04:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1220590540901583,
+      "prediction_time": "2024-02-06T05:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1609233405906183,
+      "prediction_time": "2024-02-06T06:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1631042467140011,
+      "prediction_time": "2024-02-06T07:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1598688957684302,
+      "prediction_time": "2024-02-06T08:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1673648124671396,
+      "prediction_time": "2024-02-06T09:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1521529518722435,
+      "prediction_time": "2024-02-06T10:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1405038456053296,
+      "prediction_time": "2024-02-06T11:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.146323692679359,
+      "prediction_time": "2024-02-06T12:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1469070938258321,
+      "prediction_time": "2024-02-06T13:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1484661675869234,
+      "prediction_time": "2024-02-06T14:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1486083949937744,
+      "prediction_time": "2024-02-06T15:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1492784805729168,
+      "prediction_time": "2024-02-06T16:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": 1.8554300741814198,
+      "prediction_time": "2024-02-06T17:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1531219568872106,
+      "prediction_time": "2024-02-06T18:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1553605920252725,
+      "prediction_time": "2024-02-06T19:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1546576542108253,
+      "prediction_time": "2024-02-06T20:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1581812638090463,
+      "prediction_time": "2024-02-06T21:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.14674970706182,
+      "prediction_time": "2024-02-06T22:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1473206442147743,
+      "prediction_time": "2024-02-06T23:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1309326179746126,
+      "prediction_time": "2024-02-07T00:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": 1.868902466727574,
+      "prediction_time": "2024-02-07T01:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.132917026861168,
+      "prediction_time": "2024-02-07T02:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1329103822668531,
+      "prediction_time": "2024-02-07T03:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.132934842166046,
+      "prediction_time": "2024-02-07T04:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 2,
+      "net_r": -1.1327828024570907,
+      "prediction_time": "2024-02-07T05:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.134453406272562,
+      "prediction_time": "2024-02-07T06:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1284956401646813,
+      "prediction_time": "2024-02-07T07:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.132370224662173,
+      "prediction_time": "2024-02-07T08:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1328653212151039,
+      "prediction_time": "2024-02-07T09:00:00+00:00",
+      "probability": 0.1387286860742169,
+      "side": "short"
+    },
+    {
+      "bars_to_exit": 1,
+      "net_r": -1.1368494325443197,
+      "prediction_time": "2024-02-07T10:00:00+00:00",
+      "probability": 0.13872868608456207,
+      "side": "short"
+    }
+  ]
+}

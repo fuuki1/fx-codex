@@ -1,0 +1,33 @@
+{
+  "cost_model_version": "declared_static_v1",
+  "rows": [
+    {
+      "cost_multiplier": 1.0,
+      "max_drawdown_r": 126.89212384117793,
+      "median_net_r": -1.1264596552885529,
+      "net_expectancy_r": -1.075356981704898,
+      "trade_count": 118
+    },
+    {
+      "cost_multiplier": 1.25,
+      "max_drawdown_r": 130.61515480147244,
+      "median_net_r": -1.1580745691106573,
+      "net_expectancy_r": -1.1069080915379026,
+      "trade_count": 118
+    },
+    {
+      "cost_multiplier": 1.5,
+      "max_drawdown_r": 134.3381857617671,
+      "median_net_r": -1.1896894829327618,
+      "net_expectancy_r": -1.1384592013709072,
+      "trade_count": 118
+    },
+    {
+      "cost_multiplier": 2.0,
+      "max_drawdown_r": 141.7842476823561,
+      "median_net_r": -1.2529193105769707,
+      "net_expectancy_r": -1.2015614210369165,
+      "trade_count": 118
+    }
+  ]
+}
