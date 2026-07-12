@@ -147,3 +147,32 @@ main (3595582)
 - CI: PR #26 run `29135404071`、#29 `29146673480`、#30 `29156577877`、#31 `29157699125` すべてpass。
 - 文書: `docs/audits/INSTITUTIONAL_READINESS_AUDIT.md`(evidence freeze 2026-07-11)、`reports/institutional_benchmark_20260711.md`(dataset SHA-256 `b93513ba…8427`)。
 - 性能: **alphaは確認されていない**。合成benchmarkは機能検証のみで、性能検証は「評価不能」。この結論は本監査でも変わらない。
+
+## 補遺: 本作業実施後の再採点(2026-07-12、同日)
+
+G1〜G11のうち G1(authoritative pipeline)・G2(trial ledger)・G3(lockbox)・
+G4(baseline群)・G5(policy設定化)・G8(shadow/TCA schema)・G9(strategy card)・
+G10(runbook)・G11(typed failure)を本ブランチで実装した。
+G6(source adapter契約)は schema+実装状態registry のみ(adapterはCOT以外未実装)、
+G7(SLO)は quote streamで計測可能なsubsetのみ。
+
+| 軸 | before | after(本ブランチ) | 3に満たない理由 |
+|---|---:|---:|---|
+| Data integrity | 2 | 2 | 実データcorpus・main統合なし |
+| PIT integrity | 2 | **2+** | pipelineがfeature joinを所有し再構成検査を持つが、実データ・main統合なし |
+| Label quality | 2 | 2 | 実PIT labelコーパスなし |
+| Validation rigor | 2 | **2+** | orchestration(G1)は解消。実データ実験ゼロ |
+| Model performance | 0 | **0** | 変化なし。実データが存在しない限り評価不能 |
+| Probability calibration | 2 | 2 | 実データreliabilityなし |
+| Execution reproducibility | 2 | **2+** | shadow intent/TCA schemaはあるが実quote照合なし |
+| Risk management | 2 | 2 | shadow実績なし |
+| Reproducibility | 2 | **2+** | 同一manifest→同一hashのCIテストあり。#30(hash lock)未統合 |
+| Monitoring | 2 | 2 | Mac mini未配備(runbookのみ) |
+| Governance | 2 | **2+** | ledger/lockbox/policy設定化/red-team済み。独立custody・main統合なし |
+| Operational safety | 2 | 2 | 移行未実施 |
+
+「2+」は「3の構造要件をコード・テストで満たすが、**main統合と実データ証跡という
+3の必須条件を欠く**」状態を指す。unweightedスコアとしては依然 **約1.83〜2.0/5** であり、
+3/5への到達は (1) PR統合、(2) 実データ収集稼働、(3) 実データ実験1本の完走、
+の人間作業を要する。**本作業は「3へ進められる構造」を提供するものであり、
+3を宣言するものではない。**
