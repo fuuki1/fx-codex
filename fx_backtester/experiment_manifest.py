@@ -232,9 +232,31 @@ class CostSection:
 class SelectionSection:
     primary_metric: str
     minimum_trade_count: int
+    minimum_effective_trades: int
+    max_regime_concentration: float
+    max_month_concentration: float
     multiple_testing_method: str
     bootstrap_block_size: int
     pbo_blocks: int
+
+
+@dataclass(frozen=True)
+class StrategyCard:
+    """Hypothesis-driven economics of the candidate family (§strategy card).
+
+    ``exploratory=True`` declares economically unmotivated feature mining;
+    such experiments face the same gates but must say so up front.
+    """
+
+    strategy_id: str
+    economic_mechanism: str
+    why_should_edge_exist: str
+    who_is_paying_the_edge: str
+    expected_horizon: str
+    known_failure_regimes: tuple[str, ...]
+    capacity_assumption: str
+    cost_assumption: str
+    exploratory: bool
 
 
 @dataclass(frozen=True)
@@ -258,6 +280,7 @@ class ExperimentManifest:
     research_question: str
     economic_hypothesis: str
     invalidation_conditions: tuple[str, ...]
+    strategy_card: StrategyCard
     git: GitBinding
     environment: EnvironmentBinding
     data: DataSection
@@ -280,6 +303,17 @@ class ExperimentManifest:
             "research_question": self.research_question,
             "economic_hypothesis": self.economic_hypothesis,
             "invalidation_conditions": list(self.invalidation_conditions),
+            "strategy_card": {
+                "strategy_id": self.strategy_card.strategy_id,
+                "economic_mechanism": self.strategy_card.economic_mechanism,
+                "why_should_edge_exist": self.strategy_card.why_should_edge_exist,
+                "who_is_paying_the_edge": self.strategy_card.who_is_paying_the_edge,
+                "expected_horizon": self.strategy_card.expected_horizon,
+                "known_failure_regimes": list(self.strategy_card.known_failure_regimes),
+                "capacity_assumption": self.strategy_card.capacity_assumption,
+                "cost_assumption": self.strategy_card.cost_assumption,
+                "exploratory": self.strategy_card.exploratory,
+            },
             "git": {
                 "commit": self.git.commit,
                 "dirty_worktree_allowed": self.git.dirty_worktree_allowed,
@@ -359,6 +393,9 @@ class ExperimentManifest:
             "selection": {
                 "primary_metric": self.selection.primary_metric,
                 "minimum_trade_count": self.selection.minimum_trade_count,
+                "minimum_effective_trades": self.selection.minimum_effective_trades,
+                "max_regime_concentration": self.selection.max_regime_concentration,
+                "max_month_concentration": self.selection.max_month_concentration,
                 "multiple_testing_method": self.selection.multiple_testing_method,
                 "bootstrap_block_size": self.selection.bootstrap_block_size,
                 "pbo_blocks": self.selection.pbo_blocks,
@@ -396,6 +433,7 @@ def parse_experiment_manifest(payload: Any) -> ExperimentManifest:
             "research_question",
             "economic_hypothesis",
             "invalidation_conditions",
+            "strategy_card",
             "git",
             "environment",
             "data",
@@ -750,12 +788,56 @@ def parse_experiment_manifest(payload: Any) -> ExperimentManifest:
         stress_multipliers=tuple(sorted(multipliers)),
     )
 
+    card_map = _take(
+        _require_mapping(root["strategy_card"], "strategy_card"),
+        "strategy_card",
+        (
+            "strategy_id",
+            "economic_mechanism",
+            "why_should_edge_exist",
+            "who_is_paying_the_edge",
+            "expected_horizon",
+            "known_failure_regimes",
+            "capacity_assumption",
+            "cost_assumption",
+            "exploratory",
+        ),
+    )
+    failure_regimes_raw = card_map["known_failure_regimes"]
+    if not isinstance(failure_regimes_raw, list) or not failure_regimes_raw:
+        raise _invalid("strategy_card.known_failure_regimes must be a non-empty list")
+    strategy_card = StrategyCard(
+        strategy_id=_text(card_map["strategy_id"], "strategy_card.strategy_id"),
+        economic_mechanism=_text(
+            card_map["economic_mechanism"], "strategy_card.economic_mechanism"
+        ),
+        why_should_edge_exist=_text(
+            card_map["why_should_edge_exist"], "strategy_card.why_should_edge_exist"
+        ),
+        who_is_paying_the_edge=_text(
+            card_map["who_is_paying_the_edge"], "strategy_card.who_is_paying_the_edge"
+        ),
+        expected_horizon=_text(card_map["expected_horizon"], "strategy_card.expected_horizon"),
+        known_failure_regimes=tuple(
+            _text(item, f"strategy_card.known_failure_regimes[{index}]")
+            for index, item in enumerate(failure_regimes_raw)
+        ),
+        capacity_assumption=_text(
+            card_map["capacity_assumption"], "strategy_card.capacity_assumption"
+        ),
+        cost_assumption=_text(card_map["cost_assumption"], "strategy_card.cost_assumption"),
+        exploratory=_boolean(card_map["exploratory"], "strategy_card.exploratory"),
+    )
+
     selection_map = _take(
         _require_mapping(root["selection"], "selection"),
         "selection",
         (
             "primary_metric",
             "minimum_trade_count",
+            "minimum_effective_trades",
+            "max_regime_concentration",
+            "max_month_concentration",
             "multiple_testing_method",
             "bootstrap_block_size",
             "pbo_blocks",
@@ -767,6 +849,15 @@ def parse_experiment_manifest(payload: Any) -> ExperimentManifest:
         ),
         minimum_trade_count=_positive_int(
             selection_map["minimum_trade_count"], "selection.minimum_trade_count"
+        ),
+        minimum_effective_trades=_positive_int(
+            selection_map["minimum_effective_trades"], "selection.minimum_effective_trades"
+        ),
+        max_regime_concentration=_positive_number(
+            selection_map["max_regime_concentration"], "selection.max_regime_concentration"
+        ),
+        max_month_concentration=_positive_number(
+            selection_map["max_month_concentration"], "selection.max_month_concentration"
         ),
         multiple_testing_method=_choice(
             selection_map["multiple_testing_method"],
@@ -780,6 +871,16 @@ def parse_experiment_manifest(payload: Any) -> ExperimentManifest:
     )
     if selection.pbo_blocks < 4 or selection.pbo_blocks % 2 != 0:
         raise _invalid("selection.pbo_blocks must be an even number >= 4")
+    if not 0.0 < selection.max_regime_concentration <= 1.0:
+        raise _invalid("selection.max_regime_concentration must be inside (0, 1]")
+    if not 0.0 < selection.max_month_concentration <= 1.0:
+        raise _invalid("selection.max_month_concentration must be inside (0, 1]")
+    if selection.minimum_effective_trades > selection.minimum_trade_count:
+        raise _invalid(
+            "selection.minimum_effective_trades cannot exceed minimum_trade_count",
+            minimum_trade_count=selection.minimum_trade_count,
+            minimum_effective_trades=selection.minimum_effective_trades,
+        )
 
     lockbox_map = _take(
         _require_mapping(root["lockbox"], "lockbox"),
@@ -820,6 +921,7 @@ def parse_experiment_manifest(payload: Any) -> ExperimentManifest:
         research_question=_text(root["research_question"], "research_question"),
         economic_hypothesis=_text(root["economic_hypothesis"], "economic_hypothesis"),
         invalidation_conditions=invalidation,
+        strategy_card=strategy_card,
         git=git,
         environment=environment,
         data=data,

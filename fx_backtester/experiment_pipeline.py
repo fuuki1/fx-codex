@@ -49,8 +49,10 @@ from fx_backtester.experiment_manifest import (
 )
 from fx_backtester.failures import FailureReason, TypedFailure
 from fx_backtester.lockbox import LockboxRegistry, LockboxState, verify_lockbox_file
+from fx_backtester.promotion_policy import load_promotion_policy
 from fx_backtester.governance import (
     PromotionEvidence,
+    PromotionPolicy,
     PromotionReport,
     evaluate_promotion,
 )
@@ -74,6 +76,7 @@ from fx_backtester.time_series_validation import (
     chronological_model_partitions,
 )
 from fx_backtester.trial_ledger import TrialLedger, TrialLedgerEntry
+from fx_intel.gbm import GradientBoostingClassifier
 
 PIPELINE_VERSION = "experiment_pipeline_v1"
 FEATURE_LEAKAGE_SAMPLES = 7
@@ -599,13 +602,154 @@ def _require_hyper(candidate: ModelCandidate, allowed: set[str]) -> dict[str, An
     return supplied
 
 
+class _RowHashRandomModel(_TrainedModel):
+    """No-skill random predictor keyed by row content, deterministic per seed."""
+
+    def __init__(self, seed: int) -> None:
+        self.seed = seed
+
+    def predict_probability(self, features: np.ndarray) -> np.ndarray:
+        probabilities = np.empty(features.shape[0], dtype=float)
+        for index in range(features.shape[0]):
+            key = json.dumps(
+                [self.seed, [float(value) for value in features[index]]],
+                separators=(",", ":"),
+            ).encode("ascii")
+            digest = hashlib.sha256(key).digest()
+            probabilities[index] = int.from_bytes(digest[:8], "big") / float(2**64)
+        return np.clip(probabilities, 1e-6, 1.0 - 1e-6)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"family": "random_uniform", "seed": self.seed}
+
+
+class _FeatureRuleModel(_TrainedModel):
+    """Simple transparent baselines driven by one declared feature."""
+
+    def __init__(self, family: str, feature_index: int, strength: float) -> None:
+        self.family = family
+        self.feature_index = feature_index
+        self.strength = strength
+
+    def predict_probability(self, features: np.ndarray) -> np.ndarray:
+        values = features[:, self.feature_index]
+        if self.family == "rsi_reversion":
+            signal = np.clip((50.0 - values) / 50.0, -1.0, 1.0)
+        else:
+            signal = np.sign(values)
+        return np.clip(0.5 + self.strength * signal, 1e-6, 1.0 - 1e-6)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "family": self.family,
+            "feature_index": self.feature_index,
+            "strength": self.strength,
+        }
+
+
+class _RidgeRegressionModel(_TrainedModel):
+    def __init__(self, coefficients: np.ndarray, means: np.ndarray, scales: np.ndarray) -> None:
+        self.coefficients = coefficients
+        self.means = means
+        self.scales = scales
+
+    def predict_probability(self, features: np.ndarray) -> np.ndarray:
+        standardized = (features - self.means) / self.scales
+        design = np.hstack([standardized, np.ones((standardized.shape[0], 1))])
+        return np.clip(design @ self.coefficients, 1e-6, 1.0 - 1e-6)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "family": "ridge_regression",
+            "coefficients": [float(value) for value in self.coefficients],
+            "means": [float(value) for value in self.means],
+            "scales": [float(value) for value in self.scales],
+        }
+
+
+class _GbdtModel(_TrainedModel):
+    def __init__(self, classifier: GradientBoostingClassifier) -> None:
+        self.classifier = classifier
+
+    def predict_probability(self, features: np.ndarray) -> np.ndarray:
+        return np.asarray(self.classifier.predict_proba_many(features.tolist()), dtype=float)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"family": "gbdt", "model": self.classifier.to_dict()}
+
+
+# baseline: transparent reference strategies; complex: learned candidates that
+# are admissible only when they strictly beat the best baseline on tune.
+MODEL_FAMILY_KIND: dict[str, str] = {
+    "constant_probability": "baseline",
+    "random_uniform": "baseline",
+    "always_long": "baseline",
+    "always_short": "baseline",
+    "previous_return_sign": "baseline",
+    "ma_crossover": "baseline",
+    "rsi_reversion": "baseline",
+    "logistic_ridge": "complex",
+    "ridge_regression": "complex",
+    "gbdt": "complex",
+}
+
+_RULE_FAMILY_FEATURE = {
+    "previous_return_sign": "ret_1",
+    "ma_crossover": "ma_ratio_24",
+    "rsi_reversion": "rsi_14",
+}
+_GBDT_HYPERS = {
+    "n_estimators",
+    "learning_rate",
+    "max_depth",
+    "min_samples_leaf",
+    "subsample",
+    "feature_fraction",
+    "reg_lambda",
+}
+
+
+def _feature_index(
+    candidate: ModelCandidate, feature_names: Sequence[str], feature_name: str
+) -> int:
+    if feature_name not in feature_names:
+        raise TypedFailure(
+            FailureReason.INCOMPLETE,
+            "baseline family requires a feature the manifest does not declare",
+            context={
+                "candidate_id": candidate.candidate_id,
+                "family": candidate.family,
+                "required_feature": feature_name,
+            },
+        )
+    return list(feature_names).index(feature_name)
+
+
+def _require_two_classes(candidate: ModelCandidate, train_labels: np.ndarray) -> None:
+    if len(np.unique(train_labels)) < 2:
+        raise TypedFailure(
+            FailureReason.INSUFFICIENT_SAMPLE,
+            "training labels are single-class; the fit is unavailable",
+            context={"candidate_id": candidate.candidate_id},
+        )
+
+
+def _standardize(train_features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    means = train_features.mean(axis=0)
+    scales = train_features.std(axis=0, ddof=0)
+    scales = np.where(scales > 1e-12, scales, 1.0)
+    return (train_features - means) / scales, means, scales
+
+
 def _train_candidate(
     candidate: ModelCandidate,
+    feature_names: Sequence[str],
     train_features: np.ndarray,
     train_labels: np.ndarray,
     seed: int,
 ) -> _TrainedModel:
-    if candidate.family == "constant_probability":
+    family = candidate.family
+    if family == "constant_probability":
         supplied = _require_hyper(candidate, {"probability"})
         probability = float(supplied["probability"])
         if not 0.0 < probability < 1.0:
@@ -615,7 +759,27 @@ def _train_candidate(
                 context={"candidate_id": candidate.candidate_id},
             )
         return _ConstantProbabilityModel(probability)
-    if candidate.family == "logistic_ridge":
+    if family == "always_long":
+        _require_hyper(candidate, set())
+        return _ConstantProbabilityModel(1.0 - 1e-6)
+    if family == "always_short":
+        _require_hyper(candidate, set())
+        return _ConstantProbabilityModel(1e-6)
+    if family == "random_uniform":
+        _require_hyper(candidate, set())
+        return _RowHashRandomModel(seed)
+    if family in _RULE_FAMILY_FEATURE:
+        supplied = _require_hyper(candidate, {"strength"})
+        strength = float(supplied["strength"])
+        if not 0.0 < strength < 0.5:
+            raise TypedFailure(
+                FailureReason.INVALID,
+                "strength must be inside (0, 0.5)",
+                context={"candidate_id": candidate.candidate_id},
+            )
+        index = _feature_index(candidate, feature_names, _RULE_FAMILY_FEATURE[family])
+        return _FeatureRuleModel(family, index, strength)
+    if family == "logistic_ridge":
         supplied = _require_hyper(candidate, {"ridge"})
         ridge = float(supplied["ridge"])
         if ridge <= 0 or not np.isfinite(ridge):
@@ -624,23 +788,58 @@ def _train_candidate(
                 "ridge must be positive and finite",
                 context={"candidate_id": candidate.candidate_id},
             )
-        if len(np.unique(train_labels)) < 2:
-            raise TypedFailure(
-                FailureReason.INSUFFICIENT_SAMPLE,
-                "training labels are single-class; logistic fit is unavailable",
-                context={"candidate_id": candidate.candidate_id},
-            )
-        means = train_features.mean(axis=0)
-        scales = train_features.std(axis=0, ddof=0)
-        scales = np.where(scales > 1e-12, scales, 1.0)
-        standardized = (train_features - means) / scales
+        _require_two_classes(candidate, train_labels)
+        standardized, means, scales = _standardize(train_features)
         design = np.hstack([standardized, np.ones((standardized.shape[0], 1))])
         coefficients = _fit_ridge_logistic(design, train_labels.astype(float), ridge)
         return _LogisticRidgeModel(coefficients, means, scales)
+    if family == "ridge_regression":
+        supplied = _require_hyper(candidate, {"ridge"})
+        ridge = float(supplied["ridge"])
+        if ridge <= 0 or not np.isfinite(ridge):
+            raise TypedFailure(
+                FailureReason.INVALID,
+                "ridge must be positive and finite",
+                context={"candidate_id": candidate.candidate_id},
+            )
+        _require_two_classes(candidate, train_labels)
+        standardized, means, scales = _standardize(train_features)
+        design = np.hstack([standardized, np.ones((standardized.shape[0], 1))])
+        penalty = np.full(design.shape[1], ridge, dtype=float)
+        penalty[-1] = 0.0
+        gram = design.T @ design + np.diag(penalty)
+        coefficients = np.linalg.solve(gram, design.T @ train_labels.astype(float))
+        if not bool(np.isfinite(coefficients).all()):
+            raise TypedFailure(
+                FailureReason.INVALID, "ridge regression produced non-finite coefficients"
+            )
+        return _RidgeRegressionModel(coefficients, means, scales)
+    if family == "gbdt":
+        supplied = _require_hyper(candidate, _GBDT_HYPERS)
+        _require_two_classes(candidate, train_labels)
+        try:
+            classifier = GradientBoostingClassifier(
+                n_estimators=int(supplied["n_estimators"]),
+                learning_rate=float(supplied["learning_rate"]),
+                max_depth=int(supplied["max_depth"]),
+                min_samples_leaf=int(supplied["min_samples_leaf"]),
+                subsample=float(supplied["subsample"]),
+                feature_fraction=float(supplied["feature_fraction"]),
+                reg_lambda=float(supplied["reg_lambda"]),
+                seed=seed,
+            )
+            classifier.fit(train_features.tolist(), train_labels.tolist())
+        except ValueError as error:
+            raise TypedFailure(
+                FailureReason.INVALID,
+                "gbdt training rejected its inputs",
+                context={"candidate_id": candidate.candidate_id, "error": str(error)},
+            ) from error
+        return _GbdtModel(classifier)
     raise TypedFailure(
         FailureReason.INVALID,
         "unknown model family",
-        context={"candidate_id": candidate.candidate_id, "family": candidate.family},
+        context={"candidate_id": candidate.candidate_id, "family": family},
     )
 
 
@@ -702,6 +901,7 @@ def _evaluate_decisions(
                 "side": side,
                 "probability": float(probability),
                 "net_r": trade_net_r(manifest, row, side, cost_multiplier),
+                "bars_to_exit": int(row[f"{side}_bars_to_exit"]),
             }
         )
     returns = np.array([trade["net_r"] for trade in trades], dtype=float)
@@ -762,6 +962,8 @@ def run_experiment(
     state = git_state or collect_git_state(repo_root)
     _verify_git_binding(manifest, state)
     environment = _verify_environment(manifest, repo_root)
+    _require_baseline_candidates(manifest)
+    policy = _load_policy(manifest, repo_root)
     ledger = TrialLedger(
         trial_ledger_path
         if trial_ledger_path is not None
@@ -892,13 +1094,14 @@ def run_experiment(
         stress_rows,
         lockbox_state,
     )
-    report = evaluate_promotion(evidence, target_stage="validated")
+    report = evaluate_promotion(evidence, target_stage="validated", policy=policy)
     promotion_payload = {
         "target_stage": report.target_stage,
         "passed": report.passed,
         "failures": list(report.failures),
         "report": report.to_dict(),
         "evidence": _json_ready(asdict(evidence)),
+        "policy_source": manifest.promotion.policy_path or "governance defaults",
     }
     bind("promotion_decision", _canonical_sha256(promotion_payload))
 
@@ -1088,7 +1291,9 @@ def evaluate_lockbox(
         lockbox_evaluated_once=registry.state(manifest.experiment_id).evaluated_once,
         lockbox_reused_for_selection=registry.state(manifest.experiment_id).reused_for_selection,
     )
-    report = evaluate_promotion(evidence, target_stage="validated")
+    report = evaluate_promotion(
+        evidence, target_stage="validated", policy=_load_policy(manifest, repo_root)
+    )
 
     opened_at = _utc_iso(now)
     result_payload = {
@@ -1254,7 +1459,11 @@ def _run_trials(
         record["started_at"] = started.isoformat()
         try:
             model = _train_candidate(
-                candidate, train_features, train_labels, manifest.models.random_seed + order
+                candidate,
+                manifest.features.definitions,
+                train_features,
+                train_labels,
+                manifest.models.random_seed + order,
             )
             long_threshold = float(candidate.hyperparameters["long_threshold"])
             short_threshold = float(candidate.hyperparameters["short_threshold"])
@@ -1307,6 +1516,32 @@ def _per_row_returns(
     return returns
 
 
+def _load_policy(manifest: ExperimentManifest, repo_root: Path) -> PromotionPolicy | None:
+    if manifest.promotion.policy_path is None:
+        return None
+    policy_path = Path(manifest.promotion.policy_path)
+    if not policy_path.is_absolute():
+        policy_path = repo_root / policy_path
+    return load_promotion_policy(policy_path)
+
+
+def _require_baseline_candidates(manifest: ExperimentManifest) -> None:
+    if not any(
+        MODEL_FAMILY_KIND.get(candidate.family) == "baseline"
+        for candidate in manifest.models.candidates
+    ):
+        raise TypedFailure(
+            FailureReason.INVALID,
+            "at least one baseline candidate family is required so that complex "
+            "models are compared under identical conditions",
+            context={
+                "baseline_families": sorted(
+                    name for name, kind in MODEL_FAMILY_KIND.items() if kind == "baseline"
+                )
+            },
+        )
+
+
 def _select_trial(manifest: ExperimentManifest, trials: Sequence[dict[str, Any]]) -> dict[str, Any]:
     qualified = [
         trial
@@ -1329,13 +1564,38 @@ def _select_trial(manifest: ExperimentManifest, trials: Sequence[dict[str, Any]]
                 ],
             },
         )
-    return max(
-        qualified,
-        key=lambda trial: (
-            float(trial["tune_metrics"]["net_expectancy_r"]),
-            trial["candidate_id"],
-        ),
-    )
+
+    def metric(trial: Mapping[str, Any]) -> float:
+        return float(trial["tune_metrics"]["net_expectancy_r"])
+
+    def kind(trial: Mapping[str, Any]) -> str:
+        return MODEL_FAMILY_KIND.get(trial["candidate"].family, "complex")
+
+    baselines = [trial for trial in qualified if kind(trial) == "baseline"]
+    # A flat book earns 0R, so no complex model is admissible below that floor.
+    benchmark_floor = max([0.0, *(metric(trial) for trial in baselines)])
+    admissible = [
+        trial for trial in qualified if kind(trial) == "baseline" or metric(trial) > benchmark_floor
+    ]
+    if not admissible:
+        raise TypedFailure(
+            FailureReason.INVALID,
+            "no admissible candidate: complex models must strictly beat the best "
+            "qualified baseline (or 0R when no baseline qualifies) under identical "
+            "conditions",
+            context={
+                "benchmark_floor_net_expectancy_r": benchmark_floor,
+                "qualified": [
+                    {
+                        "candidate_id": trial["candidate_id"],
+                        "family": trial["candidate"].family,
+                        "net_expectancy_r": metric(trial),
+                    }
+                    for trial in qualified
+                ],
+            },
+        )
+    return max(admissible, key=lambda trial: (metric(trial), trial["candidate_id"]))
 
 
 def _fit_calibration(
@@ -1473,26 +1733,24 @@ def _evaluate_test(
         multiple_testing = {"method": "holm", "status": "evaluation_unavailable"}
 
     bounds = _regime_bounds(development["train"])
-    regime_counts: dict[str, int] = {}
+    trade_regimes: list[str] = []
     for row, trade in zip(test_rows, _test_trade_flags(calibrated, selected)):
         if trade:
-            regime = _regime_of(float(row["volatility"]), bounds)
-            regime_counts[regime] = regime_counts.get(regime, 0) + 1
+            trade_regimes.append(_regime_of(float(row["volatility"]), bounds))
+    regime_counts: dict[str, int] = {}
+    for regime in trade_regimes:
+        regime_counts[regime] = regime_counts.get(regime, 0) + 1
     regimes = {
         "method": "trailing_vol_terciles_train_fit_v1",
         "bounds": {"low_upper": bounds[0], "mid_upper": bounds[1]},
         "test_trade_counts": dict(sorted(regime_counts.items())),
     }
 
-    trade_count = int(evaluated["metrics"]["trade_count"])
-    guard_passed = trade_count >= manifest.selection.minimum_trade_count
-    sample_size_guard = {
-        "minimum_trade_count": manifest.selection.minimum_trade_count,
-        "test_trade_count": trade_count,
-        "passed": guard_passed,
-    }
+    sample_size_guard = _sample_size_guard(manifest, evaluated["trades"], trade_regimes)
     performance_claim = (
-        "evaluation_available_descriptive" if guard_passed else "evaluation_unavailable"
+        "evaluation_available_descriptive"
+        if sample_size_guard["passed"]
+        else "evaluation_unavailable"
     )
     diagnostics = {
         "statistics": statistics,
@@ -1502,6 +1760,77 @@ def _evaluate_test(
         "performance_claim": performance_claim,
     }
     return evaluated, diagnostics
+
+
+def _sample_size_guard(
+    manifest: ExperimentManifest,
+    trades: Sequence[Mapping[str, Any]],
+    trade_regimes: Sequence[str],
+) -> dict[str, Any]:
+    """Refuse to call a result 'evaluated' on thin, overlapping or lopsided samples.
+
+    Effective trades are counted greedily over non-overlapping label windows so
+    that stacked positions on the same move cannot masquerade as independent
+    evidence. Concentration checks reject samples dominated by one volatility
+    regime or one calendar month. Thresholds come from the manifest and are
+    internal pre-registered choices, not industry standards.
+    """
+
+    selection = manifest.selection
+    trade_count = len(trades)
+    interval = timedelta(minutes=manifest.data.bar_interval_minutes)
+    effective = 0
+    last_end: pd.Timestamp | None = None
+    for trade in sorted(trades, key=lambda item: str(item["prediction_time"])):
+        start = pd.Timestamp(trade["prediction_time"])
+        end = start + interval * (1 + int(trade["bars_to_exit"]))
+        if last_end is None or start >= last_end:
+            effective += 1
+            last_end = end
+
+    def share(counts: Mapping[str, int]) -> float | None:
+        if trade_count == 0 or not counts:
+            return None
+        return max(counts.values()) / trade_count
+
+    regime_tally: dict[str, int] = {}
+    for regime in trade_regimes:
+        regime_tally[regime] = regime_tally.get(regime, 0) + 1
+    month_tally: dict[str, int] = {}
+    for trade in trades:
+        month = str(trade["prediction_time"])[:7]
+        month_tally[month] = month_tally.get(month, 0) + 1
+    regime_share = share(regime_tally)
+    month_share = share(month_tally)
+    checks: dict[str, dict[str, Any]] = {
+        "trade_count": {
+            "observed": trade_count,
+            "minimum": selection.minimum_trade_count,
+            "passed": trade_count >= selection.minimum_trade_count,
+        },
+        "effective_trades": {
+            "observed": effective,
+            "minimum": selection.minimum_effective_trades,
+            "passed": effective >= selection.minimum_effective_trades,
+        },
+        "regime_concentration": {
+            "observed": regime_share,
+            "maximum": selection.max_regime_concentration,
+            "passed": regime_share is not None
+            and regime_share <= selection.max_regime_concentration,
+        },
+        "month_concentration": {
+            "observed": month_share,
+            "maximum": selection.max_month_concentration,
+            "passed": month_share is not None and month_share <= selection.max_month_concentration,
+        },
+    }
+    return {
+        "checks": checks,
+        "test_trade_count": trade_count,
+        "effective_trade_count": effective,
+        "passed": all(check["passed"] for check in checks.values()),
+    }
 
 
 def _test_trade_flags(
@@ -1581,7 +1910,7 @@ def _promotion_evidence(
         point_in_time_violations=0,
         future_feature_violations=0,
         trial_count=trial_count,
-        sample_count=int(guard["test_trade_count"]),
+        sample_count=int(guard["effective_trade_count"]),
         net_expectancy_r=metrics.get("net_expectancy_r"),
         expectancy_ci_lower_r=stat_value("bootstrap_ci", "lower"),
         dsr_probability=stat_value("dsr_tune_selection", "dsr"),

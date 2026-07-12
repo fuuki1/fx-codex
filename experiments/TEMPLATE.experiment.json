@@ -8,6 +8,17 @@
   "invalidation_conditions": [
     "REPLACE: observable condition under which the hypothesis is rejected"
   ],
+  "strategy_card": {
+    "strategy_id": "REPLACE-strategy-id",
+    "economic_mechanism": "REPLACE: mechanism that generates the edge",
+    "why_should_edge_exist": "REPLACE: why the edge persists after costs",
+    "who_is_paying_the_edge": "REPLACE: hedgers / momentum chasers / liquidity takers ...",
+    "expected_horizon": "REPLACE: e.g. 12 hourly bars",
+    "known_failure_regimes": ["REPLACE: e.g. central-bank intervention days"],
+    "capacity_assumption": "REPLACE: notional at which the edge decays",
+    "cost_assumption": "REPLACE: declared static spread/slippage/commission/financing",
+    "exploratory": false
+  },
   "git": {
     "commit": "REPLACE-full-40-hex-commit",
     "dirty_worktree_allowed": false
@@ -98,6 +109,9 @@
   "selection": {
     "primary_metric": "net_expectancy_r",
     "minimum_trade_count": 30,
+    "minimum_effective_trades": 20,
+    "max_regime_concentration": 0.6,
+    "max_month_concentration": 0.5,
     "multiple_testing_method": "holm",
     "bootstrap_block_size": 5,
     "pbo_blocks": 8
