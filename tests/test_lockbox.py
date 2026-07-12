@@ -249,6 +249,31 @@ class TestGovernedEvaluation:
         registry = LockboxRegistry(pipeline_setup["tmp_path"] / "runs" / "lockbox_registry")
         assert registry.state(result.experiment_id).evaluated_once is False
 
+    def test_rehashed_statistics_edit_is_still_detected(
+        self, pipeline_setup: dict[str, Any]
+    ) -> None:
+        """DSR/PBO/CI/cost-stress values in the evidence are also replay-verified."""
+
+        import hashlib
+
+        result = _run(pipeline_setup)
+        decision_path = result.output_dir / "promotion_decision.json"
+        payload = json.loads(decision_path.read_text("utf-8"))
+        payload["evidence"]["dsr_probability"] = 0.999
+        decision_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", "utf-8")
+        hashes_path = result.output_dir / "artifact_hashes.json"
+        hashes = json.loads(hashes_path.read_text("utf-8"))
+        hashes["artifacts"]["promotion_decision.json"] = hashlib.sha256(
+            decision_path.read_bytes()
+        ).hexdigest()
+        hashes_path.write_text(json.dumps(hashes, indent=2, sort_keys=True) + "\n", "utf-8")
+        with pytest.raises(TypedFailure) as excinfo:
+            _evaluate(pipeline_setup, result.output_dir)
+        assert excinfo.value.reason is FailureReason.LINEAGE_BROKEN
+        assert any(
+            item["field"] == "dsr_probability" for item in excinfo.value.context["mismatched"]
+        )
+
     def test_registry_wipe_cannot_reopen_an_evaluated_bundle(
         self, pipeline_setup: dict[str, Any]
     ) -> None:

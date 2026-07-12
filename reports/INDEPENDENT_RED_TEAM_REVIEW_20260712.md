@@ -23,9 +23,10 @@ P2 = 迂回に既知の限界の悪用が必要、または開示済みの制約
   再導出できない数値は `lineage_broken` で拒否される。
 - **検証**: `tests/test_lockbox.py::test_rehashed_evidence_edit_is_still_detected`
   (改竄+hash再生成→拒否、かつsingle-use accessは未消費のまま)。
-- **残余**: DSR/PBO/bootstrap CI等の統計値は再検証対象外(すべて同一replayから
-  決定論的に導出可能であり、拡張は後続課題)。performance数値の一次防衛線
-  (net E[R]・dataset・commit・synthetic)は封鎖済み。
+- **残余**: 当初はDSR/PBO/bootstrap CI等の統計値が再検証対象外だったが、
+  後続修正(RT-16)で `expectancy_ci_lower_r` / `dsr_probability` /
+  `pbo_probability` / `cost_stress_2x_expectancy_r` もreplayから再計算して
+  照合するよう拡張済み。
 
 ### RT-2 (P1 → 修正済み): registry削除で同一bundleのlockboxを再評価できた
 
@@ -61,12 +62,23 @@ P2 = 迂回に既知の限界の悪用が必要、または開示済みの制約
 | RT-13 | **実験レベルの多重性**: 多数のexperiment_idを試し最良のみ報告できる。DSR/PBOは実験内試行のみ補正 | 共有ledgerが全実験の全試行を保持するためレビュアは検出可能(隠すにはledger削除が必要=RT-8に帰着)。後続: research-program横断の多重性補正 |
 | RT-14 | `data.synthetic`は自己申告であり、偽装(false宣言)は可能 | 偽装しても現時点ではregime/pair/lockbox/実データ系譜の他ゲートで昇格不能。後続: source license/attestation契約(source_contractsのUNIMPLEMENTED群)の実装が本質的対策 |
 | RT-15 | feature registryのコードがleakage検査のsample位置を特殊処理する攻撃 | registryは in-repo のレビュー対象コードで、manifest からは登録名しか選べない。コードレビュー境界として受容 |
-| RT-16 | 統計値(DSR/PBO/CI)はpost-lockbox再検証されない(RT-1の残余) | 一次性能値とdataset/commit/syntheticは封鎖済み。統計値も同一replayから再導出可能であり、拡張は機械的。後続課題として記録 |
+
+### RT-16 (P2 → 修正済み): 統計値のpost-lockbox再検証
+
+当初「統計値(DSR/PBO/CI/2×cost)はpost-lockbox再検証されない」として
+P2受容していたが、後続修正で `_verify_prior_evidence` を拡張し、
+`_headline_statistics`(runと共有)とcost stressのreplayから
+`expectancy_ci_lower_r` / `dsr_probability` / `pbo_probability` /
+`cost_stress_2x_expectancy_r` を再計算して記録値と厳密照合するようにした。
+検証: `tests/test_lockbox.py::test_rehashed_statistics_edit_is_still_detected`。
+残る非照合フィールドは運用状態系(incidents/shadow_days等、replayから
+導出不能でNoneのままゲート不合格になるもの)のみ。
 
 ## 結論
 
-- **P0: 0件。P1: 2件発見、いずれも本ブランチ内で修正しテストで固定。**
-- P2は5件で、すべて (a) 既存監査で開示済みのlocal custody限界に帰着するか、
+- **P0: 0件。P1: 2件発見、いずれも本ブランチ内で修正しテストで固定。
+  P2のうち1件(RT-16)も追加修正済み。**
+- 残るP2は4件で、すべて (a) 既存監査で開示済みのlocal custody限界に帰着するか、
   (b) 他ゲートにより現時点で昇格へ到達不能。
 - 本レビューは「悪意ある単独運用者に対する完全防御」を主張しない。主張するのは
   「**事故・自己欺瞞・単純な改竄では偽の性能主張が通らず、痕跡なしに統制を

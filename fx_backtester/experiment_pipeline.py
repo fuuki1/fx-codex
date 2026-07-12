@@ -1229,7 +1229,9 @@ def evaluate_lockbox(
         name: [rows[index] for index in getattr(partitions, name)]
         for name in ("train", "tune", "calibration", "test")
     }
-    trials, _, _ = _run_trials(manifest, development["train"], development["tune"])
+    trials, _, tune_returns_matrix = _run_trials(
+        manifest, development["train"], development["tune"]
+    )
     selected = _select_trial(manifest, trials)
     evaluation = json.loads((bundle / "evaluation.json").read_text(encoding="utf-8"))
     if selected["candidate_id"] != evaluation.get("selected_candidate_id"):
@@ -1269,7 +1271,20 @@ def evaluate_lockbox(
     # single-use access is consumed; a bundle whose artifact_hashes.json was
     # regenerated around edited numbers fails here instead of being trusted.
     prior = json.loads((bundle / "promotion_decision.json").read_text(encoding="utf-8"))
-    _verify_prior_evidence(prior, manifest, state, normalized_hash, replayed_test)
+    replayed_returns = np.array([trade["net_r"] for trade in replayed_test["trades"]], dtype=float)
+    replayed_statistics = _headline_statistics(
+        manifest, trials, selected, tune_returns_matrix, replayed_returns
+    )
+    replayed_stress = _run_cost_stress(manifest, selected, calibrator, development["test"])
+    _verify_prior_evidence(
+        prior,
+        manifest,
+        state,
+        normalized_hash,
+        replayed_test,
+        replayed_statistics,
+        replayed_stress,
+    )
 
     registry = LockboxRegistry(
         lockbox_registry_dir
@@ -1348,6 +1363,8 @@ def _verify_prior_evidence(
     git_state: GitState,
     normalized_hash: str,
     replayed_test: Mapping[str, Any],
+    replayed_statistics: Mapping[str, Any],
+    replayed_stress: Sequence[Mapping[str, Any]],
 ) -> None:
     """Cross-check recorded promotion evidence against the deterministic replay."""
 
@@ -1359,12 +1376,40 @@ def _verify_prior_evidence(
         )
     replayed_returns = np.array([trade["net_r"] for trade in replayed_test["trades"]], dtype=float)
     replayed_expectancy = float(replayed_returns.mean()) if replayed_returns.size else None
+
+    def stat_value(name: str, key: str) -> float | None:
+        entry = replayed_statistics[name]
+        if not entry["available"]:
+            return None
+        value = entry["value"].get(key)
+        return float(value) if value is not None else None
+
+    stress_2x = next(
+        (row["net_expectancy_r"] for row in replayed_stress if row["cost_multiplier"] == 2.0),
+        None,
+    )
     expectations: list[tuple[str, Any, Any]] = [
         ("dataset_hash", evidence.get("dataset_hash"), normalized_hash),
         ("git_commit", evidence.get("git_commit"), git_state.commit),
         ("synthetic_data", evidence.get("synthetic_data"), manifest.data.synthetic),
         ("net_expectancy_r", evidence.get("net_expectancy_r"), replayed_expectancy),
         ("pair_count", evidence.get("pair_count"), 1),
+        (
+            "expectancy_ci_lower_r",
+            evidence.get("expectancy_ci_lower_r"),
+            stat_value("bootstrap_ci", "lower"),
+        ),
+        (
+            "dsr_probability",
+            evidence.get("dsr_probability"),
+            stat_value("dsr_tune_selection", "dsr"),
+        ),
+        ("pbo_probability", evidence.get("pbo_probability"), stat_value("pbo", "pbo")),
+        (
+            "cost_stress_2x_expectancy_r",
+            evidence.get("cost_stress_2x_expectancy_r"),
+            stress_2x,
+        ),
     ]
     mismatched = [
         {"field": name, "recorded": recorded, "replayed": replayed}
@@ -1694,6 +1739,42 @@ def _regime_of(volatility: float, bounds: tuple[float, float]) -> str:
     return "high_vol"
 
 
+def _headline_statistics(
+    manifest: ExperimentManifest,
+    trials: Sequence[dict[str, Any]],
+    selected: Mapping[str, Any],
+    tune_returns_matrix: pd.DataFrame,
+    trade_returns: np.ndarray,
+) -> dict[str, Any]:
+    """Bootstrap CI / PSR / DSR / PBO, shared by the run and the lockbox replay."""
+
+    statistics: dict[str, Any] = {}
+    statistics["bootstrap_ci"] = _safe_statistic(
+        lambda: vars(
+            circular_block_bootstrap_mean_ci(
+                trade_returns,
+                block_size=min(manifest.selection.bootstrap_block_size, max(1, len(trade_returns))),
+                seed=manifest.models.random_seed,
+            )
+        )
+    )
+    statistics["psr"] = _safe_statistic(lambda: probabilistic_sharpe_ratio(trade_returns))
+    trial_sharpes = [
+        per_period_sharpe(np.asarray(trial["tune_returns"], dtype=float)) for trial in trials
+    ]
+    statistics["dsr_tune_selection"] = _safe_statistic(
+        lambda: deflated_sharpe_ratio(
+            np.asarray(selected["tune_returns"], dtype=float), trial_sharpes
+        )
+    )
+    statistics["pbo"] = _safe_statistic(
+        lambda: probability_of_backtest_overfitting(
+            tune_returns_matrix, n_blocks=manifest.selection.pbo_blocks
+        )
+    )
+    return statistics
+
+
 def _evaluate_test(
     manifest: ExperimentManifest,
     selected: dict[str, Any],
@@ -1731,29 +1812,8 @@ def _evaluate_test(
     )
 
     trade_returns = np.array([trade["net_r"] for trade in evaluated["trades"]], dtype=float)
-    statistics: dict[str, Any] = {}
-    statistics["bootstrap_ci"] = _safe_statistic(
-        lambda: vars(
-            circular_block_bootstrap_mean_ci(
-                trade_returns,
-                block_size=min(manifest.selection.bootstrap_block_size, max(1, len(trade_returns))),
-                seed=manifest.models.random_seed,
-            )
-        )
-    )
-    statistics["psr"] = _safe_statistic(lambda: probabilistic_sharpe_ratio(trade_returns))
-    trial_sharpes = [
-        per_period_sharpe(np.asarray(trial["tune_returns"], dtype=float)) for trial in trials
-    ]
-    statistics["dsr_tune_selection"] = _safe_statistic(
-        lambda: deflated_sharpe_ratio(
-            np.asarray(selected["tune_returns"], dtype=float), trial_sharpes
-        )
-    )
-    statistics["pbo"] = _safe_statistic(
-        lambda: probability_of_backtest_overfitting(
-            tune_returns_matrix, n_blocks=manifest.selection.pbo_blocks
-        )
+    statistics = _headline_statistics(
+        manifest, trials, selected, tune_returns_matrix, trade_returns
     )
 
     p_values: list[float] = []
