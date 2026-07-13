@@ -1,0 +1,96 @@
+{
+  "acquired_at": "2026-07-13T13:06:43.558638+00:00",
+  "admitted": true,
+  "artifact_kind": "cftc_cot_paginated_capture_bundle",
+  "dataset_id": "6dca-aqww",
+  "errors": [],
+  "expected_row_count": 13727,
+  "page_size": 5000,
+  "responses": [
+    {
+      "body_bytes": 24,
+      "body_sha256": "c831e1a44845103c38ca0e74bdc422ec6abbd098ac0ef1f9b50dc69579a08494",
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "date": "Mon, 13 Jul 2026 13:06:16 GMT",
+        "etag": "\"aG90ZWwuNTEzMDVfM18zODBHQzlMbDk5Y3JuYzFkc2ZRcVFLQUVUZ3Ridms--gzivpPN2o3TXA65GAh3O8pxB6wvJfs---gzip\"",
+        "last-modified": "Fri, 10 Jul 2026 19:31:01 GMT"
+      },
+      "request_started_at": "2026-07-13T13:06:15.673332+00:00",
+      "request_uri": "https://publicreporting.cftc.gov/resource/6dca-aqww.json?$select=count(*)%20as%20row_count&$where=cftc_contract_market_code%20in%28%27090741%27%2C%27092741%27%2C%27096742%27%2C%27097741%27%2C%27098662%27%2C%27099741%27%2C%27112741%27%2C%27232741%27%29",
+      "response_completed_at": "2026-07-13T13:06:16.835243+00:00",
+      "role": "count_start",
+      "status_code": 200
+    },
+    {
+      "body_bytes": 23407046,
+      "body_sha256": "52930254607fa06f491258e8cb22907723936825bb874ac97a48c8609d838e31",
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "date": "Mon, 13 Jul 2026 13:06:19 GMT",
+        "etag": "\"aG90ZWwuNTEzMDVfM18zODA1Si1Vc3R6YV9uQXgtb29HUDVDYTVrVW1kbXM---gzirxDyspSwOakWR8B2nVGrLevwz50g--gzip--gzip\"",
+        "last-modified": "Fri, 10 Jul 2026 19:31:01 GMT"
+      },
+      "limit": 5000,
+      "offset": 0,
+      "request_started_at": "2026-07-13T13:06:16.837689+00:00",
+      "request_uri": "https://publicreporting.cftc.gov/resource/6dca-aqww.json?$where=cftc_contract_market_code%20in%28%27090741%27%2C%27092741%27%2C%27096742%27%2C%27097741%27%2C%27098662%27%2C%27099741%27%2C%27112741%27%2C%27232741%27%29&$order=report_date_as_yyyy_mm_dd%20DESC,id%20ASC&$limit=5000&$offset=0",
+      "response_completed_at": "2026-07-13T13:06:24.974257+00:00",
+      "role": "page",
+      "status_code": 200
+    },
+    {
+      "body_bytes": 23374767,
+      "body_sha256": "4af1dba609f81ac641895cc5a31dd80bd94df074fb0081e225f566886b90a471",
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "date": "Mon, 13 Jul 2026 13:06:26 GMT",
+        "etag": "\"aG90ZWwuNTEzMDVfM18zODBpV2NHMWpFMWxiYlBISWZENXVneUEtTVY2ODg---gzioD5bh2bJoFQeh09LZFc8xKNu7mbw--gzip--gzip\"",
+        "last-modified": "Fri, 10 Jul 2026 19:31:01 GMT"
+      },
+      "limit": 5000,
+      "offset": 5000,
+      "request_started_at": "2026-07-13T13:06:25.179158+00:00",
+      "request_uri": "https://publicreporting.cftc.gov/resource/6dca-aqww.json?$where=cftc_contract_market_code%20in%28%27090741%27%2C%27092741%27%2C%27096742%27%2C%27097741%27%2C%27098662%27%2C%27099741%27%2C%27112741%27%2C%27232741%27%29&$order=report_date_as_yyyy_mm_dd%20DESC,id%20ASC&$limit=5000&$offset=5000",
+      "response_completed_at": "2026-07-13T13:06:32.262940+00:00",
+      "role": "page",
+      "status_code": 200
+    },
+    {
+      "body_bytes": 17420611,
+      "body_sha256": "a4dd3bb4959fd54ff68f27652ac60d192f3ab3e2855316e7706611ef701a1297",
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "date": "Mon, 13 Jul 2026 13:06:33 GMT",
+        "etag": "\"aG90ZWwuNTEzMDVfM18zODB1RmVsYi1aZXlKcnE1WmFmVXpJYnczZHdLVDg---gziq8_fGN6aBGAlwREIhdfTcinmEy7Q--gzip--gzip\"",
+        "last-modified": "Fri, 10 Jul 2026 19:31:01 GMT"
+      },
+      "limit": 5000,
+      "offset": 10000,
+      "request_started_at": "2026-07-13T13:06:32.473923+00:00",
+      "request_uri": "https://publicreporting.cftc.gov/resource/6dca-aqww.json?$where=cftc_contract_market_code%20in%28%27090741%27%2C%27092741%27%2C%27096742%27%2C%27097741%27%2C%27098662%27%2C%27099741%27%2C%27112741%27%2C%27232741%27%29&$order=report_date_as_yyyy_mm_dd%20DESC,id%20ASC&$limit=5000&$offset=10000",
+      "response_completed_at": "2026-07-13T13:06:42.461797+00:00",
+      "role": "page",
+      "status_code": 200
+    },
+    {
+      "body_bytes": 24,
+      "body_sha256": "c831e1a44845103c38ca0e74bdc422ec6abbd098ac0ef1f9b50dc69579a08494",
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "date": "Mon, 13 Jul 2026 13:06:43 GMT",
+        "etag": "\"aG90ZWwuNTEzMDVfM18zODBHQzlMbDk5Y3JuYzFkc2ZRcVFLQUVUZ3Ridms--gzivpPN2o3TXA65GAh3O8pxB6wvJfs---gzip\"",
+        "last-modified": "Fri, 10 Jul 2026 19:31:01 GMT"
+      },
+      "request_started_at": "2026-07-13T13:06:42.627378+00:00",
+      "request_uri": "https://publicreporting.cftc.gov/resource/6dca-aqww.json?$select=count(*)%20as%20row_count&$where=cftc_contract_market_code%20in%28%27090741%27%2C%27092741%27%2C%27096742%27%2C%27097741%27%2C%27098662%27%2C%27099741%27%2C%27112741%27%2C%27232741%27%29",
+      "response_completed_at": "2026-07-13T13:06:43.558638+00:00",
+      "role": "count_end",
+      "status_code": 200
+    }
+  ],
+  "run_id": "cftc-cot-20260713T130615673332Z",
+  "schema_version": 1,
+  "validated_at": "2026-07-13T13:06:45.533173+00:00",
+  "writer_id": "audit-integration:real-cftc"
+}

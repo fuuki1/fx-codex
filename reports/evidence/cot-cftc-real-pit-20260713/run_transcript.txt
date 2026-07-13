@@ -1,0 +1,46 @@
+# Real CFTC COT PIT run transcript — generated 2026-07-13T13:16:06Z
+# code commit at materialize time: eb4263ccac4fe6276f4f5e078b2ccc8deb0a3b89 (clean worktree)
+# dataset_id: 254d2cb4a34e715051280f546f4e7d82a457b1f61e85d6e5017fec6c3f64b95c
+# raw capture (82MB, not committed): 13,727 FX rows, SHA256-verified across 3 pages + 2 count guards
+# NOTE: capture completed 2026-07-13T13:06:45Z; release attestation bound 2026-07-13T13:08:51Z.
+#       This is why "available_time" is the capture/attestation instant, not the report date —
+#       PIT availability is normalized to WHEN WE ACTUALLY HELD THE DATA, never the report date.
+
+## Independent audit (deterministic replay from raw content-addressed bytes)
+{
+  "passed": true,
+  "observation_count": 13727,
+  "release_attestation_count": 1,
+  "errors": [],
+  "promotion_eligible": false,
+  "research_only": true
+}
+
+## PIT gate — as-of 2026-07-13T12:00Z (BEFORE 13:06Z capture): must be UNAVAILABLE
+{
+  "status": "unavailable",
+  "usable": false,
+  "reports": []
+}
+
+## PIT gate — as-of 2026-07-14T00:00Z (AFTER capture + attested release): USABLE, real positioning
+{
+  "status": "ok",
+  "usable": true,
+  "net_positions": {
+    "AUD": -24651,
+    "CAD": -173126,
+    "CHF": -37414,
+    "EUR": -16227,
+    "GBP": -87903,
+    "JPY": -123778,
+    "NZD": -65189,
+    "USD": 13269
+  },
+  "report_date": [
+    "2026-07-07"
+  ],
+  "available_time": [
+    "2026-07-13T13:08:51.860391+00:00"
+  ]
+}
