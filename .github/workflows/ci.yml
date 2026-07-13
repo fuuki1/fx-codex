@@ -30,6 +30,6 @@ jobs:
       - name: Black
         run: black --check .
       - name: Mypy
-        run: mypy fx_backtester fx_intel *.py
+        run: mypy fx_backtester fx_intel data_platform *.py
       - name: Tests
         run: pytest
