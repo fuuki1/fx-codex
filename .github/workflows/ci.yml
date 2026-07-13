@@ -30,6 +30,22 @@ jobs:
       - name: Black
         run: black --check .
       - name: Mypy
-        run: mypy fx_backtester fx_intel data_platform *.py
+        # tools/ をmypy対象に含める（研究v2要件: tools/data_platformを除外しない）
+        run: mypy fx_backtester fx_intel data_platform tools *.py
+      - name: Conflict markers
+        # マージ衝突マーカーの取り込みを防ぐ（git diff --check 相当の意図。既存EOF空行では
+        # 落とさず、実害のある衝突マーカーのみを検出）
+        run: |
+          if git grep -nE '^(<<<<<<< |>>>>>>> |={7}$)' -- '*.py' '*.md' '*.yml' '*.yaml' '*.toml' '*.sh'; then
+            echo "::error::merge conflict markers found"; exit 1
+          fi
       - name: Tests
         run: pytest
+      - name: Safety invariants (fail-closed gates)
+        # 昇格・lockbox・改竄・no-live・再現性の不変条件を明示ゲート化（回帰検出）
+        run: >
+          pytest -q
+          tests/test_governance.py
+          tests/test_lockbox.py
+          tests/test_trial_ledger.py
+          tests/test_experiment_pipeline.py
