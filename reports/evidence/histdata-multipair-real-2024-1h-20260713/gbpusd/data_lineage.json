@@ -1,0 +1,48 @@
+{
+  "chain": [
+    {
+      "artifact": "manifest",
+      "sha256": "fbab837ae6911e16d1e927f42a3df2a2fdcdfce3065dbfab2f4d4184beeeb9be"
+    },
+    {
+      "artifact": "raw:histdata_gbpusd_2024_m1_resampled_1h",
+      "sha256": "98824aa825cf467215dd27bfef3ae1431213dd72029ea4d4221ae05ea666b639"
+    },
+    {
+      "artifact": "normalized_dataset",
+      "sha256": "390e9f648c87658a907681d058f4577f578d6c826ced1be9fa72940b61379bcd"
+    },
+    {
+      "artifact": "feature_dataset",
+      "sha256": "b3949e97f3e6b423d74023699f658d1b45499410a38f4f26db442e0cb0b15deb"
+    },
+    {
+      "artifact": "label_dataset",
+      "sha256": "88706b82a813199387281e5310accdb3afee78fde5bce758d5a89baf0a390e58"
+    },
+    {
+      "artifact": "split",
+      "sha256": "ec57ba0c40163b0d67a6b7b3eeb2a45c9d0299f939a4ca3df0e8367884963491"
+    },
+    {
+      "artifact": "trained_model",
+      "sha256": "4c3d0555185d0f5d2bb13bb72786805cd4661ad7be214f42bdfe0f4b4cd5714e"
+    },
+    {
+      "artifact": "test_predictions",
+      "sha256": "d393f5f70216de74419de3f94c54ac01f6d59d60729cb0cab87c801d980ad27b"
+    },
+    {
+      "artifact": "evaluation",
+      "sha256": "040b9032f8077078c2fef8c9238262a93b3db2f73055507e9b6a62f9c6d49126"
+    },
+    {
+      "artifact": "cost_stress",
+      "sha256": "6f6607313a6d4493eb5d75edcceabbfe6d81593b007a3850dd4c04ad59855b31"
+    },
+    {
+      "artifact": "promotion_decision",
+      "sha256": "d001ac75f621ffbb37fc1f4b4c15308da889ada46ca56c25dbcfe6fe758efb94"
+    }
+  ]
+}

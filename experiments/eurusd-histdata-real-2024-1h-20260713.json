@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "experiment_id": "eurusd-histdata-real-2024-1h-20260713-v2",
+  "created_at": "2026-07-13T00:00:00+00:00",
+  "created_by": "audit-integration session (cross-pair real-data OOS)",
+  "research_question": "On real EURUSD 2024 hourly bars, do any transparent baselines or the GBDT candidate produce positive cost-net expectancy out-of-sample, or does the pipeline correctly deny promotion (close-only data, declared static spread)?",
+  "economic_hypothesis": "Weak/none expected. Hourly USD/JPY is highly efficient; with a declared static spread and close-only bars there is no reason a simple technical rule should net a positive edge after costs. A negative/zero result is the expected, honest outcome.",
+  "invalidation_conditions": [
+    "Any promotion gate passing on this close-only real dataset invalidates the quality-cap wiring.",
+    "Any non-reproducible artifact hash across identical replays invalidates the run."
+  ],
+  "strategy_card": {
+    "strategy_id": "real-histdata-oos-eurusd-v1",
+    "economic_mechanism": "Exploratory scan of transparent baselines + GBDT on real bars; no edge claimed.",
+    "why_should_edge_exist": "It likely should not survive costs; this run measures that honestly.",
+    "who_is_paying_the_edge": "Unknown/none; retail hourly FX is efficient.",
+    "expected_horizon": "12 hourly bars",
+    "known_failure_regimes": [
+      "2024 BoJ intervention spike (Jul/Aug), thin liquidity around rollovers"
+    ],
+    "capacity_assumption": "not assessed (exploratory)",
+    "cost_assumption": "declared static spread 0.8pip/slippage 0.2pip/commission/financing, 1-2x stress",
+    "exploratory": true
+  },
+  "git": {
+    "commit": "09b0fda89bd08cfd26729a6217edb4378a0fdc80",
+    "dirty_worktree_allowed": true
+  },
+  "environment": {
+    "python_version": "3.12",
+    "dependency_lock_sha256": "4d9bdfd3d67b3fbf983bfcb712d9670bab440c0a5e40461bcc45d992ef193a90",
+    "platform_note": "macOS local worktree; see environment.json in the bundle"
+  },
+  "data": {
+    "sources": [
+      {
+        "source_id": "histdata_eurusd_2024_m1_resampled_1h",
+        "kind": "price_csv",
+        "path": "data/real/histdata/eurusd_2024_1h.csv",
+        "raw_sha256": "799f3c9f1cbf86a6e56545d83f0220f6834c14727ad0a1a438eb583037eed668",
+        "license_note": "HistData.com free ASCII M1, EST->UTC, resampled to 1h. Personal/research use per HistData terms. CLOSE-ONLY (no bid/ask, no real volume): NOT admissible for any promotion or performance claim; label quality is capped accordingly."
+      }
+    ],
+    "symbol": "EURUSD",
+    "start": "2024-01-01T22:00:00+00:00",
+    "end": "2024-12-31T22:00:00+00:00",
+    "timezone": "UTC",
+    "as_of_cutoff": "2025-01-02T00:00:00+00:00",
+    "bar_interval_minutes": 60,
+    "required_quality_level": "strict",
+    "synthetic": false
+  },
+  "features": {
+    "definitions": [
+      "ret_1",
+      "ret_4",
+      "ma_ratio_24",
+      "rsi_14",
+      "vol_24"
+    ],
+    "availability_rule": "completed_bar_close",
+    "version": "features_v1"
+  },
+  "labels": {
+    "type": "triple_barrier",
+    "horizon_bars": 12,
+    "take_profit_vol_multiple": 2.0,
+    "stop_vol_multiple": 1.0,
+    "volatility_window_bars": 24,
+    "same_bar_policy": "stop_first",
+    "gap_policy": "adverse_open"
+  },
+  "splits": {
+    "method": "chronological_five_way",
+    "train_fraction": 0.5,
+    "tune_fraction": 0.15,
+    "calibration_fraction": 0.1,
+    "test_fraction": 0.15,
+    "lockbox_fraction": 0.1,
+    "purge_bars": 12,
+    "embargo_bars": 2,
+    "min_rows_per_partition": 10
+  },
+  "models": {
+    "candidates": [
+      {
+        "candidate_id": "noskill",
+        "family": "constant_probability",
+        "hyperparameters": {
+          "probability": 0.5,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "random",
+        "family": "random_uniform",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "always-long",
+        "family": "always_long",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "always-short",
+        "family": "always_short",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "prev-sign",
+        "family": "previous_return_sign",
+        "hyperparameters": {
+          "strength": 0.1,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "ma-cross",
+        "family": "ma_crossover",
+        "hyperparameters": {
+          "strength": 0.1,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "rsi-rev",
+        "family": "rsi_reversion",
+        "hyperparameters": {
+          "strength": 0.1,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "logit-r1",
+        "family": "logistic_ridge",
+        "hyperparameters": {
+          "ridge": 1.0,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "ridge-reg",
+        "family": "ridge_regression",
+        "hyperparameters": {
+          "ridge": 1.0,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "gbdt-small",
+        "family": "gbdt",
+        "hyperparameters": {
+          "n_estimators": 20,
+          "learning_rate": 0.1,
+          "max_depth": 2,
+          "min_samples_leaf": 10,
+          "subsample": 1.0,
+          "feature_fraction": 1.0,
+          "reg_lambda": 1.0,
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      }
+    ],
+    "random_seed": 42,
+    "trial_budget": 10
+  },
+  "calibration": {
+    "method": "platt"
+  },
+  "costs": {
+    "cost_model_version": "declared_static_v1",
+    "spread_pips": 0.8,
+    "slippage_pips": 0.2,
+    "pip_size": 0.0001,
+    "commission_r_per_trade": 0.001,
+    "financing_r_per_bar": 0.0001,
+    "stress_multipliers": [
+      1.0,
+      1.25,
+      1.5,
+      2.0
+    ]
+  },
+  "selection": {
+    "primary_metric": "net_expectancy_r",
+    "minimum_trade_count": 5,
+    "minimum_effective_trades": 3,
+    "max_regime_concentration": 0.8,
+    "max_month_concentration": 1.0,
+    "multiple_testing_method": "holm",
+    "bootstrap_block_size": 5,
+    "pbo_blocks": 8
+  },
+  "lockbox": {
+    "access_policy": "single_use",
+    "access_count_limit": 1
+  },
+  "promotion": {
+    "target_stage": "validated",
+    "policy_path": null
+  }
+}
