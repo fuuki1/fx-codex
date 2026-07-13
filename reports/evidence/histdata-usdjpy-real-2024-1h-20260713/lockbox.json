@@ -1,0 +1,10 @@
+{
+  "commitment_sha256": "2cb8f3453865a581738236117724102c97b888ef9605c5537f489cb855bef9b3",
+  "inputs_sha256": "9f6dcc40e00a8b761255cac821a22756528a387951fe062f6a476586f78b59fc",
+  "policy": {
+    "access_count_limit": 1,
+    "access_policy": "single_use"
+  },
+  "row_count": 624,
+  "status": "unopened"
+}
