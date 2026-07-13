@@ -14,11 +14,13 @@
 
 | 軸 | 構造 | 実証 | 一言 |
 |---|---:|---:|---|
-| **1. AI学習ロジック** | **72** | **48** | Triple Barrier/long-short/no-trade/baseline dominance/較正/abstention/uncertainty は実装・テスト済み。実データOOSは COT PIT 単発のみで、価格ラベルの実データ学習は未実施 |
-| **2. 検証の厳密さ** | **74** | **55** | 5分割・purge/embargo・CPCV-like・PSR/DSR/PBO/MTRL・block bootstrap・Holm・lockbox single-use・trial ledger 全て実装＋合成E2Eで昇格拒否を実証。実データ駆動の評価bundleが未生成 |
-| **3. データ基盤** | **63** | **42** | PIT契約・immutable raw・quality state・bid/ask bar materializer・broker Protocol は実装。**COT PITは実CFTCで実証済み**。broker bid/ask は未接続、30取引日連続運用は未達 |
+| **1. AI学習ロジック** | **75** | **58** | Triple Barrier/long-short/no-trade/baseline dominance/**GBDT**/較正/abstention/uncertainty は実装・テスト済み。**実USD/JPY 2024で pipeline 完走・GBDT選択・OOS評価を実証**（負の結果＝偽alpha無し）。価格ソースが close-only・単年のため実証は中位 |
+| **2. 検証の厳密さ** | **74** | **62** | 5分割・purge/embargo・CPCV-like・PSR/DSR/PBO/MTRL・block bootstrap・Holm・lockbox single-use・trial ledger 全て実装＋合成E2E＋**実データE2Eで昇格拒否と deterministic replay を実証**。外部custodyは未実装 |
+| **3. データ基盤** | **63** | **45** | PIT契約・immutable raw・quality state・bid/ask bar materializer・broker Protocol は実装。**COT PIT（実CFTC）と実FX価格取込を実証**。broker bid/ask は未接続、30取引日連続運用は未達 |
 
-**総合判定: 判定2** — 70点相当の構造はほぼ完成しているが、実データ蓄積・shadow実績が不足しているため正式到達は未宣言。
+**総合判定: 判定2** — 70点相当の構造はほぼ完成しており、本セッションで**実データE2E**（COT PIT + 実価格 pipeline run）まで実証したが、**close-only・単年・単一pair・30取引日連続運用なし**のため正式到達は未宣言。
+
+> 【2026-07-13 更新】初版から実証軸を上方修正。理由: (1) 実HistData USD/JPYで authoritative pipeline を完走し、GBDT含む10候補のOOS評価と昇格拒否・deterministic replay を実データで実証（[evidence](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)）。(2) GBDTが pipeline 未登録という初版の記述は誤りで、実際は登録済み・実データ run で選択された。ただし close-only（bid/ask無し）・2024単年・USD/JPY のみのため、実証は「70到達」には届かない。
 
 ---
 
@@ -41,17 +43,18 @@
 | uncertainty / abstention | `calibration.py`（abstention policy）、`drift.py` | `test_drift.py` | ✅ |
 | drift時停止 | `drift.py`（PSI/KS→`abstain`/`demote`） | `test_drift.py` | ✅ |
 | 正式artifactはauthoritative pipelineのみ | `experiment_pipeline.py` が唯一のformal経路。旧 `ml.py` は補助 | `test_experiment_pipeline.py` | ✅ |
-| GBDT | `fx_intel/gbm.py` + `ml.py`（委員会側）。pipeline側は logistic/ridge を complex 候補として実装 | `test_gbm.py` | ⚠️ 部分（pipeline に GBDT 候補family未追加。§Gapへ） |
+| GBDT | **pipeline に登録済み**（`MODEL_FAMILY_KIND["gbdt"]="complex"`、標準ライブラリのみの gradient boosting）。`fx_intel/gbm.py` は committee 側に別途存在 | `test_gbm.py` + 実データ run で選択 | ✅ |
 
-**構造の減点理由（72で止めた根拠）:**
-- pipeline の complex 候補が `logistic_ridge` / `ridge_regression` のみ。タスク Phase 6 が要求する **GBDT を同一manifest比較の候補family** として pipeline に組み込む配線が未完（`fx_intel/gbm.py` は committee 側に存在するが authoritative pipeline の `_FAMILY_KIND` 未登録）。
-- 階層型（global + pair/timeframe/regime補正）学習が設計文書レベルで、pipeline 実装は単一global止まり。
+**構造の減点理由（75で止めた根拠）:**
+- 階層型（global + pair/timeframe/regime補正）学習が設計文書レベルで、pipeline 実装は単一global止まり（P2-2）。
+- close-only 経路の品質上限は実装されているが、bid/ask を実測して net R を実データで駆動する経路は未接続（データ基盤側の制約）。
 
-### 実証 48 / 100
+### 実証 58 / 100
 
-- **実データによる価格ラベル学習の OOS 証拠が無い**。唯一の pipeline E2E は `usdjpy-synthetic-infra-selftest`（`synthetic_data:true`, `net_expectancy_r:-1.075`）で、**昇格は正しく拒否**（`failures=[non_synthetic_data, sample_size, net_expectancy, deflated_sharpe, probability_of_backtest_overfitting, untouched_lockbox, cost_stress_2x, …]`）。これは「ゲートが効く」証拠であって「モデルが効く」証拠ではない。
-- 実データは **COT PIT のみ実証**（[reports/evidence/cot-cftc-real-pit-20260713](evidence/cot-cftc-real-pit-20260713/README.md)）。ただしこれは特徴量ソースの一つであり、学習ターゲット（価格の triple barrier）ではない。
-- → 実証を50未満に据える。「構造 70相当 / 実証 50未満」（タスク§12の想定文面に一致）。
+- **実データで pipeline を完走・GOOS評価を実証**（[histdata-usdjpy-real-2024-1h](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)）: 実USD/JPY 2024 1h（6,265本）で 10候補（baseline7+logistic+ridge+**GBDT**）を train→tune→test。`gbdt-small` 選択、`net_expectancy_r:-0.065`、CI下限 -0.203、DSR 0.167、PBO 0.20、**Holm補正後 p値=全候補1.0**、PIT/future violations 0/0、**昇格DENIED**、deterministic replay 一致。→ **フレームワークが実データで偽alphaを作らないことの実証**。
+- 合成E2E（`usdjpy-synthetic-infra-selftest`, `synthetic_data:true`）でも昇格拒否を実証（ゲートの健全性）。
+- COT PIT（実CFTC）は特徴量ソースとして別途実証（[cot-cftc-real-pit](evidence/cot-cftc-real-pit-20260713/README.md)）。
+- → 実証は50を超えたが、**close-only・2024単年・USD/JPYのみ**のため 70 には届かない。「構造 70相当 / 実証 50台後半」。
 
 ---
 
@@ -81,12 +84,13 @@
 - **外部custody未実装**。lockbox は「durable local custody」であり、タスク§4が要求する GitHub Actions artifact / 別アカウントS3 / 書き込み専用外部ストレージのいずれも未配線。インターフェース・runbook も未整備（本セッションで runbook を新規作成、実装は未）。「ローカル保管で完全防御」とは主張しない。
 - month/pair/session concentration 評価は fold_dispersion 等の部品はあるが、pipeline 出力の正式ゲートとしての結線が部分的。
 
-### 実証 55 / 100
+### 実証 62 / 100
 
-- 合成E2Eで **昇格拒否の全経路が実証済み**（gate が正しく効く）。これは実証として価値がある（fail-closed の実挙動確認）。
-- **deterministic replay は実データ（COT 13,727行）で実証済み** — audit がraw から再構成し `passed`。これは検証軸の実証を押し上げる本物の証拠。
-- ただし **合格側（真の実データで gate を全部通す）は未実証**。実データ評価bundleが存在しないため、PBO/DSR/CI 等が実データ分布で妥当に動く証拠がない。
-- → 60未満（タスク§12想定の「構造70以上 / 実証60未満」に一致）。
+- **実データ E2E で検証機構が実証済み**（[histdata-usdjpy-real-2024-1h](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)）: 実USD/JPY 2024 で PBO 0.20 / DSR 0.167 / Holm補正後 p値 全1.0 / block bootstrap CI が実データ分布で妥当に動作。昇格拒否の全経路（net_expectancy/CI/DSR/cost_stress_2x/untouched_lockbox）が**実データで**発火。
+- **deterministic replay を実データで2重に実証**: (1) COT audit がraw再構成 `passed`、(2) 価格pipeline が2回runで同一 result hash（fedc9d83）。
+- 合成E2Eでも昇格拒否の全経路を実証（gate健全性）。
+- ただし **実データ評価は close-only・単年・単一pair**。多年・複数pair・複数regime にまたがる実データ評価は未実施。外部custodyも未実装。
+- → 60台前半。実データで gate が動くことは実証、網羅性（多年/多pair/合格側）は未達。
 
 ---
 
@@ -108,13 +112,14 @@
 | ニュースPIT | `data_platform/contracts/news_event.py` | contract tests | ⚠️ 契約のみ |
 | single-writer規律 | broker adapter の `writer_id` スタンプ + launchd排他 | `test_data_platform_bars.py` | ✅（設計）/ ⚠️（本番配備なし） |
 
-### 実証 42 / 100
+### 実証 45 / 100
 
-- **COT PIT のみ実データで完全実証**：実CFTC 13,727行、SHA256照合、count整合、deterministic replay、PITゲート（取得前=unavailable / 後=usable）。→ [evidence bundle](evidence/cot-cftc-real-pit-20260713/README.md)。
-- **broker bid/ask は完全に未接続**。実際に取引予定のbrokerのquoteを1件も取り込んでいない。quote→bar の実データ実証なし。
-- **30取引日連続稼働の証拠なし**。単発snapshotのみ。launchd常駐は開発機TCC制限で不可、Mac mini本番未配備。
+- **COT PIT を実データで完全実証**：実CFTC 13,727行、SHA256照合、count整合、deterministic replay、PITゲート（取得前=unavailable / 後=usable）。→ [evidence](evidence/cot-cftc-real-pit-20260713/README.md)。
+- **実FX価格取込を実証**：HistData USD/JPY 2024 M1→1h（6,265本）を EST→UTC 変換・hash固定し、pipeline の `load_price_csv` で読込・品質検査・triple-barrier ラベル・OOS評価まで通した。`scripts/fetch_histdata.py` で committed CSV を byte一致再現可。→ [evidence](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)。
+- ただし **close-only（bid/ask無し・volume無し）**。取引予定brokerの実bid/ask quoteは1件も取り込んでいない（quote→bar の実bid/ask実証なし）。
+- **30取引日連続稼働の証拠なし**。単発・単年。launchd常駐は開発機TCC制限で不可、Mac mini本番未配備。
 - macro/calendar/news の実PIT運用証拠なし。
-- → 実運用40台（タスク§12想定の「構造60以上 / 実運用40未満」に一致）。
+- → 実運用40台（構造60以上 / 実運用40台）。実FX価格を1本通した分だけ COT のみだった初版から上昇したが、broker bid/ask と連続運用が主要ボトルネックとして残る。
 
 ---
 
@@ -122,20 +127,20 @@
 
 | | 構造 | 実証 |
 |---|---:|---:|
-| AI学習ロジック | 72（≒70相当） | **48（<50）** |
-| 検証の厳密さ | 74（≥70） | **55（<60）** |
-| データ基盤 | 63（≒60以上） | **42（<40台）** |
+| AI学習ロジック | 75（≒70相当） | **58（50台後半）** |
+| 検証の厳密さ | 74（≥70） | **62（60台前半）** |
+| データ基盤 | 63（≒60以上） | **45（40台）** |
 
 ```
-AI学習ロジック:   構造 70相当    実証 50未満
-検証:            構造 70以上    実証 60未満
-データ基盤:       構造 60以上    実運用 40未満
+AI学習ロジック:   構造 70相当    実証 50台後半
+検証:            構造 70以上    実証 60台前半
+データ基盤:       構造 60以上    実運用 40台
 ```
 
 ### 判定2
 
-> **70点相当の構造は（ほぼ）完成したが、実データ蓄積・shadow実績が不足しているため正式到達は未宣言。**
+> **70点相当の構造は（ほぼ）完成し、本セッションで実データE2Eまで実証したが、close-only・単年・単一pair・shadow実績なしのため正式到達は未宣言。**
 
-証拠が不足しているため判定2とする（タスク§最終出力の指示に従う）。構造面は本セッションの監査で「既存PRスタックが要求インフラの大半を実装済み・708テスト緑」であることを確認済み。実証面は本セッションで **COT PIT を実データで初めて実証** し、データ基盤とvalidationの実証軸をわずかに押し上げたが、**価格の実データ学習・broker bid/ask接続・30取引日連続運用**という3つの主要ボトルネックが残るため、70点の"実証"は宣言できない。
+証拠が「70の実証」には届かないため判定2とする（タスク§最終出力の指示に従う）。構造面は監査で「既存PRスタックが要求インフラの大半を実装済み・708テスト緑」を確認。実証面は本セッションで **(1) COT PIT を実CFTCで実証、(2) authoritative pipeline を実USD/JPY価格で完走（GBDT選択・OOS評価・昇格拒否・deterministic replay）** まで到達し、実証軸を明確に押し上げた。しかし **close-only（bid/ask無し）・2024単年・USD/JPY のみ・broker bid/ask未接続・30取引日連続運用なし** が残るため、70点の"実証"は宣言できない。**「フレームワークが実データで偽alphaを作らない」ことは実証したが、「実データで利益が出る」ことは実証していない（そもそも close-only では原理的に困難）。**
 
 関連: [research_v2_test_evidence.md](research_v2_test_evidence.md) / [research_v2_unresolved_risks.md](research_v2_unresolved_risks.md) / [docs/audits/RESEARCH_V2_GAP_ANALYSIS.md](../docs/audits/RESEARCH_V2_GAP_ANALYSIS.md)

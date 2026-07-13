@@ -82,15 +82,18 @@ main (3595582)  [trader/ 現存]
 
 | 軸 | 構造ギャップ（小） | 実証ギャップ（大） |
 |---|---|---|
-| AI学習 | GBDT を pipeline 候補family へ登録／階層型学習の pipeline 実装 | 実価格 triple-barrier の OOS 証拠（P0-2） |
+| AI学習 | 階層型学習（global+pair/tf/regime補正）の pipeline 実装 ※GBDTは登録済み（初版の「未登録」は誤り） | 実価格 triple-barrier の OOS 証拠（P0-2、本セッションで close-only 単年を実証） |
 | 検証 | 外部custody 実装／concentration の正式ゲート化 | 実データで gate を全通過する評価bundle（合格側の実証） |
 | データ基盤 | — | broker bid/ask 実接続（P1-1）／30取引日連続運用（P0-3）／macro/calendar/news 実PIT |
 
 ## 6. 本セッションで解消したギャップ
 
 1. **mypy tools/ 28エラー解消**（コミット `3a28efd`）— タスク§10の `mypy ... tools` 要件を実際に満たした。
-2. **COT PIT 実データ実証**（コミット `e8976f5`）— 初の非合成 real-data 証拠。データ基盤とvalidationの実証軸をわずかに押し上げた。
-3. **監査・スコア・設計ドキュメント一式**（本コミット群）— タスク§11 の未作成ドキュメントを整備。
+2. **COT PIT 実データ実証**（コミット `e8976f5`）— 初の非合成 real-data 証拠。
+3. **CI強化**（`e61378a`）— mypy tools/追加・衝突マーカー検出・safety不変条件ゲート。
+4. **実FX価格で authoritative pipeline 完走**（`53c7af5`）— HistData USD/JPY 2024 で 10候補（GBDT含む）の OOS 評価・昇格拒否・deterministic replay を**実データで**実証。フレームワークが実データで偽alphaを作らないことを確認。`scripts/fetch_histdata.py` で再現可。
+5. **監査・スコア・設計ドキュメント一式**（`c4f84e5` ほか）— タスク§11 の未作成ドキュメントを整備。
+6. **誤り訂正**: 初版の「GBDT が pipeline 未登録」は誤り。実際は `MODEL_FAMILY_KIND` に登録済みで実データ run で選択された。
 
 ## 7. 結論
 

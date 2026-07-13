@@ -54,6 +54,25 @@
 
 再現: `reports/evidence/cot-cftc-real-pit-20260713/reproduce.sh`（LIVE CFTC 再取得）。
 
+### 実FX価格で authoritative pipeline 完走（本セッションで新規生成）
+
+**初の実価格 pipeline E2E。** 詳細: [reports/evidence/histdata-usdjpy-real-2024-1h-20260713/README.md](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)
+
+入力: HistData USD/JPY 2024 M1→1h（6,265本、`data/real/histdata/usdjpy_2024_1h.csv`、`raw_sha256 9e2b632d…` を manifest で固定）。
+
+| 実証項目 | 結果 |
+|---|---|
+| pipeline 完走 | `status: completed`、10候補（baseline7 + logistic + ridge + **GBDT**）を train→tune→test |
+| 実データ認識 | `synthetic_data: false` |
+| 選択候補 | `gbdt-small`（GBDT が完全配線・競争力ありを実証） |
+| OOS 期待値 | `net_expectancy_r: -0.065`（コスト控除後マイナス）、CI下限 -0.203、win_rate 34.4%、profit_factor 0.907 |
+| 統計的有意性 | DSR 0.167 / PBO 0.20 / **Holm補正後 p値=全10候補 1.0**（ノイズと区別不能） |
+| リーク検査 | PIT violations 0 / future-feature violations 0 |
+| 昇格 | **DENIED**（net_expectancy/CI/DSR/cost_stress_2x/untouched_lockbox/pair_coverage/clean_worktree） |
+| deterministic replay | 2回 run で同一 `deterministic_result_sha256 fedc9d83…`、両方 `gbdt-small` 選択 |
+
+意義: **フレームワークが実データで偽alphaを作らないことの実証**。close-only（bid/ask無し）・単年・単一pair のため正式昇格には使用不能（`license_note` 明記）。再現: `scripts/fetch_histdata.py` + manifest（committed CSV を byte一致再現）。
+
 ## 実行していない / できない検証（正直な明示）
 
 - **実broker bid/ask の取込テスト**：credentials 無しのため未実行（adapter は正直に `Unimplemented`=fail-closed）。

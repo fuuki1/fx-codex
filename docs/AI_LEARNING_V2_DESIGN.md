@@ -64,9 +64,11 @@ action = argmax(E[net R | long], E[net R | short], 0.0)   # 0.0 = no-trade
 | always_long / always_short / previous_return_sign | baseline | ✅ |
 | ma_crossover / rsi_reversion | baseline | ✅ |
 | logistic_ridge / ridge_regression | complex | ✅ |
-| **GBDT** | complex | ⚠️ **未登録**（`fx_intel/gbm.py` は committee側に存在。pipeline `_FAMILY_KIND` へ追加が残作業。依存追加禁止のため標準ライブラリ実装が要件） |
+| **GBDT** | complex | ✅ **登録済み**（`MODEL_FAMILY_KIND["gbdt"]="complex"`、`experiment_pipeline.py:693`。標準ライブラリのみの gradient boosting 実装。Newton step で学習）。**実データ run で `gbdt-small` が選択されたことを実証**（[evidence](../reports/evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)） |
 
 **複雑モデルは tune 区画で best baseline を厳密に上回る場合のみ admissible**（`test_evaluation_gates.py`）。的中率ではなく**コスト控除後期待R**が主指標。
+
+> 【2026-07-13 訂正】初版で「GBDTは pipeline 未登録」と記したのは誤り。定数名を `_FAMILY_KIND` と誤認したもので、正しくは `MODEL_FAMILY_KIND` に登録済み。実データ run で GBDT が選択候補として動作することを確認済み。`fx_intel/gbm.py`（committee側）とは別に pipeline 独自の GBDT 実装が存在する。
 
 ## 5. 階層型学習（設計、pipeline 実装は残作業）
 
