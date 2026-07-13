@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 from datetime import datetime, timedelta, UTC
 from unittest import mock
@@ -9,10 +10,17 @@ from unittest import mock
 import pytest
 
 import fx_briefing
+from fx_intel.append_only import AppendOnlyWriteError, canonical_row_hash
 from fx_intel.calendar import EconomicEvent
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
-from fx_intel import trade_outcome as to
+from fx_intel import price_history, timeframe, trade_outcome as to
+
+
+def _hashed_json(row: dict[str, object]) -> str:
+    payload = {"schema_version": 2, **row}
+    payload["content_hash"] = canonical_row_hash(payload)
+    return json.dumps(payload)
 
 
 def _view(interval, rec, close, rsi=55.0, adx=25.0, atr=0.15):
@@ -163,6 +171,55 @@ def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
     assert "主ホライズン15分後" in out
 
 
+def test_corrupt_strict_inputs_become_operational_no_trade_warning(patched_paths, capsys) -> None:
+    tf_journal, _ = patched_paths
+    tf_journal.write_text("{broken\n", encoding="utf-8")
+    decision_log_path = tf_journal.parent / "briefing_decisions.jsonl"
+    decision_log_path.write_text("{broken\n", encoding="utf-8")
+
+    with mock.patch(
+        "fx_intel.timeframe.build_timeframe_plans",
+        wraps=timeframe.build_timeframe_plans,
+    ) as builder:
+        rc = _run(
+            ["--per-timeframe", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+        )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "判断ジャーナル整合性エラー" in out
+    assert "完全判断ログ整合性エラー" in out
+    assert builder.call_args is not None
+    assert builder.call_args.kwargs["operational_data_ok"] is False
+    assert "整合性エラー" in builder.call_args.kwargs["operational_data_reason"]
+
+
+def test_calendar_warning_with_events_still_fails_closed(patched_paths, capsys) -> None:
+    event = EconomicEvent(
+        "NFP",
+        "USD",
+        datetime.now(UTC) + timedelta(hours=24),
+        "high",
+    )
+
+    with mock.patch(
+        "fx_intel.timeframe.build_timeframe_plans",
+        wraps=timeframe.build_timeframe_plans,
+    ) as builder:
+        rc = _run(
+            ["--per-timeframe", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+            calendar_result=([event], ["経済指標カレンダー部分取得: missing=nextweek"]),
+        )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "部分取得" in out
+    assert builder.call_args is not None
+    assert builder.call_args.kwargs["calendar_ok"] is False
+
+
 def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
     rc = _run(
         ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
@@ -250,6 +307,115 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     assert "Discord送信なし" in out
 
 
+@pytest.mark.parametrize(
+    ("fail_journal", "fail_decision"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_required_persistence_failure_suppresses_normal_discord_and_returns_nonzero(
+    patched_paths,
+    capsys,
+    fail_journal,
+    fail_decision,
+) -> None:
+    event = EconomicEvent(
+        "NFP",
+        "USD",
+        datetime.now(UTC) + timedelta(hours=24),
+        "high",
+    )
+    slot = datetime.now(UTC)
+    slot = slot.replace(minute=slot.minute - slot.minute % 5, second=0, microsecond=0)
+    with ExitStack() as stack:
+        if fail_journal:
+            stack.enter_context(
+                mock.patch(
+                    "fx_intel.journal.append_timeframe_plans",
+                    side_effect=AppendOnlyWriteError("journal disk failure"),
+                )
+            )
+        if fail_decision:
+            stack.enter_context(
+                mock.patch(
+                    "fx_intel.decision_log.append_decision_events",
+                    side_effect=AppendOnlyWriteError("decision disk failure"),
+                )
+            )
+        stack.enter_context(mock.patch.object(fx_briefing, "load_webhook_url", return_value="x"))
+        posted = stack.enter_context(mock.patch.object(fx_briefing, "post_to_discord"))
+        rc = _run(
+            [
+                "--per-timeframe",
+                "--no-macro",
+                "--no-learning",
+                "--no-trade-expectancy",
+                "--no-export-events",
+                "--no-event-archive",
+                "--run-slot",
+                slot.isoformat(),
+                "--symbols",
+                "USDJPY",
+            ],
+            capsys,
+            calendar_result=([event], []),
+        )
+
+    assert rc == 1
+    posted.assert_not_called()
+    assert "通常Discord通知を抑止" in capsys.readouterr().err
+
+
+def test_discord_retry_reuses_persisted_decision_receipt_without_duplicate_rows(
+    patched_paths,
+    capsys,
+) -> None:
+    tf_journal, _ = patched_paths
+    event = EconomicEvent(
+        "NFP",
+        "USD",
+        datetime.now(UTC) + timedelta(hours=24),
+        "high",
+    )
+    slot = datetime.now(UTC)
+    slot = slot.replace(minute=slot.minute - slot.minute % 5, second=0, microsecond=0)
+    argv = [
+        "--per-timeframe",
+        "--no-macro",
+        "--no-learning",
+        "--no-trade-expectancy",
+        "--no-export-events",
+        "--no-event-archive",
+        "--run-slot",
+        slot.isoformat(),
+        "--symbols",
+        "USDJPY",
+    ]
+    with (
+        mock.patch.object(fx_briefing, "load_webhook_url", return_value="x"),
+        mock.patch.object(
+            fx_briefing,
+            "post_to_discord",
+            side_effect=[RuntimeError("simulated timeout"), None],
+        ) as posted,
+    ):
+        with pytest.raises(RuntimeError, match="simulated timeout"):
+            _run(argv, capsys, calendar_result=([event], []))
+        assert _run(argv, capsys, calendar_result=([event], [])) == 0
+
+    journal_rows = [json.loads(line) for line in tf_journal.read_text().splitlines() if line]
+    decision_rows = [
+        json.loads(line)
+        for line in fx_briefing.DEFAULT_DECISION_LOG_PATH.read_text().splitlines()
+        if line
+    ]
+    assert len(journal_rows) == 4
+    assert len(decision_rows) == 4
+    assert len({row["notification_batch_id"] for row in decision_rows}) == 1
+    receipts = [call.args[1]["content"].splitlines()[-1] for call in posted.call_args_list]
+    assert receipts[0] == receipts[1]
+    assert receipts[0].startswith("監査証跡: batch=")
+    assert "content_sha256=" in receipts[0]
+
+
 def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
     """既存の時間足別ジャーナルがあれば学習が働き、学習ファイルが書かれる。"""
     tf_journal, tf_learning = patched_paths
@@ -260,7 +426,7 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
     for i in range(20):
         ts = start + timedelta(hours=i)
         lines.append(
-            json.dumps(
+            _hashed_json(
                 {
                     "ts": ts.isoformat(),
                     "symbol": "USDJPY",
@@ -296,7 +462,7 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
     for i in range(20):
         ts = start + timedelta(hours=i * 3)
         journal_lines.append(
-            json.dumps(
+            _hashed_json(
                 {
                     "ts": ts.isoformat(),
                     "symbol": "USDJPY",
@@ -320,12 +486,12 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
         )
         price_lines.append(
             json.dumps(
-                {
-                    "ts": (ts + timedelta(hours=1)).isoformat(),
-                    "symbol": "USDJPY",
-                    "timeframe": "1h",
-                    "close": 99.0,
-                }
+                price_history.snapshot_entries(
+                    {"USDJPY": {"1h": 99.0}},
+                    now=ts + timedelta(hours=1),
+                    run_id=f"test-{i}",
+                    writer_id="test-writer",
+                )[0]
             )
         )
     tf_journal.write_text("\n".join(journal_lines) + "\n", encoding="utf-8")
@@ -384,8 +550,12 @@ def test_per_timeframe_applies_approved_tp_sl_registry(patched_paths, tmp_path, 
     assert rc == 0
     out = capsys.readouterr().out
     assert "承認済みTP/SL" in out
-    assert "T1 156.531" in out
-    assert "T2 156.812" in out
+    assert "TP1=0.75R / TP2=1.5R" in out
+    assert "最終判断: 見送り" in out
+    # 時間足分析は独立した較正・コスト・サイズ・risk vetoを通っていないため、
+    # 承認済み研究パラメータがあってもactionableな価格プランは表示しない。
+    assert "T1 156.531" not in out
+    assert "T2 156.812" not in out
 
 
 def test_no_learning_flag_skips_profile(patched_paths, capsys) -> None:

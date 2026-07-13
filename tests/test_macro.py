@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, UTC
 
+from fx_intel import macro
 from fx_intel.macro import (
     CotReport,
     MacroSeries,
@@ -81,6 +82,30 @@ def test_series_change_and_staleness() -> None:
     assert not series.is_stale(NOW)
     old = MacroSeries(key="vix", label_ja="VIX", points=[SeriesPoint(date(2026, 1, 1), 20.0)])
     assert old.is_stale(NOW)
+
+
+def test_future_macro_and_cot_objects_are_never_fresh() -> None:
+    future_series = MacroSeries(
+        key="vix",
+        label_ja="VIX",
+        points=[SeriesPoint(date(2026, 7, 4), 20.0)],
+    )
+    future_cot = CotReport(
+        "USD",
+        date(2026, 7, 4),
+        net_position=10,
+        open_interest=100,
+    )
+    snapshot = MacroSnapshot(
+        fetched_at=NOW,
+        series={"vix": future_series},
+        cot={"USD": future_cot},
+    )
+
+    assert future_series.is_stale(NOW)
+    assert future_cot.is_stale(NOW)
+    assert snapshot.fresh_series("vix") is None
+    assert snapshot.fresh_cot("USD") is None
 
 
 def test_regime_risk_off_from_vix_spike() -> None:
@@ -167,6 +192,63 @@ def test_fetch_uses_fresh_cache_without_network(tmp_path) -> None:
     vix_last = snap.series["vix"].last()
     assert vix_last is not None
     assert vix_last.value == 19.0
+
+
+class _FailingSession:
+    def get(self, *_args, **_kwargs):
+        raise ConnectionError("offline")
+
+
+def test_macro_rejects_naive_future_and_stale_cache_timestamps(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(macro, "FETCH_ATTEMPTS", 1)
+    body = "DATE,VALUE\n2026-07-02,1.0\n"
+    for label, fetched_at in (
+        ("naive", "2026-07-03T12:00:00"),
+        ("future", "2026-07-03T13:00:00+00:00"),
+        ("stale", "2026-07-02T12:00:00+00:00"),
+    ):
+        cache_path = tmp_path / f"{label}.json"
+        cache_path.write_text(
+            json.dumps(
+                {
+                    f"fred_{sid}": {"fetched_at": fetched_at, "body": body}
+                    for sid in ("VIXCLS", "DGS10", "DGS2", "DTWEXBGS")
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = fetch_macro_snapshot(
+            cache_path,
+            now=NOW,
+            ttl_hours=6,
+            include_cot=False,
+            session=_FailingSession(),  # type: ignore[arg-type]
+        )
+
+        assert snapshot.series == {}
+        assert any("cacheを鮮度証明できないため拒否" in warning for warning in snapshot.warnings)
+
+
+def test_macro_rejects_future_or_stale_observations_from_fresh_cache(tmp_path) -> None:
+    for label, observation_date in (("future", "2026-07-04"), ("stale", "2026-01-01")):
+        cache_path = tmp_path / f"observation-{label}.json"
+        body = f"DATE,VALUE\n{observation_date},1.0\n"
+        cache_path.write_text(
+            json.dumps(
+                {
+                    f"fred_{sid}": {"fetched_at": NOW.isoformat(), "body": body}
+                    for sid in ("VIXCLS", "DGS10", "DGS2", "DTWEXBGS")
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = fetch_macro_snapshot(cache_path, now=NOW, include_cot=False)
+
+        assert snapshot.series == {}
+        expected = "未来観測を拒否" if label == "future" else "が古い"
+        assert any(expected in warning for warning in snapshot.warnings)
 
 
 def test_coverage_reflects_fresh_data() -> None:

@@ -27,15 +27,17 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 import fcntl
 import hashlib
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import socket
 
+from .append_only import exclusive_sidecar_lock
 from .market import WEEKEND_CLOSURE, open_hours_between
 
 # 源B(外部履歴OHLC)の注入契約。
@@ -43,10 +45,21 @@ from .market import WEEKEND_CLOSURE, open_hours_between
 FuturePriceProvider = Callable[[str, str, datetime, float], float | None]
 SNAPSHOT_SCHEMA_VERSION = 2
 SNAPSHOT_CADENCE_SECONDS = 300
+MAX_AUTHORITATIVE_SOURCE_AGE = {
+    "15m": timedelta(minutes=45),
+    "1h": timedelta(hours=2),
+    "4h": timedelta(hours=8),
+    "1d": timedelta(hours=36),
+}
+JOURNAL_ORDER_CLOCK_FIELDS = ("ts", "capture_slot", "available_time", "ingested_time")
 
 
 class PriceHistoryWriteError(RuntimeError):
     """Raised when an append cannot preserve the single-writer journal contract."""
+
+
+class PriceHistoryReadError(RuntimeError):
+    """Raised when a price journal cannot be verified without guessing."""
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -54,9 +67,9 @@ def _parse_ts(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(str(value))
     except (TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def build_close_series(
@@ -70,6 +83,8 @@ def build_close_series(
     series: dict[tuple[str, str], list[tuple[datetime, float]]] = {}
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
+        if entry.get("ts") is not None and ts is None:
+            raise ValueError("price history timestamp must be valid and timezone-aware")
         close = entry.get("close")
         if ts is None or not isinstance(close, (int, float)) or isinstance(close, bool):
             continue
@@ -194,6 +209,90 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
     """
 
     target = Path(path)
+    with exclusive_sidecar_lock(target):
+        return _append_snapshot_entries_locked(target, rows)
+
+
+def read_snapshot_entries(
+    path: str | Path,
+    *,
+    as_of: datetime | None = None,
+) -> Iterator[dict[str, object]]:
+    """Read only verified schema-v2 snapshots under writer/migration locks.
+
+    Legacy or malformed rows are not silently accepted.  They must first be
+    preserved with ``prepare_v2_price_journal.py`` and a fresh v2 journal must be
+    started.  This keeps contaminated history out of learning and promotion.
+    """
+
+    cutoff: datetime | None = None
+    if as_of is not None:
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise PriceHistoryReadError("price journal as_of must be timezone-aware")
+        cutoff = as_of.astimezone(UTC)
+    target = Path(path)
+    with exclusive_sidecar_lock(target):
+        try:
+            handle = target.open(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise PriceHistoryReadError(f"cannot read price journal: {target}") from error
+        with handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                seen_keys: set[tuple[str, str, str]] = set()
+                last_clocks: dict[str, datetime] = {}
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    location = f"{target}:{line_number}"
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise PriceHistoryReadError(
+                            f"malformed price JSONL at {location}"
+                        ) from error
+                    if not isinstance(row, dict):
+                        raise PriceHistoryReadError(f"non-object price row at {location}")
+                    try:
+                        _verify_content_hash(row, location=location)
+                    except PriceHistoryWriteError as error:
+                        raise PriceHistoryReadError(str(error)) from error
+                    issues, timestamps = _snapshot_integrity_issues(row)
+                    if issues:
+                        raise PriceHistoryReadError(
+                            f"invalid price snapshot at {location}: {','.join(issues)}"
+                        )
+                    if cutoff is not None and any(value > cutoff for value in timestamps):
+                        raise PriceHistoryReadError(f"future price row beyond as_of at {location}")
+                    try:
+                        key = _snapshot_key(row)
+                    except PriceHistoryWriteError as error:
+                        raise PriceHistoryReadError(str(error)) from error
+                    if key in seen_keys:
+                        raise PriceHistoryReadError(
+                            f"duplicate price snapshot natural key {key} at {location}"
+                        )
+                    clocks = _journal_order_clocks(row)
+                    regressed = _regressed_journal_clock(last_clocks, clocks)
+                    if regressed is not None:
+                        raise PriceHistoryReadError(
+                            f"price snapshot {regressed} is not monotonic at {location}"
+                        )
+                    seen_keys.add(key)
+                    last_clocks = clocks
+                    yield row
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _append_snapshot_entries_locked(
+    target: Path,
+    rows: Sequence[Mapping[str, object]],
+) -> int:
+    """Write while the stable sidecar lock is held across replaceable inodes."""
+
     target.parent.mkdir(parents=True, exist_ok=True)
     appended = 0
     with target.open("a+", encoding="utf-8") as handle:
@@ -201,6 +300,7 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
         try:
             handle.seek(0)
             existing: dict[tuple[str, str, str], dict[str, object]] = {}
+            last_clocks: dict[str, datetime] = {}
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
@@ -212,17 +312,37 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
                     ) from error
                 if not isinstance(parsed, dict):
                     raise PriceHistoryWriteError(f"non-object JSONL row at {target}:{line_number}")
+                _verify_content_hash(parsed, location=f"{target}:{line_number}")
+                issues, _timestamps = _snapshot_integrity_issues(parsed)
+                if issues:
+                    raise PriceHistoryWriteError(
+                        f"invalid existing snapshot at {target}:{line_number}: {','.join(issues)}"
+                    )
                 key = _snapshot_key(parsed)
                 prior = existing.get(key)
-                if prior is not None and not _same_snapshot(prior, parsed):
+                if prior is not None:
                     raise PriceHistoryWriteError(
-                        f"conflicting existing snapshots for natural key {key}"
+                        f"duplicate existing snapshots for natural key {key}"
+                    )
+                clocks = _journal_order_clocks(parsed)
+                regressed = _regressed_journal_clock(last_clocks, clocks)
+                if regressed is not None:
+                    raise PriceHistoryWriteError(
+                        f"existing snapshot {regressed} is not monotonic at "
+                        f"{target}:{line_number}"
                     )
                 existing[key] = parsed
+                last_clocks = clocks
 
             pending: list[dict[str, object]] = []
-            for raw in rows:
+            for row_number, raw in enumerate(rows, start=1):
                 row = dict(raw)
+                _verify_content_hash(row, location=f"pending row {row_number}")
+                issues, _timestamps = _snapshot_integrity_issues(row)
+                if issues:
+                    raise PriceHistoryWriteError(
+                        f"invalid pending snapshot row {row_number}: {','.join(issues)}"
+                    )
                 key = _snapshot_key(row)
                 prior = existing.get(key)
                 if prior is not None:
@@ -231,8 +351,15 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
                             f"conflicting snapshot from duplicate writer for natural key {key}"
                         )
                     continue
+                clocks = _journal_order_clocks(row)
+                regressed = _regressed_journal_clock(last_clocks, clocks)
+                if regressed is not None:
+                    raise PriceHistoryWriteError(
+                        f"pending snapshot {regressed} is not monotonic at row {row_number}"
+                    )
                 existing[key] = row
                 pending.append(row)
+                last_clocks = clocks
 
             handle.seek(0, os.SEEK_END)
             for row in pending:
@@ -293,13 +420,32 @@ def _snapshot_row(
     elif bid > ask:
         flags.append("crossed_quote")
 
+    source_time = _aware_optional_timestamp(
+        snapshot.get("source_time") if isinstance(snapshot, Mapping) else None
+    )
+    available_time = _aware_optional_timestamp(
+        snapshot.get("available_time") if isinstance(snapshot, Mapping) else None
+    ) or datetime.fromisoformat(stamp)
+    ingested_time = _aware_optional_timestamp(
+        snapshot.get("ingested_time") if isinstance(snapshot, Mapping) else None
+    ) or datetime.fromisoformat(stamp)
+    source_record_id = (
+        str(snapshot.get("source_record_id") or "").strip() if isinstance(snapshot, Mapping) else ""
+    )
+    if source_time is None:
+        flags.extend(("source_time_unavailable", "event_time_unavailable"))
+    if not source_record_id:
+        flags.append("source_record_id_unavailable")
+
     row = {
         **core,
-        "event_time": stamp,
-        "available_time": stamp,
-        "ingested_time": stamp,
+        "event_time": source_time.isoformat() if source_time is not None else None,
+        "source_time": source_time.isoformat() if source_time is not None else None,
+        "available_time": available_time.astimezone(UTC).isoformat(),
+        "ingested_time": ingested_time.astimezone(UTC).isoformat(),
         "source": source,
-        "source_record_id": f"{symbol}:{timeframe}:{stamp}",
+        "source_record_id": source_record_id or None,
+        "local_record_id": f"{symbol}:{timeframe}:{stamp}",
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "run_id": run_id,
         "writer_id": writer_id,
@@ -311,11 +457,29 @@ def _snapshot_row(
     return row
 
 
+def _aware_optional_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        result = float(value)
+        return result if isfinite(result) else None
     return None
 
 
@@ -344,23 +508,30 @@ def _snapshot_key(row: Mapping[str, object]) -> tuple[str, str, str]:
 
 
 def _same_snapshot(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
-    left_writer = str(left.get("writer_id") or "").strip()
-    right_writer = str(right.get("writer_id") or "").strip()
-    if left_writer and right_writer and left_writer != right_writer:
-        return False
-    comparable = (
-        "open",
-        "high",
-        "low",
-        "close",
-        "bid",
-        "ask",
-        "spread",
-        "source",
-        "schema_version",
-        "ohlc_scope",
-    )
-    return all(left.get(key) == right.get(key) for key in comparable)
+    """Treat only a byte-semantics-equivalent retry as idempotent."""
+
+    left_hash = left.get("content_hash")
+    right_hash = right.get("content_hash")
+    return isinstance(left_hash, str) and left_hash == right_hash
+
+
+def _journal_order_clocks(row: Mapping[str, object]) -> dict[str, datetime]:
+    """Return clocks that must not move backward in physical journal order."""
+
+    clocks = {field: _parse_ts(row.get(field)) for field in JOURNAL_ORDER_CLOCK_FIELDS}
+    if any(value is None for value in clocks.values()):
+        raise PriceHistoryWriteError("snapshot row has an invalid journal-order clock")
+    return {field: value for field, value in clocks.items() if value is not None}
+
+
+def _regressed_journal_clock(
+    previous: Mapping[str, datetime],
+    current: Mapping[str, datetime],
+) -> str | None:
+    for field in JOURNAL_ORDER_CLOCK_FIELDS:
+        if field in previous and current[field] < previous[field]:
+            return field
+    return None
 
 
 def _content_hash(row: Mapping[str, object]) -> str:
@@ -373,3 +544,122 @@ def _content_hash(row: Mapping[str, object]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _verify_content_hash(row: Mapping[str, object], *, location: str) -> None:
+    """Fail closed unless ``row`` matches its canonical snapshot digest."""
+
+    supplied = row.get("content_hash")
+    if (
+        not isinstance(supplied, str)
+        or len(supplied) != 64
+        or any(character not in "0123456789abcdef" for character in supplied)
+    ):
+        raise PriceHistoryWriteError(f"invalid snapshot content_hash at {location}")
+    try:
+        expected = _content_hash(row)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise PriceHistoryWriteError(
+            f"snapshot cannot be canonically hashed at {location}"
+        ) from error
+    if supplied != expected:
+        raise PriceHistoryWriteError(f"snapshot content_hash mismatch at {location}")
+
+
+def _snapshot_integrity_issues(
+    row: Mapping[str, object],
+) -> tuple[list[str], list[datetime]]:
+    issues: list[str] = []
+    timestamps: list[datetime] = []
+    if row.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        issues.append("schema_version_not_v2")
+
+    flags = row.get("data_quality_flags")
+    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in flags):
+        issues.append("data_quality_flags_invalid")
+        flag_set: set[str] = set()
+    else:
+        flag_set = set(flags)
+
+    parsed_times: dict[str, datetime] = {}
+    for field in ("ts", "available_time", "ingested_time", "capture_slot"):
+        parsed = _parse_ts(row.get(field))
+        if parsed is None:
+            issues.append(f"{field}_invalid")
+        else:
+            parsed_times[field] = parsed
+            timestamps.append(parsed)
+    for field in ("event_time", "source_time"):
+        raw = row.get(field)
+        if raw is None:
+            if field == "source_time" and "source_time_unavailable" not in flag_set:
+                issues.append("source_time_missing_without_flag")
+            if field == "event_time" and "event_time_unavailable" not in flag_set:
+                issues.append("event_time_missing_without_flag")
+            continue
+        parsed = _parse_ts(raw)
+        if parsed is None:
+            issues.append(f"{field}_invalid")
+        else:
+            parsed_times[field] = parsed
+            timestamps.append(parsed)
+
+    available = parsed_times.get("available_time")
+    ingested = parsed_times.get("ingested_time")
+    source_time = parsed_times.get("source_time")
+    timestamp = parsed_times.get("ts")
+    capture_slot = parsed_times.get("capture_slot")
+    if timestamp is not None and capture_slot is not None:
+        expected_slot = datetime.fromisoformat(_capture_slot(timestamp.isoformat()))
+        if capture_slot != expected_slot:
+            issues.append("capture_slot_mismatch")
+    if available is not None and ingested is not None and available < ingested:
+        issues.append("available_before_ingestion")
+    if available is not None and source_time is not None and available < source_time:
+        issues.append("available_before_source")
+    timeframe = str(row.get("timeframe") or "").strip()
+    source_age_limit = MAX_AUTHORITATIVE_SOURCE_AGE.get(timeframe)
+    if (
+        available is not None
+        and source_time is not None
+        and source_age_limit is not None
+        and available - source_time > source_age_limit
+    ):
+        issues.append("authoritative_source_stale")
+
+    required_text = ("symbol", "timeframe", "source", "run_id", "writer_id", "local_record_id")
+    for field in required_text:
+        if not isinstance(row.get(field), str) or not str(row.get(field)).strip():
+            issues.append(f"{field}_missing")
+    source_record_id = row.get("source_record_id")
+    if not isinstance(source_record_id, str) or not source_record_id.strip():
+        if "source_record_id_unavailable" not in flag_set:
+            issues.append("source_record_id_missing_without_flag")
+
+    prices: dict[str, float] = {}
+    for field in ("open", "high", "low", "close", "bid", "ask", "spread"):
+        raw = row.get(field)
+        if raw is None:
+            continue
+        value = _number(raw)
+        if value is None or value <= 0:
+            issues.append(f"{field}_invalid")
+        else:
+            prices[field] = value
+    if "close" not in prices:
+        issues.append("close_missing")
+    high = prices.get("high")
+    low = prices.get("low")
+    if high is not None and low is not None and high < low:
+        issues.append("high_below_low")
+    if high is not None and any(prices.get(field, high) > high for field in ("open", "close")):
+        issues.append("price_above_high")
+    if low is not None and any(prices.get(field, low) < low for field in ("open", "close")):
+        issues.append("price_below_low")
+    bid = prices.get("bid")
+    ask = prices.get("ask")
+    if (bid is None) != (ask is None):
+        issues.append("partial_bid_ask")
+    elif bid is not None and ask is not None and bid > ask:
+        issues.append("crossed_quote")
+    return list(dict.fromkeys(issues)), timestamps

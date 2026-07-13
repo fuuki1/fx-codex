@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Iterable
+from datetime import timedelta
 
+import numpy as np
 import pandas as pd
 
 from fx_backtester.engine import BacktestConfig
@@ -90,12 +92,34 @@ def validate_backtest_inputs(
             errors.append(f"{inst.symbol} has duplicate timestamps")
         if not frame.index.is_monotonic_increasing:
             errors.append(f"{inst.symbol} timestamps must be sorted ascending")
+        if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
+            errors.append(f"{inst.symbol} timestamps must be timezone-aware UTC")
+        elif any(timestamp.utcoffset() != timedelta(0) for timestamp in frame.index):
+            errors.append(f"{inst.symbol} timestamps must be UTC")
+        try:
+            numeric_ohlc = frame[["open", "high", "low", "close"]].apply(
+                pd.to_numeric,
+                errors="raise",
+            )
+        except (TypeError, ValueError):
+            numeric_ohlc = None
+            errors.append(f"{inst.symbol} OHLC values must be numeric")
+        if numeric_ohlc is not None:
+            finite = np.isfinite(numeric_ohlc.to_numpy(dtype=float))
+            if not bool(finite.all()):
+                errors.append(f"{inst.symbol} OHLC values must be finite")
+            if bool((numeric_ohlc <= 0).any().any()):
+                errors.append(f"{inst.symbol} OHLC values must be positive")
         invalid_ohlc = (
-            (frame["high"] < frame["low"])
-            | (frame["open"] > frame["high"])
-            | (frame["open"] < frame["low"])
-            | (frame["close"] > frame["high"])
-            | (frame["close"] < frame["low"])
+            (
+                (numeric_ohlc["high"] < numeric_ohlc["low"])
+                | (numeric_ohlc["open"] > numeric_ohlc["high"])
+                | (numeric_ohlc["open"] < numeric_ohlc["low"])
+                | (numeric_ohlc["close"] > numeric_ohlc["high"])
+                | (numeric_ohlc["close"] < numeric_ohlc["low"])
+            )
+            if numeric_ohlc is not None
+            else pd.Series(False, index=frame.index)
         )
         if bool(invalid_ohlc.any()):
             errors.append(f"{inst.symbol} has invalid OHLC rows")

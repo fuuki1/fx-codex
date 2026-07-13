@@ -9,6 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel.append_only import canonical_row_hash
+from fx_intel import decision_log as dl
+from fx_intel import price_history as ph
+
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "decision_expectancy_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 
@@ -22,14 +26,22 @@ def monitor():
     return module
 
 
-def _decision_event(ts: datetime, index: int) -> dict:
-    return {
-        "schema": 2,
+def _decision_event(ts: datetime, _index: int) -> dict:
+    mode = "per_timeframe"
+    run_slot = ts.replace(
+        minute=ts.minute - ts.minute % dl.RUN_CADENCE_MINUTES,
+        second=0,
+        microsecond=0,
+    )
+    run_id = dl._run_id(run_slot, mode)
+    event = {
+        "schema": 3,
         "event_type": "chart_decision",
-        "decision_id": f"decision-{index}",
-        "run_id": "test-run",
+        "decision_id": dl._decision_id(run_id, mode, "USDJPY", "1h"),
+        "run_id": run_id,
+        "run_slot": run_slot.isoformat(),
         "ts": ts.isoformat(),
-        "mode": "per_timeframe",
+        "mode": mode,
         "symbol": "USDJPY",
         "timeframe": "1h",
         "horizon_hours": 1.0,
@@ -38,6 +50,7 @@ def _decision_event(ts: datetime, index: int) -> dict:
             "timeframe": "1h",
             "horizon_hours": 1.0,
             "direction": "long",
+            "action": "long",
             "conviction": 76,
             "tf_score": 0.62,
             "news_score": 0.15,
@@ -52,22 +65,36 @@ def _decision_event(ts: datetime, index: int) -> dict:
             "components": [{"key": "tech", "score": 0.62, "weight": 0.7}],
         },
     }
+    return dl._bind_notification_batch([event])[0]
 
 
-def _price(ts: datetime, close: float) -> dict:
-    return {
-        "ts": ts.isoformat(),
-        "symbol": "USDJPY",
-        "timeframe": "1h",
-        "close": close,
-        "high": close + 0.05,
-        "low": close - 0.05,
-    }
+def _price(ts: datetime, close: float, *, symbol: str = "USDJPY") -> dict:
+    return ph.snapshot_entries(
+        {
+            symbol: {
+                "1h": {
+                    "close": close,
+                    "high": close + 0.05,
+                    "low": close - 0.05,
+                }
+            }
+        },
+        now=ts,
+        run_id=f"test-{ts.isoformat()}",
+        writer_id="test-writer",
+    )[0]
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    prepared: list[dict] = []
+    for row in rows:
+        candidate = dict(row)
+        schema = candidate.get("schema_version", candidate.get("schema"))
+        if isinstance(schema, int) and schema >= 2 and "content_hash" not in candidate:
+            candidate["content_hash"] = canonical_row_hash(candidate)
+        prepared.append(candidate)
     path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in prepared) + "\n",
         encoding="utf-8",
     )
 
@@ -135,14 +162,7 @@ def test_decision_expectancy_monitor_marks_immature_horizon_pending(
     _write_jsonl(decision_log_path, [_decision_event(NOW, 1)])
     _write_jsonl(
         prices_path,
-        [
-            {
-                "ts": (NOW + timedelta(minutes=30)).isoformat(),
-                "symbol": "EURUSD",
-                "timeframe": "1h",
-                "close": 1.2,
-            }
-        ],
+        [_price(NOW + timedelta(minutes=30), 1.2, symbol="EURUSD")],
     )
 
     result = monitor.run_decision_expectancy_monitor(

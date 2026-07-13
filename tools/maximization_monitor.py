@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fx_intel import journal, maximization, trade_outcome  # noqa: E402
+from fx_intel import journal, maximization, price_history, trade_outcome  # noqa: E402
 
 DEFAULT_TF_JOURNAL_PATH = REPO_ROOT / "logs" / "briefing_tf_journal.jsonl"
 DEFAULT_TF_PRICES_PATH = REPO_ROOT / "logs" / "briefing_tf_prices.jsonl"
@@ -41,8 +41,8 @@ def run_maximization_monitor(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     generated_at = _utc(now or datetime.now(UTC))
-    entries = list(journal.read_entries(journal_path))
-    price_rows = list(journal.read_entries(prices_path))
+    entries = list(journal.read_entries(journal_path, as_of=generated_at))
+    price_rows = list(price_history.read_snapshot_entries(prices_path, as_of=generated_at))
     scoring_entries = entries + price_rows
 
     profile = maximization.derive_timeframe_maximization(

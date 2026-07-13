@@ -349,9 +349,9 @@ def _parse_ts(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(str(value))
     except (TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def thin_calls(calls: Sequence[EvaluatedCall], min_gap_hours: float) -> list[EvaluatedCall]:
@@ -399,6 +399,8 @@ HORIZONS: tuple[HorizonSpec, ...] = (
 def horizon_report_ja(
     entries: Iterable[dict],
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
+    *,
+    as_of: datetime | None = None,
 ) -> str:
     """ホライズン別(短期4h/主24h/スイング72h)の方向的中率1行。データ無しは空文字。"""
     materialized = list(entries)
@@ -409,6 +411,7 @@ def horizon_report_ja(
             materialized,
             horizon_hours=spec.hours,
             tolerance_hours=spec.tolerance_hours,
+            as_of=as_of,
         )
         if thin_gap_hours > 0:
             calls = thin_calls(calls, thin_gap_hours)
@@ -429,6 +432,8 @@ def evaluate_history(
     horizon_hours: float = DEFAULT_HORIZON_HOURS,
     tolerance_hours: float = DEFAULT_TOLERANCE_HOURS,
     atr_fraction: float = DEFAULT_ATR_FRACTION,
+    *,
+    as_of: datetime | None = None,
 ) -> list[EvaluatedCall]:
     """ジャーナル履歴内の全方向判断を、後続エントリの終値で採点する。
 
@@ -437,12 +442,22 @@ def evaluate_history(
     値動きが記録時ATR×atr_fraction未満ならflat(判定除外)。
     将来価格がまだ無い判断(未成熟)は結果に含めない。
     """
+    cutoff: datetime | None = None
+    if as_of is not None:
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        cutoff = as_of.astimezone(UTC)
+
     parsed: list[tuple[datetime, dict]] = []
     prices: dict[str, list[tuple[datetime, float]]] = {}
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
         if ts is None:
+            if cutoff is not None:
+                raise ValueError("learning entry timestamp must be valid and timezone-aware")
             continue
+        if cutoff is not None and ts > cutoff:
+            raise ValueError("learning entry is later than as_of")
         parsed.append((ts, entry))
         close = entry.get("close")
         if isinstance(close, (int, float)):

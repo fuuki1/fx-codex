@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import price_history as ph
+from fx_intel.append_only import canonical_row_hash
+
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "maximization_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 
@@ -39,21 +42,24 @@ def _decision(ts: datetime) -> dict:
 
 
 def _price(ts: datetime, close: float) -> dict:
-    return {
-        "ts": ts.isoformat(),
-        "symbol": "USDJPY",
-        "timeframe": "1h",
-        "direction": "neutral",
-        "conviction": 0,
-        "close": close,
-        "atr": 1.0,
-        "data_quality": 1.0,
-    }
+    return ph.snapshot_entries(
+        {"USDJPY": {"1h": {"close": close}}},
+        now=ts,
+        run_id=f"test-{ts.isoformat()}",
+        writer_id="test-writer",
+    )[0]
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    prepared: list[dict] = []
+    for row in rows:
+        candidate = dict(row)
+        if "content_hash" not in candidate:
+            candidate["schema_version"] = 2
+            candidate["content_hash"] = canonical_row_hash(candidate)
+        prepared.append(candidate)
     path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in prepared) + "\n",
         encoding="utf-8",
     )
 

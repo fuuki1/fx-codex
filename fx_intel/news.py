@@ -130,8 +130,10 @@ def _parse_pubdate(text: str) -> datetime | None:
             parsed = datetime.fromisoformat(text)
         except ValueError:
             return None
+    # RSS dates without an offset are ambiguous around DST and cannot prove when
+    # the article was available.  Do not guess UTC at the source boundary.
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        return None
     return parsed.astimezone(UTC)
 
 
@@ -208,12 +210,20 @@ def fetch_news_for_symbols(
     max_items: int = 60,
     timeout: float = 15.0,
     session: requests.Session | None = None,
+    *,
+    as_of: datetime | None = None,
+    max_future_skew_seconds: float = 0.0,
 ) -> tuple[list[NewsItem], list[str]]:
     """対象ペアに関連するニュースを収集する。
 
     戻り値は (ニュース一覧, 取得失敗ソースの警告一覧)。
     一部ソースが落ちていても残りで分析を継続する。
     """
+    if hours_back < 0 or max_items < 1 or max_future_skew_seconds < 0:
+        raise ValueError("news freshness thresholds are invalid")
+    if as_of is not None and as_of.tzinfo is None:
+        raise ValueError("news as_of must be timezone-aware")
+
     collected: list[NewsItem] = []
     warnings: list[str] = []
 
@@ -234,6 +244,16 @@ def fetch_news_for_symbols(
         except Exception as error:  # noqa: BLE001 - 外部フィード起因
             warnings.append(f"Google News({cleaned})取得失敗: {error}")
 
-    cutoff = datetime.now(UTC) - timedelta(hours=hours_back)
-    fresh = [item for item in dedupe_and_sort(collected) if item.published >= cutoff]
+    # Resolve the cutoff only after every network request has completed.  An
+    # article acquired during the run may legitimately be newer than the run's
+    # start time, while a source-dated article beyond this boundary is future
+    # information and must not enter the decision features.
+    observed_at = (as_of or datetime.now(UTC)).astimezone(UTC)
+    cutoff = observed_at - timedelta(hours=hours_back)
+    future_limit = observed_at + timedelta(seconds=max_future_skew_seconds)
+    ordered = dedupe_and_sort(collected)
+    future_count = sum(item.published > future_limit for item in ordered)
+    if future_count:
+        warnings.append(f"未来時刻のニュースを隔離: {future_count}件")
+    fresh = [item for item in ordered if cutoff <= item.published <= future_limit]
     return fresh[:max_items], warnings

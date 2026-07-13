@@ -12,6 +12,8 @@ launchd(com.fx-codex.health)から5分間隔のワンショットで起動され
 - Discord送信失敗はWARNINGログを残すだけで監視自体は失敗させない
   (通知経路の障害がデータ収集や監視の停止に波及しない)
 - 状態・レポートのJSON書込みは tmp→fsync→atomic rename で破損を防ぐ
+- 鮮度はfilesystem mtimeとpayload内の設定済みtimestampの古い方で判定する。
+  mtime更新で古い観測値を新鮮に見せられない
 - 欠損は隠さない: 監視レポートに age_seconds / last_ok / 遷移履歴を必ず残す
 """
 
@@ -20,7 +22,9 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
+import hashlib
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import socket
@@ -52,11 +56,59 @@ NotifySender = Callable[[str, dict], bool]
 class TargetConfig:
     name: str
     path: str
+    timestamp_field: str
     kind: str = "jsonl"
     expected_interval_seconds: float = 3600.0
     warn_after_seconds: float = 7200.0
     critical_after_seconds: float | None = 21600.0
     manual_action_ja: str = ""
+    require_content_hash: bool = False
+    expected_key_fields: tuple[str, ...] = ()
+    expected_keys: tuple[tuple[str, ...], ...] = ()
+    unchanged_value_fields: tuple[str, ...] = ()
+    max_unchanged_observations: int | None = None
+    lookback_records: int = 2048
+    source_timestamp_field: str = ""
+    source_warn_after_seconds: float | None = None
+    source_critical_after_seconds: float | None = None
+    source_timestamp_missing_status: str = STATUS_WARNING
+
+    def __post_init__(self) -> None:
+        expected = _finite_float(self.expected_interval_seconds, "expected_interval_seconds")
+        warning = _finite_float(self.warn_after_seconds, "warn_after_seconds")
+        critical = (
+            _finite_float(self.critical_after_seconds, "critical_after_seconds")
+            if self.critical_after_seconds is not None
+            else None
+        )
+        if expected <= 0 or warning <= expected:
+            raise ValueError("freshness thresholds require 0 < expected_interval < warn_after")
+        if critical is not None and critical <= warning:
+            raise ValueError("critical_after_seconds must exceed warn_after_seconds")
+        source_warning = (
+            _finite_float(self.source_warn_after_seconds, "source_warn_after_seconds")
+            if self.source_warn_after_seconds is not None
+            else None
+        )
+        source_critical = (
+            _finite_float(self.source_critical_after_seconds, "source_critical_after_seconds")
+            if self.source_critical_after_seconds is not None
+            else None
+        )
+        if not self.source_timestamp_field and (
+            source_warning is not None or source_critical is not None
+        ):
+            raise ValueError("source staleness thresholds require source_timestamp_field")
+        if source_warning is not None and source_warning <= 0:
+            raise ValueError("source_warn_after_seconds must be positive")
+        if source_critical is not None and (
+            source_warning is None or source_critical <= source_warning
+        ):
+            raise ValueError(
+                "source_critical_after_seconds requires and must exceed source_warn_after_seconds"
+            )
+        if self.source_timestamp_missing_status not in {STATUS_WARNING, STATUS_CRITICAL}:
+            raise ValueError("source_timestamp_missing_status must be warning or critical")
 
 
 @dataclass
@@ -68,11 +120,15 @@ class TargetResult:
     status: str = STATUS_OK
     reason: str = ""
     last_update: str | None = None
+    record_timestamp: str | None = None
+    file_mtime: str | None = None
+    timestamp_field: str = ""
     age_seconds: float | None = None
     expected_interval_seconds: float = 0.0
     warn_after_seconds: float = 0.0
     critical_after_seconds: float | None = None
     manual_action_ja: str = ""
+    quality_details: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -81,11 +137,15 @@ class TargetResult:
             "status": self.status,
             "reason": self.reason,
             "last_update": self.last_update,
+            "record_timestamp": self.record_timestamp,
+            "file_mtime": self.file_mtime,
+            "timestamp_field": self.timestamp_field,
             "age_seconds": self.age_seconds,
             "expected_interval_seconds": self.expected_interval_seconds,
             "warn_after_seconds": self.warn_after_seconds,
             "critical_after_seconds": self.critical_after_seconds,
             "manual_action_ja": self.manual_action_ja,
+            "quality_details": self.quality_details,
         }
 
 
@@ -137,34 +197,178 @@ def _opt_str(value: object) -> str | None:
 
 
 def _opt_int(value: object) -> int:
-    return int(value) if isinstance(value, (int, float)) else 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    numeric = float(value)
+    return max(0, int(numeric)) if isfinite(numeric) else 0
+
+
+def _finite_float(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{label} must be a finite number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite number") from error
+    if not isfinite(numeric):
+        raise ValueError(f"{label} must be a finite number")
+    return numeric
 
 
 def load_config(path: str | Path) -> tuple[list[TargetConfig], float]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    cooldown = float(payload.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS))
+    if not isinstance(payload, Mapping):
+        raise ValueError("freshness config must be a JSON object")
+    cooldown = _finite_float(
+        payload.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS),
+        "cooldown_seconds",
+    )
+    if cooldown <= 0:
+        raise ValueError("cooldown_seconds must be positive")
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise ValueError("freshness config requires at least one target")
     targets: list[TargetConfig] = []
-    for row in payload.get("targets", []):
+    for row in raw_targets:
+        if not isinstance(row, Mapping):
+            raise ValueError("freshness target must be a JSON object")
         critical_raw = row.get("critical_after_seconds")
+        timestamp_field = str(row.get("timestamp_field", "")).strip()
+        if not timestamp_field:
+            raise ValueError(f"freshness target {row.get('name')!r} requires timestamp_field")
+        kind = str(row.get("kind", "jsonl"))
+        if kind not in {"json", "jsonl"}:
+            raise ValueError(f"unsupported freshness target kind: {kind!r}")
+        expected_interval = _finite_float(
+            row.get("expected_interval_seconds", 3600),
+            "expected_interval_seconds",
+        )
+        warn_after = _finite_float(row.get("warn_after_seconds", 7200), "warn_after_seconds")
+        critical_after = (
+            _finite_float(critical_raw, "critical_after_seconds")
+            if critical_raw is not None
+            else None
+        )
+        if expected_interval <= 0 or warn_after <= expected_interval:
+            raise ValueError("freshness thresholds require 0 < expected_interval < warn_after")
+        if critical_after is not None and critical_after <= warn_after:
+            raise ValueError("critical_after_seconds must exceed warn_after_seconds")
+
+        key_fields = _field_names(row.get("expected_key_fields"))
+        expected_keys = _expected_keys(row.get("expected_keys"), len(key_fields))
+        unchanged_fields = _field_names(row.get("unchanged_value_fields"))
+        unchanged_limit_raw = row.get("max_unchanged_observations")
+        unchanged_limit = (
+            _positive_int(unchanged_limit_raw, "max_unchanged_observations")
+            if unchanged_limit_raw is not None
+            else None
+        )
+        lookback = _positive_int(row.get("lookback_records", 2048), "lookback_records")
+        source_timestamp_field = str(row.get("source_timestamp_field", "")).strip()
+        source_warn_raw = row.get("source_warn_after_seconds")
+        source_critical_raw = row.get("source_critical_after_seconds")
+        source_missing_status = (
+            str(row.get("source_timestamp_missing_status", STATUS_WARNING)).strip().lower()
+        )
+        if source_missing_status not in {STATUS_WARNING, STATUS_CRITICAL}:
+            raise ValueError("source_timestamp_missing_status must be warning or critical")
+        source_warn = (
+            _finite_float(source_warn_raw, "source_warn_after_seconds")
+            if source_warn_raw is not None
+            else None
+        )
+        source_critical = (
+            _finite_float(source_critical_raw, "source_critical_after_seconds")
+            if source_critical_raw is not None
+            else None
+        )
+        if not source_timestamp_field and (source_warn is not None or source_critical is not None):
+            raise ValueError("source staleness thresholds require source_timestamp_field")
+        if source_timestamp_field:
+            source_warn = warn_after if source_warn is None else source_warn
+            source_critical = critical_after if source_critical is None else source_critical
+            if source_warn <= 0:
+                raise ValueError("source_warn_after_seconds must be positive")
+            if source_critical is not None and source_critical <= source_warn:
+                raise ValueError(
+                    "source_critical_after_seconds must exceed source_warn_after_seconds"
+                )
+        if bool(key_fields) != bool(expected_keys):
+            raise ValueError("expected_key_fields and expected_keys must be configured together")
+        if unchanged_limit is not None:
+            if kind != "jsonl" or not key_fields or not unchanged_fields:
+                raise ValueError("unchanged checks require JSONL, expected keys, and value fields")
+            if unchanged_limit < 2 or lookback < unchanged_limit:
+                raise ValueError("unchanged lookback/limit is invalid")
         targets.append(
             TargetConfig(
                 name=str(row["name"]),
                 path=str(row["path"]),
-                kind=str(row.get("kind", "jsonl")),
-                expected_interval_seconds=float(row.get("expected_interval_seconds", 3600)),
-                warn_after_seconds=float(row.get("warn_after_seconds", 7200)),
-                critical_after_seconds=(float(critical_raw) if critical_raw is not None else None),
+                timestamp_field=timestamp_field,
+                kind=kind,
+                expected_interval_seconds=expected_interval,
+                warn_after_seconds=warn_after,
+                critical_after_seconds=critical_after,
                 manual_action_ja=str(row.get("manual_action_ja", "")),
+                require_content_hash=bool(row.get("require_content_hash", False)),
+                expected_key_fields=key_fields,
+                expected_keys=expected_keys,
+                unchanged_value_fields=unchanged_fields,
+                max_unchanged_observations=unchanged_limit,
+                lookback_records=lookback,
+                source_timestamp_field=source_timestamp_field,
+                source_warn_after_seconds=source_warn,
+                source_critical_after_seconds=source_critical,
+                source_timestamp_missing_status=source_missing_status,
             )
         )
     return targets, cooldown
 
 
+def _field_names(raw: object) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("freshness field lists must be non-empty arrays")
+    values = tuple(str(value).strip() for value in raw)
+    if any(not value for value in values) or len(values) != len(set(values)):
+        raise ValueError("freshness field names must be unique and non-empty")
+    return values
+
+
+def _expected_keys(raw: object, width: int) -> tuple[tuple[str, ...], ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not raw or width <= 0:
+        raise ValueError("expected_keys requires expected_key_fields")
+    keys: list[tuple[str, ...]] = []
+    for item in raw:
+        if not isinstance(item, list) or len(item) != width:
+            raise ValueError("each expected key must match expected_key_fields")
+        key = tuple(str(value).strip() for value in item)
+        if any(not value for value in key):
+            raise ValueError("expected key values must be non-empty")
+        keys.append(key)
+    if len(keys) != len(set(keys)):
+        raise ValueError("expected_keys must be unique")
+    return tuple(keys)
+
+
+def _positive_int(raw: object, label: str) -> int:
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return raw
+
+
 def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResult:
-    """1対象の存在・鮮度・末尾破損をチェックする(通知はしない)。"""
+    """1対象の存在・payload timestamp・mtimeをfail closedで検証する。"""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    now = now.astimezone(UTC)
     result = TargetResult(
         name=target.name,
         path=target.path,
+        timestamp_field=target.timestamp_field,
         expected_interval_seconds=target.expected_interval_seconds,
         warn_after_seconds=target.warn_after_seconds,
         critical_after_seconds=target.critical_after_seconds,
@@ -175,10 +379,58 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
         result.status = STATUS_CRITICAL
         result.reason = "file_missing"
         return result
+    if not file_path.is_file():
+        result.status = STATUS_CRITICAL
+        result.reason = "file_not_regular"
+        return result
 
-    mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=UTC)
-    age = (now - mtime).total_seconds()
-    result.last_update = mtime.isoformat()
+    try:
+        mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=UTC)
+    except OSError:
+        result.status = STATUS_CRITICAL
+        result.reason = "file_unreadable"
+        return result
+    result.file_mtime = mtime.isoformat()
+    mtime_age = (now - mtime).total_seconds()
+    if mtime_age < 0:
+        result.status = STATUS_CRITICAL
+        result.reason = "mtime_future"
+        result.last_update = mtime.isoformat()
+        result.age_seconds = round(mtime_age, 1)
+        return result
+
+    payload, payload_error = _read_target_payload(file_path, target.kind)
+    if payload_error:
+        result.status = STATUS_CRITICAL
+        result.reason = payload_error
+        return result
+    assert payload is not None
+    hash_error = _payload_hash_error(payload, required=target.require_content_hash)
+    if hash_error:
+        result.status = STATUS_CRITICAL
+        result.reason = hash_error
+        return result
+
+    record_timestamp, timestamp_error = _payload_timestamp(payload, target.timestamp_field)
+    if timestamp_error:
+        result.status = STATUS_CRITICAL
+        result.reason = timestamp_error
+        return result
+    assert record_timestamp is not None
+    result.record_timestamp = record_timestamp.isoformat()
+    record_age = (now - record_timestamp).total_seconds()
+    if record_age < 0:
+        result.status = STATUS_CRITICAL
+        result.reason = "timestamp_future"
+        result.last_update = record_timestamp.isoformat()
+        result.age_seconds = round(record_age, 1)
+        return result
+
+    # 両方が新鮮であることを必須とする。touch/copyでmtimeだけ更新しても
+    # 古いrecordは古いまま。逆に古いmtimeも配置/復元異常として残る。
+    effective_update = min(record_timestamp, mtime)
+    age = max(record_age, mtime_age)
+    result.last_update = effective_update.isoformat()
     result.age_seconds = round(age, 1)
 
     if target.critical_after_seconds is not None and age > target.critical_after_seconds:
@@ -187,31 +439,310 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
     elif age > target.warn_after_seconds:
         result.status = STATUS_WARNING
         result.reason = "stale_warning"
-
-    # JSONLの末尾行が壊れていたら書込み途中クラッシュや破損の兆候(鮮度より優先)
     if target.kind == "jsonl":
-        tail = _read_last_nonempty_line(file_path)
-        if tail is not None:
-            try:
-                json.loads(tail)
-            except json.JSONDecodeError:
-                result.status = STATUS_CRITICAL
-                result.reason = "jsonl_corrupt_tail"
+        recent_status, recent_reason, recent_details = _check_recent_integrity(
+            file_path, target, now
+        )
+        result.quality_details.extend(recent_details)
+        if STATUS_ORDER[recent_status] > STATUS_ORDER[result.status]:
+            result.status = recent_status
+            result.reason = recent_reason
+        elif recent_status == result.status and recent_reason:
+            result.reason = recent_reason
+    if target.expected_keys:
+        series_status, series_reason, details = _check_expected_series(file_path, target, now)
+        result.quality_details.extend(details)
+        if STATUS_ORDER[series_status] > STATUS_ORDER[result.status]:
+            result.status = series_status
+            result.reason = series_reason
+        elif series_status == result.status and series_reason:
+            result.reason = series_reason
     return result
+
+
+def _check_recent_integrity(
+    path: Path,
+    target: TargetConfig,
+    now: datetime,
+) -> tuple[str, str, list[str]]:
+    """Verify the bounded recent history, including hidden secondary clocks."""
+
+    try:
+        lines = _read_recent_nonempty_lines(path, target.lookback_records)
+    except (OSError, UnicodeError):
+        return STATUS_CRITICAL, "file_unreadable", []
+    if not lines:
+        return STATUS_CRITICAL, "jsonl_empty", []
+
+    timestamp_fields = (
+        "ts",
+        "event_time",
+        "available_time",
+        "ingested_time",
+        "published_time",
+        "revision_time",
+        "source_time",
+    )
+    latest: dict[tuple[str, ...], tuple[datetime, Mapping[str, object], dict[str, datetime]]] = {}
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return STATUS_CRITICAL, "jsonl_corrupt_recent", []
+        if not isinstance(payload, Mapping):
+            return STATUS_CRITICAL, "payload_not_object", []
+        hash_error = _payload_hash_error(payload, required=target.require_content_hash)
+        if hash_error:
+            return STATUS_CRITICAL, f"recent_{hash_error}", []
+        record_time, timestamp_error = _payload_timestamp(payload, target.timestamp_field)
+        if timestamp_error or record_time is None:
+            return STATUS_CRITICAL, f"recent_{timestamp_error or 'timestamp_invalid'}", []
+        if record_time > now:
+            return STATUS_CRITICAL, "recent_timestamp_future", []
+
+        parsed: dict[str, datetime] = {}
+        for timestamp_column in timestamp_fields:
+            raw = payload.get(timestamp_column)
+            if raw is None:
+                continue
+            value, error = _payload_timestamp(payload, timestamp_column)
+            if error or value is None:
+                return (
+                    STATUS_CRITICAL,
+                    f"recent_{timestamp_column}_{error or 'invalid'}",
+                    [],
+                )
+            if value > now:
+                return STATUS_CRITICAL, f"recent_{timestamp_column}_future", []
+            parsed[timestamp_column] = value
+        available = parsed.get("available_time")
+        if available is not None:
+            for field in (
+                "event_time",
+                "ingested_time",
+                "published_time",
+                "revision_time",
+                "source_time",
+            ):
+                value = parsed.get(field)
+                if value is not None and value > available:
+                    return STATUS_CRITICAL, f"recent_{field}_after_available", []
+
+        key = (
+            tuple(str(payload.get(field, "")).strip() for field in target.expected_key_fields)
+            if target.expected_key_fields
+            else ("__target__",)
+        )
+        prior = latest.get(key)
+        if prior is None or record_time > prior[0]:
+            latest[key] = (record_time, payload, parsed)
+
+    if not target.source_timestamp_field:
+        return STATUS_OK, "", []
+
+    details: list[str] = []
+    status = STATUS_OK
+    reason = ""
+    for key, (_record_time, payload, parsed) in sorted(latest.items()):
+        label = ",".join(key)
+        source_raw = payload.get(target.source_timestamp_field)
+        if source_raw is None:
+            details.append(f"{label}: {target.source_timestamp_field}_unavailable")
+            if STATUS_ORDER[target.source_timestamp_missing_status] > STATUS_ORDER[status]:
+                status = target.source_timestamp_missing_status
+                reason = "source_timestamp_missing"
+            continue
+        source_time = parsed.get(target.source_timestamp_field)
+        if source_time is None:
+            return STATUS_CRITICAL, "source_timestamp_invalid", details
+        age = (now - source_time).total_seconds()
+        if (
+            target.source_critical_after_seconds is not None
+            and age > target.source_critical_after_seconds
+        ):
+            status = STATUS_CRITICAL
+            reason = "source_stale_critical"
+            details.append(f"{label}: source_age_seconds={age:.1f}")
+        elif (
+            target.source_warn_after_seconds is not None
+            and age > target.source_warn_after_seconds
+            and status != STATUS_CRITICAL
+        ):
+            status = STATUS_WARNING
+            reason = "source_stale_warning"
+            details.append(f"{label}: source_age_seconds={age:.1f}")
+    return status, reason, details
 
 
 def _read_last_nonempty_line(path: Path, chunk: int = 65536) -> str | None:
     """ファイル全体を読まずに末尾の非空行を返す(ジャーナルは数MBに育つため)。"""
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - chunk))
-            data = handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - chunk))
+        data = handle.read().decode("utf-8")
     lines = [line for line in data.splitlines() if line.strip()]
     return lines[-1] if lines else None
+
+
+def _read_recent_nonempty_lines(
+    path: Path,
+    max_lines: int,
+    *,
+    chunk: int = 65536,
+) -> list[str]:
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        data = b""
+        while position > 0 and data.count(b"\n") < max_lines + 1:
+            amount = min(chunk, position)
+            position -= amount
+            handle.seek(position)
+            data = handle.read(amount) + data
+    if position > 0:
+        newline = data.find(b"\n")
+        data = data[newline + 1 :] if newline >= 0 else b""
+    return [line for line in data.decode("utf-8").splitlines() if line.strip()][-max_lines:]
+
+
+def _payload_hash_error(payload: Mapping[str, object], *, required: bool) -> str:
+    supplied = payload.get("content_hash")
+    if supplied is None:
+        return "content_hash_missing" if required else ""
+    if not isinstance(supplied, str) or len(supplied) != 64:
+        return "content_hash_invalid"
+    canonical = {str(key): value for key, value in payload.items() if key != "content_hash"}
+    try:
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return "content_hash_unverifiable"
+    expected = hashlib.sha256(encoded).hexdigest()
+    return "" if supplied == expected else "content_hash_mismatch"
+
+
+def _check_expected_series(
+    path: Path,
+    target: TargetConfig,
+    now: datetime,
+) -> tuple[str, str, list[str]]:
+    try:
+        lines = _read_recent_nonempty_lines(path, target.lookback_records)
+    except (OSError, UnicodeError):
+        return STATUS_CRITICAL, "file_unreadable", []
+
+    observations: list[tuple[datetime, tuple[str, ...], tuple[object, ...]]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return STATUS_CRITICAL, "jsonl_corrupt_recent", []
+        if not isinstance(payload, Mapping):
+            return STATUS_CRITICAL, "payload_not_object", []
+        hash_error = _payload_hash_error(payload, required=target.require_content_hash)
+        if hash_error:
+            return STATUS_CRITICAL, f"recent_{hash_error}", []
+        timestamp, timestamp_error = _payload_timestamp(payload, target.timestamp_field)
+        if timestamp_error or timestamp is None:
+            return STATUS_CRITICAL, f"recent_{timestamp_error or 'timestamp_invalid'}", []
+        if timestamp > now:
+            return STATUS_CRITICAL, "recent_timestamp_future", []
+        key = tuple(str(payload.get(field, "")).strip() for field in target.expected_key_fields)
+        if any(not value for value in key):
+            return STATUS_CRITICAL, "expected_key_missing_field", []
+        values = tuple(payload.get(field) for field in target.unchanged_value_fields)
+        observations.append((timestamp, key, values))
+
+    expected = set(target.expected_keys)
+    latest: dict[tuple[str, ...], datetime] = {}
+    latest_value: dict[tuple[str, ...], tuple[object, ...]] = {}
+    unchanged_count: dict[tuple[str, ...], int] = {}
+    closed: set[tuple[str, ...]] = set()
+    for timestamp, key, values in reversed(observations):
+        if key not in expected or key in closed:
+            continue
+        if key not in latest:
+            latest[key] = timestamp
+            latest_value[key] = values
+            unchanged_count[key] = 1
+        elif latest_value[key] == values:
+            unchanged_count[key] += 1
+        else:
+            closed.add(key)
+
+    missing = sorted(expected - set(latest))
+    if missing:
+        missing_details = ["missing=" + ",".join(key) for key in missing]
+        return STATUS_CRITICAL, "expected_key_missing", missing_details
+
+    details: list[str] = []
+    status = STATUS_OK
+    reason = ""
+    for key in sorted(expected):
+        key_label = ",".join(key)
+        age = (now - latest[key]).total_seconds()
+        if target.critical_after_seconds is not None and age > target.critical_after_seconds:
+            status = STATUS_CRITICAL
+            reason = "expected_key_stale_critical"
+            details.append(f"{key_label}: age_seconds={age:.1f}")
+        elif age > target.warn_after_seconds and status != STATUS_CRITICAL:
+            status = STATUS_WARNING
+            reason = "expected_key_stale_warning"
+            details.append(f"{key_label}: age_seconds={age:.1f}")
+        if (
+            target.max_unchanged_observations is not None
+            and unchanged_count[key] >= target.max_unchanged_observations
+        ):
+            status = STATUS_CRITICAL
+            reason = "payload_unchanged"
+            details.append(f"{key_label}: identical_observations={unchanged_count[key]}")
+    return status, reason, details
+
+
+def _read_target_payload(path: Path, kind: str) -> tuple[Mapping[str, object] | None, str]:
+    """Read the authoritative payload and return a fail-closed reason on any ambiguity."""
+    try:
+        if kind == "jsonl":
+            tail = _read_last_nonempty_line(path)
+            if tail is None:
+                return None, "jsonl_empty"
+            try:
+                payload = json.loads(tail)
+            except json.JSONDecodeError:
+                return None, "jsonl_corrupt_tail"
+        elif kind == "json":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None, "json_corrupt"
+        else:
+            return None, "unsupported_kind"
+    except (OSError, UnicodeError):
+        return None, "file_unreadable"
+    if not isinstance(payload, Mapping):
+        return None, "payload_not_object"
+    return payload, ""
+
+
+def _payload_timestamp(
+    payload: Mapping[str, object], timestamp_field: str
+) -> tuple[datetime | None, str]:
+    raw = payload.get(timestamp_field)
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "timestamp_missing"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None, "timestamp_invalid"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, "timestamp_naive"
+    return parsed.astimezone(UTC), ""
 
 
 def evaluate(
@@ -367,7 +898,12 @@ def send_discord(webhook_url: str, payload: dict) -> bool:
         response = requests.post(webhook_url, json=payload, timeout=15)
         return 200 <= response.status_code < 300
     except Exception as exc:  # noqa: BLE001 - 通知失敗が監視を殺してはいけない
-        print(f"[freshness] Discord送信失敗: {exc}", file=sys.stderr)
+        # requests例外の文字列にはwebhook path/tokenが含まれ得る。
+        # 例外型以外は永続ログへ出さない。
+        print(
+            f"[freshness] Discord送信失敗: {type(exc).__name__}",
+            file=sys.stderr,
+        )
         return False
 
 

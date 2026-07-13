@@ -607,7 +607,7 @@ def test_plan_embed_shows_actual_weights() -> None:
         news_weight=0.30,
     )
     embed = briefing._plan_embed(plan, 20, 100)
-    judgement = next(f for f in embed["fields"] if f["name"] == "判断")
+    judgement = next(f for f in embed["fields"] if f["name"] == "最終判断")
     assert "(70%)" in judgement["value"]
     assert "(30%)" in judgement["value"]
 

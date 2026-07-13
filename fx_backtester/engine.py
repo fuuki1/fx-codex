@@ -121,6 +121,12 @@ class BacktestEngine:
             self._advance_cooldowns(entry_cooldowns)
             current_bars = self._bars_at(prepared, timestamp)
             open_conversion_rates = self._conversion_rates(current_bars, last_prices, "open")
+            # Establish day/week/month risk baselines from information available at
+            # the bar open.  Using this bar's close would let an overnight position's
+            # first loss of the new period reset its own loss threshold.
+            for symbol, row in current_bars.items():
+                last_prices[symbol] = float(row["open"])
+            self.risk.on_bar(timestamp, self._equity(cash, positions, last_prices))
             cash = self._fill_pending_orders(
                 timestamp,
                 current_bars,

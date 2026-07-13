@@ -11,7 +11,7 @@ from fx_backtester.artifacts import audit_run_artifacts, write_backtest_run_arti
 from fx_backtester.data import (
     filter_economic_events_by_date,
     filter_price_data_by_date,
-    load_economic_events_csv,
+    load_economic_events_for_backtest,
     load_price_csvs,
 )
 from fx_backtester.engine import BacktestConfig, BacktestEngine
@@ -380,7 +380,7 @@ def _run_backtest(args: argparse.Namespace) -> int:
     config = _build_config(args)
     data = filter_price_data_by_date(load_price_csvs(args.data), args.start_date, args.end_date)
     events = filter_economic_events_by_date(
-        load_economic_events_csv(args.events),
+        load_economic_events_for_backtest(args.events, data),
         args.start_date,
         args.end_date,
         minutes_before=config.no_trade_minutes_before,
@@ -431,7 +431,7 @@ def _run_walk_forward(args: argparse.Namespace) -> int:
     base_config = _build_config(args)
     data = filter_price_data_by_date(load_price_csvs(args.data), args.start_date, args.end_date)
     events = filter_economic_events_by_date(
-        load_economic_events_csv(args.events),
+        load_economic_events_for_backtest(args.events, data),
         args.start_date,
         args.end_date,
         minutes_before=base_config.no_trade_minutes_before,

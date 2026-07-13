@@ -11,7 +11,7 @@ from fx_intel.timeframe import TimeframePlan
 NOW = datetime(2026, 6, 29, 9, 0, tzinfo=UTC)
 
 
-def _plan(timeframe, horizon, direction, conviction, close=156.0):
+def _plan(timeframe, horizon, direction, conviction, close=156.0, action="no_trade"):
     stop = close - 0.5 if direction in ("long", "short") else None
     return TimeframePlan(
         symbol="USDJPY",
@@ -22,6 +22,7 @@ def _plan(timeframe, horizon, direction, conviction, close=156.0):
         tf_score=0.5,
         news_score=0.1,
         composite=0.3,
+        action=action,
         close=close,
         atr=0.15,
         rsi=55.0,
@@ -116,13 +117,23 @@ def test_embeds_capped_at_ten() -> None:
     assert len(payload["embeds"]) == 10
 
 
-def test_directional_field_shows_sl_tp() -> None:
+def test_ungated_directional_field_is_no_trade_and_hides_sl_tp() -> None:
     payload = build_timeframe_discord_payload(
         {"USDJPY": _plans()}, _analysis(), [], ["USD"], now=NOW
     )
     fields = {f["name"]: f["value"] for f in payload["embeds"][1]["fields"]}
     one_hour = next(v for k, v in fields.items() if k.startswith("1時間足"))
-    assert "SL" in one_hour and "T1" in one_hour
+    assert "最終判断: 見送り" in one_hour
+    assert "分析方向" in one_hour
+    assert "SL" not in one_hour and "T1" not in one_hour
+
+
+def test_explicitly_gated_trade_action_shows_sl_tp() -> None:
+    plans = [_plan("1h", 1.0, "long", 70, action="long")]
+    payload = build_timeframe_discord_payload({"USDJPY": plans}, _analysis(), [], ["USD"], now=NOW)
+    value = payload["embeds"][1]["fields"][0]["value"]
+    assert "最終判断: ロング" in value
+    assert "SL" in value and "T1" in value
 
 
 def test_aux_report_rendered_when_provided() -> None:

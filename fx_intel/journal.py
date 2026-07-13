@@ -25,12 +25,21 @@ JSONLへ追記し、次回以降の実行で過去の方向判断が的中して
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
+import hashlib
+import os
 from pathlib import Path
+import socket
 from collections.abc import Mapping, Sequence
 
+from .append_only import (
+    AppendOnlyReadError,
+    AppendOnlyWriteError,
+    append_jsonl_idempotent,
+    canonical_row_hash,
+    read_jsonl_strict,
+)
 from .briefing import TradePlan
 from .market import open_hours_between
 from .timeframe import TimeframePlan
@@ -38,6 +47,7 @@ from .timeframe import TimeframePlan
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
 DEFAULT_ATR_FRACTION = 0.1  # |値動き| がATRのこの割合未満なら判定しない
+RUN_CADENCE_MINUTES = 5
 
 
 @dataclass(frozen=True)
@@ -55,43 +65,61 @@ class DirectionalStats:
         return self.hits / self.evaluated
 
 
-def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | None = None) -> None:
+def append_plans(
+    path: str | Path,
+    plans: Sequence[TradePlan],
+    now: datetime | None = None,
+    *,
+    run_slot: datetime | None = None,
+) -> None:
     """今回の判断をJSONLへ追記する(1プラン1行)。"""
-    now = now or datetime.now(UTC)
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        for plan in plans:
-            handle.write(
-                json.dumps(
-                    {
-                        "ts": now.isoformat(),
-                        "symbol": plan.symbol,
-                        "direction": plan.direction,
-                        "conviction": plan.conviction,
-                        "composite": plan.composite,
-                        "tech_score": plan.tech_score,
-                        "news_score": plan.news_score,
-                        "close": plan.close,
-                        "atr": plan.atr,
-                        "stop": plan.stop,
-                        "target1": plan.target1,
-                        "target2": plan.target2,
-                        "target_policy": plan.target_policy,
-                        "data_quality": plan.data_quality,
-                        # チャート状態の特徴量(learning.pyの状態別学習に使う)
-                        "features": plan.features,
-                        # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
-                        "components": plan.components,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
+    now = _utc(now or datetime.now(UTC))
+    resolved_run_slot = _resolve_run_slot(now, run_slot)
+    rows = []
+    for plan in plans:
+        rows.append(
+            _journal_envelope(
+                {
+                    "ts": now.isoformat(),
+                    "symbol": plan.symbol,
+                    "timeframe": "fusion",
+                    "direction": plan.direction,
+                    "action": _plan_action(plan),
+                    "conviction": plan.conviction,
+                    "composite": plan.composite,
+                    "tech_score": plan.tech_score,
+                    "news_score": plan.news_score,
+                    "close": plan.close,
+                    "atr": plan.atr,
+                    "stop": plan.stop,
+                    "target1": plan.target1,
+                    "target2": plan.target2,
+                    "target_policy": plan.target_policy,
+                    "data_quality": plan.data_quality,
+                    # チャート状態の特徴量(learning.pyの状態別学習に使う)
+                    "features": plan.features,
+                    # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
+                    "components": plan.components,
+                },
+                now,
+                run_slot=resolved_run_slot,
             )
+        )
+    append_jsonl_idempotent(
+        path,
+        rows,
+        identity=_journal_identity_for_write,
+        row_digest=_journal_logical_digest,
+        tolerate_legacy_conflicts=True,
+    )
 
 
 def append_timeframe_plans(
-    path: str | Path, plans: Sequence[TimeframePlan], now: datetime | None = None
+    path: str | Path,
+    plans: Sequence[TimeframePlan],
+    now: datetime | None = None,
+    *,
+    run_slot: datetime | None = None,
 ) -> None:
     """時間足別の判断をJSONLへ追記する(1プラン1行)。
 
@@ -103,61 +131,193 @@ def append_timeframe_plans(
     エントリが追記されるので、その close 列が「過去判断から見た将来価格」に
     なる(price_history.build_close_series が (symbol, timeframe) 別に組む)。
     """
-    now = now or datetime.now(UTC)
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        for plan in plans:
-            handle.write(
-                json.dumps(
-                    {
-                        "ts": now.isoformat(),
-                        "symbol": plan.symbol,
-                        # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
-                        # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
-                        "timeframe": plan.timeframe,
-                        "horizon_hours": plan.horizon_hours,
-                        "direction": plan.direction,
-                        "conviction": plan.conviction,
-                        "composite": plan.composite,
-                        # 融合版の tech_score に相当(時間足単体の方向スコア)。
-                        # learning._signal_hit_rate が読むキー名に合わせる
-                        "tech_score": plan.tf_score,
-                        "news_score": plan.news_score,
-                        "close": plan.close,
-                        "atr": plan.atr,
-                        "rsi": plan.rsi,
-                        "adx": plan.adx,
-                        "stop": plan.stop,
-                        "target1": plan.target1,
-                        "target2": plan.target2,
-                        "target_policy": plan.target_policy,
-                        "data_quality": plan.data_quality,
-                        "features": plan.features,
-                        "components": plan.components,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
+    now = _utc(now or datetime.now(UTC))
+    resolved_run_slot = _resolve_run_slot(now, run_slot)
+    rows = []
+    for plan in plans:
+        rows.append(
+            _journal_envelope(
+                {
+                    "ts": now.isoformat(),
+                    "symbol": plan.symbol,
+                    # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
+                    # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
+                    "timeframe": plan.timeframe,
+                    "horizon_hours": plan.horizon_hours,
+                    "direction": plan.direction,
+                    "action": _plan_action(plan),
+                    "conviction": plan.conviction,
+                    "composite": plan.composite,
+                    # 融合版の tech_score に相当(時間足単体の方向スコア)。
+                    # learning._signal_hit_rate が読むキー名に合わせる
+                    "tech_score": plan.tf_score,
+                    "news_score": plan.news_score,
+                    "close": plan.close,
+                    "atr": plan.atr,
+                    "rsi": plan.rsi,
+                    "adx": plan.adx,
+                    "stop": plan.stop,
+                    "target1": plan.target1,
+                    "target2": plan.target2,
+                    "target_policy": plan.target_policy,
+                    "data_quality": plan.data_quality,
+                    "features": plan.features,
+                    "components": plan.components,
+                },
+                now,
+                run_slot=resolved_run_slot,
             )
+        )
+    append_jsonl_idempotent(
+        path,
+        rows,
+        identity=_journal_identity_for_write,
+        row_digest=_journal_logical_digest,
+        tolerate_legacy_conflicts=True,
+    )
 
 
-def read_entries(path: str | Path):
-    """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。"""
+def _journal_envelope(
+    row: dict[str, object],
+    now: datetime,
+    *,
+    run_slot: datetime,
+) -> dict[str, object]:
+    stamp = _utc(now)
+    row.update(
+        {
+            "schema_version": 3,
+            "event_time": stamp.isoformat(),
+            "available_time": stamp.isoformat(),
+            "ingested_time": stamp.isoformat(),
+            "source": "fx_briefing",
+            "run_slot": run_slot.isoformat(),
+            "run_id": f"briefing-{run_slot.strftime('%Y%m%dT%H%M%SZ')}",
+            "writer_id": os.environ.get("FX_WRITER_ID") or f"{socket.gethostname()}:{os.getpid()}",
+        }
+    )
+    identity = _journal_natural_identity(row)
+    row["decision_id"] = identity
+    row["source_record_id"] = identity
+    return row
+
+
+def _plan_action(plan: object) -> str:
+    action = str(getattr(plan, "action", "no_trade"))
+    return action if action in ("long", "short") else "no_trade"
+
+
+def _journal_natural_identity(row: Mapping[str, object]) -> str:
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(entry, dict):
-            yield entry
+        timestamp = datetime.fromisoformat(str(row.get("run_slot") or row.get("ts") or ""))
+    except ValueError as error:
+        raise ValueError("journal run_slot/ts is invalid") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("journal run_slot/ts must be timezone-aware")
+    slot = _cadence_slot(timestamp)
+    if row.get("run_slot") is not None and _utc(timestamp) != slot:
+        raise ValueError("journal run_slot must align to the five-minute cadence")
+    symbol = str(row.get("symbol") or "").strip().upper()
+    timeframe = str(row.get("timeframe") or "fusion").strip()
+    if not symbol or not timeframe:
+        raise ValueError("journal symbol/timeframe is missing")
+    raw = f"journal-v2|{slot.isoformat()}|{symbol}|{timeframe}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _validated_journal_identity(row: Mapping[str, object]) -> str:
+    identity = _journal_natural_identity(row)
+    schema = row.get("schema_version")
+    if schema is None:
+        return identity
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema < 1:
+        raise ValueError("journal schema_version is invalid")
+    # Schema-v2 rows predate explicit natural-identity enforcement. They remain
+    # readable for migration/scoring, while every newly written schema-v3 row
+    # must prove that all stored identifiers were derived from the same slot.
+    if schema < 3:
+        return identity
+    decision_id = str(row.get("decision_id") or "").strip()
+    if decision_id != identity:
+        raise ValueError("journal decision_id does not match run_slot/symbol/timeframe")
+    source_record_id = str(row.get("source_record_id") or "").strip()
+    if source_record_id != identity:
+        raise ValueError("journal source_record_id does not match natural identity")
+    slot = datetime.fromisoformat(str(row.get("run_slot") or ""))
+    slot = _utc(slot)
+    expected_run_id = f"briefing-{slot.strftime('%Y%m%dT%H%M%SZ')}"
+    if str(row.get("run_id") or "").strip() != expected_run_id:
+        raise ValueError("journal run_id does not match run_slot")
+    return identity
+
+
+def _journal_identity_for_write(row: Mapping[str, object]) -> str:
+    try:
+        return _validated_journal_identity(row)
+    except (TypeError, ValueError) as error:
+        raise AppendOnlyWriteError(f"invalid journal natural identity: {error}") from error
+
+
+def _journal_identity_for_read(row: Mapping[str, object]) -> str:
+    try:
+        return _validated_journal_identity(row)
+    except (TypeError, ValueError) as error:
+        raise AppendOnlyReadError(f"invalid journal natural identity: {error}") from error
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("journal timestamp must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _cadence_slot(value: datetime) -> datetime:
+    utc = _utc(value)
+    minute = utc.minute - utc.minute % RUN_CADENCE_MINUTES
+    return utc.replace(minute=minute, second=0, microsecond=0)
+
+
+def _resolve_run_slot(now: datetime, run_slot: datetime | None) -> datetime:
+    if run_slot is None:
+        return _cadence_slot(now)
+    slot = _utc(run_slot)
+    if slot != _cadence_slot(slot):
+        raise ValueError("run_slot must align to the five-minute cadence")
+    if slot > now:
+        raise ValueError("run_slot cannot be later than now")
+    return slot
+
+
+def _journal_logical_digest(row: Mapping[str, object]) -> str:
+    """Digest decision content while excluding retry-attempt metadata."""
+
+    volatile = {
+        "content_hash",
+        "ts",
+        "event_time",
+        "available_time",
+        "ingested_time",
+        "run_id",
+        "writer_id",
+        "source_record_id",
+    }
+    return canonical_row_hash({key: value for key, value in row.items() if key not in volatile})
+
+
+def read_entries(
+    path: str | Path,
+    *,
+    as_of: datetime | None = None,
+    allow_legacy_unhashed: bool = False,
+):
+    """Strictly read a journal; corruption, naive time, and future rows are fatal."""
+
+    yield from read_jsonl_strict(
+        path,
+        as_of=as_of,
+        allow_legacy_unhashed=allow_legacy_unhashed,
+        identity=_journal_identity_for_read,
+    )
 
 
 def evaluate_directional_accuracy(
@@ -181,7 +341,7 @@ def evaluate_directional_accuracy(
     evaluated = 0
     hits = 0
     flat = 0
-    for entry in read_entries(target):
+    for entry in read_entries(target, as_of=now):
         direction = entry.get("direction")
         if direction not in ("long", "short"):
             continue
@@ -193,8 +353,8 @@ def evaluate_directional_accuracy(
             recorded_at = datetime.fromisoformat(str(entry.get("ts", "")))
         except ValueError:
             continue
-        if recorded_at.tzinfo is None:
-            recorded_at = recorded_at.replace(tzinfo=UTC)
+        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
+            raise ValueError("journal entry timestamp must be timezone-aware")
         age_hours = open_hours_between(recorded_at, now)
         if not (horizon_hours - tolerance_hours <= age_hours <= horizon_hours + tolerance_hours):
             continue

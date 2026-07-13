@@ -91,6 +91,7 @@ def test_collect_price_snapshots_reads_ohlc_bid_ask_spread() -> None:
         "bid": 149.99,
         "ask": 150.01,
         "spread": 0.02,
+        "data_quality_flags": [],
     }
     assert snapshots["USDJPY"]["15m"] is None
 

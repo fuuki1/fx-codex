@@ -135,6 +135,9 @@ class TimeframePlan:
     tf_score: float  # その時間足の方向スコア(-1.0〜+1.0)
     news_score: float
     composite: float
+    # 時間足モデルは方向分析用であり、独立した較正・コスト・サイズ・risk vetoを
+    # 通していない。共有ゲートが明示的に上書きするまでは必ず見送る。
+    action: str = "no_trade"  # long / short / no_trade
     close: float | None = None
     atr: float | None = None
     rsi: float | None = None
@@ -164,6 +167,16 @@ class TimeframePlan:
     def emoji(self) -> str:
         return DIRECTION_EMOJI.get(self.direction, "⚪")
 
+    @property
+    def action_ja(self) -> str:
+        return {"long": "ロング(買い)", "short": "ショート(売り)"}.get(
+            self.action, "見送り(取引しない)"
+        )
+
+    @property
+    def action_emoji(self) -> str:
+        return DIRECTION_EMOJI.get(self.action, "⚪")
+
 
 def _tf_direction_score(tech: PairTechnicals, timeframe: str) -> tuple[float, str] | None:
     """時間足自身のレーティング + 上位足順張りボーナスで方向スコアを作る。
@@ -171,14 +184,14 @@ def _tf_direction_score(tech: PairTechnicals, timeframe: str) -> tuple[float, st
     その足の IntervalView が無ければ None(判断不能)。戻り値は
     (スコア -1.0〜+1.0, 根拠の一文)。上位足が同じ向きなら加点、逆なら減点する。
     """
-    view = tech.views.get(timeframe)
+    view = tech.usable_view(timeframe)
     if view is None:
         return None
     base = view.score
     higher_notes: list[str] = []
     bonus = 0.0
     for higher in HIGHER_TIMEFRAMES.get(timeframe, ()):  # 上位足の順張り/逆行
-        higher_view = tech.views.get(higher)
+        higher_view = tech.usable_view(higher)
         if higher_view is None:
             continue
         bonus += HIGHER_TF_BONUS * higher_view.score
@@ -203,10 +216,10 @@ def _extract_tf_features(tech: PairTechnicals, timeframe: str, news_count: int) 
     """
     features: dict[str, float] = {"news_count": float(news_count)}
     for interval in ("4h", "1d"):
-        higher = tech.views.get(interval)
+        higher = tech.usable_view(interval)
         if higher is not None:
             features[f"rating_{interval}"] = higher.score
-    view = tech.views.get(timeframe)
+    view = tech.usable_view(timeframe)
     if view is not None:
         if view.rsi is not None:
             features["rsi_1h"] = round(view.rsi, 2)
@@ -386,7 +399,7 @@ def build_timeframe_plan(
             direction = "neutral"
             conviction = 0
 
-    view = tech.views.get(timeframe)
+    view = tech.usable_view(timeframe)
     close = view.close if view else None
     atr = view.atr if view else None
     rsi = view.rsi if view else None

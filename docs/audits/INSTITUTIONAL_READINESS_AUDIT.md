@@ -22,6 +22,23 @@ This is a process/readiness assessment, not investment advice or a profitability
 
 The branch is a review candidate, not a release or trading artifact. Reconciliation removed the behind-main condition, but GitHub review/CI, a reproducible environment, deployment evidence and performance evidence remain separate gates. User-owned work was preserved; no hard reset, destructive checkout or stash drop was used.
 
+## PR #26 hardening addendum (2026-07-13)
+
+The original evidence freeze above remains the historical baseline. A second adversarial review of PR #26 found additional fail-open paths in timestamp cutoffs, append-only journals, freshness monitoring, calibration/promotion evidence, statistical inputs, timeframe action gating, launchd rollback and process-group termination. The candidate worktree was hardened before publication; no Mac mini, broker, launchd, cron, Docker or trading state was changed.
+
+The principal changes are:
+
+- decision, timeframe and price readers now fail closed on malformed, future, timezone-naive, schema-invalid or hash-invalid records; append paths use file locking, canonical hashes and idempotent/conflict-aware writes;
+- final acquisition time is the prediction cutoff, future news is excluded, and current scanner rows no longer fabricate a provider `source_time`;
+- freshness checks validate v2 hashes, every expected `symbol×timeframe` key and repeated effective payloads rather than trusting mtime alone;
+- calibration, model artifacts, experiment manifests and trial ledgers are verified against actual files and hashes; non-finite statistical, artifact and sizing inputs fail closed;
+- the timeframe path remains analytically observable but its final action is `no_trade` until it can supply the same independent calibration, cost, sizing, data-quality and risk evidence as the canonical decision pipeline;
+- launchd migration/rollback and the exclusive runner retain fail-closed ownership: partial mutations roll back, crontab inspection errors stop installation, and TERM/INT reaches the entire unblocked child process group before the lock is released.
+
+A later frozen-diff attack review reproduced further high-severity boundary failures: materialized OHLC was not fully bound to its payload hash, stale/future source clocks and calendar revisions could bypass point-in-time gates, normal five-minute runs collided with retry identities, migration was not reversible on manifest failure, model/calibration statistics could still be self-reported, registry history accepted forged reports, and non-finite configuration/artifact values could disable checks. These paths are now covered by explicit attack regressions. Calibration evidence schema v4 recomputes supported logistic inference from a snapshot bound to hashed dataset, feature-registry and point-in-time store artifacts; source-record publication, availability, ingestion and revision times determine effective availability. The sole admissible calibrator method is predeclared, its parameters are deterministically refitted from calibration-window raw observations, and a separate immutable test-window holdout is evaluated. Until an authoritative model seal exists, the probability remains explanatory and forces `no_trade`. Promotion recomputes DSR/PBO/holdout calibration plus raw expectancy, block-bootstrap CI, drawdown, 2× cost, coverage, incidents and PIT violations. A separately hashed lockbox artifact must contain raw returns, 2× cost, calibration, PIT quality and an equity curve reconciled from R and risk fractions; metadata-only consumption fails. Reports distinguish internal `evidence_gates_passed` from authorization. Because this build has neither a durable external approval seal nor a durable one-time lockbox-consumption seal, `passed` remains false and registry promotion/loading remain fail closed at `research`. This is stronger evidence handling, not evidence that any current model passes those gates.
+
+These corrections remove the earlier statement that the non-price journals are uniformly unsafe and replace caller-declared promotion evidence with file-bound evidence. They do **not** provide a promotion-admissible historical dataset, a real lockbox result, paper deployment evidence or a profitable strategy. The maturity ceiling therefore remains **research only / 1.83 out of 5**, model performance remains **0/5 (evaluation unavailable)**, and the branch must not be described as institutional-grade.
+
 ## Observed operating and data state
 
 ### Local evidence snapshot
@@ -62,8 +79,8 @@ Those price records did not provide verified historical bid/ask or trustworthy s
 ### High — unresolved or partial
 
 1. **PIT integration is partial.** Availability now fails closed against actual ingestion, but FRED uses current `fredgraph.csv`, macro/COT/news revision replay is incomplete, and the main CLI/briefing loaders are not uniformly PIT-backed.
-2. **Journaling is not uniformly transactional.** Price snapshots have lock/natural-key/conflict checks; decision, timeframe and outcome append paths do not yet share that contract.
-3. **Lockbox/governance state is not durable.** A process-local one-time marker and caller-supplied evidence are insufficient for independent approval.
+2. **Journaling remains file-based.** Price, fusion, timeframe and complete-decision JSONL now share locks, hashes, cadence identities and strict duplicate checks, but legacy contaminated streams require manifest-backed migration and JSONL is not a promotion-scale transactional event store. Outcome/event archives still need the same end-to-end database-level constraints.
+3. **Lockbox/governance state is not an authoritative service.** Evidence files and transition reports are now semantically revalidated, but the one-time lockbox lifecycle, external approval seal and deployment registry are not durable end to end.
 4. **Legacy reports are not authoritative.** Older commercial-readiness cost sensitivity is post-hoc. Only full-engine reruns may support a cost gate.
 5. **Market microstructure fidelity is insufficient.** Static spread/slippage proxies omit historical bid/ask, depth, latency, rejection, partial fills, venue/broker state, financing and source disagreement.
 6. **Data advantage is absent.** Public/retail observations—Legacy COT proxies, current-only FRED downloads, Stooq, RSS and an unofficial TradingView scanner—are not proprietary order flow or an institutional information moat.
@@ -98,7 +115,7 @@ The components pass unit tests but are not yet a completed institutional experim
 
 ### Calibration, drift and decision safety
 
-- ML schema v3 uses a calibration-window intercept null, requires Brier/log-loss improvement, nonempty feature importance and test AUC ≥0.55; constant features cannot become usable merely through prevalence shift.
+- ML schema v4 uses a calibration-window intercept null, a separate immutable test-window holdout, requires holdout Brier/log-loss improvement, nonempty feature importance and test AUC ≥0.55; constant features cannot become usable merely through prevalence shift.
 - Drift requires the exact feature schema. Missing/unexpected features abstain; immature realized labels require human review. Uncertainty intervals must contain the stated probability.
 - Missing costs, uncalibrated conviction, stale/invalid operational evidence and weak expectancy evidence block decisions instead of becoming neutral/default inputs.
 - Descriptive one-sample expectancy no longer passes: evidence must be independent-test, net-of-costs and have a positive confidence lower bound.
@@ -113,7 +130,8 @@ The components pass unit tests but are not yet a completed institutional experim
 ### Operational controls prepared locally
 
 - The canonical briefing path can require a recent `overall=ok` freshness report; missing, malformed, future-dated, stale, warning and critical states all veto a decision.
-- Price snapshots have an OS lock, writer ID, 5-minute natural key, idempotent replay and conflicting-writer rejection.
+- Price snapshots have an OS lock, writer ID and 5-minute natural key. Only an exact canonical-hash retry is idempotent; strict reads and appends reject duplicate natural keys and timestamp regression before contaminated rows can feed learning.
+- Artifact event provenance rejects future `recorded_at`/effective vintage clocks at the artifact creation boundary, and the calendar writer requires archive-wide nondecreasing `recorded_at` before append.
 - Launchd templates/scripts define one 5-minute price writer, hourly briefing and 5-minute health monitor; installation refuses detected manual/direct/cron writers and verifies bootout before replacing a plist.
 - Failed Discord delivery is retried without waiting for cooldown, and `--no-notify` does not consume canonical notification state.
 - Status treats missing, malformed, stale, future-dated and unknown freshness evidence as critical; it detects legacy labels and writer candidates. Restart preflights all labels before any kickstart.
@@ -160,7 +178,7 @@ Unweighted evidence score moves from **0.92/5 to 1.83/5**. The increase is proce
 | PIT/data validity | Ambiguous availability; mutable evidence; inconsistent source claims | Stronger immutable primitive and source ledger | Partial only; no admissible dataset |
 | Leakage-resistant research | Legacy split/reuse risks; weak statistical evidence handling | Label-aware splits, calibration and inference primitives | Partial only; no orchestrated experiment |
 | Decision fail-closed behavior | Missing/stale/cost/uncertainty evidence could degrade softly | Freshness, cost, calibration, drift and risk vetoes hardened | Safer research/shadow behavior |
-| Concurrency/operations | Duplicate writers, stale logs, hidden failures | Price-writer lock and canonical launchd/runbook prepared | Not deployed; other journals remain unsafe |
+| Concurrency/operations | Duplicate writers, stale logs, hidden failures | Price and decision journals use sidecar/file locks, canonical hashes and fail-closed readers; canonical launchd/runbook prepared | Not deployed; legacy streams require archived migration evidence |
 | Execution/risk simulation | Entry-only leverage and stale-order/end-of-data gaps | Mark-to-market latch, TTL and per-symbol close | Simulation correctness improved |
 | Performance maturity | Evaluation unavailable | Evaluation unavailable; synthetic baselines fail | No improvement claim |
 | Governance stage | Research | Research | No candidate promoted |
@@ -169,7 +187,7 @@ Process-control maturity improved. Data-edge, statistical-evidence and deploymen
 
 ## Verification
 
-Final local checks on code HEAD `c84bd76` plus the audit/report worktree:
+Historical checks for the original 2026-07-11 freeze on code HEAD `c84bd76`:
 
 - `pytest -q`: **489 passed, 1 skipped** in 14.66 seconds.
 - `ruff check .`: passed.
@@ -177,8 +195,21 @@ Final local checks on code HEAD `c84bd76` plus the audit/report worktree:
 - `mypy fx_backtester fx_intel *.py`: 64 source files, no issues.
 - zsh/bash syntax checks selected by each script shebang: passed.
 - staged and unstaged `git diff --check`: passed.
-- Deterministic synthetic base and 1×/1.5×/2×/3× full-engine cost reruns completed; see [institutional benchmark](../../reports/institutional_benchmark_20260711.md).
+- Deterministic synthetic base and 1×/1.5×/2×/3× full-engine cost reruns completed; that historical result is retained in [institutional benchmark 2026-07-11](../../reports/institutional_benchmark_20260711.md).
 - GitHub Actions run `29134903400` failed only on the same two mypy findings reproduced locally. The focused finite-float normalization fix is in `5693d44`; current-head run `29135088717` then passed on Python 3.11 and 3.12.
+
+Final local candidate checks on parent HEAD `3c5bbc7a9889ebbe411699d48a9b1043a3b01e45` plus the reviewed dirty worktree:
+
+- Frozen implementation manifest: [institutional_candidate_20260713_manifest.json](../../reports/institutional_candidate_20260713_manifest.json), 141 files including 50 test files. Path-and-content tree SHA-256: `9e34a4ad4de7b620da2476794e34ccde9ce92061c96817ae43133038bf66bd84`; canonical payload SHA-256: `d6e772faf932f600b8835e102daf54c80ea8765cdba4792a2e3d09ebd7bdab62`; retained JSON file SHA-256: `9847f1c31923f103feb74aa98fe5f1790518ad3aa2fe1aafa884ec9ff4f1d1f8`.
+- `pytest -q`: **838 passed** with 9 pandas timezone-to-period warnings in 29.64 seconds; no failures or skips.
+- `ruff check .`: passed.
+- `black --check .`: 126 files unchanged.
+- `mypy fx_backtester fx_intel *.py`: 65 source files, no issues.
+- shell syntax and `git diff --check`: passed.
+- Current-candidate artifact generation plus `audit-run`: integrity `passed=true`, no errors, and `promotion_eligible=false` with the expected warning because the synthetic sample has no promotion-admissible price provenance.
+- Four strategies × observed/1.5×/2×/3× costs were rerun through the full engine. The retained summary SHA-256 is `0638bf76f324db2e78e0cfe12c72f70f0bbddc267a2a63c2fc7a589df4530e67`; see [institutional benchmark 2026-07-13](../../reports/institutional_benchmark_20260713.md).
+- PBO, calibrated Brier and lockbox performance remain unavailable for the synthetic baseline family and therefore fail promotion. The only positive 1× result has 11 trades and becomes negative at 1.5× cost.
+- Independent frozen-diff reviewers initially reported no P0 but reproduced P1 boundary failures. Every disclosed attack received a fail-closed regression, and a separate post-fix reviewer then independently rebuilt the final manifest, reran 233 targeted attacks, and reported **P0=0 / P1=0**. This release review does not replace a durable lockbox, real-data performance evidence, GitHub CI, or named human approval.
 
 ## Exit criteria for the next stage
 

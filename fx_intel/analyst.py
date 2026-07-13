@@ -234,7 +234,9 @@ def _source_weight(source: str) -> float:
 
 
 def _recency_weight(published: datetime, now: datetime) -> float:
-    age_hours = max(0.0, (now - published).total_seconds() / 3600.0)
+    if published.tzinfo is None or now.tzinfo is None or published > now:
+        return 0.0
+    age_hours = (now - published).total_seconds() / 3600.0
     return math.pow(0.5, age_hours / RECENCY_HALF_LIFE_HOURS)
 
 

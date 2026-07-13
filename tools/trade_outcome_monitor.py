@@ -47,7 +47,7 @@ def run_trade_outcome_monitor(
 ) -> dict[str, Any]:
     """Run the full trade-outcome monitoring pass and write JSON artifacts."""
     generated_at = _utc(now or datetime.now(UTC))
-    entries = list(journal.read_entries(journal_path))
+    entries = list(journal.read_entries(journal_path, as_of=generated_at))
     outcomes = trade_outcome.evaluate_trade_outcomes(entries)
     summary = trade_outcome.summarize_expectancy(outcomes)
     findings = trade_outcome.expectancy_findings(summary)
@@ -327,8 +327,8 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("evaluation time must be timezone-aware")
     return value.astimezone(UTC)
 
 

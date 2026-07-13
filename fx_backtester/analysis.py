@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from fx_backtester.artifacts import audit_run_artifacts
-from fx_backtester.data import load_economic_events_csv, load_price_csvs
+from fx_backtester.data import load_economic_events_for_backtest, load_price_csvs
 from fx_backtester.engine import BacktestConfig, BacktestEngine
 from fx_backtester.execution import ExecutionConfig
 from fx_backtester.metrics import calculate_metrics
@@ -936,7 +936,7 @@ def baseline_comparison_summary(
         data_paths = [item["path"] for item in manifest["inputs"]["data"]]
         events_path = (manifest.get("inputs", {}).get("events", {}) or {}).get("path")
         data = load_price_csvs(data_paths)
-        events = load_economic_events_csv(events_path)
+        events = load_economic_events_for_backtest(events_path, data)
         config = _config_from_dict(run_config)
         for baseline in (
             FlatStrategy(),

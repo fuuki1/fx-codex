@@ -19,6 +19,23 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+MATERIALIZED_MARKET_FIELDS: tuple[str, ...] = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "bid",
+    "ask",
+    "spread",
+    "spread_price",
+    "spread_pips",
+    "volume",
+    "tick_volume",
+    "real_volume",
+    "quote_count",
+    "venue",
+)
+
 
 class PointInTimeError(ValueError):
     """Raised when data cannot be proven available at the prediction time."""
@@ -60,7 +77,7 @@ class PointInTimeRecord:
 
     ``event_time`` is what the observation describes. ``available_time`` is the
     first instant this system could actually use it, so it is normalized to the
-    latest of declared availability, publication, revision, and ingestion.
+    latest of declared availability, publication, source, revision, and ingestion.
     ``ingested_time`` records when this system received it. Scheduled events may
     have an event time in the future, so no ordering is imposed between event and
     availability time.
@@ -106,6 +123,7 @@ class PointInTimeRecord:
                 self.available_time,
                 self.ingested_time,
                 self.published_time,
+                self.source_time,
                 self.revision_time,
             )
             if timestamp is not None
@@ -151,7 +169,8 @@ def point_in_time_asof_join(
     """Backward as-of join that proves every feature was already available.
 
     The output is restored to the original observation order.  Naive timestamps,
-    missing keys, and any impossible future match are rejected rather than coerced.
+    missing keys, ambiguous feature keys, and any impossible future match are
+    rejected rather than coerced.
     """
 
     if prediction_time not in observations:
@@ -170,10 +189,13 @@ def point_in_time_asof_join(
     # Raw feature tables sometimes carry the source's nominal release time in
     # available_time. Actual use cannot precede our ingestion (or a later revision),
     # so normalize before sorting/joining rather than trusting that declaration.
-    for boundary in ("published_time", "ingested_time", "revision_time"):
+    for boundary in ("published_time", "ingested_time", "source_time", "revision_time"):
         if boundary in right:
             right[boundary] = _utc_series(right[boundary], boundary)
             right[available_time] = right[[available_time, boundary]].max(axis=1)
+    asof_key = [*by_columns, available_time]
+    if bool(right.duplicated(subset=asof_key, keep=False).any()):
+        raise PointInTimeError("features contain ambiguous duplicate as-of keys")
     left["__pit_order"] = np.arange(len(left), dtype=int)
 
     left_sort = [prediction_time, *by_columns]
@@ -432,7 +454,7 @@ def evaluate_price_quality(
                 add("point_in_time_metadata_null", is_critical=True)
 
             timestamp_columns = ["event_time", "available_time", "ingested_time"]
-            for optional in ("published_time", "revision_time"):
+            for optional in ("published_time", "source_time", "revision_time"):
                 if optional in frame:
                     timestamp_columns.append(optional)
             parsed_timestamps: dict[str, pd.Series] = {}
@@ -441,12 +463,25 @@ def evaluate_price_quality(
                     parsed_timestamps[column] = _utc_series(frame[column], column)
                 except (TypeError, ValueError, PointInTimeError):
                     add("point_in_time_timestamp_invalid", is_critical=True)
+            # In a strict price-quality frame event_time describes the quote/bar,
+            # not a future scheduled macro event.  Every declared clock boundary
+            # must therefore be observable no later than the configured clock-skew
+            # allowance.  The per-column counts make the veto auditable.
+            future_boundary = pd.Timestamp(now_utc + limits.max_future_skew)
+            future_metadata_counts = {
+                column: int((values > future_boundary).sum())
+                for column, values in parsed_timestamps.items()
+            }
+            metrics["future_point_in_time_timestamp_counts"] = future_metadata_counts
+            metrics["future_point_in_time_timestamp_count"] = sum(future_metadata_counts.values())
+            if any(future_metadata_counts.values()):
+                add("future_point_in_time_timestamp", is_critical=True)
             if {"available_time", "ingested_time"} <= parsed_timestamps.keys():
                 if bool(
                     (parsed_timestamps["available_time"] < parsed_timestamps["ingested_time"]).any()
                 ):
                     add("available_before_ingestion", is_critical=True)
-            for boundary in ("published_time", "revision_time"):
+            for boundary in ("published_time", "source_time", "revision_time"):
                 if {"available_time", boundary} <= parsed_timestamps.keys() and bool(
                     (parsed_timestamps["available_time"] < parsed_timestamps[boundary]).any()
                 ):
@@ -465,6 +500,51 @@ def evaluate_price_quality(
             if not bool(valid_hashes.all()):
                 add("invalid_content_hash", is_critical=True)
 
+            # A syntactically valid SHA-256 is not integrity evidence unless it
+            # can be recomputed from the immutable source payload.  Strict PIT
+            # frames therefore either carry that payload or fail closed as
+            # unverifiable; a caller-supplied string of 64 zeroes must never pass.
+            hash_mismatch_count = 0
+            hash_unverifiable_count = 0
+            projection_missing_count = 0
+            projection_mismatch_count = 0
+            if "payload" not in frame:
+                hash_unverifiable_count = len(frame)
+                projection_missing_count = len(frame)
+            else:
+                for row_position, (payload, supplied_hash) in enumerate(
+                    zip(frame["payload"], hashes, strict=True)
+                ):
+                    if not isinstance(payload, Mapping):
+                        hash_unverifiable_count += 1
+                        projection_missing_count += 1
+                        continue
+                    try:
+                        expected_hash = canonical_content_hash(payload)
+                    except (PointInTimeError, TypeError, ValueError):
+                        hash_unverifiable_count += 1
+                        continue
+                    if supplied_hash != expected_hash:
+                        hash_mismatch_count += 1
+                    missing, mismatched = _materialized_projection_counts(
+                        payload,
+                        frame.iloc[row_position],
+                    )
+                    projection_missing_count += missing
+                    projection_mismatch_count += mismatched
+            metrics["content_hash_mismatch_count"] = hash_mismatch_count
+            metrics["content_hash_unverifiable_count"] = hash_unverifiable_count
+            metrics["payload_projection_missing_count"] = projection_missing_count
+            metrics["payload_projection_mismatch_count"] = projection_mismatch_count
+            if hash_mismatch_count:
+                add("content_hash_mismatch", is_critical=True)
+            if hash_unverifiable_count:
+                add("content_hash_unverifiable", is_critical=True)
+            if projection_missing_count:
+                add("payload_projection_missing", is_critical=True)
+            if projection_mismatch_count:
+                add("payload_projection_mismatch", is_critical=True)
+
     return PriceQualityReport(metrics, tuple(flags), tuple(critical))
 
 
@@ -480,6 +560,44 @@ def _spread_series(frame: pd.DataFrame) -> pd.Series | None:
         if column in frame:
             return frame[column]
     return None
+
+
+def _materialized_projection_counts(
+    payload: Mapping[str, Any],
+    row: pd.Series,
+) -> tuple[int, int]:
+    """Prove that every consumed market field is covered by the payload hash."""
+
+    missing = 0
+    mismatched = 0
+    for column in MATERIALIZED_MARKET_FIELDS:
+        if column not in row.index:
+            continue
+        materialized = row[column]
+        try:
+            is_missing = bool(pd.isna(materialized))
+        except (TypeError, ValueError):
+            is_missing = False
+        if is_missing:
+            continue
+        if column not in payload:
+            missing += 1
+            continue
+        if not _projection_values_equal(payload[column], materialized):
+            mismatched += 1
+    return missing, mismatched
+
+
+def _projection_values_equal(source: object, materialized: object) -> bool:
+    if isinstance(source, bool) or isinstance(materialized, (bool, np.bool_)):
+        return type(source) is type(materialized) and source == materialized
+    if isinstance(source, (int, float, np.integer, np.floating)) and isinstance(
+        materialized, (int, float, np.integer, np.floating)
+    ):
+        source_number = float(source)
+        materialized_number = float(materialized)
+        return bool(np.isfinite(source_number) and source_number == materialized_number)
+    return source == materialized
 
 
 def _json_ready(value: Any) -> Any:

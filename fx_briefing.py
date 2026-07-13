@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping
 import json
+from math import isfinite
 import sys
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
@@ -72,6 +73,7 @@ from pathlib import Path
 import requests
 
 from fx_intel import (
+    append_only,
     briefing,
     calendar,
     committee,
@@ -130,6 +132,181 @@ DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
 # ガードが早期returnするため、データが足りないうちは実質ノーコスト)
 ML_RETRAIN_DAYS = 7.0
+RUN_CADENCE_MINUTES = 5
+MAX_EXTERNAL_RUN_SLOT_AGE_MINUTES = 65
+DISCORD_CONTENT_LIMIT = 2000
+MAX_RECEIPT_DECISION_IDS = 12
+
+
+def _prediction_time_after_acquisition(
+    started_at: datetime,
+    *,
+    completed_at: datetime | None = None,
+) -> datetime:
+    """Return the UTC decision cutoff only after every input is available."""
+
+    if started_at.tzinfo is None:
+        raise ValueError("started_at must be timezone-aware")
+    completed = completed_at or datetime.now(UTC)
+    if completed.tzinfo is None:
+        raise ValueError("completed_at must be timezone-aware")
+    started_utc = started_at.astimezone(UTC)
+    completed_utc = completed.astimezone(UTC)
+    if completed_utc < started_utc:
+        raise RuntimeError("clock moved backwards while acquiring decision inputs")
+    return completed_utc
+
+
+def _resolve_run_slot(raw: str | None, started_at: datetime) -> datetime:
+    """Resolve one scheduler-owned identity before any network acquisition.
+
+    The canonical wrapper supplies the scheduled Unix epoch so a launchd retry
+    keeps the original identity even after a five-minute boundary.  Direct/manual
+    runs use the cadence containing process start, never the later prediction
+    cutoff reached after network acquisition.
+    """
+
+    if started_at.tzinfo is None or started_at.utcoffset() is None:
+        raise ValueError("run start must be timezone-aware")
+    started_utc = started_at.astimezone(UTC)
+    if raw is None:
+        minute = started_utc.minute - started_utc.minute % RUN_CADENCE_MINUTES
+        return started_utc.replace(minute=minute, second=0, microsecond=0)
+    value = raw.strip()
+    if not value:
+        raise ValueError("--run-slot must not be empty")
+    try:
+        if value.isdigit():
+            slot = datetime.fromtimestamp(int(value), tz=UTC)
+        else:
+            slot = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (OverflowError, OSError, ValueError) as error:
+        raise ValueError("--run-slot must be a Unix epoch or aware ISO-8601 timestamp") from error
+    if slot.tzinfo is None or slot.utcoffset() is None:
+        raise ValueError("--run-slot must be timezone-aware")
+    slot = slot.astimezone(UTC)
+    if slot.minute % RUN_CADENCE_MINUTES != 0 or slot.second != 0 or slot.microsecond != 0:
+        raise ValueError("--run-slot must align to the five-minute cadence")
+    if slot > started_utc:
+        raise ValueError("--run-slot cannot be later than process start")
+    return slot
+
+
+def _persisted_decision_batch(
+    path: Path,
+    pending_events: list[dict[str, object]],
+    *,
+    as_of: datetime,
+) -> list[dict[str, object]]:
+    """Read back the exact durable rows used by a notification receipt."""
+
+    expected_ids = {str(event.get("decision_id") or "") for event in pending_events}
+    if "" in expected_ids or len(expected_ids) != len(pending_events):
+        raise append_only.AppendOnlyWriteError("pending decision batch has invalid identities")
+    persisted = [
+        event
+        for event in decision_log.read_decision_events(path, as_of=as_of)
+        if str(event.get("decision_id") or "") in expected_ids
+    ]
+    persisted_ids = {str(event.get("decision_id") or "") for event in persisted}
+    if persisted_ids != expected_ids or len(persisted) != len(expected_ids):
+        raise append_only.AppendOnlyWriteError("durable decision batch could not be read back")
+    expected_batches = {str(event.get("notification_batch_id") or "") for event in pending_events}
+    persisted_batches = {str(event.get("notification_batch_id") or "") for event in persisted}
+    if "" in expected_batches or persisted_batches != expected_batches:
+        raise append_only.AppendOnlyWriteError("durable notification batch binding mismatch")
+    return persisted
+
+
+def _attach_decision_receipt(
+    payload: dict[str, object],
+    persisted_events: list[dict[str, object]],
+) -> str | None:
+    """Bind the Discord message to verified append-only decision rows."""
+
+    if not persisted_events:
+        return None
+    references: list[dict[str, str]] = []
+    batch_ids: set[str] = set()
+    for event in persisted_events:
+        decision_id = str(event.get("decision_id") or "")
+        content_hash = str(event.get("content_hash") or "")
+        batch_id = str(event.get("notification_batch_id") or "")
+        if not decision_id or not content_hash or not batch_id:
+            raise append_only.AppendOnlyWriteError(
+                "persisted decision receipt metadata is incomplete"
+            )
+        if append_only.canonical_row_hash(event) != content_hash:
+            raise append_only.AppendOnlyWriteError("persisted decision receipt hash mismatch")
+        references.append({"decision_id": decision_id, "content_hash": content_hash})
+        batch_ids.add(batch_id)
+    if len(batch_ids) != 1:
+        raise append_only.AppendOnlyWriteError(
+            "persisted decisions span multiple notification batches"
+        )
+    references.sort(key=lambda item: item["decision_id"])
+    receipt_hash = append_only.canonical_row_hash(
+        {
+            "schema": "decision_notification_receipt.v1",
+            "notification_batch_id": next(iter(batch_ids)),
+            "decisions": references,
+        }
+    )
+    visible_ids = [item["decision_id"] for item in references[:MAX_RECEIPT_DECISION_IDS]]
+    if len(references) > len(visible_ids):
+        visible_ids.append(f"+{len(references) - len(visible_ids)}")
+    receipt = (
+        "監査証跡: "
+        f"batch={next(iter(batch_ids))} "
+        f"content_sha256={receipt_hash} "
+        f"decision_ids={','.join(visible_ids)}"
+    )
+    if len(receipt) >= DISCORD_CONTENT_LIMIT:
+        raise append_only.AppendOnlyWriteError("decision receipt exceeds Discord content limit")
+    content = payload.get("content")
+    current = content if isinstance(content, str) else ""
+    available = DISCORD_CONTENT_LIMIT - len(receipt) - 1
+    current = current[:available].rstrip()
+    payload["content"] = f"{current}\n{receipt}" if current else receipt
+    return receipt
+
+
+def _bind_notification_receipt_or_fail(
+    payload: dict[str, object],
+    persisted_events: list[dict[str, object]],
+    *,
+    require_for_external_send: bool,
+) -> str | None:
+    """Attach a durable receipt and reject any external unbound notification."""
+
+    try:
+        receipt = _attach_decision_receipt(payload, persisted_events)
+    except append_only.AppendOnlyWriteError as error:
+        raise append_only.AppendOnlyWriteError(
+            f"通常Discord通知の監査receiptを構築できません: {error}"
+        ) from error
+    if not require_for_external_send:
+        return receipt
+    content = payload.get("content")
+    if (
+        not persisted_events
+        or not receipt
+        or not isinstance(content, str)
+        or receipt not in content
+    ):
+        raise append_only.AppendOnlyWriteError(
+            "通常Discord通知には永続化済み判断batchと監査receiptが必須です"
+        )
+    return receipt
+
+
+def _persistence_failure(reasons: list[str]) -> int:
+    detail = "; ".join(dict.fromkeys(reason for reason in reasons if reason))
+    print(
+        "判断ログの永続化に失敗したため通常Discord通知を抑止しました: " + (detail or "原因不明"),
+        file=sys.stderr,
+    )
+    return 1
 
 
 def ml_needs_retrain(
@@ -170,10 +347,17 @@ def _realized_expectancy_r(summary: dict | None, symbol: str, direction: str) ->
     ):
         return None
     ci_lower = cell.get("expectancy_r_ci_lower")
-    if not isinstance(ci_lower, (int, float)) or isinstance(ci_lower, bool) or ci_lower <= 0:
+    if (
+        not isinstance(ci_lower, (int, float))
+        or isinstance(ci_lower, bool)
+        or not isfinite(ci_lower)
+        or ci_lower <= 0
+    ):
         return None
     value = cell.get("expectancy_r")
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value):
+        return None
+    return float(value)
 
 
 def load_webhook_url() -> str | None:
@@ -204,9 +388,21 @@ def load_strategy_params() -> tuple[int, int, float, str | None]:
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
-    response = requests.post(webhook_url, json=payload, timeout=15)
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=15)
+    except requests.RequestException as error:
+        # requests exceptions commonly embed the complete URL, including the
+        # Discord token.  Preserve only the exception type in operator logs.
+        raise RuntimeError(f"Discord通知に失敗: network_error={type(error).__name__}") from None
     if response.status_code >= 300:
-        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
+        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code}")
+
+
+def _fixed_evaluation_time(value: datetime | None = None) -> datetime:
+    evaluation_time = value or datetime.now(UTC)
+    if evaluation_time.tzinfo is None or evaluation_time.utcoffset() is None:
+        raise ValueError("evaluation time must be timezone-aware")
+    return evaluation_time.astimezone(UTC)
 
 
 def score_trade_outcomes_cli(
@@ -215,9 +411,11 @@ def score_trade_outcomes_cli(
     json_report_path: Path | None = None,
     improvement_registry_path: Path | None = None,
     monitor_json_path: Path | None = None,
+    now: datetime | None = None,
 ) -> int:
     """判断ジャーナルをMFE/MAE/TP/SLで採点し、期待値監査レポートを出す。"""
-    entries = list(journal.read_entries(journal_path))
+    evaluation_time = _fixed_evaluation_time(now)
+    entries = list(journal.read_entries(journal_path, as_of=evaluation_time))
     outcomes = trade_outcome.evaluate_trade_outcomes(entries)
     summary = trade_outcome.summarize_expectancy(outcomes)
     findings = trade_outcome.expectancy_findings(summary)
@@ -231,10 +429,12 @@ def score_trade_outcomes_cli(
             previous,
             candidates,
             managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
+            now=evaluation_time,
         )
         registry, paused_policies = trade_outcome.auto_pause_underperforming_approved_policies(
             registry,
             summary,
+            now=evaluation_time,
         )
         trade_outcome.save_improvement_registry(registry, improvement_registry_path)
 
@@ -275,6 +475,7 @@ def score_trade_outcomes_cli(
             summary,
             registry=registry,
             health_report=health_report,
+            now=evaluation_time,
         )
         monitor_json_path.parent.mkdir(parents=True, exist_ok=True)
         monitor_json_path.write_text(
@@ -294,9 +495,11 @@ def check_trade_outcome_health_cli(
     journal_path: Path,
     *,
     require_sample_ok: bool = False,
+    now: datetime | None = None,
 ) -> int:
     """期待値監査のCI/cron向けヘルスチェック。"""
-    entries = list(journal.read_entries(journal_path))
+    evaluation_time = _fixed_evaluation_time(now)
+    entries = list(journal.read_entries(journal_path, as_of=evaluation_time))
     outcomes = trade_outcome.evaluate_trade_outcomes(entries)
     summary = trade_outcome.summarize_expectancy(outcomes)
     report = trade_outcome.check_expectancy_health(
@@ -339,9 +542,11 @@ def retest_trade_variants_cli(
     improvement_registry_path: Path | None = None,
     target1_r_candidates: list[float] | None = None,
     target2_r_candidates: list[float] | None = None,
+    now: datetime | None = None,
 ) -> int:
     """TP1/TP2候補を過去ジャーナルでpaper再採点する。"""
-    entries = list(journal.read_entries(journal_path))
+    evaluation_time = _fixed_evaluation_time(now)
+    entries = list(journal.read_entries(journal_path, as_of=evaluation_time))
     report = trade_outcome.retest_tp_sl_variants(
         entries,
         target1_r_candidates=target1_r_candidates or trade_outcome.DEFAULT_TP1_R_CANDIDATES,
@@ -358,6 +563,7 @@ def retest_trade_variants_cli(
             previous,
             candidates,
             managed_action_types=trade_outcome.VARIANT_CANDIDATE_ACTION_TYPES,
+            now=evaluation_time,
         )
         trade_outcome.save_improvement_registry(registry, improvement_registry_path)
 
@@ -550,6 +756,25 @@ def _fmt_expectancy_pct(value: object) -> str:
     return f"{value * 100:.0f}%"
 
 
+def _veto_fusion_plans(plans: list[briefing.TradePlan], reason: str) -> None:
+    """Apply a late operational veto without overwriting the analytical signal."""
+
+    warning = f"⛔ 運用データ整合性ゲート: {reason}"
+    for plan in plans:
+        plan.action = "no_trade"
+        if warning not in plan.warnings:
+            plan.warnings.append(warning)
+        plan.checklist["blocked"] = True
+        plan.checklist["final_action"] = "no_trade"
+        steps = plan.checklist.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, dict) and step.get("key") == "event":
+                    step["status"] = "block"
+                    step["note"] = warning
+                    break
+
+
 def append_note(base: str, addition: str) -> str:
     if not addition:
         return base
@@ -572,6 +797,7 @@ def _run_per_timeframe(
     fetch_warnings,
     items,
     now,
+    run_slot,
     operational_data_ok,
     operational_data_reason,
 ) -> int:
@@ -581,25 +807,68 @@ def _run_per_timeframe(
     自己採点・学習して次回の確信度に反映する。融合1判断モードとは
     ジャーナル・学習ファイルを分ける(スキーマも採点ホライズンも異なるため)。
     """
-    journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
+    integrity_reasons: list[str] = []
+    journal_integrity_ok = True
+    try:
+        journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH, as_of=now))
+    except append_only.AppendOnlyReadError as error:
+        journal_entries = []
+        journal_integrity_ok = False
+        reason = f"時間足別判断ジャーナル整合性エラー: {error}"
+        integrity_reasons.append(reason)
+        fetch_warnings.append(f"⛔ {reason}")
 
     # 採点用の将来価格系列を組む。判断ジャーナル(源A)に加え、通知停止中も
     # fx_tf_snapshot.py で継続できる価格専用系列と、今回の現在価格を
     # 結合する。direction を持たない価格行は採点対象を増やさず将来価格系列だけを
     # 密にするので、15m/1h/4h/1d の全時間足が採点可能になる。
-    price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
+    price_integrity_ok = True
+    try:
+        price_rows = list(price_history.read_snapshot_entries(DEFAULT_TF_PRICES_PATH, as_of=now))
+    except price_history.PriceHistoryReadError as error:
+        price_rows = []
+        price_integrity_ok = False
+        reason = f"時間足別価格ジャーナル整合性エラー: {error}"
+        integrity_reasons.append(reason)
+        fetch_warnings.append(f"⛔ {reason}")
+
+    decision_log_integrity_ok = True
+    prior_decision_events: list[dict[str, object]] = []
+    if not args.no_journal:
+        try:
+            prior_decision_events = list(
+                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH, as_of=now)
+            )
+        except append_only.AppendOnlyReadError as error:
+            decision_log_integrity_ok = False
+            reason = f"完全判断ログ整合性エラー: {error}"
+            integrity_reasons.append(reason)
+            fetch_warnings.append(f"⛔ {reason}")
+
+    if integrity_reasons:
+        operational_data_ok = False
+        operational_data_reason = "; ".join(
+            reason for reason in (operational_data_reason, *integrity_reasons) if reason
+        )
     current_snapshot = price_history.snapshot_entries(
         {
             symbol: {tf: tech_map[symbol].price_snapshot(tf) for tf in timeframe.DEFAULT_TIMEFRAMES}
             for symbol in symbols
         },
-        # The main analysis timestamp is captured before network I/O. Price
-        # availability must instead reflect acquisition completion.
-        now=datetime.now(UTC),
+        # The underlying quote was acquired before the final prediction cutoff.
+        # Stamp the derived snapshot at that cutoff; stamping after it would let
+        # the same run consume a nominally future row during scoring/learning.
+        now=now,
     )
     # 5分ボード自身が方向を持たない価格系列も保存するため、別の価格取得ループを
     # 併走せずに短期足の採点と鮮度監視を維持できる。
-    if args.signal_board and not args.no_price_write and not args.no_journal and not args.dry_run:
+    if (
+        price_integrity_ok
+        and args.signal_board
+        and not args.no_price_write
+        and not args.no_journal
+        and not args.dry_run
+    ):
         try:
             price_history.append_snapshot_entries(DEFAULT_TF_PRICES_PATH, current_snapshot)
         except (OSError, price_history.PriceHistoryWriteError) as error:
@@ -717,52 +986,79 @@ def _run_per_timeframe(
                 aux_reports_by_symbol.setdefault("_shared", {})[tf] = line
 
     # ジャーナル: 今回の時間足別判断を専用ジャーナルへ追記
+    persisted_decision_events: list[dict[str, object]] = []
+    persistence_errors: list[str] = []
     if not args.no_journal and not args.dry_run:
         all_plans = [plan for plans in plans_by_symbol.values() for plan in plans]
-        try:
-            journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
-        except OSError as error:
-            fetch_warnings.append(f"時間足別ジャーナル書き込み失敗: {error}")
-        try:
-            prior_decision_events = list(
-                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-            )
-            decision_events = decision_log.build_timeframe_decision_events(
-                plans_by_symbol,
-                now=now,
-                analysis=analysis,
-                tech_map=tech_map,
-                news_items=items,
-                events_48h=events_48h,
-                fetch_warnings=fetch_warnings,
-                calendar_ok=calendar_ok,
-                timeframe_learning=tf_learn if not args.no_learning else None,
-                tp_sl_learning=tp_sl_learn,
-                maximization_profile=max_profile,
-                decision_feedback_profile=decision_feedback_profile,
-                expectancy_summaries=_expectancy_summaries,
-            )
-            decision_outcome_report = decision_log.score_decision_events(
-                [*prior_decision_events, *decision_events],
-                price_entries=[*price_rows, *current_snapshot],
-                now=now,
-            )
-            decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
-            decision_log.save_latest_snapshot(
-                DEFAULT_DECISION_LATEST_PATH,
-                decision_events,
-                now=now,
-            )
-            decision_log.save_outcome_report(
-                decision_outcome_report,
-                DEFAULT_DECISION_OUTCOMES_PATH,
-            )
-            decision_feedback.save_decision_feedback(
-                decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
-                DEFAULT_DECISION_FEEDBACK_PATH,
-            )
-        except OSError as error:
-            fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
+        if journal_integrity_ok:
+            try:
+                journal.append_timeframe_plans(
+                    DEFAULT_TF_JOURNAL_PATH,
+                    all_plans,
+                    now=now,
+                    run_slot=run_slot,
+                )
+            except (OSError, append_only.AppendOnlyWriteError) as error:
+                reason = f"時間足別ジャーナル書き込み失敗: {error}"
+                fetch_warnings.append(reason)
+                persistence_errors.append(reason)
+        else:
+            persistence_errors.append("時間足別ジャーナル整合性を証明できず追記不可")
+        if decision_log_integrity_ok:
+            try:
+                decision_events = decision_log.build_timeframe_decision_events(
+                    plans_by_symbol,
+                    now=now,
+                    analysis=analysis,
+                    tech_map=tech_map,
+                    news_items=items,
+                    events_48h=events_48h,
+                    fetch_warnings=fetch_warnings,
+                    calendar_ok=calendar_ok,
+                    timeframe_learning=tf_learn if not args.no_learning else None,
+                    tp_sl_learning=tp_sl_learn,
+                    maximization_profile=max_profile,
+                    decision_feedback_profile=decision_feedback_profile,
+                    expectancy_summaries=_expectancy_summaries,
+                    run_slot=run_slot,
+                )
+                decision_outcome_report = decision_log.score_decision_events(
+                    [*prior_decision_events, *decision_events],
+                    price_entries=[*price_rows, *current_snapshot],
+                    now=now,
+                )
+                decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
+                persisted_decision_events = _persisted_decision_batch(
+                    DEFAULT_DECISION_LOG_PATH,
+                    decision_events,
+                    as_of=now,
+                )
+                decision_log.save_latest_snapshot(
+                    DEFAULT_DECISION_LATEST_PATH,
+                    decision_events,
+                    now=now,
+                )
+                decision_log.save_outcome_report(
+                    decision_outcome_report,
+                    DEFAULT_DECISION_OUTCOMES_PATH,
+                )
+                decision_feedback.save_decision_feedback(
+                    decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
+                    DEFAULT_DECISION_FEEDBACK_PATH,
+                )
+            except (
+                OSError,
+                append_only.AppendOnlyReadError,
+                append_only.AppendOnlyWriteError,
+            ) as error:
+                reason = f"完全判断ログ書き込み失敗: {error}"
+                fetch_warnings.append(reason)
+                persistence_errors.append(reason)
+        else:
+            persistence_errors.append("完全判断ログ整合性を証明できず追記不可")
+
+    if persistence_errors:
+        return _persistence_failure(persistence_errors)
 
     if args.signal_board:
         data_quality = signal_board.assess_data_quality(
@@ -790,6 +1086,14 @@ def _run_per_timeframe(
             aux_reports_by_symbol={s: aux_reports_by_symbol.get("_shared", {}) for s in symbols},
             now=now,
         )
+    try:
+        _bind_notification_receipt_or_fail(
+            payload,
+            persisted_decision_events,
+            require_for_external_send=not args.dry_run and not args.no_discord,
+        )
+    except append_only.AppendOnlyWriteError as error:
+        return _persistence_failure([str(error)])
 
     if args.dry_run:
         print(payload["content"])
@@ -856,7 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-journal",
         action="store_true",
-        help="判断ジャーナル(logs/briefing_journal.jsonl)の記録・検証を行わない",
+        help="判断ジャーナルの記録・検証を行わない(--dry-run/--no-discord専用)",
     )
     parser.add_argument(
         "--no-learning",
@@ -899,6 +1203,11 @@ def main(argv: list[str] | None = None) -> int:
         "--require-freshness",
         action="store_true",
         help="新規方向判断に最新の正常なfreshness reportを必須化する",
+    )
+    parser.add_argument(
+        "--run-slot",
+        default=None,
+        help="schedulerが固定する判断run slot (5分境界、外部通知は65分以内)",
     )
     parser.add_argument(
         "--freshness-report",
@@ -1035,6 +1344,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.promote_live is not None:
         parser.error("--promote-live is disabled; this build is research/shadow only")
+    if args.no_journal and not (args.dry_run or args.no_discord):
+        parser.error(
+            "--no-journal requires --dry-run or --no-discord; external notifications require durable decision journals"
+        )
     if args.signal_board:
         args.per_timeframe = True
 
@@ -1101,7 +1414,18 @@ def main(argv: list[str] | None = None) -> int:
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
     fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
-    now = datetime.now(UTC)
+    run_started_at = datetime.now(UTC)
+    try:
+        run_slot = _resolve_run_slot(args.run_slot, run_started_at)
+    except ValueError as error:
+        parser.error(str(error))
+    if run_started_at - run_slot > timedelta(minutes=MAX_EXTERNAL_RUN_SLOT_AGE_MINUTES) and not (
+        args.dry_run or args.no_discord
+    ):
+        parser.error(
+            f"--run-slot older than {MAX_EXTERNAL_RUN_SLOT_AGE_MINUTES} minutes is allowed only with --dry-run or --no-discord"
+        )
+    now = run_started_at
     trade_improvement_registry = (
         trade_outcome.load_improvement_registry(args.trade_improvement_registry)
         if not args.no_trade_expectancy
@@ -1127,23 +1451,15 @@ def main(argv: list[str] | None = None) -> int:
         status="not_required",
         reason="freshness gate not requested",
     )
-    if args.require_freshness:
-        freshness_gate = freshness.evaluate_freshness_report(
-            args.freshness_report,
-            now=now,
-            max_report_age_seconds=args.freshness_max_age_seconds,
-        )
-        if not freshness_gate.allow_new_risk:
-            fetch_warnings.append(f"⛔ 運用データ鮮度ゲート: {freshness_gate.reason}")
-
     # 1. 経済指標カレンダー(レート制限対策にローカルキャッシュ併用)
     events, calendar_warnings = calendar.fetch_calendar(cache_path=DEFAULT_CALENDAR_CACHE)
+    calendar_acquired_at = _prediction_time_after_acquisition(run_started_at)
     fetch_warnings.extend(calendar_warnings)
     # イベントが1件も取れていない=警戒窓判定が機能しない状態。判断側で安全側に倒す
-    calendar_ok = bool(events)
-    events_48h = calendar.upcoming_events(
-        events, currencies, now, hours_ahead=args.hours_ahead, min_impact="high"
-    )
+    # Any partial/stale/cache-quality warning means the blackout calendar cannot
+    # prove complete event coverage. Keep the events for operator context, but
+    # fail closed at the decision gate.
+    calendar_ok = bool(events) and not calendar_warnings
     if not args.no_export_events and events:
         try:
             calendar.export_events_csv(events, DEFAULT_EVENTS_CSV)
@@ -1151,7 +1467,7 @@ def main(argv: list[str] | None = None) -> int:
             fetch_warnings.append(f"イベントCSV書き出し失敗: {error}")
     if not args.no_event_archive and events:
         try:
-            calendar.append_events_archive(events, DEFAULT_EVENTS_ARCHIVE, now=now)
+            calendar.append_events_archive(events, DEFAULT_EVENTS_ARCHIVE, now=calendar_acquired_at)
         except OSError as error:
             fetch_warnings.append(f"イベント履歴アーカイブ追記失敗: {error}")
 
@@ -1165,16 +1481,34 @@ def main(argv: list[str] | None = None) -> int:
         macro_snapshot = macro.fetch_macro_snapshot(DEFAULT_MACRO_CACHE, now=now)
         fetch_warnings.extend(macro_snapshot.warnings)
 
-    # 4. センチメント分析(Claude API → 自前分析エンジン。レジームはマクロ実データ優先)
-    analysis = sentiment.analyze_market(
-        items, ordered_currencies, use_llm=not args.no_llm, macro=macro_snapshot, now=now
-    )
-
-    # 5. テクニカル取得
+    # 4. テクニカル取得
     tech_map, tech_warnings = technicals.fetch_pair_technicals(
         symbols, fast_window=fast_window, slow_window=slow_window
     )
     fetch_warnings.extend(tech_warnings)
+
+    # 5. センチメント分析(Claude APIを含む)も入力取得の一部。判断時刻は
+    # この処理が完了するまで確定しない。
+    analysis_as_of = _prediction_time_after_acquisition(run_started_at)
+    analysis = sentiment.analyze_market(
+        items,
+        ordered_currencies,
+        use_llm=not args.no_llm,
+        macro=macro_snapshot,
+        now=analysis_as_of,
+    )
+    now = _prediction_time_after_acquisition(run_started_at)
+    events_48h = calendar.upcoming_events(
+        events, currencies, now, hours_ahead=args.hours_ahead, min_impact="high"
+    )
+    if args.require_freshness:
+        freshness_gate = freshness.evaluate_freshness_report(
+            args.freshness_report,
+            now=now,
+            max_report_age_seconds=args.freshness_max_age_seconds,
+        )
+        if not freshness_gate.allow_new_risk:
+            fetch_warnings.append(f"⛔ 運用データ鮮度ゲート: {freshness_gate.reason}")
 
     # 時間足別モード: ここで専用パスへ分岐して早期return(融合1判断の
     # 委員会・ML・昇格は使わず、時間足別の判断・採点・学習だけを回す)
@@ -1194,6 +1528,7 @@ def main(argv: list[str] | None = None) -> int:
             fetch_warnings=fetch_warnings,
             items=items,
             now=now,
+            run_slot=run_slot,
             operational_data_ok=freshness_gate.allow_new_risk,
             operational_data_reason=freshness_gate.reason,
         )
@@ -1202,13 +1537,46 @@ def main(argv: list[str] | None = None) -> int:
     profile = learning.LearnedProfile()
     learning_note = ""
     calls: list[learning.EvaluatedCall] = []
-    journal_entries = list(journal.read_entries(DEFAULT_JOURNAL_PATH))
+    integrity_reasons: list[str] = []
+    journal_integrity_ok = True
+    try:
+        journal_entries = list(journal.read_entries(DEFAULT_JOURNAL_PATH, as_of=now))
+    except append_only.AppendOnlyReadError as error:
+        journal_entries = []
+        journal_integrity_ok = False
+        reason = f"判断ジャーナル整合性エラー: {error}"
+        integrity_reasons.append(reason)
+        fetch_warnings.append(f"⛔ {reason}")
+
+    decision_log_integrity_ok = True
+    prior_decision_events: list[dict[str, object]] = []
+    if not args.no_journal:
+        try:
+            prior_decision_events = list(
+                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH, as_of=now)
+            )
+        except append_only.AppendOnlyReadError as error:
+            decision_log_integrity_ok = False
+            reason = f"完全判断ログ整合性エラー: {error}"
+            integrity_reasons.append(reason)
+            fetch_warnings.append(f"⛔ {reason}")
+
+    if integrity_reasons:
+        combined_reason = "; ".join(
+            reason for reason in (freshness_gate.reason, *integrity_reasons) if reason
+        )
+        freshness_gate = freshness.FreshnessGate(
+            allow_new_risk=False,
+            status="invalid",
+            reason=combined_reason,
+            monitor_timestamp=freshness_gate.monitor_timestamp,
+        )
     if not args.no_learning:
-        calls = learning.evaluate_history(journal_entries)
+        calls = learning.evaluate_history(journal_entries, as_of=now)
         profile = learning.derive_profile(calls, now=now)
         learning_note = profile.summary_ja()
         # ホライズン別(4h/24h/72h)の的中率観測。学習は24hのみを使う
-        horizon_line = learning.horizon_report_ja(journal_entries)
+        horizon_line = learning.horizon_report_ja(journal_entries, as_of=now)
         if horizon_line:
             learning_note = (learning_note + "\n" + horizon_line).strip()
         if not args.dry_run:
@@ -1362,24 +1730,43 @@ def main(argv: list[str] | None = None) -> int:
             operational_data_ok=freshness_gate.allow_new_risk,
             operational_data_reason=freshness_gate.reason,
         )
+        # Preserve the committee's analytical direction, but expose/record only
+        # the independently gated action as the trade decision.
+        plan.action = checklist.final_action
         plan.checklist = checklist.to_dict()
         plans.append(plan)
 
     # 10. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
     journal_note = ""
-    if not args.no_journal:
+    persisted_decision_events: list[dict[str, object]] = []
+    persistence_errors: list[str] = []
+    if not args.no_journal and journal_integrity_ok:
         closes = {symbol: tech_map[symbol].close() for symbol in symbols}
-        stats = journal.evaluate_directional_accuracy(DEFAULT_JOURNAL_PATH, closes, now=now)
-        journal_note = journal.format_stats_ja(stats)
-        if not args.dry_run:
+        try:
+            stats = journal.evaluate_directional_accuracy(DEFAULT_JOURNAL_PATH, closes, now=now)
+            journal_note = journal.format_stats_ja(stats)
+        except append_only.AppendOnlyReadError as error:
+            reason = f"判断ジャーナル再読込整合性エラー: {error}"
+            fetch_warnings.append(f"⛔ {reason}")
+            _veto_fusion_plans(plans, reason)
+            persistence_errors.append(reason)
+    if not args.no_journal and not args.dry_run:
+        if journal_integrity_ok and not persistence_errors:
             try:
-                journal.append_plans(DEFAULT_JOURNAL_PATH, plans, now=now)
-            except OSError as error:
-                fetch_warnings.append(f"判断ジャーナル書き込み失敗: {error}")
-            try:
-                prior_decision_events = list(
-                    decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
+                journal.append_plans(
+                    DEFAULT_JOURNAL_PATH,
+                    plans,
+                    now=now,
+                    run_slot=run_slot,
                 )
+            except (OSError, append_only.AppendOnlyWriteError) as error:
+                reason = f"判断ジャーナル書き込み失敗: {error}"
+                fetch_warnings.append(reason)
+                persistence_errors.append(reason)
+        elif not journal_integrity_ok:
+            persistence_errors.append("判断ジャーナル整合性を証明できず追記不可")
+        if decision_log_integrity_ok:
+            try:
                 decision_events = decision_log.build_fusion_decision_events(
                     plans,
                     now=now,
@@ -1396,12 +1783,18 @@ def main(argv: list[str] | None = None) -> int:
                     decision_feedback_profile=decision_feedback_profile,
                     ml_artifact=ml_artifact if not args.no_ml else None,
                     promotion_state=promotion_state,
+                    run_slot=run_slot,
                 )
                 decision_outcome_report = decision_log.score_decision_events(
                     [*prior_decision_events, *decision_events],
                     now=now,
                 )
                 decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
+                persisted_decision_events = _persisted_decision_batch(
+                    DEFAULT_DECISION_LOG_PATH,
+                    decision_events,
+                    as_of=now,
+                )
                 decision_log.save_latest_snapshot(
                     DEFAULT_DECISION_LATEST_PATH,
                     decision_events,
@@ -1415,8 +1808,19 @@ def main(argv: list[str] | None = None) -> int:
                     decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
                     DEFAULT_DECISION_FEEDBACK_PATH,
                 )
-            except OSError as error:
-                fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
+            except (
+                OSError,
+                append_only.AppendOnlyReadError,
+                append_only.AppendOnlyWriteError,
+            ) as error:
+                reason = f"完全判断ログ書き込み失敗: {error}"
+                fetch_warnings.append(reason)
+                persistence_errors.append(reason)
+        else:
+            persistence_errors.append("完全判断ログ整合性を証明できず追記不可")
+
+    if persistence_errors:
+        return _persistence_failure(persistence_errors)
 
     if ml_artifact.model is not None:
         learning_note = append_note(learning_note, ml_artifact.summary_ja())
@@ -1434,6 +1838,14 @@ def main(argv: list[str] | None = None) -> int:
         promotion_note=promotion_note,
         now=now,
     )
+    try:
+        _bind_notification_receipt_or_fail(
+            payload,
+            persisted_decision_events,
+            require_for_external_send=not args.dry_run and not args.no_discord,
+        )
+    except append_only.AppendOnlyWriteError as error:
+        return _persistence_failure([str(error)])
 
     if args.dry_run:
         print(payload["content"])

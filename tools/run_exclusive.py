@@ -13,8 +13,9 @@ Mac mini実機で「手動loop×3 + launchd + cron」が同時稼働してジャ
 - ロック取得失敗(=先行プロセスが実行中)は既定で exit 0。launchdのStartIntervalで
   定期起動される前提のため、「スキップ」は正常系でありエラー扱いにしない
   (--busy-exit-code で変更可能)。
-- SIGTERM/SIGINT は子プロセスへ転送し、子の終了を待ってから同じコードで終了する
-  (launchctl bootout / kickstart -k での停止を正常終了扱いにするため)。
+- 子コマンドは専用process groupで起動する。SIGTERM/SIGINTは孫プロセスも
+  含むgroup全体へ転送し、猶予時間後も残る場合はSIGKILLへエスカレートする。
+  groupが消滅するまでflockは解放しない。
 
 使用例(launchdのProgramArgumentsから):
     python3 tools/run_exclusive.py --name fx-snapshot --locks-dir logs/locks \
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, UTC
+import errno
 import fcntl
 import json
 import os
@@ -33,11 +35,14 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from types import FrameType
 from typing import IO
 
 DEFAULT_LOCKS_DIR = "logs/locks"
 BUSY_EXIT_CODE_DEFAULT = 0
+DEFAULT_TERMINATION_GRACE_SECONDS = 10.0
+PROCESS_GROUP_POLL_SECONDS = 0.05
 
 
 class ExclusiveLock:
@@ -54,9 +59,14 @@ class ExclusiveLock:
         handle = self.path.open("a+", encoding="utf-8")
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as error:
             handle.close()
-            return False
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                return False
+            # Unsupported locking, I/O errors, and descriptor failures are not
+            # evidence of another writer.  Propagate them so launchd records a
+            # failed safety boundary instead of a successful busy skip.
+            raise
         # 診断メタデータ(排他判定には使わない。判定はflockが唯一の真実)
         handle.seek(0)
         handle.truncate()
@@ -103,8 +113,11 @@ def run_locked(
     command: list[str],
     locks_dir: str | Path = DEFAULT_LOCKS_DIR,
     busy_exit_code: int = BUSY_EXIT_CODE_DEFAULT,
+    termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
 ) -> int:
     """ロック下でコマンドを実行し、子の終了コードを返す。取得失敗はbusy_exit_code。"""
+    if termination_grace_seconds <= 0:
+        raise ValueError("termination_grace_seconds must be positive")
     with ExclusiveLock(name, locks_dir) as lock:
         if not lock.acquire():
             holder = lock.holder_info()
@@ -116,22 +129,91 @@ def run_locked(
             )
             return busy_exit_code
 
-        child = subprocess.Popen(command)
+        # handlerをspawn前に設定し、spawn中のTERM/INTは一時保留する。
+        # signal maskをblockしたままforkすると、子がexec後もそのmaskを
+        # 継承してTERMを受信できないため、pthread_sigmaskは使わない。
+        process_group_id: int | None = None
+        pending_signals: list[int] = []
+        termination_deadline: float | None = None
+        force_kill_sent = False
 
         def _forward(signum: int, _frame: FrameType | None) -> None:
-            # launchdからの停止(SIGTERM)やCtrl-Cを子へ転送し、子の後始末を待つ
-            try:
-                child.send_signal(signum)
-            except ProcessLookupError:
-                pass
+            nonlocal termination_deadline
+            # signal handler内ではgroupへの転送とdeadline設定だけ行い、
+            # 待機とSIGKILL escalationは下のメインループで行う。
+            if termination_deadline is None:
+                termination_deadline = time.monotonic() + termination_grace_seconds
+            if process_group_id is None:
+                pending_signals.append(signum)
+                return
+            _signal_process_group(process_group_id, signum)
 
         previous_term = signal.signal(signal.SIGTERM, _forward)
         previous_int = signal.signal(signal.SIGINT, _forward)
         try:
-            return child.wait()
+            # shell wrapper配下のPython等も一括停止できるよう、子を新しい
+            # session/process groupのleaderにする。このgroupが消えるまでlockを保持する。
+            child = subprocess.Popen(command, start_new_session=True)
+        except BaseException:
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
+            # spawn中に終了シグナルを受けた場合は、元のハンドラを
+            # 復元後に再送し、通常の終了意味を握りつぶさない。
+            if pending_signals:
+                os.kill(os.getpid(), pending_signals[-1])
+            raise
+        process_group_id = child.pid
+        for pending_signum in pending_signals:
+            _signal_process_group(process_group_id, pending_signum)
+        pending_signals.clear()
+
+        try:
+            while True:
+                returncode = child.poll()
+                group_alive = _process_group_exists(process_group_id)
+                if returncode is not None and not group_alive:
+                    return returncode
+
+                if (
+                    termination_deadline is not None
+                    and not force_kill_sent
+                    and time.monotonic() >= termination_deadline
+                ):
+                    if group_alive:
+                        print(
+                            f"[run_exclusive] {name}: process groupがTERM後も残存; "
+                            "SIGKILLへエスカレート",
+                            file=sys.stderr,
+                        )
+                        _signal_process_group(process_group_id, signal.SIGKILL)
+                    force_kill_sent = True
+
+                # group leaderが先に終了しても、孫プロセスが残る間は
+                # lockを解放しない。SIGKILL後もkernelの終了処理を待つ。
+                time.sleep(PROCESS_GROUP_POLL_SECONDS)
         finally:
             signal.signal(signal.SIGTERM, previous_term)
             signal.signal(signal.SIGINT, previous_int)
+
+
+def _signal_process_group(process_group_id: int, signum: int) -> None:
+    """Best-effort signal delivery to the complete child process group."""
+    try:
+        os.killpg(process_group_id, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    """Return whether any process still belongs to ``process_group_id``."""
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 同一userの子groupでは通常起きないが、不明を終了扱いしない。
+        return True
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -144,6 +226,12 @@ def main(argv: list[str] | None = None) -> int:
         default=BUSY_EXIT_CODE_DEFAULT,
         help="ロック取得失敗(先行実行中)時の終了コード。既定0=正常スキップ",
     )
+    parser.add_argument(
+        "--termination-grace-seconds",
+        type=float,
+        default=DEFAULT_TERMINATION_GRACE_SECONDS,
+        help="TERM/INT転送後にprocess groupを待つ秒数。超過後はSIGKILL",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- の後に実行コマンド")
     args = parser.parse_args(argv)
 
@@ -152,7 +240,13 @@ def main(argv: list[str] | None = None) -> int:
         command = command[1:]
     if not command:
         parser.error("実行コマンドを -- の後に指定してください")
-    return run_locked(args.name, command, args.locks_dir, args.busy_exit_code)
+    return run_locked(
+        args.name,
+        command,
+        args.locks_dir,
+        args.busy_exit_code,
+        args.termination_grace_seconds,
+    )
 
 
 if __name__ == "__main__":

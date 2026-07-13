@@ -15,12 +15,21 @@ import hashlib
 import json
 from pathlib import Path
 
+from .append_only import (
+    AppendOnlyReadError,
+    AppendOnlyWriteError,
+    TIMESTAMP_FIELDS,
+    append_jsonl_idempotent,
+    canonical_row_hash,
+    read_jsonl_strict,
+)
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 EVENT_TYPE = "chart_decision"
 SCORING_METHOD = "tp_sl_mfe_mae_first_touch"
+RUN_CADENCE_MINUTES = 5
 SCORING_METRICS = (
     "first_touch",
     "realized_r",
@@ -119,11 +128,13 @@ def build_timeframe_decision_events(
     decision_feedback_profile: object | None = None,
     expectancy_summaries: Mapping[str, Mapping[str, object]] | None = None,
     source: str = "fx_briefing",
+    run_slot: datetime | None = None,
 ) -> list[dict[str, object]]:
     """Build append-only audit events for --per-timeframe decisions."""
 
     now = _utc(now)
-    run_id = _run_id(now, "per_timeframe")
+    resolved_run_slot = _resolve_run_slot(now, run_slot)
+    run_id = _run_id(resolved_run_slot, "per_timeframe")
     market_context = _market_context(
         analysis,
         news_items=news_items,
@@ -134,9 +145,8 @@ def build_timeframe_decision_events(
     events: list[dict[str, object]] = []
     for symbol, plans in plans_by_symbol.items():
         technical_context = _technical_context(tech_map.get(symbol))
-        for index, plan in enumerate(plans):
+        for plan in plans:
             timeframe = str(getattr(plan, "timeframe", ""))
-            direction = str(getattr(plan, "direction", ""))
             event = {
                 "schema": SCHEMA_VERSION,
                 "event_type": EVENT_TYPE,
@@ -145,10 +155,9 @@ def build_timeframe_decision_events(
                     "per_timeframe",
                     str(symbol),
                     timeframe,
-                    direction,
-                    index,
                 ),
                 "run_id": run_id,
+                "run_slot": resolved_run_slot.isoformat(),
                 "ts": now.isoformat(),
                 "source": source,
                 "mode": "per_timeframe",
@@ -161,7 +170,7 @@ def build_timeframe_decision_events(
                 "learning_context": _timeframe_learning_context(
                     str(symbol),
                     timeframe,
-                    direction,
+                    str(getattr(plan, "direction", "")),
                     timeframe_learning=timeframe_learning,
                     tp_sl_learning=tp_sl_learning,
                     maximization_profile=maximization_profile,
@@ -171,7 +180,7 @@ def build_timeframe_decision_events(
                 "audit": _audit_flags(plan),
             }
             events.append(_json_ready_dict(event))
-    return events
+    return _bind_notification_batch(events)
 
 
 def build_fusion_decision_events(
@@ -190,11 +199,13 @@ def build_fusion_decision_events(
     ml_artifact: object | None = None,
     promotion_state: object | None = None,
     source: str = "fx_briefing",
+    run_slot: datetime | None = None,
 ) -> list[dict[str, object]]:
     """Build append-only audit events for the legacy one-decision-per-symbol path."""
 
     now = _utc(now)
-    run_id = _run_id(now, "fusion")
+    resolved_run_slot = _resolve_run_slot(now, run_slot)
+    run_id = _run_id(resolved_run_slot, "fusion")
     market_context = _market_context(
         analysis,
         news_items=news_items,
@@ -203,20 +214,20 @@ def build_fusion_decision_events(
         calendar_ok=calendar_ok,
     )
     events: list[dict[str, object]] = []
-    for index, plan in enumerate(plans):
+    for plan in plans:
         symbol = str(getattr(plan, "symbol", ""))
-        direction = str(getattr(plan, "direction", ""))
         event = {
             "schema": SCHEMA_VERSION,
             "event_type": EVENT_TYPE,
-            "decision_id": _decision_id(run_id, "fusion", symbol, "fusion", direction, index),
+            "decision_id": _decision_id(run_id, "fusion", symbol, "fusion"),
             "run_id": run_id,
+            "run_slot": resolved_run_slot.isoformat(),
             "ts": now.isoformat(),
             "source": source,
             "mode": "fusion",
             "symbol": symbol,
             "timeframe": "fusion",
-            "horizon_hours": 24.0,
+            "horizon_hours": _number_or_none(getattr(plan, "horizon_hours", None)),
             "decision": _fusion_plan_snapshot(plan),
             "market_context": market_context,
             "technical_context": _technical_context(tech_map.get(symbol)),
@@ -227,7 +238,7 @@ def build_fusion_decision_events(
                     decision_feedback_profile,
                     symbol,
                     "fusion",
-                    direction,
+                    str(getattr(plan, "direction", "")),
                 ),
                 "ml": _ml_artifact_snapshot(ml_artifact),
                 "promotion": _promotion_snapshot(promotion_state),
@@ -235,17 +246,129 @@ def build_fusion_decision_events(
             "audit": _audit_flags(plan),
         }
         events.append(_json_ready_dict(event))
-    return events
+    return _bind_notification_batch(events)
 
 
 def append_decision_events(path: str | Path, events: Iterable[Mapping[str, object]]) -> None:
     """Append audit events as JSONL.  One line is one immutable decision event."""
 
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        for event in events:
-            handle.write(json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n")
+    prepared = [dict(event) for event in events]
+    _validate_notification_batch(prepared, error_type=AppendOnlyWriteError)
+    try:
+        list(read_decision_events(path))
+    except AppendOnlyReadError as error:
+        raise AppendOnlyWriteError("existing decision journal failed semantic replay") from error
+    append_jsonl_idempotent(
+        path,
+        prepared,
+        identity=_decision_event_identity_for_write,
+        row_digest=_decision_event_logical_digest,
+    )
+
+
+def _decision_event_identity_for_write(event: Mapping[str, object]) -> str:
+    try:
+        return _validated_decision_event_identity(event)
+    except (TypeError, ValueError) as error:
+        raise AppendOnlyWriteError(f"invalid decision natural identity: {error}") from error
+
+
+def _decision_event_identity_for_read(event: Mapping[str, object]) -> str:
+    try:
+        return _validated_decision_event_identity(event)
+    except (TypeError, ValueError) as error:
+        raise AppendOnlyReadError(f"invalid decision natural identity: {error}") from error
+
+
+def _validated_decision_event_identity(event: Mapping[str, object]) -> str:
+    if event.get("event_type") != EVENT_TYPE:
+        raise ValueError(f"event_type must be {EVENT_TYPE!r}")
+    schema = event.get("schema")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema < 2:
+        raise ValueError("decision schema must be an integer >= 2")
+    mode = str(event.get("mode") or "").strip()
+    if mode not in {"fusion", "per_timeframe"}:
+        raise ValueError("decision mode is invalid")
+    symbol = str(event.get("symbol") or "").strip()
+    timeframe = str(event.get("timeframe") or "").strip()
+    if not symbol or not timeframe:
+        raise ValueError("decision symbol/timeframe is missing")
+    if mode == "fusion" and timeframe != "fusion":
+        raise ValueError("fusion decision must use timeframe='fusion'")
+
+    run_id = str(event.get("run_id") or "").strip()
+    if not run_id:
+        raise ValueError("decision run_id is missing")
+    run_slot_raw = event.get("run_slot")
+    if run_slot_raw is None:
+        if schema >= 3:
+            raise ValueError("schema-v3 decision requires run_slot")
+        run_slot = _run_slot_from_run_id(run_id, mode)
+    else:
+        run_slot = _parse_aware_datetime(run_slot_raw, "run_slot")
+    if run_slot != _cadence_slot(run_slot):
+        raise ValueError("decision run_slot must align to the five-minute cadence")
+    expected_run_id = _run_id(run_slot, mode)
+    if run_id != expected_run_id:
+        raise ValueError("decision run_id does not match run_slot/mode")
+
+    decision_time = _parse_aware_datetime(event.get("ts"), "ts")
+    if run_slot > decision_time:
+        raise ValueError("decision run_slot cannot be later than ts")
+    expected_decision_id = _decision_id(run_id, mode, symbol, timeframe)
+    decision_id = str(event.get("decision_id") or "").strip()
+    if decision_id != expected_decision_id:
+        raise ValueError("decision_id does not match run_id/mode/symbol/timeframe")
+    return expected_decision_id
+
+
+def _parse_aware_datetime(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"decision {field} is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"decision {field} is invalid") from error
+    return _utc(parsed)
+
+
+def _run_slot_from_run_id(run_id: str, mode: str) -> datetime:
+    suffix = f"-{mode}-"
+    if suffix not in run_id:
+        raise ValueError("decision run_id format is invalid")
+    compact, digest = run_id.split(suffix, 1)
+    if len(digest) != 8 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("decision run_id digest is invalid")
+    try:
+        slot = datetime.strptime(compact, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    except ValueError as error:
+        raise ValueError("decision run_id timestamp is invalid") from error
+    if _run_id(slot, mode) != run_id:
+        raise ValueError("decision run_id digest does not match its timestamp/mode")
+    return slot
+
+
+def _decision_event_logical_digest(event: Mapping[str, object]) -> str:
+    """Hash decision semantics while ignoring retry-only clock/hash metadata."""
+
+    normalized = {
+        str(key): _without_retry_metadata(value)
+        for key, value in event.items()
+        if key not in {"content_hash", "ts"}
+    }
+    return canonical_row_hash(normalized)
+
+
+def _without_retry_metadata(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_retry_metadata(item)
+            for key, item in value.items()
+            if key not in {"generated_at", "updated_at"}
+        }
+    if isinstance(value, list | tuple):
+        return [_without_retry_metadata(item) for item in value]
+    return value
 
 
 def save_latest_snapshot(
@@ -260,10 +383,11 @@ def save_latest_snapshot(
     action_counts: dict[str, int] = {}
     for event in events:
         decision = event.get("decision")
-        direction = ""
+        action = "no_trade"
         if isinstance(decision, Mapping):
-            direction = str(decision.get("direction", ""))
-        action_counts[direction] = action_counts.get(direction, 0) + 1
+            candidate = str(decision.get("action", "no_trade"))
+            action = candidate if candidate in ("long", "short") else "no_trade"
+        action_counts[action] = action_counts.get(action, 0) + 1
     payload = {
         "schema": SCHEMA_VERSION,
         "generated_at": generated_at.isoformat(),
@@ -282,23 +406,31 @@ def save_latest_snapshot(
     )
 
 
-def read_decision_events(path: str | Path):
-    """Read append-only decision events.  Corrupt lines are skipped."""
+def read_decision_events(
+    path: str | Path,
+    *,
+    as_of: datetime | None = None,
+    allow_legacy_unhashed: bool = False,
+):
+    """Strictly read decision events without hiding corruption or future rows."""
 
-    try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            yield event
+    rows = list(
+        read_jsonl_strict(
+            path,
+            as_of=as_of,
+            allow_legacy_unhashed=allow_legacy_unhashed,
+            identity=_decision_event_identity_for_read,
+        )
+    )
+    batches: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        batch_id = str(row.get("notification_batch_id") or "").strip()
+        if not batch_id:
+            raise AppendOnlyReadError("decision event is missing notification_batch_id")
+        batches.setdefault(batch_id, []).append(row)
+    for batch in batches.values():
+        _validate_notification_batch(batch, error_type=AppendOnlyReadError)
+    yield from rows
 
 
 def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, object] | None:
@@ -318,6 +450,9 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         horizon = _number_or_none(decision.get("horizon_hours"))
     if horizon is None:
         horizon = _horizon_for_timeframe(timeframe)
+    signal_direction = str(decision.get("direction", ""))
+    candidate_action = str(decision.get("action", "no_trade"))
+    action = candidate_action if candidate_action in ("long", "short") else "no_trade"
     entry = {
         "ts": ts,
         "symbol": symbol,
@@ -326,7 +461,9 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "horizon_hours": horizon,
         "decision_id": event.get("decision_id"),
         "run_id": event.get("run_id"),
-        "direction": decision.get("direction"),
+        "direction": action,
+        "action": action,
+        "signal_direction": signal_direction,
         "conviction": decision.get("conviction"),
         "composite": decision.get("composite"),
         "tech_score": decision.get("tf_score", decision.get("tech_score")),
@@ -354,10 +491,16 @@ def score_decision_events(
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
+    raw_events = [dict(event) for event in events]
+    raw_prices = [dict(row) for row in price_entries]
+    _validate_scoring_rows_as_of(raw_events, generated_at, "decision event")
+    _validate_scoring_rows_as_of(raw_prices, generated_at, "price row")
     event_entries = [
-        entry for event in events if (entry := decision_event_to_scoring_entry(event)) is not None
+        entry
+        for event in raw_events
+        if (entry := decision_event_to_scoring_entry(event)) is not None
     ]
-    normalized_prices = [_normalize_price_entry(row) for row in price_entries]
+    normalized_prices = [_normalize_price_entry(row) for row in raw_prices]
     all_entries = event_entries + normalized_prices
     contexts = sorted(
         {
@@ -557,6 +700,7 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "timeframe": getattr(plan, "timeframe", ""),
         "horizon_hours": _number_or_none(getattr(plan, "horizon_hours", None)),
         "direction": getattr(plan, "direction", ""),
+        "action": _plan_action(plan),
         "direction_ja": getattr(plan, "direction_ja", ""),
         "conviction": _int_or_none(getattr(plan, "conviction", None)),
         "tf_score": _number_or_none(getattr(plan, "tf_score", None)),
@@ -586,11 +730,13 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
     return {
         "symbol": getattr(plan, "symbol", ""),
         "direction": getattr(plan, "direction", ""),
+        "action": _plan_action(plan),
         "direction_ja": getattr(plan, "direction_ja", ""),
         "conviction": _int_or_none(getattr(plan, "conviction", None)),
         "composite": _number_or_none(getattr(plan, "composite", None)),
         "tech_score": _number_or_none(getattr(plan, "tech_score", None)),
         "news_score": _number_or_none(getattr(plan, "news_score", None)),
+        "horizon_hours": _number_or_none(getattr(plan, "horizon_hours", None)),
         "close": _number_or_none(getattr(plan, "close", None)),
         "atr": _number_or_none(getattr(plan, "atr", None)),
         "stop": _number_or_none(getattr(plan, "stop", None)),
@@ -776,22 +922,27 @@ def _technical_context(tech: object | None) -> dict[str, object] | None:
 
 
 def _audit_flags(plan: object) -> dict[str, object]:
-    direction = str(getattr(plan, "direction", ""))
+    action = _plan_action(plan)
     return {
-        "is_trade_candidate": direction in ("long", "short"),
+        "is_trade_candidate": action in ("long", "short"),
         "has_price": getattr(plan, "close", None) is not None,
         "has_atr": getattr(plan, "atr", None) is not None,
         "has_tp_sl": all(
             getattr(plan, key, None) is not None for key in ("stop", "target1", "target2")
         ),
         "scoring_ready": (
-            direction in ("long", "short")
+            action in ("long", "short")
             and getattr(plan, "close", None) is not None
             and getattr(plan, "atr", None) is not None
             and all(getattr(plan, key, None) is not None for key in ("stop", "target1", "target2"))
         ),
         "append_only": True,
     }
+
+
+def _plan_action(plan: object) -> str:
+    action = str(getattr(plan, "action", "no_trade"))
+    return action if action in ("long", "short") else "no_trade"
 
 
 def _currency_sentiment(sentiment: object) -> dict[str, object]:
@@ -868,11 +1019,96 @@ def _decision_id(
     mode: str,
     symbol: str,
     timeframe: str,
-    direction: str,
-    index: int,
 ) -> str:
-    raw = "|".join((run_id, mode, symbol, timeframe, direction, str(index)))
+    """Return the immutable natural identity for one scheduled decision cell.
+
+    Direction and list position are decision *content*.  Including either in the
+    identity would let a retry append a second, contradictory decision for the
+    same scheduled symbol/timeframe instead of surfacing a conflict.
+    """
+
+    raw = "|".join((run_id, mode, symbol, timeframe))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _bind_notification_batch(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Bind a deterministic notification batch to identities and decision content."""
+
+    decision_ids = [str(event.get("decision_id") or "") for event in events]
+    if any(not decision_id for decision_id in decision_ids):
+        raise ValueError("decision notification batch contains an event without identity")
+    if len(set(decision_ids)) != len(decision_ids):
+        raise ValueError("duplicate decision natural key in notification batch")
+    batch_id = _expected_notification_batch_id(events)
+    for event in events:
+        event["notification_batch_id"] = batch_id
+    return events
+
+
+def _expected_notification_batch_id(events: Sequence[Mapping[str, object]]) -> str:
+    schemas = {event.get("schema") for event in events}
+    if len(schemas) != 1:
+        raise ValueError("decision notification batch mixes schema versions")
+    schema = next(iter(schemas), None)
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema < 2:
+        raise ValueError("decision notification batch schema is invalid")
+    if schema < 3:
+        return canonical_row_hash(
+            {
+                "schema": "decision_notification_batch.v1",
+                "decision_ids": sorted(str(event.get("decision_id") or "") for event in events),
+                "run_ids": sorted(
+                    {str(event.get("run_id") or "") for event in events if event.get("run_id")}
+                ),
+            }
+        )
+    bound_events = sorted(
+        (
+            {
+                "decision_id": str(event.get("decision_id") or ""),
+                "run_id": str(event.get("run_id") or ""),
+                "logical_sha256": _decision_event_batch_digest(event),
+            }
+            for event in events
+        ),
+        key=lambda item: item["decision_id"],
+    )
+    return canonical_row_hash(
+        {
+            "schema": "decision_notification_batch.v2",
+            "events": bound_events,
+        }
+    )
+
+
+def _decision_event_batch_digest(event: Mapping[str, object]) -> str:
+    normalized = {
+        str(key): _without_retry_metadata(value)
+        for key, value in event.items()
+        if key not in {"content_hash", "notification_batch_id", "ts"}
+    }
+    return canonical_row_hash(normalized)
+
+
+def _validate_notification_batch(
+    events: Sequence[Mapping[str, object]],
+    *,
+    error_type: type[AppendOnlyReadError] | type[AppendOnlyWriteError],
+) -> None:
+    if not events:
+        return
+    try:
+        decision_ids = [_validated_decision_event_identity(event) for event in events]
+        if len(set(decision_ids)) != len(decision_ids):
+            raise ValueError("duplicate decision natural key in notification batch")
+        batch_ids = {str(event.get("notification_batch_id") or "").strip() for event in events}
+        if "" in batch_ids or len(batch_ids) != 1:
+            raise ValueError("notification_batch_id must be present and identical for the batch")
+        expected = _expected_notification_batch_id(events)
+        if next(iter(batch_ids)) != expected:
+            raise ValueError("notification_batch_id does not match batch identities/content")
+    except (AppendOnlyWriteError, TypeError, ValueError) as error:
+        raise error_type(f"invalid decision notification batch: {error}") from error
 
 
 def _normalize_price_entry(row: Mapping[str, object]) -> dict[str, object]:
@@ -882,6 +1118,32 @@ def _normalize_price_entry(row: Mapping[str, object]) -> dict[str, object]:
     entry.setdefault("mode", "per_timeframe" if timeframe != "fusion" else "fusion")
     entry.setdefault("horizon_hours", _horizon_for_timeframe(timeframe))
     return _json_ready_dict(entry)
+
+
+def _validate_scoring_rows_as_of(
+    rows: Sequence[Mapping[str, object]],
+    cutoff: datetime,
+    label: str,
+) -> None:
+    """Reject scoring inputs whose declared clocks are invalid or in the future."""
+
+    for index, row in enumerate(rows):
+        found_timestamp = False
+        for field in TIMESTAMP_FIELDS:
+            raw = row.get(field)
+            if raw is None:
+                continue
+            found_timestamp = True
+            try:
+                parsed = datetime.fromisoformat(str(raw))
+            except ValueError as error:
+                raise ValueError(f"{label} {index} has invalid {field}") from error
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError(f"{label} {index} has naive {field}")
+            if parsed.astimezone(UTC) > cutoff:
+                raise ValueError(f"future {label} {field} beyond scoring as_of")
+        if not found_timestamp:
+            raise ValueError(f"{label} {index} has no timestamp")
 
 
 def _entry_matches_context(
@@ -1005,8 +1267,9 @@ def _round_mean(values: object) -> float | None:
 
 
 def _run_id(now: datetime, mode: str) -> str:
-    compact = now.strftime("%Y%m%dT%H%M%SZ")
-    digest = hashlib.sha256(f"{mode}|{now.isoformat()}".encode()).hexdigest()[:8]
+    slot = _cadence_slot(_utc(now))
+    compact = slot.strftime("%Y%m%dT%H%M%SZ")
+    digest = hashlib.sha256(f"{mode}|{slot.isoformat()}".encode()).hexdigest()[:8]
     return f"{compact}-{mode}-{digest}"
 
 
@@ -1034,9 +1297,28 @@ def _json_ready(value: object) -> object:
 
 
 def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _cadence_slot(value: datetime) -> datetime:
+    utc = _utc(value)
+    minute = utc.minute - utc.minute % RUN_CADENCE_MINUTES
+    return utc.replace(minute=minute, second=0, microsecond=0)
+
+
+def _resolve_run_slot(now: datetime, run_slot: datetime | None) -> datetime:
+    """Resolve a stable retry slot without collapsing later scheduled runs."""
+
+    if run_slot is None:
+        return _cadence_slot(now)
+    slot = _utc(run_slot)
+    if slot != _cadence_slot(slot):
+        raise ValueError("run_slot must align to the five-minute cadence")
+    if slot > now:
+        raise ValueError("run_slot cannot be later than now")
+    return slot
 
 
 def _iso(value: object) -> str:

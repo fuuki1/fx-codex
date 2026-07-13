@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, UTC
 from collections.abc import Callable, Mapping, Sequence
+from math import isfinite
 
 from .calendar import (
     EconomicEvent,
@@ -75,6 +76,12 @@ DIRECTION_JA = {
     "closed": "休場(週末クローズ)",
 }
 
+ACTION_JA = {
+    "long": "ロング(買い)",
+    "short": "ショート(売り)",
+    "no_trade": "見送り(取引しない)",
+}
+
 # 初心者向けに「この判断が何を意味するか」を一文で言い換える
 DIRECTION_HINT_JA = {
     "long": "値上がりを見込んで「買い」が優勢という判断です。",
@@ -124,6 +131,11 @@ class TradePlan:
     composite: float
     tech_score: float
     news_score: float
+    # ``direction`` is the analytical signal.  ``action`` is the final,
+    # independently gated decision.  A plan is non-trading unless the shared
+    # decision pipeline explicitly promotes it after every veto has passed.
+    action: str = "no_trade"  # long / short / no_trade
+    horizon_hours: float = 24.0
     close: float | None = None
     atr: float | None = None
     stop: float | None = None
@@ -157,6 +169,14 @@ class TradePlan:
     @property
     def emoji(self) -> str:
         return DIRECTION_EMOJI.get(self.direction, "⚪")
+
+    @property
+    def action_ja(self) -> str:
+        return ACTION_JA.get(self.action, "見送り(取引しない)")
+
+    @property
+    def action_emoji(self) -> str:
+        return DIRECTION_EMOJI.get(self.action, "⚪")
 
 
 def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -206,10 +226,10 @@ def _extract_features(tech: PairTechnicals, news_count: int) -> dict[str, float]
     """
     features: dict[str, float] = {"news_count": float(news_count)}
     for interval in ("4h", "1d"):
-        higher = tech.views.get(interval)
+        higher = tech.usable_view(interval)
         if higher is not None:
             features[f"rating_{interval}"] = higher.score
-    view = tech.views.get("1h")
+    view = tech.usable_view("1h")
     if view is not None:
         if view.rsi is not None:
             features["rsi_1h"] = round(view.rsi, 2)
@@ -233,7 +253,7 @@ def _extract_features(tech: PairTechnicals, news_count: int) -> dict[str, float]
 def _interval_summary(tech: PairTechnicals) -> str:
     parts = []
     for interval in ("15m", "1h", "4h", "1d"):
-        view = tech.views.get(interval)
+        view = tech.usable_view(interval)
         if view is not None:
             parts.append(f"{interval} {view.recommendation_ja}")
     return " | ".join(parts) if parts else "テクニカル取得失敗"
@@ -268,6 +288,7 @@ def build_trade_plan(
     windows: Sequence[RiskWindow],
     news_items: Sequence[NewsItem],
     now: datetime | None = None,
+    horizon_hours: float = 24.0,
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
@@ -317,6 +338,13 @@ def build_trade_plan(
     shadow段階の委員でも成績を後から採点できるようにする)。
     """
     now = now or datetime.now(UTC)
+    if (
+        not isinstance(horizon_hours, (int, float))
+        or isinstance(horizon_hours, bool)
+        or not isfinite(horizon_hours)
+        or horizon_hours <= 0
+    ):
+        raise ValueError("horizon_hours must be a finite positive number")
     base, quote = symbol_currencies(symbol)
 
     tech_score, ma_note = _tech_score(tech)
@@ -372,6 +400,7 @@ def build_trade_plan(
 
     # データ品質: 根拠データの揃い具合。確信度の減衰と方向判断の見送りに使う
     tech_cov = tech.coverage()
+    technical_quality_issues = tech.critical_quality_issues()
     news_cov = min(1.0, len(relevant_items) / NEWS_FULL_COVERAGE_COUNT)
     quality = round(
         QUALITY_TECH_WEIGHT * tech_cov
@@ -397,6 +426,12 @@ def build_trade_plan(
     elif tech_cov < 1.0:
         missing = ", ".join(tech.missing_intervals())
         warnings.append(f"テクニカル欠損: {missing} 未取得(取得率{tech_cov:.0%})")
+    if technical_quality_issues:
+        detail = "; ".join(
+            f"{interval}={','.join(issues)}"
+            for interval, issues in sorted(technical_quality_issues.items())
+        )
+        warnings.append(f"⛔ テクニカル品質違反: {detail}")
     if not relevant_items:
         warnings.append("関連ニュース0件 — ニュース根拠なし")
     if not calendar_ok:
@@ -421,7 +456,7 @@ def build_trade_plan(
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if not operational_data_ok:
+    if not operational_data_ok or technical_quality_issues:
         direction = "neutral"
         conviction = 0
     elif not is_market_open(now):
@@ -510,6 +545,7 @@ def build_trade_plan(
         composite=composite,
         tech_score=round(tech_score, 3),
         news_score=news_score,
+        horizon_hours=float(horizon_hours),
         close=close,
         atr=atr,
         stop=stop,
@@ -620,7 +656,7 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
         "long": COLOR_LONG,
         "short": COLOR_SHORT,
         "standby": COLOR_STANDBY,
-    }.get(plan.direction, COLOR_NEUTRAL)
+    }.get(plan.action, COLOR_NEUTRAL)
 
     hint = DIRECTION_HINT_JA.get(plan.direction, "")
     if plan.components:
@@ -639,10 +675,11 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
     )
     fields = [
         {
-            "name": "判断",
+            "name": "最終判断",
             "value": (
-                f"{plan.emoji} **{plan.direction_ja}** — 確信度 {plan.conviction}/100"
-                "(根拠のそろい具合)\n"
+                f"{plan.action_emoji} **{plan.action_ja}**\n"
+                f"分析方向: {plan.emoji} {plan.direction_ja} — "
+                f"シグナル強度 {plan.conviction}/100\n"
                 f"{hint}\n"
                 f"{breakdown}\n{plan.ma_note}"
             ),
@@ -658,7 +695,7 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
             "inline": False,
         },
     ]
-    if plan.direction in ("long", "short") and plan.stop is not None:
+    if plan.action in ("long", "short") and plan.stop is not None:
         fields.append(
             {
                 "name": "売買プラン(価格の目安)",
@@ -699,7 +736,7 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
             }
         )
     return {
-        "title": f"{plan.symbol} — {plan.direction_ja}",
+        "title": f"{plan.symbol} — 最終判断 {plan.action_ja}",
         "color": color,
         "fields": fields,
     }
@@ -723,7 +760,9 @@ def build_discord_payload(
     now_iso = now.isoformat()
 
     headline_parts = [
-        f"{plan.emoji} {plan.symbol} {plan.direction_ja} 確信度{plan.conviction}" for plan in plans
+        f"{plan.action_emoji} {plan.symbol} {plan.action_ja}"
+        f"(分析:{plan.direction_ja} {plan.conviction})"
+        for plan in plans
     ]
     engine_ja = {
         "claude": "Claude分析",

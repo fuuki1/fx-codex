@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, UTC
 import json
 
+import pytest
+
 from fx_briefing import (
     approve_trade_candidate_cli,
     check_trade_outcome_health_cli,
@@ -12,6 +14,7 @@ from fx_briefing import (
     score_trade_outcomes_cli,
 )
 from fx_intel import briefing, journal, trade_outcome as to
+from fx_intel.append_only import AppendOnlyReadError, canonical_row_hash
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import IntervalView, PairTechnicals
 
@@ -84,8 +87,13 @@ def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict
 
 
 def _write_jsonl(path, rows: list[dict]) -> None:
+    prepared = []
+    for row in rows:
+        payload = {"schema_version": 2, **row}
+        payload["content_hash"] = canonical_row_hash(payload)
+        prepared.append(payload)
     path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in prepared) + "\n",
         encoding="utf-8",
     )
 
@@ -212,6 +220,9 @@ def test_target_policy_is_written_to_journal_and_scored_by_policy(tmp_path) -> N
             policy,
         ),
     )
+    # This fixture exercises realized target-policy scoring, so explicitly mark
+    # the otherwise analysis-only plan as an executed legacy-paper action.
+    plan.action = plan.direction
     path = tmp_path / "journal.jsonl"
 
     journal.append_plans(path, [plan], now=NOW)
@@ -774,6 +785,64 @@ def test_evaluate_trade_outcomes_can_override_tp_r_targets() -> None:
     assert tighter_tp[0].first_touch == "tp1"
     assert tighter_tp[0].target1 == 100.75
     assert tighter_tp[0].realized_r == 0.75
+
+
+def test_schema_v3_no_trade_action_is_not_scored_as_an_executed_trade() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            schema_version=3,
+            direction="long",
+            action="no_trade",
+            conviction=80,
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(
+            NOW + DAY,
+            "USDJPY",
+            101.2,
+            schema_version=3,
+            direction="neutral",
+            action="no_trade",
+        ),
+    ]
+
+    assert to.evaluate_trade_outcomes(rows, min_path_points=1) == []
+
+
+def test_schema_v3_missing_action_does_not_fall_back_to_analytical_direction() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            schema_version=3,
+            direction="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(NOW + DAY, "USDJPY", 101.2, schema_version=3, direction="neutral"),
+    ]
+
+    assert to.evaluate_trade_outcomes(rows, min_path_points=1) == []
+
+
+def test_trade_outcome_clis_reject_rows_later_than_fixed_evaluation_time(tmp_path) -> None:
+    journal_path = tmp_path / "future.jsonl"
+    _write_jsonl(journal_path, [_entry(NOW + DAY, "USDJPY", 100.0)])
+
+    for command in (
+        score_trade_outcomes_cli,
+        check_trade_outcome_health_cli,
+        retest_trade_variants_cli,
+    ):
+        with pytest.raises(AppendOnlyReadError, match="future row"):
+            command(journal_path, now=NOW)
 
 
 def test_evaluate_trade_outcomes_uses_high_low_path_for_touch_and_quality() -> None:

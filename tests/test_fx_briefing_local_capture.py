@@ -10,6 +10,8 @@ import pytest
 
 import fx_briefing
 from fx_intel import trade_outcome as to
+from fx_intel.append_only import AppendOnlyWriteError, canonical_row_hash
+from fx_intel.calendar import EconomicEvent
 from fx_intel.market import is_market_open
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -112,6 +114,94 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert "Discord送信なし" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "failing_append",
+    [
+        "fx_intel.journal.append_plans",
+        "fx_intel.decision_log.append_decision_events",
+    ],
+)
+def test_fusion_persistence_failure_suppresses_normal_discord(
+    failing_append: str,
+    capsys,
+) -> None:
+    event = EconomicEvent(
+        "NFP",
+        "USD",
+        datetime.now(UTC) + timedelta(hours=24),
+        "high",
+    )
+    slot = datetime.now(UTC)
+    slot = slot.replace(minute=slot.minute - slot.minute % 5, second=0, microsecond=0)
+
+    with (
+        mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
+        mock.patch("fx_intel.calendar.fetch_calendar", return_value=([event], [])),
+        mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
+        mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
+        mock.patch(
+            failing_append,
+            side_effect=AppendOnlyWriteError("simulated required persistence failure"),
+        ),
+        mock.patch.object(fx_briefing, "load_webhook_url", return_value="x"),
+        mock.patch.object(fx_briefing, "post_to_discord") as posted,
+    ):
+        rc = fx_briefing.main(
+            [
+                "--no-macro",
+                "--no-ml",
+                "--no-learning",
+                "--no-trade-expectancy",
+                "--no-export-events",
+                "--no-event-archive",
+                "--run-slot",
+                slot.isoformat(),
+                "--symbols",
+                "USDJPY",
+            ]
+        )
+
+    assert rc == 1
+    posted.assert_not_called()
+    assert "通常Discord通知を抑止" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode_args", [[], ["--per-timeframe"]])
+def test_external_notification_rejects_no_journal_for_both_modes(
+    mode_args: list[str],
+    capsys,
+) -> None:
+    with pytest.raises(SystemExit) as captured:
+        fx_briefing.main(["--no-journal", *mode_args])
+
+    assert captured.value.code == 2
+    assert "external notifications require durable decision journals" in capsys.readouterr().err
+
+
+def test_external_notification_requires_persisted_receipt() -> None:
+    with pytest.raises(AppendOnlyWriteError, match="永続化済み判断batch"):
+        fx_briefing._bind_notification_receipt_or_fail(
+            {"content": "candidate"},
+            [],
+            require_for_external_send=True,
+        )
+
+
+def test_external_notification_rejects_excessively_old_run_slot(capsys) -> None:
+    old_slot = datetime.now(UTC) - timedelta(hours=2)
+    old_slot = old_slot.replace(
+        minute=old_slot.minute - old_slot.minute % 5,
+        second=0,
+        microsecond=0,
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        fx_briefing.main(["--run-slot", old_slot.isoformat()])
+
+    assert captured.value.code == 2
+    assert "older than 65 minutes" in capsys.readouterr().err
+
+
 def _approved_overall_policy_registry(path, candidate_id: str) -> None:
     candidate = to.TradeImprovementCandidate(
         candidate_id,
@@ -161,34 +251,33 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
     lines = []
     for i in range(20):
         close = 100.0 - 1.5 * i
-        lines.append(
-            json.dumps(
-                {
-                    "ts": (start + timedelta(hours=i * 3)).isoformat(),
-                    "symbol": "USDJPY",
-                    "direction": "long",
-                    "conviction": 20,
-                    "composite": 0.6,
-                    "tech_score": 0.6,
-                    "news_score": 0.1,
-                    "close": close,
-                    "atr": 1.0,
-                    "stop": close - 1.0,
-                    "target1": close + 0.75,
-                    "target2": close + 1.5,
-                    "data_quality": 1.0,
-                    "target_policy": {
-                        "candidate_id": candidate_id,
-                        "scope": "overall",
-                        "key": "",
-                        "target1_r": 0.75,
-                        "target2_r": 1.5,
-                    },
-                    "features": {},
-                    "components": [],
-                }
-            )
-        )
+        row = {
+            "ts": (start + timedelta(hours=i * 3)).isoformat(),
+            "symbol": "USDJPY",
+            "direction": "long",
+            "conviction": 20,
+            "composite": 0.6,
+            "tech_score": 0.6,
+            "news_score": 0.1,
+            "close": close,
+            "atr": 1.0,
+            "stop": close - 1.0,
+            "target1": close + 0.75,
+            "target2": close + 1.5,
+            "data_quality": 1.0,
+            "target_policy": {
+                "candidate_id": candidate_id,
+                "scope": "overall",
+                "key": "",
+                "target1_r": 0.75,
+                "target2_r": 1.5,
+            },
+            "features": {},
+            "components": [],
+        }
+        row["schema_version"] = 2
+        row["content_hash"] = canonical_row_hash(row)
+        lines.append(json.dumps(row))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

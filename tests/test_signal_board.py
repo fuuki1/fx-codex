@@ -119,9 +119,10 @@ def test_board_matches_requested_single_message_shape() -> None:
     assert "新規エントリー候補：なし" in content
     assert content.index("1位 GBPUSD 4h") < content.index("2位 EURUSD 15m")
     assert content.index("2位 EURUSD 15m") < content.index("3位 USDJPY 15m")
-    assert "🟢 買い方向｜押し目待ち" in content
-    assert "🔴 売り方向｜見送り" in content
-    assert "安値追いショートは禁止" in content
+    assert "⚪ 最終判断：見送り(取引しない)" in content
+    assert "分析方向：🟢 買い｜見送り" in content
+    assert "分析方向：🔴 売り｜見送り" in content
+    assert "較正・コスト・サイズ・risk veto" in content
     assert "次回通知：5分後" in content
     assert "※シグナル強度は的中確率ではありません。" in content
     assert len(content) <= 2000
@@ -133,6 +134,7 @@ def test_ranking_uses_only_one_timeframe_per_symbol() -> None:
     ranked = rank_candidates(plans)
     assert [item.plan.symbol for item in ranked] == ["GBPUSD", "EURUSD", "USDJPY"]
     assert ranked[0].plan.timeframe == "4h"
+    assert all(not item.assessment.is_candidate for item in ranked)
 
 
 def test_macro_staleness_is_shown_with_last_observation() -> None:

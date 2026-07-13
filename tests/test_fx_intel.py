@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
+from concurrent.futures import ThreadPoolExecutor
 from typing import cast
 
 import pytest
 import requests
 
-from fx_intel import briefing
+from fx_intel import briefing, news
+from fx_intel.append_only import AppendOnlyReadError
 from fx_intel.calendar import (
     EconomicEvent,
     active_and_next_window,
@@ -78,6 +80,19 @@ def test_parse_calendar_json_converts_to_utc() -> None:
     assert event.forecast == "110K"
 
 
+def test_parse_calendar_json_rejects_timezone_naive_observation() -> None:
+    raw = [
+        {
+            "title": "Ambiguous release",
+            "country": "USD",
+            "date": "2026-07-03T08:30:00",
+            "impact": "High",
+        }
+    ]
+
+    assert parse_calendar_json(raw) == []
+
+
 def test_upcoming_events_filters_currency_horizon_and_impact() -> None:
     events = [
         EconomicEvent("NFP", "USD", NOW + timedelta(hours=6), "high"),
@@ -143,8 +158,24 @@ def test_append_events_archive_accumulates_without_duplicates(tmp_path) -> None:
 
 def test_append_events_archive_keeps_revisions_as_new_rows(tmp_path) -> None:
     archive = tmp_path / "event_history.csv"
-    draft = EconomicEvent("NFP", "USD", NOW, "high", forecast="", previous="139K")
-    revised = EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")
+    draft = EconomicEvent(
+        "NFP",
+        "USD",
+        NOW,
+        "high",
+        forecast="",
+        previous="139K",
+        occurrence_id="ff:nfp-20260702",
+    )
+    revised = EconomicEvent(
+        "NFP",
+        "USD",
+        NOW + timedelta(hours=1),
+        "low",
+        forecast="110K",
+        previous="139K",
+        occurrence_id="ff:nfp-20260702",
+    )
 
     append_events_archive([draft], archive, now=NOW)
     _, appended = append_events_archive([revised], archive, now=NOW + timedelta(days=1))
@@ -156,6 +187,9 @@ def test_append_events_archive_keeps_revisions_as_new_rows(tmp_path) -> None:
         rows = list(csvlib.DictReader(handle))
     assert len(rows) == 2
     assert rows[0]["recorded_at"] != rows[1]["recorded_at"]
+    assert [row["occurrence_id"] for row in rows] == ["ff:nfp-20260702"] * 2
+    assert [row["revision"] for row in rows] == ["1", "2"]
+    assert [row["identity_quality"] for row in rows] == ["source", "source"]
 
 
 def test_append_events_archive_is_loadable_by_backtester(tmp_path) -> None:
@@ -168,12 +202,174 @@ def test_append_events_archive_is_loadable_by_backtester(tmp_path) -> None:
 
     from fx_backtester.data import load_economic_events_csv
 
-    frame = load_economic_events_csv(archive)
+    frame = load_economic_events_csv(archive, as_of=NOW)
     assert len(frame) == 1
+    assert "recorded_at" in frame.columns
     row = frame.iloc[0]
     assert row["currency"] == "USD"
     assert row["impact"] == "high"
     assert row["name"] == "NFP"
+
+
+def test_event_archive_requires_as_of_and_hides_later_revisions(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    draft = EconomicEvent("NFP", "USD", NOW, "high", forecast="", previous="139K")
+    revised = EconomicEvent(
+        "NFP",
+        "USD",
+        NOW,
+        "high",
+        forecast="110K",
+        previous="139K",
+    )
+    append_events_archive([draft], archive, now=NOW)
+    append_events_archive([revised], archive, now=NOW + timedelta(days=1))
+
+    from fx_backtester.data import load_economic_events_csv
+
+    with pytest.raises(ValueError, match="explicit aware as_of"):
+        load_economic_events_csv(archive)
+    historical = load_economic_events_csv(archive, as_of=NOW + timedelta(hours=1))
+
+    assert len(historical) == 1
+    assert historical.iloc[0]["recorded_at"] == NOW
+
+
+def test_event_archive_records_cancellation_as_tombstone(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    scheduled = EconomicEvent(
+        "NFP",
+        "USD",
+        NOW + timedelta(hours=2),
+        "high",
+        occurrence_id="ff:nfp-20260702",
+    )
+    cancelled = EconomicEvent(
+        "NFP",
+        "USD",
+        NOW + timedelta(hours=2),
+        "high",
+        occurrence_id="ff:nfp-20260702",
+        cancelled=True,
+    )
+
+    append_events_archive([scheduled], archive, now=NOW)
+    append_events_archive([cancelled], archive, now=NOW + timedelta(hours=1))
+
+    import csv as csvlib
+
+    with archive.open(encoding="utf-8", newline="") as handle:
+        rows = list(csvlib.DictReader(handle))
+    assert [row["revision"] for row in rows] == ["1", "2"]
+    assert [row["is_tombstone"] for row in rows] == ["False", "True"]
+
+
+def test_event_archive_marks_source_without_stable_id_promotion_ineligible(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    append_events_archive(
+        [EconomicEvent("NFP", "USD", NOW, "high")],
+        archive,
+        now=NOW,
+    )
+
+    from fx_backtester.data import load_economic_events_csv
+
+    frame = load_economic_events_csv(archive, as_of=NOW, require_point_in_time=True)
+
+    assert frame.iloc[0]["identity_quality"] == "heuristic"
+    assert frame.attrs["event_provenance"]["promotion_eligible"] is False
+
+
+def test_event_archive_rejects_legacy_schema_without_modification(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    original = (
+        b"timestamp,currency,impact,name,recorded_at\n"
+        b"2026-07-02T10:00:00Z,USD,high,NFP,2026-07-02T08:00:00Z\n"
+    )
+    archive.write_bytes(original)
+
+    with pytest.raises(OSError, match="legacy or unknown schema"):
+        append_events_archive([EconomicEvent("NFP", "USD", NOW, "high")], archive, now=NOW)
+
+    assert archive.read_bytes() == original
+
+
+def test_event_archive_rejects_recorded_at_regression_without_appending(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    original = (
+        b"timestamp,currency,symbol,impact,name,category,source_url,notes,occurrence_id,"
+        b"revision,effective_from,effective_to,is_tombstone,identity_quality,recorded_at\n"
+        b"2026-07-20T08:30:00Z,USD,,high,CPI,economic_calendar,x,,src:1,1,"
+        b"2026-07-10T00:00:00Z,,False,source,2026-07-10T00:00:00Z\n"
+        b"2026-07-20T09:30:00Z,USD,,high,CPI revised,economic_calendar,x,,src:1,2,"
+        b"2026-07-11T00:00:00Z,,False,source,2026-07-09T00:00:00Z\n"
+    )
+    archive.write_bytes(original)
+
+    with pytest.raises(OSError, match="recorded_at"):
+        append_events_archive(
+            [
+                EconomicEvent(
+                    "CPI final",
+                    "USD",
+                    NOW + timedelta(days=1),
+                    "high",
+                    occurrence_id="src:1",
+                )
+            ],
+            archive,
+            now=NOW,
+        )
+
+    assert archive.read_bytes() == original
+
+
+def test_event_archive_rejects_global_recorded_at_regression_for_new_occurrence(
+    tmp_path,
+) -> None:
+    archive = tmp_path / "event_history.csv"
+    first = EconomicEvent(
+        "CPI",
+        "USD",
+        NOW + timedelta(days=1),
+        "high",
+        occurrence_id="src:1",
+    )
+    append_events_archive([first], archive, now=NOW)
+    original = archive.read_bytes()
+
+    with pytest.raises(OSError, match="latest recorded_at"):
+        append_events_archive(
+            [
+                EconomicEvent(
+                    "PMI",
+                    "EUR",
+                    NOW + timedelta(days=1),
+                    "high",
+                    occurrence_id="src:2",
+                )
+            ],
+            archive,
+            now=NOW - timedelta(minutes=1),
+        )
+
+    assert archive.read_bytes() == original
+
+
+def test_append_events_archive_is_concurrency_safe(tmp_path) -> None:
+    archive = tmp_path / "event_history.csv"
+    event = EconomicEvent("NFP", "USD", NOW, "high", forecast="110K", previous="139K")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: append_events_archive([event], archive, now=NOW),
+                range(8),
+            )
+        )
+
+    assert sum(appended for _, appended in results) == 1
+    assert len(archive.read_text(encoding="utf-8").strip().splitlines()) == 2
 
 
 def test_symbol_currencies() -> None:
@@ -219,10 +415,46 @@ def test_fetch_calendar_uses_fresh_cache_without_network(tmp_path) -> None:
     )
     assert session.calls == 0  # 新鮮なキャッシュがあればネットワークを叩かない
     assert len(events) == 1 and events[0].title == "NFP"
-    assert warnings == []
+    assert warnings == ["経済指標カレンダー部分キャッシュ: missing=nextweek"]
 
 
-def test_fetch_calendar_falls_back_to_stale_cache(tmp_path) -> None:
+def test_fetch_calendar_rejects_empty_current_week_even_if_next_week_has_events(
+    tmp_path,
+) -> None:
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        __import__("json").dumps(
+            {
+                "fetched_at": NOW.isoformat(),
+                "weeks": {
+                    "thisweek": [],
+                    "nextweek": [
+                        {
+                            "title": "Next week CPI",
+                            "country": "USD",
+                            "date": "2026-07-20T12:00:00+00:00",
+                            "impact": "High",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    session = _FailingSession()
+
+    events, warnings = fetch_calendar(
+        session=cast(requests.Session, session),
+        cache_path=cache_path,
+        now=NOW,
+    )
+
+    assert events == []
+    assert session.calls == 2
+    assert any("キャッシュ品質違反" in warning for warning in warnings)
+
+
+def test_fetch_calendar_rejects_stale_cache(tmp_path) -> None:
     import json as jsonlib
 
     cache_path = tmp_path / "cache.json"
@@ -249,8 +481,45 @@ def test_fetch_calendar_falls_back_to_stale_cache(tmp_path) -> None:
         session=cast(requests.Session, session), cache_path=cache_path
     )
     assert session.calls == 2  # thisweek/nextweek両方失敗
-    assert len(events) == 1 and events[0].title == "CPI"
-    assert any("キャッシュを使用" in w for w in warnings)
+    assert events == []
+    assert any("期限切れキャッシュを拒否" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "fetched_at",
+    [
+        "2026-07-13T03:00:00",
+        (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    ],
+)
+def test_fetch_calendar_rejects_naive_or_future_cache(tmp_path, fetched_at: str) -> None:
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        __import__("json").dumps(
+            {
+                "fetched_at": fetched_at,
+                "weeks": {
+                    "thisweek": [
+                        {
+                            "title": "CPI",
+                            "country": "USD",
+                            "date": "2026-07-13T08:30:00+00:00",
+                            "impact": "High",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    events, warnings = fetch_calendar(
+        session=cast(requests.Session, _FailingSession()),
+        cache_path=cache_path,
+    )
+
+    assert events == []
+    assert warnings
 
 
 def test_fetch_calendar_no_cache_no_network_returns_empty(tmp_path) -> None:
@@ -296,6 +565,55 @@ def test_parse_rss_extracts_items_and_tags() -> None:
     assert "<p>" not in first.summary
     second = items[1]
     assert set(second.currencies) >= {"USD", "CAD"}
+
+
+def test_parse_rss_rejects_timezone_naive_publication_date() -> None:
+    payload = """
+    <rss><channel><item><title>Fed rate hike</title>
+    <pubDate>2026-07-02T06:50:43</pubDate></item></channel></rss>
+    """
+    assert parse_rss(payload, "test") == []
+
+
+def test_news_collection_quarantines_future_articles(monkeypatch) -> None:
+    future = NewsItem(
+        title="Fed rate hike from the future",
+        source="test",
+        link="https://example.com/future",
+        published=NOW + timedelta(hours=1),
+        currencies=("USD",),
+    )
+    current = NewsItem(
+        title="Fed rate hike now",
+        source="test",
+        link="https://example.com/current",
+        published=NOW - timedelta(minutes=5),
+        currencies=("USD",),
+    )
+    monkeypatch.setattr(news, "fetch_fxstreet", lambda **_: [future, current])
+    monkeypatch.setattr(news, "fetch_google_news", lambda *_, **__: [])
+
+    items, warnings = news.fetch_news_for_symbols(["USDJPY"], as_of=NOW)
+
+    assert items == [current]
+    assert warnings == ["未来時刻のニュースを隔離: 1件"]
+
+
+def test_news_collection_rejects_even_small_future_skew_by_default(monkeypatch) -> None:
+    future = NewsItem(
+        title="Release timestamped thirty seconds ahead",
+        source="test",
+        link="https://example.com/future-30s",
+        published=NOW + timedelta(seconds=30),
+        currencies=("USD",),
+    )
+    monkeypatch.setattr(news, "fetch_fxstreet", lambda **_: [future])
+    monkeypatch.setattr(news, "fetch_google_news", lambda *_, **__: [])
+
+    items, warnings = news.fetch_news_for_symbols(["USDJPY"], as_of=NOW)
+
+    assert items == []
+    assert warnings == ["未来時刻のニュースを隔離: 1件"]
 
 
 def test_tag_currencies_pair_and_keywords() -> None:
@@ -457,6 +775,95 @@ def test_coverage_and_missing_intervals() -> None:
     }
     assert tech.coverage() == 1.0
     assert tech.missing_intervals() == []
+
+
+def test_invalid_price_view_is_excluded_and_hard_vetoes_direction() -> None:
+    tech = bullish_tech()
+    tech.views["1h"] = build_interval_view(
+        "1h",
+        {"RECOMMENDATION": "STRONG_BUY", "BUY": 15, "SELL": 1, "NEUTRAL": 1},
+        {
+            "close": -1.0,
+            "open": 2.0,
+            "high": 1.0,
+            "low": 3.0,
+            "bid": 2.0,
+            "ask": 1.0,
+            "ATR": 0.1,
+            "SMA20": 2.0,
+            "SMA100": 1.0,
+        },
+        20,
+        100,
+    )
+
+    plan = briefing.build_trade_plan(
+        "USDJPY",
+        tech,
+        {"USD": CurrencySentiment("USD", 0.5), "JPY": CurrencySentiment("JPY", -0.5)},
+        [],
+        [],
+        now=NOW,
+    )
+
+    assert plan.direction == "neutral"
+    assert plan.conviction == 0
+    assert plan.close is None
+    assert plan.stop is None and plan.target1 is None
+    assert any("テクニカル品質違反" in warning for warning in plan.warnings)
+
+
+def test_missing_authoritative_provenance_is_warning_but_snapshot_is_retained() -> None:
+    view = build_interval_view(
+        "1h",
+        {"RECOMMENDATION": "BUY", "BUY": 10, "SELL": 2, "NEUTRAL": 4},
+        {"close": 150.0, "ATR": 0.5, "SMA20": 150.5, "SMA100": 149.0},
+        20,
+        100,
+        acquired_at=NOW,
+        provenance_required=True,
+    )
+    tech = PairTechnicals(symbol="USDJPY", views={"1h": view})
+
+    assert view.quality_issues == ()
+    assert view.provenance_warnings == (
+        "source_time_unavailable",
+        "source_record_id_unavailable",
+    )
+    assert tech.usable_view("1h") is view
+    snapshot = tech.price_snapshot("1h")
+    assert snapshot is not None
+    assert snapshot["data_quality_flags"] == list(view.provenance_warnings)
+
+
+def test_authoritative_source_staleness_is_critical_by_timeframe() -> None:
+    summary = {"RECOMMENDATION": "BUY", "BUY": 10, "SELL": 2, "NEUTRAL": 4}
+    indicators = {"close": 150.0, "ATR": 0.5, "SMA20": 150.5, "SMA100": 149.0}
+    stale_15m = build_interval_view(
+        "15m",
+        summary,
+        indicators,
+        20,
+        100,
+        source_time=NOW - timedelta(hours=1),
+        acquired_at=NOW,
+        source_record_id="provider:15m:1",
+        provenance_required=True,
+    )
+    acceptable_1d = build_interval_view(
+        "1d",
+        summary,
+        indicators,
+        20,
+        100,
+        source_time=NOW - timedelta(hours=30),
+        acquired_at=NOW,
+        source_record_id="provider:1d:1",
+        provenance_required=True,
+    )
+
+    assert "authoritative_source_stale" in stale_15m.quality_issues
+    assert acceptable_1d.quality_issues == ()
 
 
 # ---------------------------------------------------------------- briefing
@@ -661,7 +1068,6 @@ def test_journal_append_and_evaluate(tmp_path) -> None:
     plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=recorded_at)
     assert plan.direction == "long" and plan.close == 150.0
     append_plans(path, [plan], now=recorded_at)
-    path.open("a", encoding="utf-8").write("壊れた行 not json\n")  # 耐性確認
 
     # 記録時150.0 → 現値151.0: ロング的中(ATR0.5×10%=0.05を超える動き)
     stats = evaluate_directional_accuracy(path, {"USDJPY": 151.0}, now=NOW)
@@ -682,6 +1088,12 @@ def test_journal_append_and_evaluate(tmp_path) -> None:
         path, {"USDJPY": 151.0}, now=recorded_at + timedelta(hours=40)
     )
     assert stats.evaluated == 0
+    # 壊れた監査証跡を黙って読み飛ばすと、欠損した判断だけを除外した成績に
+    # なるため、以後の判断・学習を必ず停止する。
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("壊れた行 not json\n")
+    with pytest.raises(AppendOnlyReadError, match="malformed JSONL"):
+        evaluate_directional_accuracy(path, {"USDJPY": 151.0}, now=NOW)
     # 存在しないファイルは空集計
     stats = evaluate_directional_accuracy(tmp_path / "none.jsonl", {}, now=NOW)
     assert stats.evaluated == 0
@@ -789,8 +1201,10 @@ def test_build_discord_payload_structure() -> None:
     assert "判断の検証(自己採点)" in field_names
     pair_embed = payload["embeds"][1]
     assert pair_embed["title"].startswith("USDJPY")
-    assert any("売買プラン" in f["name"] for f in pair_embed["fields"])
-    plan_field = next(f for f in pair_embed["fields"] if f["name"] == "判断")
+    assert not any("売買プラン" in f["name"] for f in pair_embed["fields"])
+    plan_field = next(f for f in pair_embed["fields"] if f["name"] == "最終判断")
+    assert "見送り" in plan_field["value"]
+    assert "分析方向" in plan_field["value"]
     assert "買い" in plan_field["value"]  # 初心者向けの言い換えが入る
     assert any("用語ミニ解説" in f["name"] for f in macro["fields"])
 

@@ -55,7 +55,7 @@ def collect_closes(
 def collect_price_snapshots(
     tech_map: dict[str, technicals.PairTechnicals],
     intervals=technicals.DEFAULT_INTERVALS,
-) -> dict[str, dict[str, dict[str, float] | None]]:
+) -> dict[str, dict[str, dict[str, object] | None]]:
     """{symbol: {timeframe: price snapshot}} を組む(OHLC/bid/ask/spread対応)。"""
 
     return {

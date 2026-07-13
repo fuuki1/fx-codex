@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "dataset_sha256": "b93513ba74070117edc02f404d285670b13f53772ac4ce91a10c87b6c398e427",
+  "raw_artifact_set_sha256": "3edb1969a976213922ea12e357d012bb593e6fb3366723c82b41be2e86cbfb27",
+  "pbo": null,
+  "pbo_reason": "No complete timestamp-aligned return matrix for the disclosed search family.",
+  "scenarios": [
+    {"strategy": "ma_cross", "cost_multiplier": 1.0, "return": -0.010652755968790562, "expectancy_r": -0.012005107402354718, "trades": 79, "sharpe": -0.7489888876985182, "max_drawdown": 0.04678191141596344},
+    {"strategy": "ma_cross", "cost_multiplier": 1.5, "return": -0.020620984461818925, "expectancy_r": -0.02489291446836049, "trades": 79, "sharpe": -1.5422246231228285, "max_drawdown": 0.04704717250657375},
+    {"strategy": "ma_cross", "cost_multiplier": 2.0, "return": -0.03156004480552188, "expectancy_r": -0.03913650175705459, "trades": 79, "sharpe": -2.437516402703972, "max_drawdown": 0.05298235167204679},
+    {"strategy": "ma_cross", "cost_multiplier": 3.0, "return": -0.0511370279701131, "expectancy_r": -0.06503541233649392, "trades": 79, "sharpe": -4.119271764534789, "max_drawdown": 0.06766615414131483},
+    {"strategy": "rsi_mean_reversion", "cost_multiplier": 1.0, "return": 0.0011019144299853068, "expectancy_r": 0.010726209240367242, "trades": 11, "sharpe": 0.34491346362675496, "max_drawdown": 0.013343696364206625},
+    {"strategy": "rsi_mean_reversion", "cost_multiplier": 1.5, "return": -0.0010659510846129372, "expectancy_r": -0.009021422835782344, "trades": 11, "sharpe": -0.3068584349454869, "max_drawdown": 0.014211354519541586},
+    {"strategy": "rsi_mean_reversion", "cost_multiplier": 2.0, "return": -0.0031483764303551487, "expectancy_r": -0.028025914902357774, "trades": 11, "sharpe": -0.9508979490815974, "max_drawdown": 0.015044649435890789},
+    {"strategy": "rsi_mean_reversion", "cost_multiplier": 3.0, "return": -0.00707627832020008, "expectancy_r": -0.06396808439052735, "trades": 11, "sharpe": -2.2019106762252822, "max_drawdown": 0.016615867022293895},
+    {"strategy": "donchian", "cost_multiplier": 1.0, "return": -0.020515809462673618, "expectancy_r": -0.027193361859464034, "trades": 72, "sharpe": -1.541132308521602, "max_drawdown": 0.0637561200817719},
+    {"strategy": "donchian", "cost_multiplier": 1.5, "return": -0.030551271633568855, "expectancy_r": -0.04153312530163742, "trades": 72, "sharpe": -2.3708317771897227, "max_drawdown": 0.07048393588795099},
+    {"strategy": "donchian", "cost_multiplier": 2.0, "return": -0.04019245592223264, "expectancy_r": -0.05544569384092086, "trades": 72, "sharpe": -3.195565544793248, "max_drawdown": 0.0769639079585761},
+    {"strategy": "donchian", "cost_multiplier": 3.0, "return": -0.05838116379887137, "expectancy_r": -0.08206566003662828, "trades": 72, "sharpe": -4.825083839839271, "max_drawdown": 0.08923383281395336},
+    {"strategy": "ai_logistic", "cost_multiplier": 1.0, "return": -0.05137398220842182, "expectancy_r": -0.03139124978822238, "trades": 167, "sharpe": -7.548099167629323, "max_drawdown": 0.05673055184042919},
+    {"strategy": "ai_logistic", "cost_multiplier": 1.5, "return": -0.07322719597226035, "expectancy_r": -0.04534517552008339, "trades": 167, "sharpe": -10.94075867432531, "max_drawdown": 0.07629504024750189},
+    {"strategy": "ai_logistic", "cost_multiplier": 2.0, "return": -0.09397460827359827, "expectancy_r": -0.05889871480913979, "trades": 167, "sharpe": -14.212730942610607, "max_drawdown": 0.09510321850817594},
+    {"strategy": "ai_logistic", "cost_multiplier": 3.0, "return": -0.13156665625298158, "expectancy_r": -0.08426209527704052, "trades": 167, "sharpe": -20.091324973830023, "max_drawdown": 0.13161708997442678}
+  ],
+  "descriptive_statistics": {
+    "ma_cross": {"n": 79, "psr": 0.419297076107884, "dsr": 0.16874891067742015, "ci": [-0.11206832005471566, 0.08859167386981531], "raw_p": 0.6014797040591882, "holm_p": 1.0},
+    "rsi_mean_reversion": {"n": 11, "psr": 0.5377674199287926, "dsr": 0.4273174531400141, "ci": [-0.18766201319534281, 0.20777789588795184], "raw_p": 0.508498300339932, "holm_p": 1.0},
+    "donchian": {"n": 72, "psr": 0.3283808138026756, "dsr": 0.12434646119767606, "ci": [-0.144828285012655, 0.09344546836937348], "raw_p": 0.6616676664667066, "holm_p": 1.0},
+    "ai_logistic": {"n": 167, "psr": 0.010496420695202291, "dsr": 0.00021853924178560913, "ci": [-0.06237663975008383, -0.000600380732031556], "raw_p": 0.9644071185762847, "holm_p": 1.0}
+  }
+}

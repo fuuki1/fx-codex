@@ -114,6 +114,17 @@ def _macro_quality(snapshot: MacroSnapshot | None, now: datetime) -> str:
 
 
 def _entry_assessment(plan: TimeframePlan) -> EntryAssessment:
+    if plan.action not in ("long", "short"):
+        direction_ja = "買い" if plan.direction == "long" else "売り"
+        return EntryAssessment(
+            setup="見送り",
+            suitability="取引不可",
+            is_candidate=False,
+            judgment=(
+                f"分析方向は{direction_ja}ですが、較正・コスト・サイズ・risk vetoを"
+                "完了していないため最終判断は見送りです。"
+            ),
+        )
     rsi = plan.rsi
     overextended = (plan.direction == "long" and rsi is not None and rsi >= 70) or (
         plan.direction == "short" and rsi is not None and rsi <= 30
@@ -265,7 +276,8 @@ def _candidate_section(
     direction_word = "買い" if plan.direction == "long" else "売り"
     lines = [
         f"{rank}位 {plan.symbol} {plan.timeframe}",
-        f"{icon} {direction_word}方向｜{assessment.setup}",
+        f"⚪ 最終判断：{plan.action_ja}",
+        f"分析方向：{icon} {direction_word}｜{assessment.setup}",
         f"シグナル強度：{plan.conviction}/100",
         f"エントリー適性：{assessment.suitability}",
         "",
@@ -273,7 +285,7 @@ def _candidate_section(
     ]
     lines.extend(f"・{reason}" for reason in _candidate_reasons(plan, analysis, tech))
     lines.extend(["", "判断", assessment.judgment])
-    if plan.close is not None:
+    if plan.close is not None and plan.action in ("long", "short"):
         lines.extend(
             [
                 "",
@@ -302,7 +314,7 @@ def build_signal_board_payload(
     entry_candidates = [
         f"{item.plan.symbol} {item.plan.timeframe}"
         for item in ranked
-        if item.assessment.is_candidate
+        if item.plan.action in ("long", "short") and item.assessment.is_candidate
     ]
     candidate_text = "、".join(entry_candidates) if entry_candidates else "なし"
     quality_icon = "⚠️" if data_quality.has_warning else "✅"

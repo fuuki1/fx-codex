@@ -1,0 +1,870 @@
+{
+  "file_count": 141,
+  "files": [
+    {
+      "kind": "file",
+      "path": "fx_backtester/.codex/environments/environment.toml",
+      "sha256": "b72e3e71f42787b2ea6df5ad2707635497f11981dc9aa510f6c493d6611d034a",
+      "size": 102
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/__init__.py",
+      "sha256": "63aede1fa0c6171ae5ed27d2b3d625f0acd08079f310f2079ac782e9a817f89a",
+      "size": 492
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/analysis.py",
+      "sha256": "d3aad207ada7178599dddd564f3b479a650eee1766150470c1151613ba83984a",
+      "size": 76195
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/artifacts.py",
+      "sha256": "23cee8a522611510d5b87f6b099c005322d1ce5d11f574f3d41bd5327a35c14e",
+      "size": 44065
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/calibration.py",
+      "sha256": "66e566b2c5dd9f49da89db4126b66dc9edf5b3776b22a3bd65af4718a3b11926",
+      "size": 20936
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/cli.py",
+      "sha256": "a6f01f7f80af3794bfc014f1519278cad6780cbe5703dc432ee4273507a48cec",
+      "size": 30845
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/data.py",
+      "sha256": "b55214034b241f8a5b705fcd3e8e81c2881c26064b90070a2c0c1049446aedd4",
+      "size": 23570
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/drift.py",
+      "sha256": "daebcae47d0e0ddf797c8f45cefc45e1b3f39eca466a2616fc135e72d1b3ea68",
+      "size": 20225
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/engine.py",
+      "sha256": "84e32bcf67e9063f9b43f54b410e8bcc746c14c939bb27106df4f65c3a710b36",
+      "size": 33829
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/execution.py",
+      "sha256": "72cebb5e60f7b380f4038fffee5a07ed7f5a7c27e87a56dd6c9bdc5c2858a3d2",
+      "size": 11339
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/governance.py",
+      "sha256": "2f152721e600f0d1c6118b0602e7da23f62e8111b0470f74fe42b3faba94ff03",
+      "size": 88879
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/indicators.py",
+      "sha256": "42ba6e080548c6b29f4942ffe2e990eb6a84a5702247bbee01292c8b2d16cbfc",
+      "size": 1095
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/labeling.py",
+      "sha256": "719a4cdd3208388db6c2f609d5dfc74e2cbb857f616670c08c1f0344e867f302",
+      "size": 20470
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/metrics.py",
+      "sha256": "fb7b1bfed356a49f57fabeeee2fcbafbb65bfaf5bdb54881ae1a555ba6253e76",
+      "size": 6679
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/models.py",
+      "sha256": "8b1afc38bf47e1c4c9a473c97744512bd580d83de40a30931ee49296243a375b",
+      "size": 6072
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/overfitting.py",
+      "sha256": "67daf8e228eea8f0632efb7c20db75b34fc9c4bc99b737cb35e1607ff7c2bf9c",
+      "size": 14092
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/point_in_time.py",
+      "sha256": "28b8395c9ad1252f7a3eae0e61cccbee6556aefc78c0914694f8407ee72e555b",
+      "size": 26285
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/qa.py",
+      "sha256": "56c9846836743b6a238946d98e7d7501ee1acec1e15d82f7207e1d10ad40b814",
+      "size": 4837
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/research.py",
+      "sha256": "d93baa73731d3676bf64a035aef4cbf597be224180b7e713b76ad24d9bea46f9",
+      "size": 14491
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/risk.py",
+      "sha256": "0d73c9f8dcc5e9615b8ec0bfda04850b6a1555d6d7316b2a5a36da11af67221b",
+      "size": 15098
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/statistical_validation.py",
+      "sha256": "edcb32a1e887f46961c37a2df67c2d12d9bb3ca122a5028be6a5002149bfc045",
+      "size": 9194
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/__init__.py",
+      "sha256": "2f66059de2b37669233706d634445fecdad438f44637707c2e302f73d396e93f",
+      "size": 1413
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/ai_logistic.py",
+      "sha256": "77dff5b9c1c5d89f8df2ab9134f429acba339af2450ed6d915f5dc2ffbe61f37",
+      "size": 8882
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/base.py",
+      "sha256": "9c3cf410e33726d789926e199e1e908207faea3eb248f4979336b23809b62c8a",
+      "size": 1287
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/baselines.py",
+      "sha256": "d0fb07b0949eff596231f310eac7b1b7855c3f2d01e50a4518ffc0fb02fce08f",
+      "size": 2430
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/donchian_breakout.py",
+      "sha256": "9063f2992facee3e4bac77af5bff0cd90d10d5a4eeb45427ead48e0a0720d61d",
+      "size": 2429
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/filters.py",
+      "sha256": "7428e96a6e7c41fc3b78d8b8f6e2462b184ba2ff0667826a1dd3d0b35b808354",
+      "size": 4559
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/moving_average_cross.py",
+      "sha256": "2d14671262f4399e5782a64cd6978ee51365036cae6810f4b6f7476dc18d5511",
+      "size": 1170
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/strategies/rsi_mean_reversion.py",
+      "sha256": "487bc8baa6d49cd94f047ce70391bab35bf5ad951f3a029aa528ab571d86eb6a",
+      "size": 1776
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/stress.py",
+      "sha256": "a30ca457be51354028889aaaa7995f067df10a916b1a2351664047b92ed7250c",
+      "size": 3674
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/time_series_validation.py",
+      "sha256": "bfb73a7026f5eb6708979128734ba26a361f047ec07382865fd866892110b90b",
+      "size": 15530
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/tradingview.py",
+      "sha256": "1283f34a9eb79ae3ec7e5af53280973aeb0791a9cd7cd5097ce1ef74822dfea0",
+      "size": 7030
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/trial_log.py",
+      "sha256": "df26c6404db450b1e1ea56142bbccc3e7109961deb9603bd1bc09afd555797db",
+      "size": 7288
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/validation.py",
+      "sha256": "1d947736316b05a39774289eb1fec6ec9a51c89c0c275bed614d832d68faef95",
+      "size": 8832
+    },
+    {
+      "kind": "file",
+      "path": "fx_backtester/walk_forward.py",
+      "sha256": "cdacadf4d7d255f2af09ee247af749cd4b28773ac8dcb564a248b040661acda4",
+      "size": 8720
+    },
+    {
+      "kind": "file",
+      "path": "fx_briefing.py",
+      "sha256": "0ca7446893f4ae8f1e91c81aef6265bc79eaa2e08b0d671217b8c4f2172985bd",
+      "size": 80025
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/__init__.py",
+      "sha256": "cd2d1e497deed42ee9dee199f8c8c79feb84ec0cfe6ae8d51f247872424be961",
+      "size": 2958
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/analyst.py",
+      "sha256": "66802e361e3b6c7b2780f770b48134128f658815c6a60db130a0183e8855d3d8",
+      "size": 16169
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/append_only.py",
+      "sha256": "4b4d56eb9c9f202b3cff77d98a4e719d4d9c3c9572580b0e9660217334faf2e2",
+      "size": 14785
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/briefing.py",
+      "sha256": "af8938ff294aacdb37c6fd6a50bf7265aee9f11568e13cbf14b8979801018cf3",
+      "size": 35718
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/calendar.py",
+      "sha256": "ed8e16ac056cd02b3c783202db8d33f753f6b3fe450feb865ae8aee015a538ff",
+      "size": 24078
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/committee.py",
+      "sha256": "ad8e4cc9bd8c4031f04899a1ef9120959eb3bdae5ab40fcd8fc41e0a4591f00b",
+      "size": 9723
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/decision_feedback.py",
+      "sha256": "53229f137558810608f347cd60a2079591ec9cd8092be12ade98d6626f10e42d",
+      "size": 39742
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/decision_log.py",
+      "sha256": "b859b165a79c0c042f3de7edd8f6aff4c157cb9a1c1adafff8cae55bad7aa77e",
+      "size": 53696
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/decision_pipeline.py",
+      "sha256": "10fedc9023dd16cdaf74e0b3ba2e771ca401b0fca99277123f0b443edc060c56",
+      "size": 77899
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/freshness.py",
+      "sha256": "58398de59e5f1f8167508e6c70bf170f43b196d524389d32cf622656ed3f1b5b",
+      "size": 3163
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/gbm.py",
+      "sha256": "98482277c4436da907f0b583def9f0dfaf0c8bdc4b153449346fe5e2a5dd4e3a",
+      "size": 18250
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/journal.py",
+      "sha256": "0c1afdaf24f058296673bf2a80d0e237a5d90cffe49995e31628a358ad8aa5ce",
+      "size": 15338
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/learning.py",
+      "sha256": "6a060d78ae285af54b82ab85eae162a20bd4320b3191c1680a57dff35559f7af",
+      "size": 47213
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/macro.py",
+      "sha256": "39fa8de9fe5ec35cadc4b67a0d0c0b0e52a4a09e8311a0c2347a0f4b8cc28f04",
+      "size": 23677
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/market.py",
+      "sha256": "8886c03039575a4ac1cbc5878cf3211e698bf4eec9c25600a4da46401c6c2853",
+      "size": 2474
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/maximization.py",
+      "sha256": "f46fb66946eb55eb937674e19666cd93126509f70a2e4564e4b0274c998d2589",
+      "size": 33970
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/ml.py",
+      "sha256": "3a6a1d25572d3e67ccafd1a006cc8fdae1b661a5988f893be625b76d428f6213",
+      "size": 24221
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/news.py",
+      "sha256": "3088242d7ad202e3336e236299ec5246ab0a4e9dd22f52e843f1225c56f15ee2",
+      "size": 8607
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/price_history.py",
+      "sha256": "bd63d3ff189b159b2e440dd61f9345683424ffa247ba5436113834f957ace688",
+      "size": 28064
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/promotion.py",
+      "sha256": "e1bb4e3fdd5d927b80d58c986f98ed3d5a91766955267b3abd99dc89e5dc6a71",
+      "size": 17479
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/sentiment.py",
+      "sha256": "802e0d56b4379fd973dcd7fec732f40076f2ffe5964af4a180d25b4eb46b8396",
+      "size": 14758
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/signal_board.py",
+      "sha256": "0e1a4bc1a2e3e5b37e7f646ff7ccd59aaab9553b39cf9dded328bece2ad44ca5",
+      "size": 13738
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/technicals.py",
+      "sha256": "6a1c7eeaa127273794168e7d69c5ec5a40383e0af0c52e5acb49724182d0685b",
+      "size": 17032
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/tf_briefing.py",
+      "sha256": "8a603eabe489d9d662cd7011d3989da0cf877f5439749114922defdbdab403ca",
+      "size": 9595
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/tf_learning.py",
+      "sha256": "6205caa14b2cd7358d34bb9ff8be9de61af10b74103f6bb6e5a96c55670ef15f",
+      "size": 12389
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/timeframe.py",
+      "sha256": "e9acfdc15e71554897afd71dcb0721dab068271ef17d8d100888545bc10ccaad",
+      "size": 22214
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/tp_sl_learning.py",
+      "sha256": "efc4785581e173bb5eacb5d9ab90c4b9ad39c9b4d9e5d535a385f94b7cc36106",
+      "size": 16337
+    },
+    {
+      "kind": "file",
+      "path": "fx_intel/trade_outcome.py",
+      "sha256": "aaac7b8a66058294c0b72c8f63db22287243a89e30aa0fb579283f09abba798f",
+      "size": 97084
+    },
+    {
+      "kind": "file",
+      "path": "fx_tf_snapshot.py",
+      "sha256": "413acbb8bddb2f0544270ea4e14cf705321a14afd52215a6e519eb0af08e2cd6",
+      "size": 4965
+    },
+    {
+      "kind": "file",
+      "path": "ops/freshness_targets.json",
+      "sha256": "24a3b5d4be594b6f4cbbc35c1e9c133c18e30fa06f4538a33050fec888859e0f",
+      "size": 3872
+    },
+    {
+      "kind": "file",
+      "path": "ops/launchd/com.fx-codex.briefing.plist.tmpl",
+      "sha256": "69d102dabdc5977ff0d97a8bc777c029973632195cbd01213a7e4832e3d717df",
+      "size": 1358
+    },
+    {
+      "kind": "file",
+      "path": "ops/launchd/com.fx-codex.health.plist.tmpl",
+      "sha256": "dea5f09701154c716ae96c4832bd2eea4cbf12fc51ded62b8c7bda5457fbc5e7",
+      "size": 1312
+    },
+    {
+      "kind": "file",
+      "path": "ops/launchd/com.fx-codex.snapshot.plist.tmpl",
+      "sha256": "c91a40adeea75cc06cc2e5c81f59ba8e92c53906a05b607f7c85851ad3ff6353",
+      "size": 1331
+    },
+    {
+      "kind": "file",
+      "path": "requirements.lock",
+      "sha256": "4d9bdfd3d67b3fbf983bfcb712d9670bab440c0a5e40461bcc45d992ef193a90",
+      "size": 419
+    },
+    {
+      "kind": "file",
+      "path": "scripts/fx_briefing_once.sh",
+      "sha256": "e411fe6fc8b0ec18f95be5d897e5b20a45a34423750b43647f248d59b42ec851",
+      "size": 1151
+    },
+    {
+      "kind": "file",
+      "path": "scripts/install_launchd.sh",
+      "sha256": "a59340367272e1d4e8b0e9251dce92939e148b9700cb4222bdf7faea534a3f0a",
+      "size": 11493
+    },
+    {
+      "kind": "file",
+      "path": "scripts/restart_fx_services.sh",
+      "sha256": "390391f21886889715386dbe11eb0cbda07d91bf433e73bbcd5fca8dd3fe8150",
+      "size": 2599
+    },
+    {
+      "kind": "file",
+      "path": "scripts/status_fx_services.sh",
+      "sha256": "ac0b32ae81f2d9c014de2f429f5bb47878434f765b0053b105f5bf513e02c61a",
+      "size": 5505
+    },
+    {
+      "kind": "file",
+      "path": "scripts/uninstall_launchd.sh",
+      "sha256": "65a75251a93e5161e32caf4512e5bd87ced860f0cbaff2106ee53a06bdf093f4",
+      "size": 2250
+    },
+    {
+      "kind": "file",
+      "path": "scripts/writer_preflight.sh",
+      "sha256": "4c8e483a59879fae6558b25f81adde59d586a1f7af17ad93d4471b62c82a5c7d",
+      "size": 735
+    },
+    {
+      "kind": "file",
+      "path": "tests/conftest.py",
+      "sha256": "ccb4dcaf9e6d3768efc8b41e9d7c1e214b56124ffbf338f45cb818b7d22bdc9f",
+      "size": 2120
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_analyst.py",
+      "sha256": "912ddeefbe1aebff5d1e2bb6a78c24ddaf713ecae156b8555361b79ef64bf7b6",
+      "size": 4825
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_append_only.py",
+      "sha256": "fc5242d261c411cfd7666960d39d124ed9cdd9c674cf6db9dfb2a327fc5f9b22",
+      "size": 5257
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_artifacts.py",
+      "sha256": "7be89567960c68e5ad2951e07cef0801d52427ef843e987d2431109043ddae0e",
+      "size": 21254
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_backtester.py",
+      "sha256": "81492934653c49746d8b58c052f9dc347a84580644dfeafde7a93a4588c509a2",
+      "size": 60111
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_calibration.py",
+      "sha256": "b4cef5dbb83ca1ccc5d89e543ef9885cf0a672beeee929cd774b5432f5fba06a",
+      "size": 5086
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_committee.py",
+      "sha256": "163f3ead543eee621696447da7d4bf823b97cdbf5241ca288d33ca679d299ebc",
+      "size": 4526
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_dashboard_timeframe.py",
+      "sha256": "c2c98aed2cdf4b535a797609024273dfc4e770d03e91a393bd20e365f590f6b4",
+      "size": 11918
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_decision_expectancy_monitor.py",
+      "sha256": "895fa275076b58ee74301b8d44c2fc8f4f3c07b0b73739879151666d0cd0a3f5",
+      "size": 8023
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_decision_feedback.py",
+      "sha256": "06c080789d68c558dc4b6a0c5ae0b72ae512668daed6cc143fa6d667dd3d5b73",
+      "size": 4466
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_decision_log.py",
+      "sha256": "10861ee74d9818a349d201af5e5d39727bc984e7512b5661468ed0a05002e5cc",
+      "size": 19092
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_decision_pipeline.py",
+      "sha256": "f291837b7c63721dbfdf599d3d9c9d9b105d2c55482395f7d27bf73852c824b1",
+      "size": 44216
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_drift.py",
+      "sha256": "ba6b11268d7b2eafc4c9bf6d6aaaed9bc9024d54adc7bde906873f8fefa74b23",
+      "size": 4207
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_freshness_gate.py",
+      "sha256": "f474649cd86d5b47d4e2f293dfbea294eff28315fa0701941cb0ef4bfea11af5",
+      "size": 2183
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_fx_briefing_expectancy_evidence.py",
+      "sha256": "3335df1890e1bdfe169c480311f1cbef35243d51e47ac4d9d862f84f822bd3dc",
+      "size": 1031
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_fx_briefing_local_capture.py",
+      "sha256": "62165f6f92a49f9692586e439e87ac31afb40876ae8d24f6c916f23e4c78e653",
+      "size": 13549
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_fx_briefing_ml.py",
+      "sha256": "057bc72300e235010b57c0086b69855207f9d63a80dd45f3c37fe2728a655cef",
+      "size": 3728
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_fx_briefing_per_timeframe.py",
+      "sha256": "b894ac9b8dac6663bafabc45d45b00b5b46ba018cd45e772a053229896be74ce",
+      "size": 21274
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_fx_intel.py",
+      "sha256": "8d67eca185ecaa18887d435e90a6b9c06b706051e1d09aa8edfaa31cc3ec18bf",
+      "size": 44162
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_gbm.py",
+      "sha256": "9e483e10dac6bebd082a13a26f40e48e9c585c3b1aeb663f70d7f8457d20f9f0",
+      "size": 3414
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_governance.py",
+      "sha256": "7106d5f932df8875fb696c943f4496fcb16ec5f839f053e9d7d82dace39e41c4",
+      "size": 38819
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_implementation_manifest.py",
+      "sha256": "23b610bcf8f0e03342db9e5eaf156c743d6fcaa5023c5203370ddd3714df3c71",
+      "size": 2203
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_labeling.py",
+      "sha256": "9b7293a22c78121f3d1b804962ab0bd46913e88102f2f9560994095f7393eaa4",
+      "size": 7942
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_learning.py",
+      "sha256": "c7ec79bc52e2a1dffb56d721eccb9e14381d46250e9aec95797c7c752d11f30b",
+      "size": 31663
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_learning_capture.py",
+      "sha256": "2dbef67c827476c0fb5077d959aeb7562107c4eb1f3a401eb99dc41b513192c6",
+      "size": 1798
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_macro.py",
+      "sha256": "2b27c51f24b15172c290493e5fba20705826931ae7fb8bd03b979f271899d3e5",
+      "size": 9041
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_maximization.py",
+      "sha256": "7c9a6ac81e02162019331e17d66945311a3d7375265f4f2d3ee78315be2ca373",
+      "size": 5118
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_maximization_monitor.py",
+      "sha256": "cabbe48ab5c30f598be7a3155b82929e14fdac8b8a0379298a15ae935fc342fc",
+      "size": 4047
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_metrics_institutional.py",
+      "sha256": "26d55c1ff800ee581fa3439957dfbda3f9ee36fc2bec048902a31282d2428098",
+      "size": 1789
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_ml.py",
+      "sha256": "ce7c33c2e9037e5219c9f7a80f2c0e9e5ae872e56aefb5d8ef9a2a1b10e6c35f",
+      "size": 8113
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_numeric_boundaries.py",
+      "sha256": "f321e016dc2045bff63a76e1d0187d70dbe7bb77adc6e6f191511fa9ce9bd7aa",
+      "size": 4349
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_ops_freshness.py",
+      "sha256": "3c0640ae62c7d0a9ae56ee2f919815cad6640bb6f58902552e61727cf2551513",
+      "size": 24532
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_ops_lock_and_launchd.py",
+      "sha256": "698fa217c8624bbc7c598a310fe327bccd066f453d4158d70804aa5424e4cfea",
+      "size": 38477
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_overfitting.py",
+      "sha256": "73e662b71c34ebe6ed6feb9dc31a46ee921e0d342c26d2128f219e900f7734cf",
+      "size": 8441
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_point_in_time.py",
+      "sha256": "4f94e23d26a19d91a6f2d9465dbde937a5965aaff86c5410845a0954d5f01f28",
+      "size": 15695
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_price_history.py",
+      "sha256": "034cb04bb6a00b32c0a5baf62e7c6681ecba25663b0829ac229fc16e6cd4571c",
+      "size": 21843
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_price_journal_migration.py",
+      "sha256": "26ea53f543a3e5fbb9fda5b5ed3ada7ba061e224e73545fa5ccba56b86f45567",
+      "size": 6941
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_promotion.py",
+      "sha256": "3fd66a6c0ad7b59e19deffcaeef002b9388eeb9fb50f247eb1b10c728ac78e6b",
+      "size": 7073
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_signal_board.py",
+      "sha256": "8fc8de02a1a4214113af6c4d1675b068d07459934221ed875d22b4da7a557a0b",
+      "size": 5782
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_statistical_validation.py",
+      "sha256": "79720b70732f6bc158059066a612c2c7afc99e89a449addb2b2c6341126ae407",
+      "size": 2640
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_stress.py",
+      "sha256": "7018661775c48e2c2a7575eee43c2e6cb8d7c51e00ef2443dd14b4c6b9b69f0f",
+      "size": 2003
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_tf_briefing.py",
+      "sha256": "8f5fe12ab310f99ebdc70b114d13ef658fa72518ae07011598e9ce1e4c39a4be",
+      "size": 5162
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_tf_learning.py",
+      "sha256": "bf2e87dfbf57734dda4021a05f721f7551623216557704d723e4989ba882f0a4",
+      "size": 7007
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_tf_snapshot.py",
+      "sha256": "bb81615f1291e89364e8458acb7a5c4de63b245b77abe35e1bef10664275b74d",
+      "size": 6868
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_time_series_validation.py",
+      "sha256": "d7c5a4f3a8533e3616270324620ad6ebce966bf5397b9d314745099e0ced491b",
+      "size": 4986
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_timeframe.py",
+      "sha256": "67b1f9b6d5c0d02cde877aa6b32937d090084889185676454361006ac5f8f278",
+      "size": 8057
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_tp_sl_learning.py",
+      "sha256": "4b23aeebf05d5eea7646e68b957a5ba184e374a5faeb40c5381f93cc29ba6adc",
+      "size": 4891
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_trade_outcome.py",
+      "sha256": "74cae3fcfef68c5cc6f0e2d2defdc3b185ed4c3d7a9359b90668b84519f818fc",
+      "size": 36640
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_trade_outcome_monitor.py",
+      "sha256": "60bb37c669aabffcc1761a84cb5f5558bb1565fdf20f264b3adadcce9e40b0c6",
+      "size": 8351
+    },
+    {
+      "kind": "file",
+      "path": "tests/test_trial_log.py",
+      "sha256": "f4399f57fe9d8e87c0ac5186e5ebd6ed51193d08f7e9d12d73767361b0218438",
+      "size": 6712
+    },
+    {
+      "kind": "file",
+      "path": "tools/ai_learning_dashboard/README.md",
+      "sha256": "24456ddb534095db97aa9b14847ff921dc83a923b8be38172780e871a1724c0e",
+      "size": 2203
+    },
+    {
+      "kind": "file",
+      "path": "tools/ai_learning_dashboard/server.py",
+      "sha256": "57753ed39df1a49d58f96444f6cdf6692b079888596a86d9b3dfc0bed8a77a32",
+      "size": 42540
+    },
+    {
+      "kind": "file",
+      "path": "tools/ai_learning_dashboard/static/app.js",
+      "sha256": "effad851a1aa8f0c1b5849cf8505a8deab6d74a3757e94dba5395513b237c841",
+      "size": 25917
+    },
+    {
+      "kind": "file",
+      "path": "tools/ai_learning_dashboard/static/index.html",
+      "sha256": "ddbcf5bc76de66d8d9a5fde43432f9db97384c0c898f88e563a300a1b79d750c",
+      "size": 9747
+    },
+    {
+      "kind": "file",
+      "path": "tools/ai_learning_dashboard/static/styles.css",
+      "sha256": "099e674f4f8f3eeb491273fe02c8b13a4afd43516d05d9aead245b19e532de6c",
+      "size": 8199
+    },
+    {
+      "kind": "file",
+      "path": "tools/data_freshness_monitor.py",
+      "sha256": "ac29ddc02165e29c721fafb5ba4a78b5497632d8d8987531e59b26bd71af5a48",
+      "size": 42245
+    },
+    {
+      "kind": "file",
+      "path": "tools/decision_expectancy_monitor.py",
+      "sha256": "892f4590c7261f77bc557f08b234901cc46fca772699696d7ca0dd7974bdf392",
+      "size": 11245
+    },
+    {
+      "kind": "file",
+      "path": "tools/implementation_manifest.py",
+      "sha256": "32476306e73223920d81a110ae0d94a4f9355ff5a48be2238a6298f9f5b00827",
+      "size": 4038
+    },
+    {
+      "kind": "file",
+      "path": "tools/journal_gap_audit.py",
+      "sha256": "9a40cbead2575ec5ec0848b437197e07f2b27e920bbd86321507061c3ff2f368",
+      "size": 7212
+    },
+    {
+      "kind": "file",
+      "path": "tools/learning_capture.py",
+      "sha256": "f6d1c88b17ce108a1a74031eda9e1d5dcf54015e22c97a723365d672e2d0d84b",
+      "size": 4900
+    },
+    {
+      "kind": "file",
+      "path": "tools/maximization_monitor.py",
+      "sha256": "45fadb0b65a817110e920123ee3ecccb2ccaa420cf3cabcad7cce5c9be0e0116",
+      "size": 6231
+    },
+    {
+      "kind": "file",
+      "path": "tools/prepare_v2_price_journal.py",
+      "sha256": "a1de567a1e49e82cdbc8e70b0fe46f73bcac9e6d7d2970b57c3e1e28e42cd2c6",
+      "size": 12586
+    },
+    {
+      "kind": "file",
+      "path": "tools/run_exclusive.py",
+      "sha256": "2a076614753ffe50f985bae4153c19eb6a9a5e462e1cfa962409799f9912f3ae",
+      "size": 10331
+    },
+    {
+      "kind": "file",
+      "path": "tools/trade_outcome_monitor.py",
+      "sha256": "857fe355d15c29c54af46b7cf05ae4c52b832cae1df1c3b7c3e3c44e56bec36c",
+      "size": 12602
+    },
+    {
+      "kind": "file",
+      "path": "tv_discord_notify.py",
+      "sha256": "2c11551d070038fa5d68f5c41320a7a85edc1756a48b999b28f5ba5dda411c42",
+      "size": 9945
+    }
+  ],
+  "git_head": "3c5bbc7a9889ebbe411699d48a9b1043a3b01e45",
+  "manifest_payload_sha256": "d6e772faf932f600b8835e102daf54c80ea8765cdba4792a2e3d09ebd7bdab62",
+  "schema_version": 1,
+  "scope": {
+    "directory_prefixes": [
+      "fx_backtester/",
+      "fx_intel/",
+      "ops/",
+      "scripts/",
+      "tests/",
+      "tools/"
+    ],
+    "root_globs": [
+      "*.py",
+      "requirements*"
+    ],
+    "source": "git tracked plus non-ignored untracked files"
+  },
+  "tree_sha256": "9e34a4ad4de7b620da2476794e34ccde9ce92061c96817ae43133038bf66bd84"
+}

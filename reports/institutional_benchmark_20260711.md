@@ -1,5 +1,7 @@
 # Institutional benchmark — 2026-07-11
 
+> Historical evidence only. The candidate engine changed after this run, so these numbers are not the current benchmark. Use [institutional_benchmark_20260713.md](institutional_benchmark_20260713.md) for the present candidate. This file is retained rather than rewritten to preserve the audit trail.
+
 ## Verdict
 
 This run verifies deterministic engine behavior and the new risk/measurement controls. It does **not** establish an investable edge. Three of four strategies lose money at the configured baseline-cost proxy; the only positive result has 11 trades, a confidence interval spanning zero, DSR 0.428 and becomes negative at 1.5× costs. No candidate is admissible for validation, paper or live promotion.

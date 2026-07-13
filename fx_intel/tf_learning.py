@@ -77,6 +77,8 @@ def evaluate_timeframe_history(
     entries: Iterable[Mapping[str, object]],
     timeframe: str,
     atr_fraction: float | None = None,
+    *,
+    as_of: datetime | None = None,
 ) -> list[EvaluatedCall]:
     """1時間足ぶんの全判断を、その時間足の主ホライズンで採点する。
 
@@ -90,7 +92,7 @@ def evaluate_timeframe_history(
     kwargs: dict[str, float] = {"horizon_hours": horizon, "tolerance_hours": tolerance}
     if atr_fraction is not None:
         kwargs["atr_fraction"] = atr_fraction
-    return evaluate_history(filtered, **kwargs)
+    return evaluate_history(filtered, as_of=as_of, **kwargs)
 
 
 def _calls_for_symbol(calls: Sequence[EvaluatedCall], symbol: str) -> list[EvaluatedCall]:
@@ -180,7 +182,7 @@ def derive_timeframe_learning(
     per_timeframe: dict[str, LearnedProfile] = {}
 
     for timeframe in timeframes:
-        calls = evaluate_timeframe_history(materialized, timeframe)
+        calls = evaluate_timeframe_history(materialized, timeframe, as_of=now)
         if not calls:
             continue
         horizon_label = _fmt_hours(PRIMARY_HORIZON_HOURS.get(timeframe, 24.0))
@@ -209,6 +211,8 @@ def auxiliary_horizon_report_ja(
     entries: Iterable[Mapping[str, object]],
     timeframe: str,
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
+    *,
+    as_of: datetime | None = None,
 ) -> str:
     """補助ホライズン(観測専用)での的中率を1行にまとめる。データ無しは空文字。
 
@@ -223,7 +227,10 @@ def auxiliary_horizon_report_ja(
     total_scored = 0
     for horizon in aux:
         calls = evaluate_history(
-            filtered, horizon_hours=horizon, tolerance_hours=tolerance_for(horizon)
+            filtered,
+            horizon_hours=horizon,
+            tolerance_hours=tolerance_for(horizon),
+            as_of=as_of,
         )
         if thin_gap_hours > 0:
             calls = thin_calls(calls, thin_gap_hours)

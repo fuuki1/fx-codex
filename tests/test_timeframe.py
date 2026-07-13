@@ -59,6 +59,7 @@ def test_build_plans_one_per_timeframe_with_primary_horizon() -> None:
     for plan in plans:
         assert plan.horizon_hours == PRIMARY_HORIZON_HOURS[plan.timeframe]
         assert plan.auxiliary_horizons == AUXILIARY_HORIZON_HOURS[plan.timeframe]
+        assert plan.action == "no_trade"
 
 
 def test_primary_horizons_match_spec() -> None:

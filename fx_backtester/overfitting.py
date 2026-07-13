@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 from itertools import combinations
+from numbers import Real
 from typing import Any
 from collections.abc import Sequence
 
@@ -95,7 +96,7 @@ def norm_ppf(p: float) -> float:
 
 def per_period_sharpe(returns: pd.Series | np.ndarray) -> float:
     """per-period の Sharpe(mean/std, ddof=1)。分散0や観測不足は0を返す。"""
-    series = pd.Series(returns, dtype=float).dropna()
+    series = _strict_return_series(returns, "returns")
     if len(series) < 2:
         return 0.0
     std = float(series.std(ddof=1))
@@ -131,7 +132,7 @@ def deflated_sharpe_ratio(
     戻り値の dsr は「観測Sharpeが、N回探索のまぐれ期待値(SR*)を超えて
     本物である確率」。慣例的に 0.95 以上で合格とみなす。
     """
-    series = pd.Series(selected_returns, dtype=float).dropna()
+    series = _strict_return_series(selected_returns, "selected_returns")
     n_obs = len(series)
     if n_obs < 3:
         raise ValueError(f"リターン観測数が不足({n_obs}件)。DSRには3件以上が必要")
@@ -139,10 +140,22 @@ def deflated_sharpe_ratio(
     if std <= _MIN_STD or not math.isfinite(std):
         raise ValueError("リターンの分散が実質0のためSharpeが定義できない")
 
-    finite_sharpes = np.asarray(
-        [s for s in trial_sharpes if isinstance(s, int | float) and math.isfinite(s)],
-        dtype=float,
-    )
+    disclosed_sharpes = list(trial_sharpes)
+    if not disclosed_sharpes:
+        raise ValueError("試行Sharpeが1件も無い")
+    invalid_positions = [
+        position
+        for position, sharpe in enumerate(disclosed_sharpes)
+        if not isinstance(sharpe, Real)
+        or isinstance(sharpe, bool)
+        or not math.isfinite(float(sharpe))
+    ]
+    if invalid_positions:
+        raise ValueError(
+            "試行Sharpeに非数値または非有限値がある: "
+            + ", ".join(str(position) for position in invalid_positions)
+        )
+    finite_sharpes = np.asarray(disclosed_sharpes, dtype=float)
     n_trials = int(finite_sharpes.size)
     if n_trials < 1:
         raise ValueError("有効な試行Sharpeが1件も無い")
@@ -208,6 +221,33 @@ def probability_of_backtest_overfitting(
         raise ValueError(f"n_blocks は4以上の偶数であること: {n_blocks}")
     if matrix is None or matrix.empty:
         raise ValueError("リターン行列が空")
+    if not isinstance(matrix.index, pd.DatetimeIndex):
+        raise ValueError("リターン行列のindexはDatetimeIndexであること")
+    if matrix.index.tz is None:
+        raise ValueError("リターン行列のDatetimeIndexはtimezone-awareであること")
+    if not matrix.index.is_monotonic_increasing or matrix.index.has_duplicates:
+        raise ValueError("リターン行列のDatetimeIndexは一意かつ単調増加であること")
+    if matrix.columns.has_duplicates:
+        raise ValueError("リターン行列の試行列名は一意であること")
+    raw_values = matrix.to_numpy(dtype=object)
+    boolean_positions = [
+        (row, column)
+        for row in range(raw_values.shape[0])
+        for column in range(raw_values.shape[1])
+        if isinstance(raw_values[row, column], (bool, np.bool_))
+    ]
+    if boolean_positions:
+        preview = ", ".join(f"({row},{column})" for row, column in boolean_positions[:10])
+        raise ValueError(f"リターン行列にboolean値がある: {preview}")
+    non_numeric_positions = [
+        (row, column)
+        for row in range(raw_values.shape[0])
+        for column in range(raw_values.shape[1])
+        if not isinstance(raw_values[row, column], Real)
+    ]
+    if non_numeric_positions:
+        preview = ", ".join(f"({row},{column})" for row, column in non_numeric_positions[:10])
+        raise ValueError(f"リターン行列に非数値がある: {preview}")
     values = matrix.to_numpy(dtype=float)
     if not bool(np.isfinite(values).all()):
         missing = int((~np.isfinite(values)).sum())
@@ -254,7 +294,14 @@ def probability_of_backtest_overfitting(
     omega = rank / (n_trials + 1.0)
     lam = np.log(omega / (1.0 - omega))
 
-    slope, intercept = np.polyfit(selected_is, selected_oos, 1)
+    degradation_available = bool(np.std(selected_is) > _MIN_STD)
+    if degradation_available:
+        slope, intercept = np.polyfit(selected_is, selected_oos, 1)
+        degradation_slope: float | None = float(slope)
+        degradation_intercept: float | None = float(intercept)
+    else:
+        degradation_slope = None
+        degradation_intercept = None
     return {
         "pbo": float(np.mean(lam < 0.0) + 0.5 * np.mean(lam == 0.0)),
         "n_trials": int(n_trials),
@@ -263,6 +310,25 @@ def probability_of_backtest_overfitting(
         "n_observations": int(n_obs),
         "lambda_median": float(np.median(lam)),
         "prob_oos_loss": float(np.mean(selected_oos < 0.0)),
-        "degradation_slope": float(slope),
-        "degradation_intercept": float(intercept),
+        "degradation_available": degradation_available,
+        "degradation_slope": degradation_slope,
+        "degradation_intercept": degradation_intercept,
     }
+
+
+def _strict_return_series(
+    values: pd.Series | np.ndarray,
+    label: str,
+) -> pd.Series:
+    raw = pd.Series(values)
+    invalid = [
+        position
+        for position, value in enumerate(raw.tolist())
+        if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(float(value))
+    ]
+    if invalid:
+        raise ValueError(
+            f"{label} contains non-numeric, boolean, missing, or non-finite values at: "
+            + ", ".join(str(position) for position in invalid)
+        )
+    return raw.astype(float)

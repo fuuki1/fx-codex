@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fx_intel import decision_feedback, decision_log, journal, trade_outcome  # noqa: E402
+from fx_intel import decision_feedback, decision_log, price_history, trade_outcome  # noqa: E402
 
 DEFAULT_DECISION_LOG_PATH = REPO_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_TF_PRICES_PATH = REPO_ROOT / "logs" / "briefing_tf_prices.jsonl"
@@ -45,8 +45,12 @@ def run_decision_expectancy_monitor(
     """Run the full complete-decision expectancy monitoring pass."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    events = list(decision_log.read_decision_events(decision_log_path))
-    price_rows = list(journal.read_entries(prices_path)) if prices_path is not None else []
+    events = list(decision_log.read_decision_events(decision_log_path, as_of=generated_at))
+    price_rows = (
+        list(price_history.read_snapshot_entries(prices_path, as_of=generated_at))
+        if prices_path is not None
+        else []
+    )
     price_health = _price_file_health(
         prices_path,
         price_rows,
@@ -156,13 +160,15 @@ def _print_summary(result: Mapping[str, Any]) -> None:
     if not isinstance(monitor, Mapping):
         print("decision expectancy monitor: no monitor payload")
         return
-    summary = monitor.get("summary") if isinstance(monitor.get("summary"), Mapping) else {}
-    overall = summary.get("overall") if isinstance(summary.get("overall"), Mapping) else {}
-    counts = (
-        summary.get("action_counts") if isinstance(summary.get("action_counts"), Mapping) else {}
-    )
-    price_health = (
-        summary.get("price_health") if isinstance(summary.get("price_health"), Mapping) else {}
+    summary_value = monitor.get("summary")
+    summary: Mapping[str, Any] = summary_value if isinstance(summary_value, Mapping) else {}
+    overall_value = summary.get("overall")
+    overall: Mapping[str, Any] = overall_value if isinstance(overall_value, Mapping) else {}
+    counts_value = summary.get("action_counts")
+    counts: Mapping[str, Any] = counts_value if isinstance(counts_value, Mapping) else {}
+    price_health_value = summary.get("price_health")
+    price_health: Mapping[str, Any] = (
+        price_health_value if isinstance(price_health_value, Mapping) else {}
     )
     print(
         "decision expectancy monitor: "

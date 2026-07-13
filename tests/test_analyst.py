@@ -62,6 +62,13 @@ def test_recency_decay_reduces_old_news() -> None:
     assert abs(old["USD"].score) < abs(fresh["USD"].score)
 
 
+def test_future_news_has_zero_feature_weight() -> None:
+    future = make_news("Fed signals rate hike", hours_ago=-1.0)
+    scores = score_headlines([future], ["USD"], now=NOW)
+
+    assert scores["USD"].score == 0.0
+
+
 def test_effective_score_is_bias_times_confidence() -> None:
     """薄い材料(1件)は確信度が低く、実効スコアが抑えられる。"""
     scores = score_headlines([make_news("USD resilient")], ["USD"], now=NOW)

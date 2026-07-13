@@ -54,13 +54,13 @@ def _symbol_color(plans: Sequence[TimeframePlan]) -> int:
 
     実際には一覧なので、方向がついた足のうち確信度が最も高いものの色にする。
     """
-    directional = [p for p in plans if p.direction in ("long", "short")]
+    directional = [p for p in plans if p.action in ("long", "short")]
     if directional:
         best = max(directional, key=lambda p: p.conviction)
-        return _DIRECTION_COLOR.get(best.direction, COLOR_NEUTRAL)
+        return _DIRECTION_COLOR.get(best.action, COLOR_NEUTRAL)
     for plan in plans:
-        if plan.direction in _DIRECTION_COLOR:
-            return _DIRECTION_COLOR[plan.direction]
+        if plan.action in _DIRECTION_COLOR:
+            return _DIRECTION_COLOR[plan.action]
     return COLOR_NEUTRAL
 
 
@@ -69,11 +69,13 @@ def _timeframe_field(plan: TimeframePlan) -> dict:
     label = TIMEFRAME_LABEL_JA.get(plan.timeframe, plan.timeframe)
     horizon = _fmt_horizon(plan.horizon_hours)
     lines = [
-        f"{plan.emoji} **{plan.direction_ja}** 確信度 {plan.conviction}/100" f"(採点: {horizon})"
+        f"{plan.action_emoji} **最終判断: {plan.action_ja}**",
+        f"分析方向: {plan.emoji} {plan.direction_ja} "
+        f"シグナル強度 {plan.conviction}/100 (採点: {horizon})",
     ]
     if plan.reason:
         lines.append(plan.reason)
-    if plan.direction in ("long", "short") and plan.stop is not None:
+    if plan.action in ("long", "short") and plan.stop is not None:
         lines.append(
             f"現値 {format_price(plan.symbol, plan.close)}"
             f" / SL {format_price(plan.symbol, plan.stop)}"
@@ -120,7 +122,10 @@ def _symbol_embed(
                     "inline": False,
                 }
             )
-    headline = " / ".join(f"{p.timeframe} {p.emoji}{p.direction_ja}({p.conviction})" for p in plans)
+    headline = " / ".join(
+        f"{p.timeframe} {p.action_emoji}{p.action_ja}(分析:{p.direction_ja} {p.conviction})"
+        for p in plans
+    )
     return {
         "title": f"{symbol} — 時間足別の判断",
         "description": headline,
@@ -168,7 +173,8 @@ def build_timeframe_discord_payload(
         )
         if lead is not None:
             headline_parts.append(
-                f"{lead.emoji} {symbol} {lead.timeframe}{lead.direction_ja}({lead.conviction})"
+                f"{lead.action_emoji} {symbol} {lead.timeframe}{lead.action_ja}"
+                f"(分析:{lead.direction_ja} {lead.conviction})"
             )
     content = (
         f"📊 **FX時間足別ブリーフィング** {now.astimezone(JST):%m/%d %H:%M} JST ({engine_ja})\n"

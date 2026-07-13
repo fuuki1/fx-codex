@@ -11,12 +11,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from math import isfinite
+from numbers import Real
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
-SameBarPolicy = Literal["stop_first", "take_profit_first", "unresolved"]
+SameBarPolicy = Literal["stop_first", "unresolved"]
 
 
 @dataclass(frozen=True)
@@ -25,19 +26,36 @@ class TripleBarrierConfig:
     stop_vol_multiple: float = 1.0
     entry_lag_bars: int = 1
     same_bar_policy: SameBarPolicy = "stop_first"
-    cost_r: float = 0.0
+    cost_r: float | None = None
 
     def __post_init__(self) -> None:
-        if self.take_profit_vol_multiple <= 0 or not isfinite(self.take_profit_vol_multiple):
+        if (
+            isinstance(self.take_profit_vol_multiple, bool)
+            or self.take_profit_vol_multiple <= 0
+            or not isfinite(self.take_profit_vol_multiple)
+        ):
             raise ValueError("take_profit_vol_multiple must be positive and finite")
-        if self.stop_vol_multiple <= 0 or not isfinite(self.stop_vol_multiple):
+        if (
+            isinstance(self.stop_vol_multiple, bool)
+            or self.stop_vol_multiple <= 0
+            or not isfinite(self.stop_vol_multiple)
+        ):
             raise ValueError("stop_vol_multiple must be positive and finite")
-        if self.entry_lag_bars < 0:
+        if (
+            not isinstance(self.entry_lag_bars, int)
+            or isinstance(self.entry_lag_bars, bool)
+            or self.entry_lag_bars < 0
+        ):
             raise ValueError("entry_lag_bars must be >= 0")
-        if self.same_bar_policy not in {"stop_first", "take_profit_first", "unresolved"}:
+        if self.same_bar_policy not in {"stop_first", "unresolved"}:
             raise ValueError("unsupported same_bar_policy")
-        if self.cost_r < 0 or not isfinite(self.cost_r):
-            raise ValueError("cost_r must be finite and >= 0")
+        if self.cost_r is not None and (
+            not isinstance(self.cost_r, Real)
+            or isinstance(self.cost_r, bool)
+            or self.cost_r < 0
+            or not isfinite(float(self.cost_r))
+        ):
+            raise ValueError("cost_r must be None or finite and >= 0")
 
 
 @dataclass(frozen=True)
@@ -63,7 +81,7 @@ class TripleBarrierLabel:
     mae_r: float
     realized_return: float | None
     gross_r: float | None
-    cost_r: float
+    cost_r: float | None
     net_r: float | None
     ambiguous_intrabar: bool = False
     data_quality_flags: tuple[str, ...] = ()
@@ -126,6 +144,8 @@ def triple_barrier_label(
     risk_distance = volatility * settings.stop_vol_multiple
     upper_barrier = entry_price + (profit_distance if direction == 1 else risk_distance)
     lower_barrier = entry_price - (risk_distance if direction == 1 else profit_distance)
+    if lower_barrier <= 0 or not all(isfinite(value) for value in (upper_barrier, lower_barrier)):
+        raise ValueError("triple-barrier levels must remain positive and finite")
     profit_barrier = upper_barrier if direction == 1 else lower_barrier
     stop_barrier = lower_barrier if direction == 1 else upper_barrier
 
@@ -157,7 +177,10 @@ def triple_barrier_label(
             gross_r=None,
             cost_r=settings.cost_r,
             net_r=None,
-            data_quality_flags=("label_horizon_unavailable",),
+            data_quality_flags=_cost_flags(
+                settings.cost_r,
+                ("label_horizon_unavailable",),
+            ),
         )
 
     mfe = 0.0
@@ -253,17 +276,14 @@ def triple_barrier_label(
                     cost_r=settings.cost_r,
                     net_r=None,
                     ambiguous_intrabar=True,
-                    data_quality_flags=("ambiguous_intrabar_touch",),
+                    data_quality_flags=_cost_flags(
+                        settings.cost_r,
+                        ("ambiguous_intrabar_touch",),
+                    ),
                 )
-            stop_first = settings.same_bar_policy == "stop_first"
-            exit_price = stop_barrier if stop_first else profit_barrier
-            first_touch = "sl" if stop_first else "tp"
-            if stop_first:
-                mae = max(mae, risk_distance)
-            else:
-                mfe = max(mfe, profit_distance)
-                _, bar_adverse = _moves(direction, entry_price, high, low)
-                mae = max(mae, bar_adverse)
+            exit_price = stop_barrier
+            first_touch = "sl"
+            mae = max(mae, risk_distance)
             result = _completed_label(
                 horizon,
                 prediction_time,
@@ -373,6 +393,15 @@ def multi_horizon_triple_barrier(
 ) -> pd.DataFrame:
     """Generate auditable labels for multiple strategy-aligned horizons."""
 
+    if isinstance(directions, bool):
+        raise ValueError("directions must not be boolean")
+    if isinstance(volatility, bool):
+        raise ValueError("volatility must not be boolean")
+    for name, bars in horizons_bars.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("horizon names must be non-empty strings")
+        if not isinstance(bars, int) or isinstance(bars, bool) or bars < 1:
+            raise ValueError("horizon bars must be positive integers, not booleans")
     direction_values = (
         [int(directions)] * len(prediction_positions)
         if isinstance(directions, int)
@@ -389,7 +418,7 @@ def multi_horizon_triple_barrier(
                 prediction_position=prediction_position,
                 direction=direction_values[offset],
                 volatility=sigma,
-                max_horizon_bars=int(bars),
+                max_horizon_bars=bars,
                 horizon=str(name),
                 config=config,
             )
@@ -407,13 +436,22 @@ def _validate_input(
     missing = {"open", "high", "low", "close"} - set(data.columns)
     if missing:
         raise ValueError(f"missing OHLC columns: {sorted(missing)}")
-    if prediction_position < 0 or prediction_position >= len(data):
+    if (
+        not isinstance(prediction_position, int)
+        or isinstance(prediction_position, bool)
+        or prediction_position < 0
+        or prediction_position >= len(data)
+    ):
         raise IndexError("prediction_position out of range")
-    if direction not in (-1, 1):
+    if not isinstance(direction, int) or isinstance(direction, bool) or direction not in (-1, 1):
         raise ValueError("direction must be +1 or -1")
-    if not isfinite(volatility) or volatility <= 0:
+    if isinstance(volatility, bool) or not isfinite(volatility) or volatility <= 0:
         raise ValueError("volatility must be positive and finite")
-    if max_horizon_bars < 1:
+    if (
+        not isinstance(max_horizon_bars, int)
+        or isinstance(max_horizon_bars, bool)
+        or max_horizon_bars < 1
+    ):
         raise ValueError("max_horizon_bars must be >= 1")
     if not isinstance(data.index, pd.DatetimeIndex):
         raise ValueError("data index must be a DatetimeIndex")
@@ -426,6 +464,15 @@ def _validate_input(
         raise ValueError("OHLC must be finite")
     if bool((numeric <= 0).any().any()):
         raise ValueError("OHLC must be positive")
+    invalid_relationship = (
+        (numeric["high"] < numeric["low"])
+        | (numeric["high"] < numeric["open"])
+        | (numeric["high"] < numeric["close"])
+        | (numeric["low"] > numeric["open"])
+        | (numeric["low"] > numeric["close"])
+    )
+    if bool(invalid_relationship.any()):
+        raise ValueError("OHLC relationship is impossible")
 
 
 def _completed_label(
@@ -446,7 +493,7 @@ def _completed_label(
     mfe: float,
     mae: float,
     risk_distance: float,
-    cost_r: float,
+    cost_r: float | None,
     *,
     ambiguous: bool = False,
     flags: tuple[str, ...] = (),
@@ -475,9 +522,9 @@ def _completed_label(
         realized_return=direction * (exit_price - entry_price) / entry_price,
         gross_r=gross_r,
         cost_r=cost_r,
-        net_r=gross_r - cost_r,
+        net_r=gross_r - cost_r if cost_r is not None else None,
         ambiguous_intrabar=ambiguous,
-        data_quality_flags=flags,
+        data_quality_flags=_cost_flags(cost_r, flags),
     )
 
 
@@ -513,8 +560,14 @@ def _unavailable_label(
         gross_r=None,
         cost_r=config.cost_r,
         net_r=None,
-        data_quality_flags=(flag,),
+        data_quality_flags=_cost_flags(config.cost_r, (flag,)),
     )
+
+
+def _cost_flags(cost_r: float | None, flags: tuple[str, ...]) -> tuple[str, ...]:
+    if cost_r is None:
+        return tuple(dict.fromkeys((*flags, "cost_unavailable")))
+    return flags
 
 
 def _moves(direction: int, entry: float, high: float, low: float) -> tuple[float, float]:
@@ -528,7 +581,13 @@ def _volatility_at(
     position: int,
 ) -> float:
     if isinstance(volatility, pd.Series):
-        return float(volatility.iloc[position])
-    if isinstance(volatility, (int, float)):
-        return float(volatility)
-    return float(volatility[position])
+        value = volatility.iloc[position]
+    elif isinstance(volatility, Real) and not isinstance(volatility, bool):
+        value = volatility
+    elif isinstance(volatility, Sequence):
+        value = volatility[position]
+    else:
+        raise ValueError("volatility must be a real number or sequence of real numbers")
+    if not isinstance(value, Real) or isinstance(value, bool) or not isfinite(float(value)):
+        raise ValueError("volatility observations must be finite real numbers, not booleans")
+    return float(value)

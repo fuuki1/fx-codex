@@ -3,6 +3,12 @@
 set -u
 setopt NULL_GLOB
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PREFLIGHT_LIB="$ROOT/scripts/writer_preflight.sh"
+if [ ! -r "$PREFLIGHT_LIB" ]; then
+  echo "CRITICAL: writer preflight libraryがありません: $PREFLIGHT_LIB" >&2
+  exit 2
+fi
+source "$PREFLIGHT_LIB"
 LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health)
 LEGACY_LABELS=(com.fx-codex.briefing.hourly)
 overall_status=0
@@ -28,10 +34,40 @@ echo ""
 echo "=== 競合writer候補(あれば二重起動リスク) ==="
 loops=$(pgrep -fl "fx_briefing_loop.sh|fx_tf_snapshot_loop.sh" || true)
 direct_writers=$(pgrep -fl "[p]ython.*(fx_briefing.py|fx_tf_snapshot.py)" || true)
-cron_writers=$(crontab -l 2>/dev/null | grep -E "fx_briefing.py|fx_tf_snapshot.py|fx_.*_loop.sh" || true)
-if [ -n "$loops$direct_writers$cron_writers" ]; then
+wrapper_writers=$(pgrep -fl "[f]x_briefing_once.sh|[r]un_exclusive.py.*fx-(briefing|snapshot)" || true)
+cron_stdout=$(mktemp "${TMPDIR:-/tmp}/fx-codex-status-crontab.XXXXXX") || {
+  echo "  CRITICAL: crontab検証用一時ファイルを作成できません"
+  overall_status=2
+  cron_stdout=""
+}
+cron_stderr=$(mktemp "${TMPDIR:-/tmp}/fx-codex-status-crontab-error.XXXXXX") || {
+  echo "  CRITICAL: crontab検証用一時ファイルを作成できません"
+  [ -z "$cron_stdout" ] || rm -f "$cron_stdout"
+  overall_status=2
+  cron_stdout=""
+}
+cron_writers=""
+if [ -n "$cron_stdout" ] && [ -n "$cron_stderr" ]; then
+  crontab -l > "$cron_stdout" 2> "$cron_stderr"
+  cron_status=$?
+  if [ "$cron_status" -eq 0 ]; then
+    cron_writers=$(fx_filter_writer_lines < "$cron_stdout" || true)
+  elif fx_crontab_is_absent "$cron_status" "$cron_stderr"; then
+    :
+  else
+    echo "  CRITICAL: crontabを検証できません"
+    sed -n '1,3p' "$cron_stderr" | sed 's/^/  /'
+    overall_status=2
+  fi
+  rm -f "$cron_stdout" "$cron_stderr"
+else
+  [ -z "${cron_stdout:-}" ] || rm -f "$cron_stdout"
+  [ -z "${cron_stderr:-}" ] || rm -f "$cron_stderr"
+fi
+if [ -n "$loops$direct_writers$wrapper_writers$cron_writers" ]; then
   [ -z "$loops" ] || echo "$loops"
   [ -z "$direct_writers" ] || echo "$direct_writers"
+  [ -z "$wrapper_writers" ] || echo "$wrapper_writers"
   [ -z "$cron_writers" ] || echo "$cron_writers"
   echo "  activeな正規launchd子プロセスか、手動/cron/別checkoutかを親PID/cwdで確認してください。"
   overall_status=2

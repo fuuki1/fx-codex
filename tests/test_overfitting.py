@@ -92,7 +92,7 @@ def test_dsr_rejects_degenerate_inputs() -> None:
 
 def _noise_matrix(seed: int = 7, periods: int = 256, trials: int = 20) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    index = pd.date_range("2024-01-01", periods=periods, freq="h")
+    index = pd.date_range("2024-01-01", periods=periods, freq="h", tz="UTC")
     return pd.DataFrame(
         rng.normal(0.0, 0.01, (periods, trials)),
         index=index,
@@ -131,6 +131,74 @@ def test_pbo_rejects_nan_instead_of_treating_unknown_as_flat_return() -> None:
     matrix.iloc[:40, 0] = np.nan
     with pytest.raises(ValueError, match="欠測"):
         probability_of_backtest_overfitting(matrix, n_blocks=4)
+
+
+def test_pbo_rejects_boolean_return_instead_of_coercing_it_to_one() -> None:
+    matrix = _noise_matrix(periods=64, trials=4).astype(object)
+    matrix.iloc[10, 2] = True
+
+    with pytest.raises(ValueError, match="boolean"):
+        probability_of_backtest_overfitting(matrix, n_blocks=4)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [float("nan"), float("inf"), float("-inf"), "0.2", True],
+)
+def test_dsr_rejects_each_invalid_disclosed_trial_sharpe(invalid: object) -> None:
+    with pytest.raises(ValueError, match="非数値または非有限値"):
+        deflated_sharpe_ratio(_drift_returns(), [0.1, invalid, 0.2])
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), True])
+def test_dsr_rejects_invalid_selected_return_observations(invalid: object) -> None:
+    returns = _drift_returns().astype(object)
+    returns.iloc[10] = invalid
+
+    with pytest.raises(ValueError, match="selected_returns contains"):
+        deflated_sharpe_ratio(returns, [0.1, 0.2])
+
+
+def test_pbo_degenerate_trials_return_evaluation_without_regression_crash() -> None:
+    index = pd.date_range("2024-01-01", periods=16, freq="h", tz="UTC")
+    matrix = pd.DataFrame(0.0, index=index, columns=["always_flat", "also_flat"])
+
+    report = probability_of_backtest_overfitting(matrix, n_blocks=4)
+
+    assert report["pbo"] == pytest.approx(0.5)
+    assert report["degradation_available"] is False
+    assert report["degradation_slope"] is None
+    assert report["degradation_intercept"] is None
+
+
+def test_pbo_requires_point_in_time_index_and_unique_trial_names() -> None:
+    matrix = _noise_matrix(periods=64, trials=4)
+
+    non_datetime = matrix.reset_index(drop=True)
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        probability_of_backtest_overfitting(non_datetime, n_blocks=4)
+
+    naive = matrix.copy()
+    naive.index = naive.index.tz_localize(None)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        probability_of_backtest_overfitting(naive, n_blocks=4)
+
+    unsorted = matrix.iloc[::-1]
+    with pytest.raises(ValueError, match="一意かつ単調増加"):
+        probability_of_backtest_overfitting(unsorted, n_blocks=4)
+
+    duplicated_index = matrix.copy()
+    duplicated_index.index = duplicated_index.index.where(
+        duplicated_index.index != duplicated_index.index[1],
+        duplicated_index.index[0],
+    )
+    with pytest.raises(ValueError, match="一意かつ単調増加"):
+        probability_of_backtest_overfitting(duplicated_index, n_blocks=4)
+
+    duplicated_columns = matrix.copy()
+    duplicated_columns.columns = ["same", "same", "t2", "t3"]
+    with pytest.raises(ValueError, match="試行列名は一意"):
+        probability_of_backtest_overfitting(duplicated_columns, n_blocks=4)
 
 
 def test_pbo_rejects_invalid_inputs() -> None:

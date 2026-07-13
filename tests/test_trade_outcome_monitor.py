@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from fx_intel import trade_outcome as to
+from fx_intel.append_only import AppendOnlyReadError, canonical_row_hash
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "trade_outcome_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -43,8 +44,13 @@ def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    prepared = []
+    for row in rows:
+        payload = {"schema_version": 2, **row}
+        payload["content_hash"] = canonical_row_hash(payload)
+        prepared.append(payload)
     path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in prepared) + "\n",
         encoding="utf-8",
     )
 
@@ -130,6 +136,24 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
     assert variant_report["best"]["target1_r"] == 0.75
 
 
+def test_monitor_rejects_journal_rows_later_than_fixed_evaluation_time(monitor, tmp_path) -> None:
+    journal_path = tmp_path / "future.jsonl"
+    _write_jsonl(journal_path, [_entry(NOW + DAY, "USDJPY", 100.0)])
+
+    with pytest.raises(AppendOnlyReadError, match="future row"):
+        monitor.run_trade_outcome_monitor(
+            journal_path=journal_path,
+            registry_path=tmp_path / "registry.json",
+            monitor_json_path=tmp_path / "monitor.json",
+            outcome_json_path=None,
+            variant_json_path=None,
+            now=NOW,
+        )
+
+    assert not (tmp_path / "registry.json").exists()
+    assert not (tmp_path / "monitor.json").exists()
+
+
 def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp_path) -> None:
     candidate = to.TradeImprovementCandidate(
         "approved-overall-tp",
@@ -165,7 +189,10 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
 
     rows: list[dict] = []
     for index in range(to.MIN_GROUP_EXPECTANCY_SAMPLES):
-        ts = NOW + timedelta(minutes=index)
+        # Schema-v2 journal migration compatibility derives its natural identity
+        # from the five-minute scheduled slot.  Each fixture decision therefore
+        # represents a distinct scheduled run instead of multiple rows in one cell.
+        ts = NOW + timedelta(minutes=index * 5)
         rows.extend(
             [
                 _entry(
@@ -200,7 +227,7 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
         outcome_json_path=None,
         variant_json_path=None,
         retest_variants=False,
-        now=NOW + timedelta(hours=3),
+        now=NOW + DAY + timedelta(hours=3),
     )
     saved = json.loads(registry_path.read_text(encoding="utf-8"))
 

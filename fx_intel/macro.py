@@ -13,7 +13,7 @@ APIキー不要の公開ソースのみを使う:
    カバレッジをデータ品質ゲートに使い、確信度を減衰する。
 2. キャッシュ優先 — 公開ソースはレート制限があるため、TTL付きの
    ローカルキャッシュ(logs/macro_cache.json)を必ず経由する。
-   ネットワーク失敗時は期限切れキャッシュでも「stale警告付き」で使う。
+   ネットワーク失敗時も期限切れ・未来・時刻不明cacheは使用しない。
 3. staleness ゲート — 日次系列は最終観測が7日超、COTは21日超で
    stale扱いとし、鮮度の落ちたデータが新鮮な顔で判断に混ざるのを防ぐ。
 4. パースは純粋関数 — parse_stooq_csv / parse_fred_csv / parse_cot_json は
@@ -121,6 +121,11 @@ class MacroSeries:
         last = self.last()
         if last is None:
             return True
+        # A negative age is not freshness: it is a point-in-time violation.  Keep
+        # this invariant on the value object as well as the network/cache loader so
+        # manually constructed and deserialized snapshots cannot bypass it.
+        if any(point.when > now.date() for point in self.points):
+            return True
         return (now.date() - last.when).days > max_age_days
 
 
@@ -142,6 +147,8 @@ class CotReport:
         return self.net_position / self.open_interest
 
     def is_stale(self, now: datetime, max_age_days: int = COT_STALE_DAYS) -> bool:
+        if self.report_date > now.date():
+            return True
         return (now.date() - self.report_date).days > max_age_days
 
 
@@ -354,9 +361,10 @@ def _cache_age_hours(entry: Mapping, now: datetime) -> float | None:
         fetched_at = datetime.fromisoformat(str(entry.get("fetched_at", "")))
     except ValueError:
         return None
-    if fetched_at.tzinfo is None:
-        fetched_at = fetched_at.replace(tzinfo=UTC)
-    return (now - fetched_at).total_seconds() / 3600.0
+    if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
+        return None
+    age = (now - fetched_at.astimezone(UTC)).total_seconds() / 3600.0
+    return age if age >= 0 else None
 
 
 def _fetch_text(url: str, session: requests.Session | None = None) -> str:
@@ -386,7 +394,7 @@ def _cached_fetch(
     warnings: list[str],
     session: requests.Session | None = None,
 ) -> str | None:
-    """TTLキャッシュ経由の取得。ネット失敗時は期限切れキャッシュへ劣化。"""
+    """TTLキャッシュ経由の取得。期限切れ・曖昧・未来cacheは使用しない。"""
     entry = cache.get(key)
     if isinstance(entry, Mapping):
         age = _cache_age_hours(entry, now)
@@ -397,11 +405,12 @@ def _cached_fetch(
     except RuntimeError as error:
         if isinstance(entry, Mapping) and isinstance(entry.get("body"), str):
             age = _cache_age_hours(entry, now)
+            age_label = "時刻不正" if age is None else f"約{age:.0f}時間前"
             warnings.append(
-                f"マクロ取得失敗のため期限切れキャッシュを使用"
-                f"({key}, 約{age:.0f}時間前): {error}"
+                f"マクロ取得失敗かつcacheを鮮度証明できないため拒否"
+                f"({key}, {age_label}): {error}"
             )
-            return entry["body"]
+            return None
         warnings.append(f"マクロ取得失敗({key}): {error}")
         return None
     cache[key] = {"fetched_at": now.isoformat(), "body": body}
@@ -430,6 +439,9 @@ def fetch_macro_snapshot(
     キャッシュを事前に仕込むことでオフライン検証できる。
     """
     now = now or datetime.now(UTC)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("macro snapshot now must be timezone-aware")
+    now = now.astimezone(UTC)
     cache_file = Path(cache_path)
     cache = _load_cache(cache_file)
     warnings: list[str] = []
@@ -453,8 +465,14 @@ def fetch_macro_snapshot(
             continue
         series = MacroSeries(key=key, label_ja=label_ja, points=points[-260:])
         last_point = series.last()
+        if last_point is not None and last_point.when > now.date():
+            warnings.append(
+                f"マクロ系列 {label_ja} の未来観測を拒否({last_point.when.isoformat()})"
+            )
+            continue
         if series.is_stale(now) and last_point is not None:
             warnings.append(f"マクロ系列 {label_ja} が古い(最終観測 {last_point.when.isoformat()})")
+            continue
         snapshot.series[key] = series
 
     if include_cot:
@@ -474,13 +492,23 @@ def fetch_macro_snapshot(
                 payload = None
                 warnings.append("COTレポートのJSONパースに失敗")
             if payload is not None:
-                snapshot.cot = parse_cot_json(payload)
-                if not snapshot.cot:
+                parsed_cot = parse_cot_json(payload)
+                if not parsed_cot:
                     warnings.append("COTレポートに既知の通貨先物が見つからない")
                 else:
-                    stale = [ccy for ccy, report in snapshot.cot.items() if report.is_stale(now)]
+                    future = [
+                        ccy for ccy, report in parsed_cot.items() if report.report_date > now.date()
+                    ]
+                    if future:
+                        warnings.append(f"COTレポートの未来観測を拒否: {', '.join(sorted(future))}")
+                    stale = [ccy for ccy, report in parsed_cot.items() if report.is_stale(now)]
                     if stale:
                         warnings.append(f"COTレポートが古い: {', '.join(sorted(stale))}")
+                    snapshot.cot = {
+                        ccy: report
+                        for ccy, report in parsed_cot.items()
+                        if ccy not in future and ccy not in stale
+                    }
 
     snapshot.warnings = warnings
     _save_cache(cache_file, cache)

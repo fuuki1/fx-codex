@@ -392,7 +392,19 @@ def evaluate_trade_outcomes(
 
     outcomes: list[TradeOutcome] = []
     for ts, entry in parsed_entries:
-        direction = str(entry.get("direction", ""))
+        # Schema-v3 separates the analytical signal (``direction``) from the
+        # independently gated trade decision (``action``).  Once an action is
+        # present it is authoritative, including ``no_trade``; only pre-action
+        # legacy rows may fall back to the analytical direction.
+        schema = entry.get("schema_version", entry.get("schema"))
+        if "action" in entry:
+            direction = str(entry.get("action", ""))
+        elif isinstance(schema, int) and not isinstance(schema, bool) and schema >= 3:
+            # A current-schema row without the required decision field is not a
+            # legacy signal and cannot be interpreted as an executed trade.
+            direction = ""
+        else:
+            direction = str(entry.get("direction", ""))
         if direction not in ("long", "short"):
             continue
         symbol = str(entry.get("symbol", "")).upper()

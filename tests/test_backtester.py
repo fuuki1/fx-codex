@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 import json
+from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import fx_backtester
 from fx_backtester.cli import (
@@ -18,6 +21,7 @@ from fx_backtester.data import (
     build_no_trade_mask,
     filter_price_data_by_date,
     load_economic_events_csv,
+    load_economic_events_for_backtest,
     load_price_csv,
 )
 from fx_backtester.engine import BacktestConfig, BacktestEngine
@@ -249,6 +253,240 @@ def test_load_price_csv_with_symbol_column(tmp_path) -> None:
 
     assert list(loaded) == ["EURUSD"]
     assert float(loaded["EURUSD"].iloc[0]["close"]) == 1.15
+    assert str(loaded["EURUSD"].index.tz) == "UTC"
+
+
+def test_data_loaders_reject_unscoped_naive_and_dst_ambiguous_timestamps(tmp_path) -> None:
+    prices = tmp_path / "prices.csv"
+    prices.write_text(
+        "timestamp,symbol,open,high,low,close\n" "2026-11-01 01:30:00,EURUSD,1.1,1.2,1.0,1.15\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="DST-ambiguous"):
+        load_price_csv(prices, timezone=None)
+    with pytest.raises(ValueError, match="DST-ambiguous"):
+        load_price_csv(prices, timezone="America/New_York")
+
+    events = tmp_path / "events.csv"
+    events.write_text(
+        "timestamp,currency,impact,name\n2026-11-01 01:30:00,USD,high,FOMC\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="DST-ambiguous"):
+        load_economic_events_csv(events, timezone=None)
+    with pytest.raises(ValueError, match="DST-ambiguous"):
+        load_economic_events_csv(events, timezone="America/New_York")
+
+
+def test_data_loaders_convert_aware_source_timestamps_to_utc(tmp_path) -> None:
+    prices = tmp_path / "prices.csv"
+    prices.write_text(
+        "timestamp,symbol,open,high,low,close\n"
+        "2026-07-13T09:00:00+09:00,EURUSD,1.1,1.2,1.0,1.15\n",
+        encoding="utf-8",
+    )
+    loaded = load_price_csv(prices, timezone=None)["EURUSD"]
+
+    assert loaded.index[0] == pd.Timestamp("2026-07-13T00:00:00Z")
+
+
+def test_event_snapshot_cannot_claim_point_in_time_without_recorded_at(tmp_path) -> None:
+    events = tmp_path / "events.csv"
+    events.write_text(
+        "timestamp,currency,impact,name\n" "2024-01-01T01:00:00+00:00,USD,high,FOMC\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="recorded_at provenance"):
+        load_economic_events_csv(
+            events,
+            as_of=datetime(2024, 1, 1, 2, 0, tzinfo=UTC),
+            require_point_in_time=True,
+        )
+
+
+def test_point_in_time_event_archive_rejects_naive_event_clock(tmp_path) -> None:
+    events = tmp_path / "event_history.csv"
+    events.write_text(
+        "timestamp,currency,impact,name,occurrence_id,revision,effective_from,effective_to,"
+        "is_tombstone,identity_quality,recorded_at\n"
+        "2026-07-13 08:30:00,USD,high,CPI,provider:1,1,2026-07-12T00:00:00Z,,"
+        "false,source,2026-07-12T00:00:00Z\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="DST-ambiguous"):
+        load_economic_events_csv(
+            events,
+            as_of=datetime(2026, 7, 13, 23, 0, tzinfo=UTC),
+            require_point_in_time=True,
+        )
+
+
+def test_event_revision_recorded_at_must_increase_with_revision(tmp_path) -> None:
+    events = tmp_path / "event_history.csv"
+    events.write_text(
+        "timestamp,currency,impact,name,occurrence_id,revision,effective_from,effective_to,"
+        "is_tombstone,identity_quality,recorded_at\n"
+        "2026-07-20T08:30:00Z,USD,high,CPI,provider:1,1,2026-07-10T00:00:00Z,,"
+        "false,source,2026-07-10T00:00:00Z\n"
+        "2026-07-20T09:30:00Z,USD,high,CPI revised,provider:1,2,2026-07-11T00:00:00Z,,"
+        "false,source,2026-07-01T00:00:00Z\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="recorded_at must strictly increase"):
+        load_economic_events_csv(
+            events,
+            as_of=datetime(2026, 7, 5, tzinfo=UTC),
+            require_point_in_time=True,
+        )
+
+
+def test_backtest_event_archive_uses_dataset_cutoff_and_per_bar_availability(tmp_path) -> None:
+    events_path = tmp_path / "event_history.csv"
+    events_path.write_text(
+        "timestamp,currency,impact,name,occurrence_id,revision,effective_from,effective_to,"
+        "is_tombstone,identity_quality,recorded_at\n"
+        "2024-01-01T01:00:00Z,USD,high,known-before,event-1,1,"
+        "2024-01-01T00:30:00Z,,false,source,2024-01-01T00:30:00Z\n"
+        "2024-01-01T02:00:00Z,USD,high,learned-too-late,event-2,1,"
+        "2024-01-01T02:15:00Z,,false,source,2024-01-01T02:15:00Z\n"
+        "2024-01-01T01:00:00Z,USD,high,after-dataset,event-3,1,"
+        "2024-01-02T00:00:00Z,,false,source,2024-01-02T00:00:00Z\n",
+        encoding="utf-8",
+    )
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=4, freq="h")
+    data = {
+        "EURUSD": pd.DataFrame(
+            {"open": 1.0, "high": 1.01, "low": 0.99, "close": 1.0},
+            index=index,
+        )
+    }
+
+    events = load_economic_events_for_backtest(events_path, data)
+    mask = build_no_trade_mask(
+        index,
+        "EURUSD",
+        events,
+        minutes_before=30,
+        minutes_after=30,
+    )
+
+    assert list(events["name"]) == ["known-before", "learned-too-late"]
+    assert mask.tolist() == [False, True, False, False]
+
+
+def test_backtest_rejects_recorded_at_without_revision_contract(tmp_path) -> None:
+    events_path = tmp_path / "legacy_event_history.csv"
+    events_path.write_text(
+        "timestamp,currency,impact,name,recorded_at\n"
+        "2024-01-01T01:00:00Z,USD,high,FOMC,2024-01-01T00:00:00Z\n",
+        encoding="utf-8",
+    )
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="h")
+    data = {
+        "EURUSD": pd.DataFrame(
+            {"open": 1.0, "high": 1.01, "low": 0.99, "close": 1.0},
+            index=index,
+        )
+    }
+
+    with pytest.raises(ValueError, match="PIT revision contract"):
+        load_economic_events_for_backtest(events_path, data)
+
+
+def _write_revision_archive(tmp_path, rows: list[str]) -> Path:
+    path = tmp_path / "event_history.csv"
+    path.write_text(
+        "timestamp,currency,impact,name,occurrence_id,revision,effective_from,effective_to,"
+        "is_tombstone,identity_quality,recorded_at\n" + "\n".join(rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _hourly_prices() -> tuple[pd.DatetimeIndex, dict[str, pd.DataFrame]]:
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=6, freq="h")
+    return index, {
+        "EURUSD": pd.DataFrame(
+            {"open": 1.0, "high": 1.01, "low": 0.99, "close": 1.0},
+            index=index,
+        )
+    }
+
+
+def test_event_time_revision_uses_latest_visible_vintage(tmp_path) -> None:
+    path = _write_revision_archive(
+        tmp_path,
+        [
+            "2024-01-01T01:00:00Z,USD,high,NFP,nfp,1,2024-01-01T00:00:00Z,,"
+            "false,source,2024-01-01T00:00:00Z",
+            "2024-01-01T03:00:00Z,USD,high,NFP,nfp,2,2024-01-01T02:00:00Z,,"
+            "false,source,2024-01-01T02:00:00Z",
+        ],
+    )
+    index, data = _hourly_prices()
+
+    events = load_economic_events_for_backtest(path, data)
+    mask = build_no_trade_mask(index, "EURUSD", events, minutes_before=0, minutes_after=0)
+
+    assert mask.tolist() == [False, True, False, True, False, False]
+
+
+def test_event_impact_downgrade_supersedes_old_blackout(tmp_path) -> None:
+    path = _write_revision_archive(
+        tmp_path,
+        [
+            "2024-01-01T02:00:00Z,USD,high,NFP,nfp,1,2024-01-01T00:00:00Z,,"
+            "false,source,2024-01-01T00:00:00Z",
+            "2024-01-01T03:00:00Z,USD,low,NFP,nfp,2,2024-01-01T01:00:00Z,,"
+            "false,source,2024-01-01T01:00:00Z",
+        ],
+    )
+    index, data = _hourly_prices()
+
+    events = load_economic_events_for_backtest(path, data)
+    mask = build_no_trade_mask(index, "EURUSD", events, minutes_before=0, minutes_after=0)
+
+    assert not mask.any()
+
+
+def test_event_tombstone_cancels_prior_blackout(tmp_path) -> None:
+    path = _write_revision_archive(
+        tmp_path,
+        [
+            "2024-01-01T02:00:00Z,USD,high,NFP,nfp,1,2024-01-01T00:00:00Z,,"
+            "false,source,2024-01-01T00:00:00Z",
+            "2024-01-01T02:00:00Z,USD,high,NFP,nfp,2,2024-01-01T01:00:00Z,,"
+            "true,source,2024-01-01T01:00:00Z",
+        ],
+    )
+    index, data = _hourly_prices()
+
+    events = load_economic_events_for_backtest(path, data)
+    mask = build_no_trade_mask(index, "EURUSD", events, minutes_before=0, minutes_after=0)
+
+    assert not mask.any()
+
+
+def test_event_revision_recorded_after_dataset_is_invisible(tmp_path) -> None:
+    path = _write_revision_archive(
+        tmp_path,
+        [
+            "2024-01-01T02:00:00Z,USD,high,NFP,nfp,1,2024-01-01T00:00:00Z,,"
+            "false,source,2024-01-01T00:00:00Z",
+            "2024-01-01T03:00:00Z,USD,low,NFP,nfp,2,2024-01-02T00:00:00Z,,"
+            "false,source,2024-01-02T00:00:00Z",
+        ],
+    )
+    index, data = _hourly_prices()
+
+    events = load_economic_events_for_backtest(path, data)
+    mask = build_no_trade_mask(index, "EURUSD", events, minutes_before=0, minutes_after=0)
+
+    assert events["revision"].tolist() == [1]
+    assert mask.tolist() == [False, False, True, False, False, False]
 
 
 def test_filter_price_data_by_date_includes_full_end_date() -> None:
@@ -309,6 +547,36 @@ def test_daily_loss_stop_prevents_more_entries() -> None:
     assert len(result.trades) == 3
     assert result.trades["reason"].tolist() == ["stop_loss", "stop_loss", "stop_loss"]
     assert bool(result.equity_curve.iloc[-1]["daily_locked"]) is True
+
+
+def test_new_day_loss_baseline_uses_open_not_future_close() -> None:
+    index = pd.date_range("2024-01-01 22:00:00", periods=4, freq="h")
+    data = {
+        "EURUSD": pd.DataFrame(
+            {
+                "open": [1.0, 1.0, 1.0, 0.94],
+                "high": [1.0, 1.0, 1.0, 0.95],
+                "low": [1.0, 1.0, 0.94, 0.94],
+                "close": [1.0, 1.0, 0.94, 0.94],
+            },
+            index=index,
+        )
+    }
+    config = BacktestConfig(
+        initial_cash=100_000,
+        risk=RiskConfig(
+            risk_per_trade_pct=0.5,
+            risk_cap_pct=0.5,
+            max_daily_loss_pct=0.02,
+            max_leverage=10,
+        ),
+        execution=_zero_cost_config(),
+    )
+
+    result = BacktestEngine(SymbolOnlyLongStrategy("EURUSD", stop_distance=0.5), config).run(data)
+
+    assert bool(result.equity_curve.loc[index[2], "daily_locked"])
+    assert result.trades.iloc[-1]["exit_reason"] == "daily_loss_stop"
 
 
 def test_each_symbol_closes_on_its_own_last_available_bar() -> None:
@@ -484,8 +752,8 @@ def test_trading_session_blocks_entries_outside_window() -> None:
 def test_fixed_and_minimum_execution_fees() -> None:
     execution = SimulatedExecution(
         ExecutionConfig(
-            spread_pips={"EURUSD": 0.0},
-            slippage_pips={"EURUSD": 0.0},
+            spread_pips={"EURUSD": 0.01},
+            slippage_pips={"EURUSD": 0.01},
             commission_per_million_usd=0.0,
             fixed_fee_usd=1.0,
             minimum_fee_usd=2.0,
@@ -642,45 +910,17 @@ def test_short_market_entry_uses_bid_and_adverse_slippage() -> None:
 
 
 def test_zero_spread_or_slippage_is_rejected() -> None:
-    index = pd.date_range("2024-01-01 00:00:00", periods=2, freq="h")
-    data = {
-        "EURUSD": pd.DataFrame(
-            {
-                "open": [1.0, 1.0],
-                "high": [1.01, 1.01],
-                "low": [0.99, 0.99],
-                "close": [1.0, 1.0],
-            },
-            index=index,
-        )
-    }
-    config = BacktestConfig(
-        execution=ExecutionConfig(
+    with pytest.raises(ValueError, match="spread_pips"):
+        ExecutionConfig(
             spread_pips={"EURUSD": 0.0},
             slippage_pips={"EURUSD": 0.1},
         )
-    )
 
-    try:
-        BacktestEngine(AlwaysLongStrategy(), config).run(data)
-    except ValueError as error:
-        assert "spread must be positive" in str(error)
-    else:
-        raise AssertionError("Expected zero spread to be rejected")
-
-    config = BacktestConfig(
-        execution=ExecutionConfig(
+    with pytest.raises(ValueError, match="slippage_pips"):
+        ExecutionConfig(
             spread_pips={"EURUSD": 0.1},
             slippage_pips={"EURUSD": 0.0},
         )
-    )
-
-    try:
-        BacktestEngine(AlwaysLongStrategy(), config).run(data)
-    except ValueError as error:
-        assert "slippage_pips must be positive" in str(error)
-    else:
-        raise AssertionError("Expected zero slippage to be rejected")
 
 
 def test_engine_rejects_missing_signal_columns() -> None:
@@ -757,33 +997,52 @@ def test_product_validation_rejects_unconfigured_symbol_costs() -> None:
 
 
 def test_product_validation_rejects_negative_execution_fees() -> None:
-    index = pd.date_range("2024-01-01 00:00:00", periods=2, freq="h")
-    data = {
-        "EURUSD": pd.DataFrame(
-            {
-                "open": [1.0, 1.0],
-                "high": [1.01, 1.01],
-                "low": [0.99, 0.99],
-                "close": [1.0, 1.0],
-                "spread_pips": [1.0, 1.0],
-            },
-            index=index,
-        )
-    }
-    config = BacktestConfig(
-        execution=ExecutionConfig(
+    with pytest.raises(ValueError, match="fixed_fee_usd"):
+        ExecutionConfig(
             spread_pips={"EURUSD": 1.0},
             slippage_pips={"EURUSD": 0.1},
             fixed_fee_usd=-1.0,
         )
+
+
+@pytest.mark.parametrize("bad_price", [0.0, -1.0, float("inf")])
+def test_product_validation_rejects_nonpositive_or_nonfinite_ohlc(
+    bad_price: float,
+) -> None:
+    index = pd.date_range("2026-07-01", periods=3, freq="h", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "open": bad_price,
+            "high": bad_price,
+            "low": bad_price,
+            "close": bad_price,
+            "spread_pips": 1.0,
+        },
+        index=index,
     )
 
-    try:
-        validate_backtest_inputs(data, config).raise_for_errors()
-    except ProductValidationError as error:
-        assert "fixed_fee_usd must be >= 0" in str(error)
-    else:
-        raise AssertionError("Expected negative execution fees to be rejected")
+    report = validate_backtest_inputs({"EURUSD": frame}, BacktestConfig())
+
+    assert report.passed is False
+    assert any("OHLC values must be" in error for error in report.errors)
+
+
+def test_product_validation_rejects_naive_price_index() -> None:
+    index = pd.date_range("2026-07-01", periods=3, freq="h")
+    frame = pd.DataFrame(
+        {
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "spread_pips": 1.0,
+        },
+        index=index,
+    )
+
+    report = validate_backtest_inputs({"EURUSD": frame}, BacktestConfig())
+
+    assert "EURUSD timestamps must be timezone-aware UTC" in report.errors
 
 
 def test_take_profit_requires_more_than_touch_and_stop_has_priority() -> None:
@@ -856,8 +1115,6 @@ def test_empty_trade_log_has_headers_and_audit_does_not_crash(tmp_path) -> None:
             "backtest",
             "--data",
             "examples/sample_prices.csv",
-            "--events",
-            "examples/sample_events.csv",
             "--strategy",
             "ma_cross",
             "--blocked-weekday",
@@ -1073,8 +1330,6 @@ def test_ai_logistic_strategy_runs_from_cli(tmp_path) -> None:
             "backtest",
             "--data",
             "examples/sample_prices.csv",
-            "--events",
-            "examples/sample_events.csv",
             "--strategy",
             "ai_logistic",
             "--param",
@@ -1293,8 +1548,6 @@ def test_analyze_run_writes_commercial_validation_pack(tmp_path) -> None:
                 "backtest",
                 "--data",
                 "examples/sample_prices.csv",
-                "--events",
-                "examples/sample_events.csv",
                 "--strategy",
                 "ma_cross",
                 "--output-dir",
@@ -1491,8 +1744,6 @@ def test_research_max_preset_runs_with_sample_data(tmp_path) -> None:
             "backtest",
             "--data",
             "examples/sample_prices.csv",
-            "--events",
-            str(output_dir / "major_fx_events.csv"),
             "--strategy",
             "ma_cross",
             "--preset",
@@ -1516,8 +1767,6 @@ def test_deep_research_max_preset_runs_with_sample_data(tmp_path) -> None:
             "backtest",
             "--data",
             "examples/sample_prices.csv",
-            "--events",
-            str(output_dir / "major_fx_events.csv"),
             "--strategy",
             "ma_cross",
             "--preset",
@@ -1539,8 +1788,6 @@ def test_output_dir_writes_auditable_artifacts(tmp_path) -> None:
             "backtest",
             "--data",
             "examples/sample_prices.csv",
-            "--events",
-            "examples/sample_events.csv",
             "--strategy",
             "ma_cross",
             "--output-dir",
