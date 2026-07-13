@@ -572,7 +572,7 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
         evaluated = int(raw_profile.get("evaluated", 0) or 0)
         hits = int(raw_profile.get("hits", 0) or 0)
         flat = int(raw_profile.get("flat", 0) or 0)
-        row = {
+        row: dict[str, Any] = {
             "timeframe": str(timeframe),
             "generated_at": raw_profile.get("generated_at") or payload.get("generated_at"),
             "evaluated": evaluated,
@@ -771,6 +771,25 @@ def _list_from_payload(payload: dict[str, Any], key: str) -> list[dict[str, Any]
     return [row for row in raw if isinstance(row, dict)]
 
 
+def _mapping(value: object) -> dict[str, Any]:
+    """Return a plain dict when ``value`` is a dict, else an empty dict.
+
+    Missing / malformed payload sections read as empty (fail-soft) and mypy sees
+    one concrete ``dict[str, Any]`` instead of the ``Any | dict | None`` union
+    that inline ``x if isinstance(x, dict) else {}`` ternaries leave behind.
+    """
+
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _list_of_dicts(value: object) -> list[dict[str, Any]]:
+    """Return the dict elements of ``value`` when it is a list, else empty."""
+
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
+
+
 def _trade_monitor_summary(
     monitor: dict[str, Any],
     registry: dict[str, Any],
@@ -835,13 +854,11 @@ def _decision_monitor_summary(
     monitor: dict[str, Any],
     feedback: dict[str, Any],
 ) -> dict[str, Any]:
-    summary = monitor.get("summary") if isinstance(monitor.get("summary"), dict) else {}
-    overall = summary.get("overall") if isinstance(summary.get("overall"), dict) else {}
-    counts = summary.get("action_counts") if isinstance(summary.get("action_counts"), dict) else {}
+    summary = _mapping(monitor.get("summary"))
+    overall = _mapping(summary.get("overall"))
+    counts = _mapping(summary.get("action_counts"))
     profile = monitor.get("profile") if isinstance(monitor.get("profile"), dict) else feedback
-    raw_cells = profile.get("cells") if isinstance(profile, dict) else {}
-    if not isinstance(raw_cells, dict):
-        raw_cells = {}
+    raw_cells = _mapping(profile.get("cells") if isinstance(profile, dict) else None)
     cells = [dict(row) for row in raw_cells.values() if isinstance(row, dict)]
     rank = {"avoid": 0, "quality_guard": 1, "dampen": 2, "hold": 3, "collect_samples": 4}
     actionable = [
@@ -859,26 +876,12 @@ def _decision_monitor_summary(
             str(row.get("symbol", "")),
         )
     )
-    worst_cells = summary.get("worst_cells") if isinstance(summary.get("worst_cells"), list) else []
-    failures = (
-        summary.get("failure_reason_summary")
-        if isinstance(summary.get("failure_reason_summary"), list)
-        else []
-    )
-    tradable_zero = (
-        summary.get("tradable_zero_reasons")
-        if isinstance(summary.get("tradable_zero_reasons"), dict)
-        else {}
-    )
-    model_delta = (
-        summary.get("model_expectancy_delta")
-        if isinstance(summary.get("model_expectancy_delta"), dict)
-        else {}
-    )
-    price_health = (
-        summary.get("price_health") if isinstance(summary.get("price_health"), dict) else {}
-    )
-    performance = summary.get("performance") if isinstance(summary.get("performance"), dict) else {}
+    worst_cells = _list_of_dicts(summary.get("worst_cells"))
+    failures = _list_of_dicts(summary.get("failure_reason_summary"))
+    tradable_zero = _mapping(summary.get("tradable_zero_reasons"))
+    model_delta = _mapping(summary.get("model_expectancy_delta"))
+    price_health = _mapping(summary.get("price_health"))
+    performance = _mapping(summary.get("performance"))
     return {
         "generated_at": monitor.get("generated_at") or feedback.get("generated_at"),
         "status": monitor.get("status") or "unknown",
@@ -892,8 +895,8 @@ def _decision_monitor_summary(
         "decision_events": int(summary.get("decision_events", 0) or 0),
         "scored_outcomes": int(summary.get("scored_outcomes", 0) or 0),
         "actionable_cells": actionable[:10],
-        "worst_cells": [dict(row) for row in worst_cells[:10] if isinstance(row, dict)],
-        "failure_reason_summary": [dict(row) for row in failures[:10] if isinstance(row, dict)],
+        "worst_cells": [dict(row) for row in worst_cells[:10]],
+        "failure_reason_summary": [dict(row) for row in failures[:10]],
         "alerts": _list_from_payload(monitor, "alerts")[:10],
         "findings": _list_from_payload(monitor, "findings")[:20],
     }
