@@ -9,7 +9,12 @@ from typing import Any
 
 import pytest
 
-from fx_backtester.experiment_pipeline import GitState, evaluate_lockbox, run_experiment
+from fx_backtester.experiment_pipeline import (
+    NO_TRADE_CANDIDATE_ID,
+    GitState,
+    evaluate_lockbox,
+    run_experiment,
+)
 from fx_backtester.failures import FailureReason, TypedFailure
 from fx_backtester.lockbox import LockboxRegistry
 
@@ -305,7 +310,8 @@ class TestGovernedEvaluation:
         pipeline_setup["manifest"].write_text(json.dumps(payload), encoding="utf-8")
         result = _run(pipeline_setup)
         decision = json.loads((result.output_dir / "promotion_decision.json").read_text("utf-8"))
-        assert decision["evidence"]["trial_count"] == 4
+        # 3 declared + broken-hyper + the injected flat book = 5 recorded trials.
+        assert decision["evidence"]["trial_count"] == 5
 
         from fx_backtester.trial_ledger import TrialLedger
 
@@ -313,4 +319,64 @@ class TestGovernedEvaluation:
         entries = ledger.entries_for_experiment(result.experiment_id)
         statuses = {entry["extra"]["candidate_id"]: entry["status"] for entry in entries}
         assert statuses["broken-hyper"] == "failed"
+        # The flat book is always recorded and always succeeds (it never trains).
+        assert statuses[NO_TRADE_CANDIDATE_ID] == "succeeded"
         assert sum(1 for entry in entries if entry["selected"]) == 1
+
+
+def _no_trade_setup(tmp_path: Path) -> dict[str, Any]:
+    """A pipeline setup whose thresholds are so extreme nothing trades, so the
+    flat book always wins selection."""
+
+    csv_path = tmp_path / "USDJPY.csv"
+    csv_sha = _write_prices(csv_path)
+    payload = _manifest_dict(csv_path, csv_sha)
+    for candidate in payload["models"]["candidates"]:
+        candidate["hyperparameters"]["long_threshold"] = 0.999
+        candidate["hyperparameters"]["short_threshold"] = 0.001
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "tmp_path": tmp_path,
+        "csv_path": csv_path,
+        "csv_sha": csv_sha,
+        "manifest": manifest_path,
+    }
+
+
+class TestNoTradeCandidate:
+    def test_flat_book_wins_end_to_end_and_denies_promotion(self, tmp_path: Path) -> None:
+        setup = _no_trade_setup(tmp_path)
+        result = _run(setup)
+        evaluation = json.loads((result.output_dir / "evaluation.json").read_text("utf-8"))
+        assert evaluation["selected_candidate_id"] == NO_TRADE_CANDIDATE_ID
+        assert evaluation["performance_claim"] == "no_trade_selected"
+        assert result.promotion_passed is False
+        # Cost stress on a book that pays no cost is an empty ladder.
+        stress = json.loads((result.output_dir / "cost_stress.json").read_text("utf-8"))
+        assert stress["rows"] == []
+
+    def test_flat_book_lockbox_opens_deterministically(self, tmp_path: Path) -> None:
+        # The model-free replay path must reproduce the flat book, pass the
+        # evidence cross-check and open the lockbox to a 0-trade, 0R result.
+        setup = _no_trade_setup(tmp_path)
+        result = _run(setup)
+        summary = _evaluate(setup, result.output_dir)
+        assert summary["promotion_passed"] is False
+        lockbox_result = json.loads((result.output_dir / "lockbox_result.json").read_text("utf-8"))
+        assert lockbox_result["metrics"]["trade_count"] == 0
+        assert lockbox_result["trades"] == []
+        # single_use is still enforced for a flat-book bundle.
+        with pytest.raises(TypedFailure) as excinfo:
+            _evaluate(setup, result.output_dir)
+        assert excinfo.value.reason is FailureReason.LOCKBOX_VIOLATION
+
+    def test_flat_book_counts_toward_search_breadth(self, tmp_path: Path) -> None:
+        from fx_backtester.trial_ledger import TrialLedger
+
+        setup = _no_trade_setup(tmp_path)
+        result = _run(setup)
+        ledger = TrialLedger(setup["tmp_path"] / "runs" / "trial_ledger.jsonl")
+        # 3 declared candidates + the flat book = 4 distinct candidates counted
+        # for the multiple-testing correction.
+        assert ledger.distinct_candidate_count(result.experiment_id) == 4

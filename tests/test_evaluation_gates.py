@@ -6,11 +6,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from fx_backtester.experiment_manifest import ModelCandidate, parse_experiment_manifest
 from fx_backtester.experiment_pipeline import (
+    NO_TRADE_CANDIDATE_ID,
     GitState,
+    _no_trade_trial,
     _sample_size_guard,
     _select_trial,
     run_experiment,
@@ -105,12 +108,35 @@ class TestBaselineDominance:
         ]
         assert _select_trial(manifest, trials)["candidate_id"] == "clever"
 
-    def test_no_admissible_candidate_fails_closed(self) -> None:
+    def test_holds_cash_when_no_candidate_beats_the_flat_book(self) -> None:
+        # A losing complex model with no admissible baseline must not be shipped:
+        # the flat book (0R) wins and the pipeline holds cash instead (§1-2).
         manifest = _parsed_manifest()
         trials = [_fake_trial("clever", "gbdt", 20, -0.01)]
-        with pytest.raises(TypedFailure) as excinfo:
-            _select_trial(manifest, trials)
-        assert excinfo.value.reason is FailureReason.INVALID
+        selected = _select_trial(manifest, trials)
+        assert selected["candidate_id"] == NO_TRADE_CANDIDATE_ID
+        assert selected["tune_metrics"]["net_expectancy_r"] == 0.0
+        assert selected["tune_metrics"]["trade_count"] == 0
+
+    def test_flat_book_selected_when_every_candidate_is_negative(self) -> None:
+        # Even with a qualifying baseline, if all expectancies are <= 0R the
+        # flat book is the maximum and is selected.
+        manifest = _parsed_manifest()
+        trials = [
+            _fake_trial("base", "rsi_reversion", 20, -0.02),
+            _fake_trial("clever", "gbdt", 20, -0.01),
+        ]
+        assert _select_trial(manifest, trials)["candidate_id"] == NO_TRADE_CANDIDATE_ID
+
+    def test_explicit_no_trade_candidate_is_preserved(self) -> None:
+        # When _run_trials already injected the flat book, selection reuses that
+        # exact trial object (with its ledgered tune returns), not a synthetic one.
+        manifest = _parsed_manifest()
+        injected = _no_trade_trial(manifest.experiment_id, pd.DatetimeIndex([]))
+        injected["tune_returns"] = [0.0, 0.0]
+        trials = [_fake_trial("clever", "gbdt", 20, -0.01), injected]
+        selected = _select_trial(manifest, trials)
+        assert selected is injected
 
 
 class TestSampleSizeGuard:
@@ -254,11 +280,15 @@ class TestPipelineIntegration:
         result = _run_with(full_setup, payload)
         assert result.promotion_passed is False
         decision = json.loads((result.output_dir / "promotion_decision.json").read_text("utf-8"))
-        assert decision["evidence"]["trial_count"] == 10
+        # 10 declared candidates + the always-injected flat book = 11 recorded
+        # trials, and the flat book counts toward search breadth honestly.
+        assert decision["evidence"]["trial_count"] == 11
         ledger_lines = (
             (result.output_dir / "trial_ledger_snapshot.jsonl").read_text("utf-8").splitlines()
         )
-        assert len(ledger_lines) == 10
+        assert len(ledger_lines) == 11
+        candidate_ids = {json.loads(line)["candidate_id"] for line in ledger_lines}
+        assert NO_TRADE_CANDIDATE_ID in candidate_ids
 
     def test_policy_file_is_wired_into_the_decision(self, full_setup: dict[str, Any]) -> None:
         policy_path = full_setup["tmp_path"] / "policy.json"

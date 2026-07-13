@@ -17,7 +17,12 @@ from fx_backtester.experiment_manifest import (
     manifest_sha256,
     parse_experiment_manifest,
 )
-from fx_backtester.experiment_pipeline import GitState, main, run_experiment
+from fx_backtester.experiment_pipeline import (
+    NO_TRADE_CANDIDATE_ID,
+    GitState,
+    main,
+    run_experiment,
+)
 from fx_backtester.failures import FailureReason, TypedFailure
 
 COMMIT = "a" * 40
@@ -310,11 +315,14 @@ class TestPipelineRun:
             .read_text("utf-8")
             .splitlines()
         ]
-        assert len(ledger) == 3
+        # The flat book (no-trade) is injected into every run as an explicit,
+        # ledgered candidate alongside the three declared ones.
+        assert len(ledger) == 4
         assert {entry["candidate_id"] for entry in ledger} == {
             "noskill-flat",
             "logistic-a",
             "logistic-b",
+            NO_TRADE_CANDIDATE_ID,
         }
 
     def test_lockbox_outcomes_are_withheld(self, experiment_setup: dict[str, Any]) -> None:
@@ -345,6 +353,20 @@ class TestPipelineRun:
         second = _run(experiment_setup, manifest_path, "out-b")
         assert first.deterministic_result_sha256 == second.deterministic_result_sha256
         assert first.manifest_sha256 == second.manifest_sha256
+
+    def test_no_trade_run_is_reproducible(self, experiment_setup: dict[str, Any]) -> None:
+        # The flat-book path must not leak wall-clock time into the lineage:
+        # two runs where no-trade wins produce identical deterministic hashes.
+        payload = _manifest_dict(experiment_setup["csv_path"], experiment_setup["csv_sha"])
+        for candidate in payload["models"]["candidates"]:
+            candidate["hyperparameters"]["long_threshold"] = 0.999
+            candidate["hyperparameters"]["short_threshold"] = 0.001
+        manifest_path = experiment_setup["tmp_path"] / "manifest.json"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        first = _run(experiment_setup, manifest_path, "out-a")
+        second = _run(experiment_setup, manifest_path, "out-b")
+        assert first.selected_candidate_id == NO_TRADE_CANDIDATE_ID
+        assert first.deterministic_result_sha256 == second.deterministic_result_sha256
 
     def test_seed_change_requires_new_experiment_and_changes_identity(
         self, experiment_setup: dict[str, Any]
@@ -398,18 +420,26 @@ class TestPipelineRun:
             _run(experiment_setup, manifest_path)
         assert excinfo.value.reason is FailureReason.HASH_MISMATCH
 
-    def test_selection_unavailable_without_qualified_trades(
-        self, experiment_setup: dict[str, Any]
-    ) -> None:
+    def test_holds_cash_when_no_candidate_qualifies(self, experiment_setup: dict[str, Any]) -> None:
+        # Thresholds so extreme that no declared candidate trades: rather than
+        # failing, the run selects the flat book, holds cash and denies promotion
+        # for want of a sample (§1-2). A model-free evidence bundle is emitted.
         payload = _manifest_dict(experiment_setup["csv_path"], experiment_setup["csv_sha"])
         for candidate in payload["models"]["candidates"]:
             candidate["hyperparameters"]["long_threshold"] = 0.999
             candidate["hyperparameters"]["short_threshold"] = 0.001
         manifest_path = experiment_setup["tmp_path"] / "manifest.json"
         manifest_path.write_text(json.dumps(payload), encoding="utf-8")
-        with pytest.raises(TypedFailure) as excinfo:
-            _run(experiment_setup, manifest_path)
-        assert excinfo.value.reason is FailureReason.INSUFFICIENT_SAMPLE
+        result = _run(experiment_setup, manifest_path)
+        assert result.promotion_passed is False
+        evaluation = json.loads((result.output_dir / "evaluation.json").read_text("utf-8"))
+        assert evaluation["selected_candidate_id"] == NO_TRADE_CANDIDATE_ID
+        assert evaluation["performance_claim"] == "no_trade_selected"
+        assert evaluation["test"]["trade_count"] == 0
+        # No trained_model artifact is bound when the flat book wins.
+        lineage = json.loads((result.output_dir / "data_lineage.json").read_text("utf-8"))
+        artifacts = [entry["artifact"] for entry in lineage["chain"]]
+        assert "trained_model" not in artifacts
 
     def test_experiment_output_directory_is_single_use(
         self, experiment_setup: dict[str, Any]

@@ -678,9 +678,21 @@ class _GbdtModel(_TrainedModel):
         return {"family": "gbdt", "model": self.classifier.to_dict()}
 
 
+# The flat-book baseline. A no-trade candidate holds cash: zero trades, zero
+# turnover, exactly 0R cost-controlled expectancy. It is injected automatically
+# into every experiment (never declared in the manifest) so that the decision
+# "trade nothing" is an explicit, persisted, auditable candidate rather than an
+# implicit ``max(0.0, ...)`` constant inside the selection rule. When no learned
+# or baseline candidate strictly beats it, no-trade is selected — the pipeline
+# then holds cash instead of shipping the least-bad losing strategy.
+NO_TRADE_CANDIDATE_ID = "no-trade"
+NO_TRADE_FAMILY = "no_trade"
+
 # baseline: transparent reference strategies; complex: learned candidates that
-# are admissible only when they strictly beat the best baseline on tune.
+# are admissible only when they strictly beat the best baseline on tune;
+# flat: the no-trade book, always available as the 0R admissibility floor.
 MODEL_FAMILY_KIND: dict[str, str] = {
+    NO_TRADE_FAMILY: "flat",
     "constant_probability": "baseline",
     "random_uniform": "baseline",
     "always_long": "baseline",
@@ -692,6 +704,119 @@ MODEL_FAMILY_KIND: dict[str, str] = {
     "ridge_regression": "complex",
     "gbdt": "complex",
 }
+
+
+def _no_trade_metrics(row_count: int) -> dict[str, Any]:
+    """Metrics for a book that never trades: 0 trades, 0 turnover, 0R expectancy.
+
+    ``net_expectancy_r`` is stated explicitly (not omitted as in a zero-trade
+    evaluation) because selection reads it as the admissibility floor.
+    """
+
+    return {
+        "rows": int(row_count),
+        "trade_count": 0,
+        "coverage": 0.0,
+        "abstention_rate": 1.0,
+        "cost_multiplier": 1.0,
+        "net_expectancy_r": 0.0,
+        "median_net_r": 0.0,
+        "turnover": 0.0,
+        "max_drawdown_r": 0.0,
+    }
+
+
+def _no_trade_trial(experiment_id: str, tune_index: pd.DatetimeIndex) -> dict[str, Any]:
+    """The synthetic flat-book candidate that participates in selection.
+
+    It carries no model; the ``run`` orchestrator short-circuits every
+    model-dependent step (calibration, test, cost stress) when it is selected.
+    """
+
+    return {
+        "candidate_id": NO_TRADE_CANDIDATE_ID,
+        "candidate": ModelCandidate(
+            candidate_id=NO_TRADE_CANDIDATE_ID, family=NO_TRADE_FAMILY, hyperparameters={}
+        ),
+        "model": None,
+        "long_threshold": None,
+        "short_threshold": None,
+        "tune_metrics": _no_trade_metrics(len(tune_index)),
+        # A flat book realises exactly 0R on every tune row.
+        "tune_returns": [0.0] * len(tune_index),
+    }
+
+
+def _no_trade_trial_record(experiment_id: str, row_count: int, now: datetime) -> dict[str, Any]:
+    """Ledger record for the flat-book candidate (always ``succeeded``)."""
+
+    stamp = now.isoformat()
+    return {
+        "trial_id": f"{experiment_id}:{NO_TRADE_CANDIDATE_ID}",
+        "experiment_id": experiment_id,
+        "parent_trial_id": None,
+        "candidate_id": NO_TRADE_CANDIDATE_ID,
+        "model_family": NO_TRADE_FAMILY,
+        "hyperparameters": {},
+        "seed": 0,
+        "started_at": stamp,
+        "finished_at": stamp,
+        "status": "succeeded",
+        "failure_reason": None,
+        "metrics": _no_trade_metrics(row_count),
+        "selected": False,
+    }
+
+
+def _no_trade_evaluation(row_count: int) -> tuple[dict[str, Any], dict[str, Any], list[Any]]:
+    """Model-free evaluation stubs used when the flat book wins selection.
+
+    A book that never trades produces no test predictions, so every statistic
+    is unavailable and the sample-size guard fails: no performance claim is
+    possible, which is the honest and desired outcome. These stubs are shaped
+    exactly like ``_evaluate_test`` / ``_run_cost_stress`` output so the shared
+    promotion and bundle code paths need no special-casing.
+    """
+
+    unavailable = {"available": False, "reason": "no_trade_selected"}
+    statistics = {
+        "bootstrap_ci": dict(unavailable),
+        "psr": dict(unavailable),
+        "dsr_tune_selection": dict(unavailable),
+        "pbo": dict(unavailable),
+    }
+    guard = {
+        "checks": {},
+        "test_trade_count": 0,
+        "effective_trade_count": 0,
+        "passed": False,
+    }
+    # On the test window a book with zero trades makes no expectancy claim, so
+    # ``net_expectancy_r`` is None here — matching what the evidence cross-check
+    # derives from empty trades. (The tune-side flat metric is an explicit 0.0
+    # because selection reads it as the admissibility floor.)
+    test_metrics = _no_trade_metrics(row_count)
+    test_metrics["net_expectancy_r"] = None
+    test_metrics["median_net_r"] = None
+    test_result = {
+        "metrics": test_metrics,
+        "trades": [],
+    }
+    diagnostics = {
+        "statistics": statistics,
+        "multiple_testing": {"method": "holm", "status": "no_trade_selected"},
+        "regimes": {
+            "method": "trailing_vol_terciles_train_fit_v1",
+            "bounds": None,
+            "test_trade_counts": {},
+        },
+        "sample_size_guard": guard,
+        "performance_claim": "no_trade_selected",
+    }
+    # No trades at any cost multiplier, so cost stress is a row of zeros — the
+    # flat book is trivially cost-robust because it pays no costs.
+    return test_result, diagnostics, []
+
 
 _RULE_FAMILY_FEATURE = {
     "previous_return_sign": "ret_1",
@@ -1036,19 +1161,28 @@ def run_experiment(
         record["selected"] = record["candidate_id"] == selected["candidate_id"]
     _persist_trials(ledger, manifest, state, lineage_hashes, trial_records, started_at)
     trial_count = _ledger_trial_count(ledger, manifest)
-    selected_model: _TrainedModel = selected["model"]
-    bind("trained_model", _canonical_sha256(selected_model.to_dict()))
 
-    calibrator, calibration_summary = _fit_calibration(
-        manifest, selected, development["calibration"]
-    )
+    if _is_no_trade(selected):
+        # The flat book won: no model, no calibration, no test predictions. Emit
+        # model-free stubs and let the shared promotion path deny promotion for
+        # want of a sample. Binding these keeps the lineage chain deterministic.
+        calibration_summary = {"method": manifest.calibration.method, "status": "no_trade_selected"}
+        test_result, diagnostics, stress_rows = _no_trade_evaluation(len(development["test"]))
+        bind("test_predictions", _canonical_sha256(test_result["trades"]))
+    else:
+        selected_model: _TrainedModel = selected["model"]
+        bind("trained_model", _canonical_sha256(selected_model.to_dict()))
 
-    test_result, diagnostics = _evaluate_test(
-        manifest, selected, calibrator, development, trials, tune_returns_matrix
-    )
-    bind("test_predictions", _canonical_sha256(test_result["trades"]))
+        calibrator, calibration_summary = _fit_calibration(
+            manifest, selected, development["calibration"]
+        )
 
-    stress_rows = _run_cost_stress(manifest, selected, calibrator, development["test"])
+        test_result, diagnostics = _evaluate_test(
+            manifest, selected, calibrator, development, trials, tune_returns_matrix
+        )
+        bind("test_predictions", _canonical_sha256(test_result["trades"]))
+
+        stress_rows = _run_cost_stress(manifest, selected, calibrator, development["test"])
 
     evaluation_payload = {
         "pipeline_version": PIPELINE_VERSION,
@@ -1073,7 +1207,16 @@ def run_experiment(
             "Synthetic or unlicensed data cannot support promotion regardless of metrics.",
             "Lockbox outcomes were neither evaluated nor persisted by this run.",
             "point_in_time check scope: bar-envelope and owned feature joins only.",
-        ],
+        ]
+        + (
+            [
+                "No candidate strictly beat the flat book on tune; the no-trade "
+                "candidate was selected. The book holds cash and makes no "
+                "performance claim (zero trades, zero turnover, 0R)."
+            ]
+            if _is_no_trade(selected)
+            else []
+        ),
     }
     bind("evaluation", _canonical_sha256(evaluation_payload))
 
@@ -1243,39 +1386,57 @@ def evaluate_lockbox(
                 "recorded": evaluation.get("selected_candidate_id"),
             },
         )
-    model: _TrainedModel = selected["model"]
-    if _canonical_sha256(model.to_dict()) != chain.get("trained_model"):
-        raise TypedFailure(
-            FailureReason.HASH_MISMATCH,
-            "replayed trained model does not match the recorded lineage",
+    prior = json.loads((bundle / "promotion_decision.json").read_text(encoding="utf-8"))
+    no_trade_selected = _is_no_trade(selected)
+
+    if no_trade_selected:
+        # The flat book was recorded: there is no trained model to replay and no
+        # test predictions to hash. Re-derive the same model-free stubs so the
+        # evidence cross-check and the lockbox opening stay deterministic.
+        replayed_test, replayed_diag, replayed_stress = _no_trade_evaluation(
+            len(development["test"])
         )
-    calibrator, _ = _fit_calibration(manifest, selected, development["calibration"])
-    test_features, _ = _matrix(manifest, development["test"])
-    test_probabilities = np.asarray(
-        calibrator.predict(model.predict_probability(test_features).tolist()), dtype=float
-    )
-    replayed_test = _evaluate_decisions(
-        manifest,
-        development["test"],
-        test_probabilities,
-        selected["long_threshold"],
-        selected["short_threshold"],
-    )
-    if _canonical_sha256(replayed_test["trades"]) != chain.get("test_predictions"):
-        raise TypedFailure(
-            FailureReason.LINEAGE_BROKEN,
-            "replayed test predictions do not match the recorded lineage",
+        if _canonical_sha256(replayed_test["trades"]) != chain.get("test_predictions"):
+            raise TypedFailure(
+                FailureReason.LINEAGE_BROKEN,
+                "replayed test predictions do not match the recorded lineage",
+            )
+        replayed_statistics = replayed_diag["statistics"]
+    else:
+        model: _TrainedModel = selected["model"]
+        if _canonical_sha256(model.to_dict()) != chain.get("trained_model"):
+            raise TypedFailure(
+                FailureReason.HASH_MISMATCH,
+                "replayed trained model does not match the recorded lineage",
+            )
+        calibrator, _ = _fit_calibration(manifest, selected, development["calibration"])
+        test_features, _ = _matrix(manifest, development["test"])
+        test_probabilities = np.asarray(
+            calibrator.predict(model.predict_probability(test_features).tolist()), dtype=float
         )
+        replayed_test = _evaluate_decisions(
+            manifest,
+            development["test"],
+            test_probabilities,
+            selected["long_threshold"],
+            selected["short_threshold"],
+        )
+        if _canonical_sha256(replayed_test["trades"]) != chain.get("test_predictions"):
+            raise TypedFailure(
+                FailureReason.LINEAGE_BROKEN,
+                "replayed test predictions do not match the recorded lineage",
+            )
+        replayed_returns = np.array(
+            [trade["net_r"] for trade in replayed_test["trades"]], dtype=float
+        )
+        replayed_statistics = _headline_statistics(
+            manifest, trials, selected, tune_returns_matrix, replayed_returns
+        )
+        replayed_stress = _run_cost_stress(manifest, selected, calibrator, development["test"])
 
     # The recorded promotion evidence must agree with the replay before the
     # single-use access is consumed; a bundle whose artifact_hashes.json was
     # regenerated around edited numbers fails here instead of being trusted.
-    prior = json.loads((bundle / "promotion_decision.json").read_text(encoding="utf-8"))
-    replayed_returns = np.array([trade["net_r"] for trade in replayed_test["trades"]], dtype=float)
-    replayed_statistics = _headline_statistics(
-        manifest, trials, selected, tune_returns_matrix, replayed_returns
-    )
-    replayed_stress = _run_cost_stress(manifest, selected, calibrator, development["test"])
     _verify_prior_evidence(
         prior,
         manifest,
@@ -1301,17 +1462,21 @@ def evaluate_lockbox(
 
     lockbox_positions = partitions.open_lockbox(selection_complete=True, purpose=purpose)
     lockbox_rows = [rows[index] for index in lockbox_positions]
-    lockbox_features, _ = _matrix(manifest, lockbox_rows)
-    lockbox_probabilities = np.asarray(
-        calibrator.predict(model.predict_probability(lockbox_features).tolist()), dtype=float
-    )
-    lockbox_result = _evaluate_decisions(
-        manifest,
-        lockbox_rows,
-        lockbox_probabilities,
-        selected["long_threshold"],
-        selected["short_threshold"],
-    )
+    if no_trade_selected:
+        # A flat book trades nothing in the lockbox either: 0 trades, 0R.
+        lockbox_result = {"metrics": _no_trade_metrics(len(lockbox_rows)), "trades": []}
+    else:
+        lockbox_features, _ = _matrix(manifest, lockbox_rows)
+        lockbox_probabilities = np.asarray(
+            calibrator.predict(model.predict_probability(lockbox_features).tolist()), dtype=float
+        )
+        lockbox_result = _evaluate_decisions(
+            manifest,
+            lockbox_rows,
+            lockbox_probabilities,
+            selected["long_threshold"],
+            selected["short_threshold"],
+        )
 
     evidence = replace(
         PromotionEvidence(**prior["evidence"]),
@@ -1587,6 +1752,16 @@ def _run_trials(
         finally:
             record["finished_at"] = datetime.now(UTC).isoformat()
             records.append(record)
+
+    # Inject the flat-book candidate so "trade nothing" is an explicit, ledgered
+    # candidate and the 0R selection floor, not a magic constant. It never
+    # trains, so it cannot raise and is always recorded as succeeded.
+    now = datetime.now(UTC)
+    no_trade = _no_trade_trial(manifest.experiment_id, tune_index)
+    trials.append(no_trade)
+    records.append(_no_trade_trial_record(manifest.experiment_id, len(tune_rows), now))
+    tune_returns[NO_TRADE_CANDIDATE_ID] = pd.Series(no_trade["tune_returns"], index=tune_index)
+
     matrix = pd.DataFrame(tune_returns, index=tune_index)
     return trials, records, matrix
 
@@ -1636,60 +1811,47 @@ def _require_baseline_candidates(manifest: ExperimentManifest) -> None:
         )
 
 
-def _select_trial(manifest: ExperimentManifest, trials: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    qualified = [
-        trial
-        for trial in trials
-        if trial["tune_metrics"]["trade_count"] >= manifest.selection.minimum_trade_count
-        and trial["tune_metrics"].get("net_expectancy_r") is not None
-    ]
-    if not qualified:
-        raise TypedFailure(
-            FailureReason.INSUFFICIENT_SAMPLE,
-            "no candidate produced the minimum tune trade count; selection is unavailable",
-            context={
-                "minimum_trade_count": manifest.selection.minimum_trade_count,
-                "candidates": [
-                    {
-                        "candidate_id": trial["candidate_id"],
-                        "trade_count": trial["tune_metrics"]["trade_count"],
-                    }
-                    for trial in trials
-                ],
-            },
-        )
+def _is_no_trade(trial: Mapping[str, Any]) -> bool:
+    return trial["candidate_id"] == NO_TRADE_CANDIDATE_ID
 
+
+def _select_trial(manifest: ExperimentManifest, trials: Sequence[dict[str, Any]]) -> dict[str, Any]:
     def metric(trial: Mapping[str, Any]) -> float:
         return float(trial["tune_metrics"]["net_expectancy_r"])
 
     def kind(trial: Mapping[str, Any]) -> str:
         return MODEL_FAMILY_KIND.get(trial["candidate"].family, "complex")
 
+    # The flat book is always available and exempt from the minimum-trade-count
+    # gate that keeps thin, noisy strategies out. ``_run_trials`` injects it into
+    # every real run; if a direct caller omits it we synthesize the same 0R floor
+    # so "hold cash" is never silently unavailable.
+    no_trade = next((trial for trial in trials if _is_no_trade(trial)), None)
+    if no_trade is None:
+        no_trade = _no_trade_trial(manifest.experiment_id, pd.DatetimeIndex([]))
+
+    qualified = [
+        trial
+        for trial in trials
+        if not _is_no_trade(trial)
+        and trial["tune_metrics"]["trade_count"] >= manifest.selection.minimum_trade_count
+        and trial["tune_metrics"].get("net_expectancy_r") is not None
+    ]
+
     baselines = [trial for trial in qualified if kind(trial) == "baseline"]
-    # A flat book earns 0R, so no complex model is admissible below that floor.
-    benchmark_floor = max([0.0, *(metric(trial) for trial in baselines)])
+    # The 0R admissibility floor is the flat book itself, made explicit. Any
+    # qualifying baseline that beats it raises the bar the complex models face.
+    benchmark_floor = max([metric(no_trade), *(metric(trial) for trial in baselines)])
     admissible = [
         trial for trial in qualified if kind(trial) == "baseline" or metric(trial) > benchmark_floor
     ]
-    if not admissible:
-        raise TypedFailure(
-            FailureReason.INVALID,
-            "no admissible candidate: complex models must strictly beat the best "
-            "qualified baseline (or 0R when no baseline qualifies) under identical "
-            "conditions",
-            context={
-                "benchmark_floor_net_expectancy_r": benchmark_floor,
-                "qualified": [
-                    {
-                        "candidate_id": trial["candidate_id"],
-                        "family": trial["candidate"].family,
-                        "net_expectancy_r": metric(trial),
-                    }
-                    for trial in qualified
-                ],
-            },
-        )
-    return max(admissible, key=lambda trial: (metric(trial), trial["candidate_id"]))
+    # Only a strategy that strictly beats the flat book (and the best qualifying
+    # baseline) is worth trading. If none does, hold cash: select no-trade rather
+    # than raising or shipping the least-bad losing strategy (§1-2).
+    tradeable = [trial for trial in admissible if metric(trial) > metric(no_trade)]
+    if not tradeable:
+        return no_trade
+    return max(tradeable, key=lambda trial: (metric(trial), trial["candidate_id"]))
 
 
 def _fit_calibration(
