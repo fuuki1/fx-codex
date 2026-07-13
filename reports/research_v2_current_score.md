@@ -86,11 +86,12 @@
 
 ### 実証 62 / 100
 
-- **実データ E2E で検証機構が実証済み**（[histdata-usdjpy-real-2024-1h](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)）: 実USD/JPY 2024 で PBO 0.20 / DSR 0.167 / Holm補正後 p値 全1.0 / block bootstrap CI が実データ分布で妥当に動作。昇格拒否の全経路（net_expectancy/CI/DSR/cost_stress_2x/untouched_lockbox）が**実データで**発火。
-- **deterministic replay を実データで2重に実証**: (1) COT audit がraw再構成 `passed`、(2) 価格pipeline が2回runで同一 result hash（fedc9d83）。
-- 合成E2Eでも昇格拒否の全経路を実証（gate健全性）。
-- ただし **実データ評価は close-only・単年・単一pair**。多年・複数pair・複数regime にまたがる実データ評価は未実施。外部custodyも未実装。
-- → 60台前半。実データで gate が動くことは実証、網羅性（多年/多pair/合格側）は未達。
+- **実データ E2E で検証機構が実証済み**: 実USD/JPY 2024 で PBO 0.20 / DSR 0.167 / Holm補正後 p値 全1.0 / block bootstrap CI が実データ分布で妥当に動作。昇格拒否の全経路（net_expectancy/CI/DSR/cost_stress_2x/untouched_lockbox）が**実データで**発火。
+- **cross-pair 頑健性を実証**（[multipair](evidence/histdata-multipair-real-2024-1h-20260713/README.md)）: USD/JPY・EUR/USD・GBP/USD の3pair全てで net expectancy が負・CI下限が負・昇格DENIED。選択候補はpairで異なり（GBDT / always-long）、単一モデルのチェリーピッキングでないことを示す。**pair-concentration 懸念に実データで応答**。
+- **deterministic replay を実データで実証**: COT audit のraw再構成 `passed` に加え、3pair全てが2回runで同一 result hash（fedc9d83 / 0a18713c / 8bbdbf9f）。
+- **lockbox の再最適化拒否を実データで実証**: pip_size 修正で manifest content が変わった際、lockbox が旧 experiment_id での再実行を拒否（`lockbox_violation`）→ 新 id 必須。
+- ただし **実データ評価は close-only・単年（2024）**。多年・複数regime・合格側（実データで gate 全通過）は未実施。外部custodyも未実装。
+- → 60台前半。実データで gate が pair をまたいで頑健に動くことは実証、網羅性（多年/合格側）は未達。
 
 ---
 
@@ -115,7 +116,7 @@
 ### 実証 45 / 100
 
 - **COT PIT を実データで完全実証**：実CFTC 13,727行、SHA256照合、count整合、deterministic replay、PITゲート（取得前=unavailable / 後=usable）。→ [evidence](evidence/cot-cftc-real-pit-20260713/README.md)。
-- **実FX価格取込を実証**：HistData USD/JPY 2024 M1→1h（6,265本）を EST→UTC 変換・hash固定し、pipeline の `load_price_csv` で読込・品質検査・triple-barrier ラベル・OOS評価まで通した。`scripts/fetch_histdata.py` で committed CSV を byte一致再現可。→ [evidence](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)。
+- **実FX価格取込を3pairで実証**：HistData USD/JPY・EUR/USD・GBP/USD 2024 M1→1h（各6,265/6,295/6,281本）を EST→UTC 変換・hash固定し、pipeline の `load_price_csv` で読込・品質検査・triple-barrier ラベル・OOS評価まで通した。`scripts/fetch_histdata.py` で committed CSV を byte一致再現可。→ [USD/JPY](evidence/histdata-usdjpy-real-2024-1h-20260713/README.md) / [cross-pair](evidence/histdata-multipair-real-2024-1h-20260713/README.md)。
 - ただし **close-only（bid/ask無し・volume無し）**。取引予定brokerの実bid/ask quoteは1件も取り込んでいない（quote→bar の実bid/ask実証なし）。
 - **30取引日連続稼働の証拠なし**。単発・単年。launchd常駐は開発機TCC制限で不可、Mac mini本番未配備。
 - macro/calendar/news の実PIT運用証拠なし。
