@@ -117,6 +117,10 @@ def _full_green_bundle(bundle: Path, ops: Path) -> None:
         (ops / f"daily_report_2026-08-{day:02d}.json").write_text(
             json.dumps(
                 {
+                    "schema_version": 1,
+                    "report_date": f"2026-08-{day:02d}",
+                    "prospective_window_ok": True,
+                    "qualifying_day": True,
                     "raw_hash_verified": True,
                     "replay_ok": True,
                     "critical_incidents": 0,
