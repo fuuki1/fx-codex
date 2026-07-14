@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.fx-codex.briefing</string>
-  <!-- 毎時:10に融合+時間足別の2モードを順番に1回実行(scripts/fx_briefing_once.sh)。
-       旧com.fx-codex.briefing.hourly(per-timeframeのみ)を置き換える。
-       RunAtLoadは付けない: インストール直後の余計なジャーナル行を作らない。 -->
+  <!-- 00/05/10/.../55分にFXシグナルボードを1回実行する。
+       run_exclusive.pyで前回処理との重複を拒否し、Discord通知を1通へ集約する。
+       RunAtLoadは付けず、インストール直後の臨時通知を発生させない。 -->
   <key>ProgramArguments</key>
   <array>
     <string>__PYTHON__</string>
@@ -18,9 +18,20 @@
   </array>
   <key>WorkingDirectory</key><string>__FX_ROOT__</string>
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Minute</key><integer>10</integer>
-  </dict>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Minute</key><integer>40</integer></dict>
+    <dict><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Minute</key><integer>50</integer></dict>
+    <dict><key>Minute</key><integer>55</integer></dict>
+  </array>
   <key>ProcessType</key><string>Background</string>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/briefing.out.log</string>
