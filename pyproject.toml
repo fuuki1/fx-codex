@@ -37,14 +37,13 @@ testpaths = ["tests"]
 [tool.black]
 line-length = 100
 target-version = ["py311"]
-# trader/（Mac mini稼働スタック）は独自ツールチェーンで検証する（ci.ymlのtraderジョブ参照）。
-# .claude/ は Claude Code のワークツリー複製で git-ignore 対象。ローカルの誤検知を防ぐため除外。
-extend-exclude = "^/(trader|\\.claude)/"
+# .claude/ は Claude Code のワークツリー複製でgit-ignore対象。
+extend-exclude = "^/\\.claude/"
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["trader", ".claude"]
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 select = ["E", "F", "UP"]
