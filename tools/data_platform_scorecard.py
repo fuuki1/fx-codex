@@ -1,70 +1,43 @@
 #!/usr/bin/env python3
 """Machine-judged data-platform empirical scorecard.
 
-Scores the data platform **only from evidence artifacts and operational
-metrics** — never from code existence, line counts, or test counts. Every
-awarded point cites the evidence file it was computed from; every unmet
-condition and every hard cap is listed with its reason. The intent is that a
-human cannot argue with the number without arguing with the evidence.
+The score is earned only from evidence artifacts and prospective operational
+reports. Code existence, test count and copied historical reports earn no
+points. Malformed or contradictory evidence fails closed.
 
-Sections (100 total)
-    trading market data ............ 30
-    dual-source verification ....... 15
-    macro / event / news PIT ....... 15
-    continuous operation ........... 20
-    reproducibility / audit ........ 10
-    fault tolerance / secrets ...... 10
-
-Hard caps (the minimum applicable cap wins; fatal conditions zero the score):
-    no real broker bid/ask quotes ............ cap 65
-    no live market data (historical only) .... cap 75
-    fewer than 30 trading days ............... cap 85
-    practice/demo data only .................. cap 90
-    no independent second source ............. cap 90
-    no macro/event PIT evidence .............. cap 95
-    future-data violation .................... score 0, status=failed
-    raw hash mismatch ........................ score 0, status=failed
-    stale quote used as tradable ............. score 0, status=failed
-    synthetic/replay counted as real ......... score 0, status=failed
-    secret leakage ........................... score 0, status=failed
-
-Usage:
-    python3 -m tools.data_platform_scorecard --evidence-dir <bundle> \
-        [--operations-dir <daily-report-dir>] [--json-out X] [--md-out Y]
-
-Exit codes: 0 = computed (status ok/capped), 2 = fatal (status failed),
-1 = scorecard itself could not run (missing/invalid inputs).
+Sections (100 total):
+- trading market data: 30
+- dual-source verification: 15
+- macro/event PIT: 15
+- continuous operation: 20
+- reproducibility/audit: 10
+- fault tolerance/secrets: 10
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+from datetime import date
 import json
 from pathlib import Path
 import sys
 from typing import Any
 
-SCORECARD_VERSION = "1.0.0"
+SCORECARD_VERSION = "1.1.0"
 REQUIRED_PAIRS = 3
 REQUIRED_TRADING_DAYS = 30
 
-# ---------------------------------------------------------------------------
-# evidence loading
-
 
 class ScorecardInputError(RuntimeError):
-    """Raised when the scorecard cannot even evaluate (not a low score)."""
+    """Evidence could not be evaluated safely."""
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
-    """Return parsed JSON or None when absent. Malformed files are an error:
-    silently treating them as absent could hide tampering."""
-
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ScorecardInputError(f"unreadable evidence file {path}: {error}") from error
     if not isinstance(payload, dict):
@@ -72,10 +45,40 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     return payload
 
 
+def _load_daily_reports(operations_dir: Path | None) -> list[dict[str, Any]]:
+    if operations_dir is None:
+        return []
+    if not operations_dir.is_dir():
+        raise ScorecardInputError(f"operations directory not found: {operations_dir}")
+
+    reports: list[dict[str, Any]] = []
+    seen_dates: set[str] = set()
+    for path in sorted(operations_dir.glob("daily_report_*.json")):
+        payload = _load_json(path)
+        assert payload is not None
+        report_date = payload.get("report_date")
+        if not isinstance(report_date, str):
+            raise ScorecardInputError(f"daily report missing report_date: {path}")
+        try:
+            date.fromisoformat(report_date)
+        except ValueError as error:
+            raise ScorecardInputError(
+                f"daily report has invalid report_date {report_date!r}: {path}"
+            ) from error
+        expected_name = f"daily_report_{report_date}.json"
+        if path.name != expected_name:
+            raise ScorecardInputError(
+                f"daily report filename/date mismatch: {path.name} != {expected_name}"
+            )
+        if report_date in seen_dates:
+            raise ScorecardInputError(f"duplicate daily report date: {report_date}")
+        seen_dates.add(report_date)
+        reports.append(payload)
+    return reports
+
+
 @dataclass
 class Evidence:
-    """Typed view over one evidence bundle + optional operations directory."""
-
     bundle_dir: Path
     collection: dict[str, Any] | None
     quality: dict[str, Any] | None
@@ -92,14 +95,6 @@ class Evidence:
     def load(cls, bundle_dir: Path, operations_dir: Path | None) -> Evidence:
         if not bundle_dir.is_dir():
             raise ScorecardInputError(f"evidence bundle directory not found: {bundle_dir}")
-        daily: list[dict[str, Any]] = []
-        if operations_dir is not None:
-            if not operations_dir.is_dir():
-                raise ScorecardInputError(f"operations directory not found: {operations_dir}")
-            for report in sorted(operations_dir.glob("daily_report_*.json")):
-                loaded = _load_json(report)
-                if loaded is not None:
-                    daily.append(loaded)
         return cls(
             bundle_dir=bundle_dir,
             collection=_load_json(bundle_dir / "collection_summary.json"),
@@ -111,15 +106,11 @@ class Evidence:
             secrets=_load_json(bundle_dir / "secrets_scan.json"),
             fault_injection=_load_json(bundle_dir / "fault_injection_report.json"),
             reproduction=_load_json(bundle_dir / "independent_reproduction.json"),
-            daily_reports=daily,
+            daily_reports=_load_daily_reports(operations_dir),
         )
 
 
-# ---------------------------------------------------------------------------
-# scoring primitives
-
-
-@dataclass
+@dataclass(frozen=True)
 class Award:
     section: str
     points: float
@@ -128,13 +119,13 @@ class Award:
     evidence_path: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class Cap:
     limit: float
     reason: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class Fatal:
     reason: str
     evidence_path: str
@@ -148,14 +139,14 @@ class ScoreBuilder:
         self.fatals: list[Fatal] = []
         self.evidence_paths: set[str] = set()
 
-    def award(self, section: str, points: float, max_points: float, reason: str, path: str) -> None:
-        points = max(0.0, min(points, max_points))
-        self.awards.append(Award(section, points, max_points, reason, path))
+    def award(self, section: str, points: float, maximum: float, reason: str, path: str) -> None:
+        bounded = max(0.0, min(points, maximum))
+        self.awards.append(Award(section, bounded, maximum, reason, path))
         if path:
             self.evidence_paths.add(path)
 
-    def miss(self, section: str, max_points: float, reason: str) -> None:
-        self.awards.append(Award(section, 0.0, max_points, reason, ""))
+    def miss(self, section: str, maximum: float, reason: str) -> None:
+        self.awards.append(Award(section, 0.0, maximum, reason, ""))
         self.unmet.append(f"[{section}] {reason}")
 
     def cap(self, limit: float, reason: str) -> None:
@@ -163,10 +154,6 @@ class ScoreBuilder:
 
     def fatal(self, reason: str, path: str) -> None:
         self.fatals.append(Fatal(reason, path))
-
-
-# ---------------------------------------------------------------------------
-# fatal checks (any true -> score 0 / status failed)
 
 
 def _check_fatals(ev: Evidence, sb: ScoreBuilder) -> None:
@@ -178,96 +165,88 @@ def _check_fatals(ev: Evidence, sb: ScoreBuilder) -> None:
     if int(quality.get("stale_used_as_tradable_count", 0)) > 0:
         sb.fatal("stale quote treated as tradable", "quality_report.json")
     collection = ev.collection or {}
-    if bool(collection.get("synthetic_or_replay_counted_as_real", False)):
+    if collection.get("synthetic_or_replay_counted_as_real") is True:
         sb.fatal("synthetic/replay rows counted as real connection", "collection_summary.json")
     secrets = ev.secrets or {}
     if int(secrets.get("leak_count", 0)) > 0:
         sb.fatal("secret leakage detected", "secrets_scan.json")
-    replay = ev.replay
-    if replay is not None and replay.get("status") == "mismatch":
+    if ev.replay is not None and ev.replay.get("status") == "mismatch":
         sb.fatal("deterministic replay mismatch on real data", "replay_report.json")
 
 
-# ---------------------------------------------------------------------------
-# section: trading market data (30)
-
-
-def _real_source_rows(collection: dict[str, Any]) -> list[dict[str, Any]]:
+def _real_sources(collection: dict[str, Any]) -> list[dict[str, Any]]:
     sources = collection.get("sources", [])
     if not isinstance(sources, list):
         return []
-    real: list[dict[str, Any]] = []
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        if bool(source.get("synthetic", False)) or bool(source.get("replay_fixture", False)):
-            continue  # never count synthetic/replay as real
-        real.append(source)
-    return real
+    return [
+        source
+        for source in sources
+        if isinstance(source, dict)
+        and source.get("synthetic") is not True
+        and source.get("replay_fixture") is not True
+    ]
 
 
 def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
     section = "trading_market_data"
-    collection = ev.collection
-    if collection is None:
+    if ev.collection is None:
         sb.miss(section, 30, "collection_summary.json missing — no market-data evidence")
         sb.cap(65, "real broker bid/ask: 0 quotes (no collection evidence)")
         sb.cap(75, "no live market data evidence")
         return
-    real_sources = _real_source_rows(collection)
-    # A source only counts in ANY category with actually-collected quotes:
-    # an implemented-but-unconnected adapter (quote_count 0) earns nothing.
+
     bidask = [
-        s
-        for s in real_sources
-        if bool(s.get("has_bid_ask", False)) and int(s.get("quote_count", 0)) > 0
+        source
+        for source in _real_sources(ev.collection)
+        if source.get("has_bid_ask") is True and int(source.get("quote_count", 0)) > 0
     ]
     live = [
-        s
-        for s in bidask
-        if s.get("collection_mode") == "live_stream"
-        and s.get("account_environment") not in ("practice", "demo")
+        source
+        for source in bidask
+        if source.get("collection_mode") == "live_stream"
+        and source.get("account_environment") not in ("practice", "demo")
     ]
-    demo_live = [s for s in bidask if s.get("collection_mode") == "live_stream" and s not in live]
-    historical = [s for s in bidask if s.get("collection_mode") == "historical_download"]
-    total_quotes = sum(int(s.get("quote_count", 0)) for s in bidask)
-    pairs = {str(p) for s in bidask for p in s.get("instruments", [])}
+    demo_live = [
+        source
+        for source in bidask
+        if source.get("collection_mode") == "live_stream" and source not in live
+    ]
+    historical = [source for source in bidask if source.get("collection_mode") == "historical_download"]
+    total_quotes = sum(int(source.get("quote_count", 0)) for source in bidask)
+    pairs = {str(pair) for source in bidask for pair in source.get("instruments", [])}
 
     if total_quotes <= 0:
         sb.cap(65, "real broker bid/ask: 0 quotes")
     if not live:
         sb.cap(75, "no live market data (historical download and/or demo only)")
-        if demo_live and not historical:
-            sb.cap(90, "practice/demo live stream only")
+    if demo_live and not live:
+        sb.cap(90, "practice/demo live stream only")
 
-    # live stream from a non-demo broker (15)
     if live:
-        live_quotes = sum(int(s.get("quote_count", 0)) for s in live)
+        live_quotes = sum(int(source.get("quote_count", 0)) for source in live)
+        providers = sorted(str(source.get("provider")) for source in live)
         sb.award(
             section,
             15,
             15,
-            f"live non-demo broker stream: {live_quotes} quotes from "
-            f"{sorted(str(s.get('provider')) for s in live)}",
+            f"live non-demo broker stream: {live_quotes} quotes from {providers}",
             "collection_summary.json",
         )
     else:
         sb.miss(section, 15, "no live non-demo broker bid/ask stream collected")
 
-    # real (non-synthetic) bid/ask quotes of any collection mode (7)
     if total_quotes > 0:
+        modes = sorted({str(source.get("collection_mode")) for source in bidask})
         sb.award(
             section,
             7,
             7,
-            f"real bid/ask quotes ingested: {total_quotes} "
-            f"(modes: {sorted({str(s.get('collection_mode')) for s in bidask})})",
+            f"real bid/ask quotes ingested: {total_quotes} (modes: {modes})",
             "collection_summary.json",
         )
     else:
         sb.miss(section, 7, "no real bid/ask quotes ingested")
 
-    # pair coverage (4)
     if len(pairs) >= REQUIRED_PAIRS:
         sb.award(section, 4, 4, f"pair coverage: {sorted(pairs)}", "collection_summary.json")
     elif pairs:
@@ -282,11 +261,11 @@ def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
     else:
         sb.miss(section, 4, "no pairs with real bid/ask")
 
-    # honest field provenance: sizes present or explicitly flagged absent (2)
-    if bidask and all(
-        bool(s.get("sizes_present", False)) or bool(s.get("sizes_flagged_absent", False))
-        for s in bidask
-    ):
+    honest_sizes = bidask and all(
+        source.get("sizes_present") is True or source.get("sizes_flagged_absent") is True
+        for source in bidask
+    )
+    if honest_sizes:
         sb.award(
             section,
             2,
@@ -297,21 +276,16 @@ def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
     else:
         sb.miss(section, 2, "size fields neither present nor flagged absent")
 
-    # raw-first verified for every real source (2)
-    if bidask and all(bool(s.get("raw_first_verified", False)) for s in bidask):
+    if bidask and all(source.get("raw_first_verified") is True for source in bidask):
         sb.award(
             section,
             2,
             2,
-            "raw-first storage verified (raw sha256 recorded before normalization)",
+            "raw-first storage verified before normalization",
             "collection_summary.json",
         )
     else:
         sb.miss(section, 2, "raw-first storage not verified for all real sources")
-
-
-# ---------------------------------------------------------------------------
-# section: dual-source verification (15)
 
 
 def _score_dual_source(ev: Evidence, sb: ScoreBuilder) -> None:
@@ -321,17 +295,15 @@ def _score_dual_source(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.miss(section, 15, "divergence_report.json missing")
         sb.cap(90, "no independent second source comparison")
         return
+
     providers = report.get("providers", [])
     independent = (
         isinstance(providers, list)
-        and len({str(p) for p in providers}) >= 2
-        and bool(report.get("providers_independent", False))
+        and len({str(provider) for provider in providers}) >= 2
+        and report.get("providers_independent") is True
+        and report.get("all_inputs_real") is True
     )
-    real_inputs = bool(report.get("all_inputs_real", False))
-    if not (independent and real_inputs):
-        sb.miss(section, 8, "no two independent real-data providers compared")
-        sb.cap(90, "no independent second source (same provider or non-real inputs)")
-    else:
+    if independent:
         sb.award(
             section,
             8,
@@ -339,39 +311,46 @@ def _score_dual_source(ev: Evidence, sb: ScoreBuilder) -> None:
             f"independent providers compared: {sorted(str(p) for p in providers)}",
             "divergence_report.json",
         )
-    pairs = {str(p) for p in report.get("instruments", [])}
+    else:
+        sb.miss(section, 8, "no two independent real-data providers compared")
+        sb.cap(90, "no independent second source (same provider or non-real inputs)")
+
+    pairs = {str(pair) for pair in report.get("instruments", [])}
     if len(pairs) >= REQUIRED_PAIRS:
         sb.award(section, 3, 3, f"compared pairs: {sorted(pairs)}", "divergence_report.json")
     elif pairs:
-        sb.award(section, 3 * len(pairs) / REQUIRED_PAIRS, 3, f"partial pairs: {sorted(pairs)}", "")
+        sb.award(
+            section,
+            3 * len(pairs) / REQUIRED_PAIRS,
+            3,
+            f"partial pairs: {sorted(pairs)}",
+            "divergence_report.json",
+        )
     else:
         sb.miss(section, 3, "no instruments compared")
+
     metrics = report.get("metrics", {})
     wanted = {"mid_diff_pips", "spread_diff_pips", "receive_time_skew_ms"}
-    populated = (
+    measured = (
         isinstance(metrics, dict)
-        and wanted.issubset(metrics.keys())
-        # a null metric is an honest "could not measure" — it earns nothing
-        and all(isinstance(metrics[name], dict) and metrics[name] for name in wanted)
+        and wanted.issubset(metrics)
+        and all(isinstance(metrics[name], dict) and bool(metrics[name]) for name in wanted)
     )
-    if populated:
+    if measured:
         sb.award(section, 2, 2, "required divergence metrics measured", "divergence_report.json")
     else:
         sb.miss(section, 2, f"divergence metrics not all measured (need {sorted(wanted)})")
-    if bool(report.get("breach_policy_exercised", False)):
+
+    if report.get("breach_policy_exercised") is True:
         sb.award(
             section,
             2,
             2,
-            "breach policy exercised (no averaging; degraded/quarantined transition observed)",
+            "breach policy exercised without averaging",
             "divergence_report.json",
         )
     else:
         sb.miss(section, 2, "divergence breach policy never exercised")
-
-
-# ---------------------------------------------------------------------------
-# section: macro / event PIT (15)
 
 
 def _score_macro_pit(ev: Evidence, sb: ScoreBuilder) -> None:
@@ -381,64 +360,63 @@ def _score_macro_pit(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.miss(section, 15, "macro_pit_report.json missing")
         sb.cap(95, "no macro/event PIT evidence")
         return
-    real_capture = bool(report.get("real_data", False)) and int(report.get("record_count", 0)) > 0
-    if not real_capture:
-        sb.miss(section, 8, "no real macro records captured")
-        sb.cap(95, "no macro/event PIT evidence (no real records)")
-    else:
+
+    real_capture = report.get("real_data") is True and int(report.get("record_count", 0)) > 0
+    if real_capture:
         sb.award(
             section,
             8,
             8,
-            f"real macro records: {report.get('record_count')} from "
-            f"{report.get('provider')} (vintage_correct={report.get('vintage_correct')})",
+            f"real macro records: {report.get('record_count')} from {report.get('provider')}",
             "macro_pit_report.json",
         )
-    if bool(report.get("as_of_query_verified", False)):
+    else:
+        sb.miss(section, 8, "no real macro records captured")
+        sb.cap(95, "no macro/event PIT evidence (no real records)")
+
+    if report.get("as_of_query_verified") is True:
         sb.award(
             section,
             4,
             4,
-            "as-of query verified on real data (pre-availability blocked)",
+            "as-of query verified on real data",
             "macro_pit_report.json",
         )
     else:
         sb.miss(section, 4, "as-of query not verified on real data")
-    if bool(report.get("revision_separation_verified", False)):
+
+    if report.get("revision_separation_verified") is True:
         sb.award(
             section,
             3,
             3,
-            "initial vs revised values stored separately (vintage evidence)",
+            "initial and revised values stored separately",
             "macro_pit_report.json",
         )
     else:
         sb.miss(section, 3, "revision separation not verified")
 
 
-# ---------------------------------------------------------------------------
-# section: continuous operation (20)
-
-
 def _score_operations(ev: Evidence, sb: ScoreBuilder) -> None:
     section = "continuous_operation"
-    valid_days = 0
-    for report in ev.daily_reports:
-        ok = (
-            bool(report.get("raw_hash_verified", False))
-            and bool(report.get("replay_ok", False))
-            and int(report.get("critical_incidents", 0)) == 0
-            and bool(report.get("primary_up", False))
-            and bool(report.get("secondary_up", False))
-        )
-        if ok:
-            valid_days += 1
+    valid_days = sum(
+        1
+        for report in ev.daily_reports
+        if report.get("qualifying_day") is True
+        and report.get("prospective_window_ok") is True
+        and report.get("raw_hash_verified") is True
+        and report.get("replay_ok") is True
+        and int(report.get("critical_incidents", 0)) == 0
+        and report.get("primary_up") is True
+        and report.get("secondary_up") is True
+    )
+
     if valid_days >= REQUIRED_TRADING_DAYS:
         sb.award(
             section,
             20,
             20,
-            f"{valid_days} qualifying trading days of continuous collection",
+            f"{valid_days} unique prospective qualifying trading days",
             "daily_report_*.json",
         )
     elif valid_days > 0:
@@ -446,39 +424,35 @@ def _score_operations(ev: Evidence, sb: ScoreBuilder) -> None:
             section,
             20 * valid_days / REQUIRED_TRADING_DAYS,
             20,
-            f"only {valid_days}/{REQUIRED_TRADING_DAYS} qualifying trading days",
+            f"only {valid_days}/{REQUIRED_TRADING_DAYS} prospective qualifying days",
             "daily_report_*.json",
         )
         sb.cap(85, f"fewer than {REQUIRED_TRADING_DAYS} trading days ({valid_days})")
     else:
-        sb.miss(section, 20, "no qualifying trading days of continuous operation")
+        sb.miss(section, 20, "no prospective qualifying days of continuous operation")
         sb.cap(85, f"fewer than {REQUIRED_TRADING_DAYS} trading days (0)")
-
-
-# ---------------------------------------------------------------------------
-# section: reproducibility / audit (10)
 
 
 def _score_reproducibility(ev: Evidence, sb: ScoreBuilder) -> None:
     section = "reproducibility_audit"
-    replay = ev.replay
-    if replay is not None and replay.get("status") == "match" and bool(replay.get("real_data")):
+    if ev.replay is not None and ev.replay.get("status") == "match" and ev.replay.get("real_data") is True:
         sb.award(
             section,
             5,
             5,
-            f"deterministic replay on real data (hash {str(replay.get('result_sha256'))[:12]}…)",
+            f"deterministic replay on real data ({str(ev.replay.get('result_sha256'))[:12]}…)",
             "replay_report.json",
         )
     else:
         sb.miss(section, 5, "no deterministic replay match on real data")
-    repro = ev.reproduction
-    if (
-        repro is not None
-        and repro.get("status") == "match"
-        and bool(repro.get("real_data"))
-        and bool(repro.get("independent_environment"))
-    ):
+
+    reproduction_ok = (
+        ev.reproduction is not None
+        and ev.reproduction.get("status") == "match"
+        and ev.reproduction.get("real_data") is True
+        and ev.reproduction.get("independent_environment") is True
+    )
+    if reproduction_ok:
         sb.award(
             section,
             5,
@@ -490,37 +464,35 @@ def _score_reproducibility(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.miss(section, 5, "no independent-environment reproduction on real data")
 
 
-# ---------------------------------------------------------------------------
-# section: fault tolerance / secrets (10)
-
-
 def _score_fault_and_secrets(ev: Evidence, sb: ScoreBuilder) -> None:
     section = "fault_tolerance_secrets"
     fault = ev.fault_injection
-    if fault is None:
-        sb.miss(section, 6, "fault_injection_report.json missing")
+    scenarios = fault.get("scenarios", []) if fault is not None else []
+    if not isinstance(scenarios, list) or not scenarios:
+        sb.miss(section, 6, "no fault-injection scenarios recorded")
     else:
-        scenarios = fault.get("scenarios", [])
-        if not isinstance(scenarios, list) or not scenarios:
-            sb.miss(section, 6, "no fault-injection scenarios recorded")
-        else:
-            passed = [s for s in scenarios if isinstance(s, dict) and s.get("outcome") == "pass"]
-            fraction = len(passed) / len(scenarios)
-            sb.award(
-                section,
-                6 * fraction,
-                6,
-                f"fault injection: {len(passed)}/{len(scenarios)} scenarios fail-closed",
-                "fault_injection_report.json",
-            )
-            if fraction < 1.0:
-                sb.unmet.append(f"[{section}] {len(scenarios) - len(passed)} scenarios failing")
-    secrets = ev.secrets
-    if secrets is not None and int(secrets.get("leak_count", -1)) == 0:
+        passed = [
+            scenario
+            for scenario in scenarios
+            if isinstance(scenario, dict) and scenario.get("outcome") == "pass"
+        ]
+        fraction = len(passed) / len(scenarios)
+        sb.award(
+            section,
+            6 * fraction,
+            6,
+            f"fault injection: {len(passed)}/{len(scenarios)} scenarios fail-closed",
+            "fault_injection_report.json",
+        )
+        if fraction < 1.0:
+            sb.unmet.append(f"[{section}] {len(scenarios) - len(passed)} scenarios failing")
+
+    if ev.secrets is not None and int(ev.secrets.get("leak_count", -1)) == 0:
         sb.award(section, 2, 2, "secrets scan clean (0 leaks)", "secrets_scan.json")
     else:
         sb.miss(section, 2, "no clean secrets scan evidence")
-    if secrets is not None and bool(secrets.get("no_order_path_verified", False)):
+
+    if ev.secrets is not None and ev.secrets.get("no_order_path_verified") is True:
         sb.award(
             section,
             2,
@@ -532,8 +504,13 @@ def _score_fault_and_secrets(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.miss(section, 2, "no-order-path isolation not verified")
 
 
-# ---------------------------------------------------------------------------
-# assembly
+def _section_totals(sb: ScoreBuilder) -> dict[str, dict[str, float]]:
+    totals: dict[str, dict[str, float]] = {}
+    for award in sb.awards:
+        entry = totals.setdefault(award.section, {"points": 0.0, "max_points": 0.0})
+        entry["points"] = round(entry["points"] + award.points, 2)
+        entry["max_points"] = round(entry["max_points"] + award.max_points, 2)
+    return totals
 
 
 def compute_scorecard(evidence: Evidence) -> dict[str, Any]:
@@ -546,50 +523,43 @@ def compute_scorecard(evidence: Evidence) -> dict[str, Any]:
     _score_reproducibility(evidence, sb)
     _score_fault_and_secrets(evidence, sb)
 
-    raw_score = sum(a.points for a in sb.awards)
-    max_score = sum(a.max_points for a in sb.awards)
-    applicable_cap = min((c.limit for c in sb.caps), default=100.0)
+    raw_score = sum(award.points for award in sb.awards)
+    maximum = sum(award.max_points for award in sb.awards)
+    cap = min((item.limit for item in sb.caps), default=100.0)
     if sb.fatals:
         status = "failed"
-        final_score = 0.0
+        score = 0.0
     else:
-        final_score = min(raw_score, applicable_cap)
-        status = "capped" if final_score < raw_score or sb.caps else "ok"
+        score = min(raw_score, cap)
+        status = "capped" if sb.caps or score < raw_score else "ok"
 
     return {
         "scorecard_version": SCORECARD_VERSION,
         "status": status,
-        "score": round(final_score, 2),
+        "score": round(score, 2),
         "raw_score": round(raw_score, 2),
-        "max_score": round(max_score, 2),
-        "hard_cap": applicable_cap,
-        "hard_cap_reasons": [{"limit": c.limit, "reason": c.reason} for c in sb.caps],
-        "fatal_reasons": [{"reason": f.reason, "evidence": f.evidence_path} for f in sb.fatals],
+        "max_score": round(maximum, 2),
+        "hard_cap": cap,
+        "hard_cap_reasons": [{"limit": item.limit, "reason": item.reason} for item in sb.caps],
+        "fatal_reasons": [
+            {"reason": item.reason, "evidence": item.evidence_path} for item in sb.fatals
+        ],
         "sections": _section_totals(sb),
         "awards": [
             {
-                "section": a.section,
-                "points": round(a.points, 2),
-                "max_points": a.max_points,
-                "reason": a.reason,
-                "evidence": a.evidence_path,
+                "section": item.section,
+                "points": round(item.points, 2),
+                "max_points": item.max_points,
+                "reason": item.reason,
+                "evidence": item.evidence_path,
             }
-            for a in sb.awards
+            for item in sb.awards
         ],
         "unmet_conditions": sb.unmet,
         "evidence_paths": sorted(sb.evidence_paths),
         "evidence_bundle": str(evidence.bundle_dir),
         "daily_report_count": len(evidence.daily_reports),
     }
-
-
-def _section_totals(sb: ScoreBuilder) -> dict[str, dict[str, float]]:
-    totals: dict[str, dict[str, float]] = {}
-    for award in sb.awards:
-        entry = totals.setdefault(award.section, {"points": 0.0, "max_points": 0.0})
-        entry["points"] = round(entry["points"] + award.points, 2)
-        entry["max_points"] = round(entry["max_points"] + award.max_points, 2)
-    return totals
 
 
 def render_markdown(result: dict[str, Any]) -> str:
@@ -605,23 +575,24 @@ def render_markdown(result: dict[str, Any]) -> str:
     for name, entry in result["sections"].items():
         lines.append(f"| {name} | {entry['points']} | {entry['max_points']} |")
     if result["hard_cap_reasons"]:
-        lines += ["", "## Hard caps", ""]
-        for cap in result["hard_cap_reasons"]:
-            lines.append(f"- **≤{cap['limit']}**: {cap['reason']}")
+        lines.extend(["", "## Hard caps", ""])
+        lines.extend(
+            f"- **≤{item['limit']}**: {item['reason']}" for item in result["hard_cap_reasons"]
+        )
     if result["fatal_reasons"]:
-        lines += ["", "## FATAL", ""]
-        for fatal in result["fatal_reasons"]:
-            lines.append(f"- {fatal['reason']} ({fatal['evidence']})")
+        lines.extend(["", "## FATAL", ""])
+        lines.extend(
+            f"- {item['reason']} ({item['evidence']})" for item in result["fatal_reasons"]
+        )
     if result["unmet_conditions"]:
-        lines += ["", "## Unmet conditions", ""]
-        for item in result["unmet_conditions"]:
-            lines.append(f"- {item}")
-    lines += ["", "## Award basis", ""]
-    for award in result["awards"]:
-        if award["points"] > 0:
+        lines.extend(["", "## Unmet conditions", ""])
+        lines.extend(f"- {item}" for item in result["unmet_conditions"])
+    lines.extend(["", "## Award basis", ""])
+    for item in result["awards"]:
+        if item["points"] > 0:
             lines.append(
-                f"- [{award['section']}] +{award['points']}/{award['max_points']}: "
-                f"{award['reason']} ({award['evidence']})"
+                f"- [{item['section']}] +{item['points']}/{item['max_points']}: "
+                f"{item['reason']} ({item['evidence']})"
             )
     return "\n".join(lines) + "\n"
 
@@ -629,21 +600,20 @@ def render_markdown(result: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", type=Path, required=True)
-    parser.add_argument("--operations-dir", type=Path, default=None)
-    parser.add_argument("--json-out", type=Path, default=None)
-    parser.add_argument("--md-out", type=Path, default=None)
+    parser.add_argument("--operations-dir", type=Path)
+    parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--md-out", type=Path)
     args = parser.parse_args(argv)
     try:
-        evidence = Evidence.load(args.evidence_dir, args.operations_dir)
-        result = compute_scorecard(evidence)
+        result = compute_scorecard(Evidence.load(args.evidence_dir, args.operations_dir))
     except ScorecardInputError as error:
         print(json.dumps({"status": "error", "detail": str(error)}))
         return 1
     payload = json.dumps(result, indent=2, sort_keys=True)
     if args.json_out:
-        args.json_out.write_text(payload + "\n")
+        args.json_out.write_text(payload + "\n", encoding="utf-8")
     if args.md_out:
-        args.md_out.write_text(render_markdown(result))
+        args.md_out.write_text(render_markdown(result), encoding="utf-8")
     print(payload)
     return 2 if result["status"] == "failed" else 0
 
