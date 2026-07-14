@@ -118,7 +118,7 @@ Follow `docs/runbooks/REAL_BIDASK_COLLECTOR.md`. Installation is prohibited
 until the credential file exists with mode 0600 and the dry-run succeeds.
 
 The wrapper prevents restart loops for expected operator-action exits. It does
-not convert unexpected runtime or I/O failures to success.
+not convert source-unavailable, runtime or I/O failures to success.
 
 ## 7. Post-migration validation
 
@@ -145,21 +145,33 @@ Then confirm:
 ## 8. Daily evidence and the 30-day clock
 
 The 30-day clock does not start merely because the collector process is running.
-For each day, generate a prospective daily report with:
+After each trading day, provide independently generated same-day health/replay
+artifacts and run:
 
 ```bash
-python -m tools.data_platform_daily_report ...
+REPORT_DATE=2026-07-14
+python -m tools.data_platform_daily_report \
+  --collection-root "$HOME/srv/fx-codex/collect" \
+  --date "$REPORT_DATE" \
+  --primary-evidence "$HOME/srv/fx-codex/collect/evidence/primary_$REPORT_DATE.json" \
+  --secondary-evidence "$HOME/srv/fx-codex/collect/evidence/secondary_$REPORT_DATE.json" \
+  --replay-evidence "$HOME/srv/fx-codex/collect/evidence/replay_$REPORT_DATE.json" \
+  --output-dir "$HOME/srv/fx-codex/collect/operations"
 ```
 
-A qualifying day requires same-day evidence for:
+A qualifying day requires:
 
+- report generation inside the prospective window
 - verified immutable raw data
-- deterministic replay
+- deterministic replay evidence for the same date
 - zero critical incidents
-- live primary coverage for USDJPY, EURUSD and GBPUSD
-- independent secondary-source availability
+- same-day primary-health evidence
+- actual live OANDA coverage for USDJPY, EURUSD and GBPUSD
+- same-day independent secondary-source evidence
 
-The current historical evidence bundles do not count as prospective days.
+The scorecard rejects filename/date mismatch and counts only explicit unique
+`qualifying_day=true` reports whose underlying fields all pass. Current
+historical bundles do not count as prospective days.
 
 ## 9. Rollback
 
@@ -188,6 +200,7 @@ PR #41 establishes structure and fail-closed operation. It does not by itself
 prove alpha or production data maturity. Remaining evidence includes:
 
 - approved live non-demo primary collection
+- independently measured primary health
 - independent prospective secondary collection
 - same-day replay evidence
 - 30 qualifying trading days
