@@ -11,7 +11,8 @@ mutating method. ``tests/test_collect_no_order_path.py`` scans for violations.
 
 Credentials are read from environment variables and are REQUIRED — without
 them the collector fails closed (``CollectorConfigError``) instead of
-degrading to a mock. Values are never logged; ``repr`` masks the token.
+degrading to a mock. Values are never logged; ``repr`` masks both token and
+account id.
 
     FX_OANDA_API_TOKEN     personal access token (read-only scope suffices)
     FX_OANDA_ACCOUNT_ID    account id the pricing stream is scoped to
@@ -33,6 +34,7 @@ import os
 import random
 import socket
 import time
+from typing import Literal
 
 from data_platform.collect.contract import CollectedQuote
 from data_platform.collect.raw_first import IngestResult, QuoteLog, ingest_payload
@@ -53,6 +55,9 @@ _STREAM_HOSTS = {
 _READ_ONLY_PATH = "/v3/accounts/{account_id}/pricing/stream"
 HEARTBEAT_TIMEOUT_SECONDS = 15.0  # OANDA emits HEARTBEAT every ~5s
 
+CollectionMode = Literal["live_stream", "replay"]
+EndpointClass = Literal["streaming_pricing", "replay_fixture"]
+
 
 class CollectorConfigError(RuntimeError):
     """Missing/invalid configuration. Fail closed — never fall back to mocks."""
@@ -64,9 +69,9 @@ class OandaConfig:
     account_id: str
     environment: str
 
-    def __repr__(self) -> str:  # never leak the token via logs/repr
+    def __repr__(self) -> str:  # never leak credential values via logs/repr
         return (
-            f"OandaConfig(token='***masked***', account_id='{self.account_id}', "
+            "OandaConfig(token='***masked***', account_id='***masked***', "
             f"environment='{self.environment}')"
         )
 
@@ -115,13 +120,15 @@ def parse_price_line(
     connection_id: str,
     tradable_allowed: bool,
     received_at: datetime | None = None,
+    source_endpoint_class: EndpointClass = "streaming_pricing",
+    collection_mode: CollectionMode = "live_stream",
 ) -> list[CollectedQuote]:
-    """Parse ONE stream line. HEARTBEAT lines yield no quotes.
+    """Parse one OANDA stream line.
 
-    OANDA PRICE lines carry ``bids``/``asks`` ladders with ``liquidity`` —
-    we take the top of book and keep its liquidity as the size (documented
-    provider semantics, not a guess). ``tradeable`` comes from the provider
-    but is forced ``False`` while our connection state is not live.
+    HEARTBEAT lines yield no quotes. Provenance is explicit: direct parsing
+    defaults to the production endpoint for backwards compatibility, while
+    ``stream_quotes`` defaults to replay provenance unless the production
+    daemon opts into ``live_stream``.
     """
 
     received = received_at or datetime.now(UTC)
@@ -154,8 +161,8 @@ def parse_price_line(
             writer_id=_writer_id(),
             revision_id=None,
             raw_payload_sha256=raw_sha,
-            source_endpoint_class="streaming_pricing",
-            collection_mode="live_stream",
+            source_endpoint_class=source_endpoint_class,
+            collection_mode=collection_mode,
         )
     ]
 
@@ -163,13 +170,11 @@ def parse_price_line(
 Transport = Callable[[str, str], Iterator[bytes]]
 Clock = Callable[[], datetime]
 StopPredicate = Callable[[], bool]
-"""(url, token) -> iterator of raw stream lines. Injectable for replay tests.
+"""(url, token) -> iterator of raw stream lines.
 
-The production transport lives in :func:`requests_transport`; tests inject
-fakes that yield fixture lines or raise to simulate failures. Quotes produced
-through a fake transport are ``collection_mode='live_stream'`` ONLY when the
-transport is the production one — replayed fixtures must be re-tagged by the
-caller and are never counted as real connection evidence.
+The production transport lives in :func:`requests_transport`. Test and replay
+transports are marked ``replay`` by default by :func:`stream_quotes`; only the
+production daemon explicitly opts into live provenance.
 """
 
 
@@ -179,16 +184,16 @@ def requests_transport(url: str, token: str) -> Iterator[bytes]:  # pragma: no c
     import requests
 
     try:
-        response = requests.get(
+        with requests.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
             stream=True,
             timeout=(10, HEARTBEAT_TIMEOUT_SECONDS),
-        )
-        if response.status_code in (401, 403):
-            raise TokenExpiredError(f"authorization rejected (HTTP {response.status_code})")
-        response.raise_for_status()
-        yield from response.iter_lines()
+        ) as response:
+            if response.status_code in (401, 403):
+                raise TokenExpiredError(f"authorization rejected (HTTP {response.status_code})")
+            response.raise_for_status()
+            yield from response.iter_lines()
     except TokenExpiredError:
         raise
     except requests.exceptions.RequestException as error:
@@ -210,15 +215,16 @@ def stream_quotes(
     clock: Clock | None = None,
     should_stop: StopPredicate | None = None,
     max_messages: int | None = None,
+    source_endpoint_class: EndpointClass = "replay_fixture",
+    collection_mode: CollectionMode = "replay",
 ) -> tuple[ConnectionState, list[IngestResult]]:
     """Run the stream through raw-first ingest with reconnect semantics.
 
-    Returns the final connection state (gaps, reconnect count, stop reason)
-    and the per-payload ingest results. Token expiry stops the collector
-    (fail-closed); transient transport errors reconnect with real
-    backoff+jitter up to ``max_reconnects``. Heartbeat expiry opens an explicit
-    gap before any late quote can be treated as tradable. ``should_stop`` is
-    polled at connection and message boundaries for graceful daemon shutdown.
+    ``max_reconnects`` limits consecutive failed connections, not the lifetime
+    number of recoverable network events. A valid provider message resets the
+    consecutive-failure budget while ``ConnectionState.reconnect_count`` keeps
+    the lifetime audit count. Token expiry stops fail-closed. Heartbeat expiry
+    opens an explicit gap before a late quote can be tradable.
     """
 
     conn = state or ConnectionState(heartbeat_timeout_seconds=HEARTBEAT_TIMEOUT_SECONDS)
@@ -229,13 +235,14 @@ def stream_quotes(
     stop_requested = should_stop or (lambda: False)
     results: list[IngestResult] = []
     url = config.stream_url(instruments)
-    attempt = 0
+    consecutive_failures = 0
     messages_seen = 0
     while conn.stopped_reason is None:
         if stop_requested():
             conn.stop("stop_requested")
             break
         connection_id = conn.mark_connected(now_fn())
+        received_healthy_message = False
         try:
             for line in transport(url, config.token):
                 if stop_requested():
@@ -247,6 +254,9 @@ def stream_quotes(
                 alive = conn.check_alive(now)
                 if alive:
                     conn.heartbeat(now)
+                    if not received_healthy_message:
+                        consecutive_failures = 0
+                        received_healthy_message = True
                 messages_seen += 1
 
                 def _parser(raw: bytes, _cid: str = connection_id) -> list[CollectedQuote]:
@@ -255,9 +265,14 @@ def stream_quotes(
                         environment=config.environment,
                         connection_id=_cid,
                         tradable_allowed=alive and conn.tradable,
+                        received_at=now,
+                        source_endpoint_class=source_endpoint_class,
+                        collection_mode=collection_mode,
                     )
 
-                results.append(ingest_payload(line, parser=_parser, store=store, log=log))
+                results.append(
+                    ingest_payload(line, parser=_parser, store=store, log=log, now=lambda: now)
+                )
                 if not alive:
                     break
                 if max_messages is not None and messages_seen >= max_messages:
@@ -280,9 +295,9 @@ def stream_quotes(
         if stop_requested():
             conn.stop("stop_requested")
             break
-        if attempt >= max_reconnects:
+        if consecutive_failures >= max_reconnects:
             conn.stop("max_reconnects_exhausted")
             break
-        wait(policy.delay(attempt, randomness))
-        attempt += 1
+        wait(policy.delay(consecutive_failures, randomness))
+        consecutive_failures += 1
     return conn, results
