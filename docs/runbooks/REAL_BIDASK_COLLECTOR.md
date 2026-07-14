@@ -1,83 +1,199 @@
-# Runbook: read-only bid/ask collector（Primary/Secondary・macro PIT）
+# Runbook: read-only bid/ask collector
 
-**対象:** `data_platform/collect/` の運用。市場データの**read-only収集専用** — 発注経路とはプロセス・設定・認証情報を完全分離（`tests/test_collect_no_order_path.py` が担保）。
-**Mac mini への適用は人間の明示承認後のみ**（本runbookは手順書であり実行承認ではない）。
+## 1. Scope and current status
 
-## 1. ソース構成
+This runbook covers only `data_platform/collect/` and the read-only OANDA
+pricing stream. It does not authorize broker orders or account mutation.
 
-| 役割 | provider | 認証 | 状態 |
-|---|---|---|---|
-| Primary(live) | OANDA v3 pricing stream | `FX_OANDA_API_TOKEN` / `FX_OANDA_ACCOUNT_ID` / `FX_OANDA_ENV` | **実装済・未接続**（credentials未保有。無しでは fail-closed EX_CONFIG=78） |
-| 実bid/ask(historical) | Dukascopy datafeed (.bi5) | 不要 | **実証済**（52,732 quote / 3pair、503リトライ実装） |
-| Secondary照合 | HistData 1h bars | 不要 | 実証済（bar-mid照合） |
-| macro PIT | ALFRED alfredgraph.csv | 不要 | **実証済**（vintage刻印列を必須化。素のfredgraph.csvはvintage無視のため使用禁止） |
+Current state on `integration/research-v3`:
 
-practice/demo は接続技術の実証にのみ使い、本番実証に数えない（scorecard cap 90）。
+- OANDA pricing adapter: implemented, credentials not committed
+- Dukascopy historical bid/ask evidence: available
+- independent historical comparison: available
+- prospective secondary live source: not yet connected
+- prospective daily-report generator: implemented fail-closed
+- Mac mini installation: not yet performed
+- 30 qualifying trading days: 0 until prospective operation starts
 
-## 2. credentials（値を聞かない・書かない・ログしない）
+Practice/demo data may validate connectivity but does not count as production
+market-data evidence.
+
+## 2. Credential file
+
+Create the file outside the repository:
 
 ```bash
 mkdir -p ~/.config/fx-codex
 cat > ~/.config/fx-codex/collector.env <<'EOF'
-FX_OANDA_API_TOKEN=<ここに読み取り専用トークン>
-FX_OANDA_ACCOUNT_ID=<アカウントID>
-FX_OANDA_ENV=live        # または practice（本番実証には数えない）
+FX_OANDA_API_TOKEN=<read-only token>
+FX_OANDA_ACCOUNT_ID=<account id>
+FX_OANDA_ENV=practice
 EOF
 chmod 600 ~/.config/fx-codex/collector.env
 ```
-- `.env` は **絶対にcommitしない**（`test_env_files_are_not_tracked` が監視）
-- plistに秘密情報は入らない。token は repr/ログで `***masked***`
-- token失効時: collector は EX_NOPERM=77 で停止（KeepAlive は再起動しない設定）→ 人間がtokenを更新して `install` し直す
 
-## 3. launchd 運用（Mac mini、承認後）
+Only the three `FX_OANDA_*` keys are accepted. The daemon parses the file as
+data; it does not source or evaluate it as shell code. Token and account values
+are masked in dry-run output and must never be committed.
+
+Use `FX_OANDA_ENV=live` only when the account and token are explicitly approved
+for prospective non-demo data collection. Read-only pricing access does not
+permit trading.
+
+## 3. Pre-install validation
 
 ```bash
-scripts/quote_collector_launchd.sh dry-run    # plist lint + 設定検証（変更なし）
-scripts/quote_collector_launchd.sh install    # 常駐化（collector.env 600 必須、無ければ拒否）
-scripts/quote_collector_launchd.sh status     # launchctl状態 + last_run.json
-scripts/quote_collector_launchd.sh uninstall  # 停止+plist撤去（raw/logは保持）
-scripts/quote_collector_launchd.sh rollback   # uninstallと同義
+cd ~/srv/fx-codex
+scripts/quote_collector_launchd.sh dry-run
 ```
-- single-writer: daemon が `ExclusiveLock`（flock）を取得。二重起動は EX_TEMPFAIL=75 で即退出
-- graceful shutdown: SIGTERM/SIGINT 捕捉、`state/last_run.json` に接続状態・gap・reconnect回数を保存
-- 再起動復旧: QuoteLog は既存JSONLから重複watermarkを再構築（テスト済）
 
-## 4. データ経路（raw-first、順序固定）
+The command must fail when:
 
+- the credential file is absent
+- its mode is not `0600`
+- a required key is missing
+- an unknown or duplicate key exists
+- the plist is malformed
+- the Python collector configuration is invalid
+
+A successful dry-run prints the rendered plist and a validation result without
+printing credential values.
+
+## 4. launchd lifecycle
+
+```bash
+scripts/quote_collector_launchd.sh install
+scripts/quote_collector_launchd.sh status
+scripts/quote_collector_launchd.sh uninstall
 ```
-provider raw bytes → ImmutableRawStore(content-addressed) → hash再検証
-  → schema validation → CollectedQuote正規化 → 品質判定(dup/ooo/stale)
-  → quotes.jsonl(append-only+fsync) / quarantine.jsonl
+
+The plist launches `/bin/sh scripts/run_quote_collector.sh --launchd ...`.
+The wrapper loads the mode-600 credential file through the daemon's narrow
+`--env-file` parser.
+
+Expected operator-action exits are translated to wrapper exit 0 so launchd does
+not loop:
+
+| Daemon code | Meaning | launchd behavior |
+|---:|---|---|
+| 75 | duplicate writer rejected | stop; inspect active writer |
+| 77 | token rejected/expired | stop; replace credentials |
+| 78 | invalid/missing configuration | stop; repair configuration |
+
+Unexpected I/O/runtime failures remain nonzero and are eligible for launchd
+restart after `ThrottleInterval`.
+
+## 5. Raw-first data path
+
+```text
+provider bytes
+  -> immutable content-addressed raw store
+  -> read-back SHA-256 verification
+  -> schema validation
+  -> normalized quote
+  -> quality classification
+  -> append-only accepted/quarantine JSONL
 ```
-- 不正データは**修復せず検疫**: bid≥ask・NaN・naive/未来時刻は契約拒否、stale は検疫、欠損フィールドは `provider_does_not_supply_*` フラグ（0埋め禁止）
-- 接続断は gap として明示記録。**前値穴埋め禁止**
 
-## 5. 日次運用（30取引日カウントの前提）
+The collector never forward-fills, averages conflicting providers, converts
+missing values to zero, or marks injected/replay transport as live. Only the
+production daemon explicitly assigns `collection_mode=live_stream`.
 
-カウント開始条件（全て満たした日から）: collector/schema/SLO version固定・Primary+Secondary稼働・raw hash検証成功・daily report生成・critical incident 0。過去データで水増ししない。
+Accepted-log bootstrap streams JSONL line-by-line. A malformed accepted row
+stops startup because silently skipping it could invalidate duplicate and
+ordering detection.
 
-daily report（`daily_report_YYYY-MM-DD.json`）: uptime/availability/quote count(pair別)/freshness p50-p99/missing・duplicate・out-of-order率/reconnect回数/最長outage/divergence分布/quarantine数/raw hash/replay hash/disk・clock skew/incidents/MTTR/scorecard/commit・config・lock hash。
+## 6. Runtime state and incidents
 
-SLO は [config/data_platform_slo_v1.json](../../config/data_platform_slo_v1.json)（変更はversion up+理由記録、過去スコアは書き換えない）。
+Terminal state:
 
-## 6. 監視・アラート
+```text
+~/srv/fx-codex/collect/state/last_run.json
+```
 
-- 鮮度: 既存 `tools/data_freshness_monitor.py` 系のDiscord通知に統合（重複抑制）
-- quarantine急増・divergence breach・token失効・lock競合・disk逼迫を通知対象へ
-- divergence breach 時は**平均化せず** degraded/quarantined へ落とし、下流研究から除外
+Incidents:
 
-## 7. 障害対応早見表
+```text
+~/srv/fx-codex/collect/state/incidents/*.json
+```
 
-| 事象 | collector挙動 | 対応 |
-|---|---|---|
-| ネットワーク断 | backoff+jitter再接続、gap記録、tradable=false | 放置可（gap は証跡） |
-| token失効 | **停止**(77)、再起動しない | token更新→install |
-| 二重起動 | 後発が75で退出 | 先発を確認 |
-| disk full | raw書込失敗→ingest中断（データ受理なし） | 容量確保→再起動（重複は自動検疫） |
-| raw改竄 | store.get がhash不一致で例外 | 調査。scorecard は fatal=0点 |
-| provider片系停止 | divergence=unavailable | 復旧待ち。研究入力から除外 |
+Recorded terminal categories include:
 
-## 8. 再取得・再現
+- duplicate writer rejection
+- authorization failure
+- I/O failure
+- unexpected runtime failure
+- graceful stop
 
-- Dukascopy: pair×hour単位で公開再取得可（`reproduce.sh`）
-- deterministic replay: raw blob→re-parse→data-hash一致（本セッションで実データ52,732行一致を実証、独立worktreeでも一致）
+State files use temp-write, file fsync, atomic replace, and directory fsync.
+Incident/state persistence may itself fail during disk exhaustion; launchd
+stderr remains the fallback evidence in that case.
+
+## 7. Reconnect semantics
+
+`max_reconnects` limits consecutive failed connections. A valid PRICE or
+HEARTBEAT message resets the consecutive-failure budget. The lifetime
+`reconnect_count` remains cumulative for audit reporting.
+
+Each disconnect opens an explicit gap. Heartbeat timeout marks the connection
+non-tradable before a late quote is processed. Token rejection never retries.
+
+## 8. Prospective daily report
+
+Generate a report after the trading day closes:
+
+```bash
+python -m tools.data_platform_daily_report \
+  --collection-root "$HOME/srv/fx-codex/collect" \
+  --date 2026-07-14 \
+  --secondary-evidence /path/to/secondary_health_2026-07-14.json \
+  --replay-evidence /path/to/replay_health_2026-07-14.json \
+  --output-dir "$HOME/srv/fx-codex/collect/operations"
+```
+
+The supporting files must be same-day JSON objects:
+
+```json
+{"report_date": "2026-07-14", "secondary_up": true}
+```
+
+```json
+{"report_date": "2026-07-14", "replay_ok": true}
+```
+
+The generator computes primary live-pair coverage, quote counts, freshness,
+quarantine flags, immutable raw verification, critical incidents and disk
+headroom. Missing secondary/replay evidence produces a report with
+`qualifying_day=false`; it is never inferred or backfilled.
+
+Exit codes:
+
+- `0`: qualifying report written
+- `2`: non-qualifying report written
+- `1`: malformed input; no valid report
+
+The scorecard counts a day only when all five fields pass:
+
+```text
+raw_hash_verified
+replay_ok
+critical_incidents == 0
+primary_up
+secondary_up
+```
+
+Historical bundles cannot be renamed or copied into the prospective operations
+directory to manufacture qualifying days.
+
+## 9. Known remaining operational blockers
+
+Before the 30-day clock can legitimately start:
+
+1. connect an approved live non-demo OANDA read-only stream
+2. connect an independent prospective secondary source
+3. generate same-day replay evidence
+4. schedule the daily-report command under a reviewed single-writer service
+5. connect alerting for token failure, incidents, stale data and non-qualifying days
+6. confirm clock synchronization and backup/retention on the Mac mini
+
+Until these are complete, the data-platform score remains evidence-capped.
