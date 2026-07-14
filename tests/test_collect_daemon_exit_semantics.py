@@ -17,7 +17,7 @@ def test_exhausted_reconnect_budget_is_transient_failure(
     monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
     monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
     monkeypatch.setenv("FX_OANDA_ENV", "practice")
-    state = ConnectionState()
+    state = ConnectionState(heartbeat_timeout_seconds=15.0)
     state.stop("max_reconnects_exhausted")
     monkeypatch.setattr(
         "tools.fx_quote_collector.stream_quotes",
