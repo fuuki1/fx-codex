@@ -1,0 +1,158 @@
+name: trader
+
+# 共通設定（YAML アンカー）。全 app サービスで使い回す。
+x-app: &app
+  build:
+    context: .
+    dockerfile: app/Dockerfile
+  image: trader-app:latest
+  restart: always
+  env_file: .env
+  init: true                 # PID1 を tini に。SIGTERM が python に届きグレースフル停止できる
+  stop_grace_period: 30s
+  logging:                   # ログローテーション（ディスク溢れ防止）
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD}
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT}
+      TIME_ZONE: ${TIME_ZONE}
+    ports:
+      - "127.0.0.1:4001:4001"
+      - "127.0.0.1:4002:4002"
+      - "127.0.0.1:5900:5900"
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: 512m
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 1g
+
+  webhook:
+    <<: *app
+    command: ["uvicorn", "webhook:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    mem_limit: 512m
+    depends_on:
+      redis: {condition: service_healthy}
+      timescaledb: {condition: service_healthy}
+
+  strategy:
+    <<: *app
+    command: ["python", "strategy.py"]
+    healthcheck:
+      test: ["CMD", "python", "healthz.py", "strategy", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    mem_limit: 512m
+    depends_on:
+      redis: {condition: service_healthy}
+      ib-gateway: {condition: service_started}
+
+  risk:
+    <<: *app
+    command: ["python", "risk.py"]
+    healthcheck:
+      test: ["CMD", "python", "healthz.py", "risk", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    mem_limit: 512m
+    depends_on:
+      redis: {condition: service_healthy}
+      timescaledb: {condition: service_healthy}
+
+  executor:
+    <<: *app
+    command: ["python", "executor.py"]
+    healthcheck:
+      test: ["CMD", "python", "healthz.py", "executor", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 40s
+    mem_limit: 512m
+    depends_on:
+      redis: {condition: service_healthy}
+      timescaledb: {condition: service_healthy}
+      ib-gateway: {condition: service_started}
+
+  monitor:
+    <<: *app
+    command: ["python", "monitor.py"]
+    healthcheck:
+      test: ["CMD", "python", "healthz.py", "monitor", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    mem_limit: 256m
+    depends_on:
+      redis: {condition: service_healthy}
+      timescaledb: {condition: service_healthy}
+      webhook: {condition: service_started}
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: always
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command: ["http", "webhook:8000", "--url=${NGROK_DOMAIN}", "--pooling-enabled", "--log=stdout"]
+    depends_on:
+      webhook: {condition: service_started}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  redis-data:
+  db-data:

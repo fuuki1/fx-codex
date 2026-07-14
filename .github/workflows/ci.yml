@@ -49,3 +49,42 @@ jobs:
           tests/test_lockbox.py
           tests/test_trial_ledger.py
           tests/test_experiment_pipeline.py
+
+  # trader/（発注スタック）は廃止判断を別PRで行うまで保全する。独自ツールチェーンで
+  # 検証する（pyproject の trader 除外設定が参照する trader ジョブ = 以下）。
+  # 保全のみであり、自動売買の有効化・Mac mini 配備は行わない。
+  trader-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: trader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: trader/requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          # 品質ゲートの再現性のため mypy を固定（flat 側 CI と同版）
+          pip install mypy==2.1.0
+      - name: Lint (ruff)
+        run: ruff check app tests fx-codex/fx_backtester fx-codex/tests
+      - name: Types (mypy) — 稼働スタック app/ を型ゲート
+        run: mypy app
+      - name: Unit tests (pytest)
+        run: pytest
+      - name: Validate docker-compose
+        run: |
+          cp .env.example .env
+          docker compose config >/dev/null
+          echo "compose config OK"
+
+  trader-build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app image
+        run: docker build -f trader/app/Dockerfile -t trader-app:ci trader
