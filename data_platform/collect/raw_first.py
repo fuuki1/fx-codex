@@ -33,14 +33,11 @@ from data_platform.raw.immutable_store import ImmutableRawStore
 FLAG_DUPLICATE = "duplicate_quote"
 FLAG_OUT_OF_ORDER = "out_of_order_quote"
 FLAG_STALE = "stale_quote"
-
-# A quote whose event time lags its receive time beyond this is stale: it is
-# recorded (raw is sacred) but must never be treated as tradable/usable.
 DEFAULT_STALE_AFTER_SECONDS = 30.0
 
 
 class RawFirstError(RuntimeError):
-    """Raised when the raw store itself cannot honour the raw-first order."""
+    """Raised when the raw store or append-only log invariants cannot be honoured."""
 
 
 @dataclass
@@ -85,8 +82,12 @@ def _append_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
 
 
 class QuoteLog:
-    """Append-only JSONL logs (accepted + quarantine) with duplicate and
-    ordering detection scoped per (provider, instrument)."""
+    """Append-only quote logs with duplicate and ordering detection.
+
+    Bootstrap streams the file line-by-line so memory use remains bounded. A
+    malformed accepted-log row is a fail-closed integrity error; silently
+    skipping it could allow a duplicate or out-of-order quote to be reaccepted.
+    """
 
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory)
@@ -99,17 +100,33 @@ class QuoteLog:
     def _bootstrap(self) -> None:
         if not self.accepted_path.is_file():
             return
-        for line in self.accepted_path.read_text().splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            self._seen.add(self._identity_from_dict(row))
-            key = (str(row["provider"]), str(row["instrument"]))
-            event = row.get("provider_event_time") or row.get("received_at")
-            stamp = datetime.fromisoformat(str(event))
-            previous = self._last_event.get(key)
-            if previous is None or stamp > previous:
-                self._last_event[key] = stamp
+        with self.accepted_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise RawFirstError(
+                        f"accepted quote log is malformed at line {line_number}: {error.msg}"
+                    ) from error
+                if not isinstance(row, dict):
+                    raise RawFirstError(
+                        f"accepted quote log row {line_number} must be a JSON object"
+                    )
+                try:
+                    identity = self._identity_from_dict(row)
+                    key = (str(row["provider"]), str(row["instrument"]))
+                    event = row.get("provider_event_time") or row.get("received_at")
+                    stamp = datetime.fromisoformat(str(event))
+                except (KeyError, TypeError, ValueError) as error:
+                    raise RawFirstError(
+                        f"accepted quote log row {line_number} violates the quote schema"
+                    ) from error
+                self._seen.add(identity)
+                previous = self._last_event.get(key)
+                if previous is None or stamp > previous:
+                    self._last_event[key] = stamp
 
     @staticmethod
     def _identity_from_dict(row: dict[str, Any]) -> tuple[str, str, str, int | None]:
@@ -126,8 +143,6 @@ class QuoteLog:
         return (quote.provider, quote.instrument, stamp.isoformat(), quote.sequence_id)
 
     def classify(self, quote: CollectedQuote) -> CollectedQuote:
-        """Assign duplicate / out-of-order flags. Never drops silently."""
-
         identity = self._identity(quote)
         if identity in self._seen:
             return quote.with_quality(QualityState.QUARANTINED, FLAG_DUPLICATE)
@@ -167,18 +182,13 @@ def ingest_payload(
     stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
     now: Callable[[], datetime] | None = None,
 ) -> IngestResult:
-    """Run one payload through the mandatory raw-first order."""
-
     clock = now or (lambda: datetime.now(UTC))
-    # 1) raw bytes into the immutable store BEFORE any interpretation
     ref = store.put(raw_payload)
-    # 2) hash verification: re-read the stored bytes and re-hash them
     stored = store.get(ref.sha256)
     observed = hashlib.sha256(stored).hexdigest()
     if observed != ref.sha256:
         raise RawFirstError(f"raw hash verification failed: {observed} != {ref.sha256}")
     result = IngestResult(raw_sha256=ref.sha256)
-    # 3) schema validation / parsing
     try:
         quotes = parser(raw_payload)
     except (QuoteContractError, ValueError, KeyError, TypeError) as error:
@@ -191,14 +201,15 @@ def ingest_payload(
         log.quarantine(record)
         result.quarantined.append(record)
         return result
-    # 4-6) normalize -> quality -> append
     for quote in quotes:
         if quote.raw_payload_sha256 != ref.sha256:
             record = QuarantineRecord(
                 raw_sha256=ref.sha256,
                 reason="raw_hash_mismatch",
-                detail=f"quote cites {quote.raw_payload_sha256[:12]}… but payload is "
-                f"{ref.sha256[:12]}…",
+                detail=(
+                    f"quote cites {quote.raw_payload_sha256[:12]}… but payload is "
+                    f"{ref.sha256[:12]}…"
+                ),
                 occurred_at=clock(),
             )
             log.quarantine(record)
