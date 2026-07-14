@@ -1,0 +1,34 @@
+........................................................................ [  8%]
+..................................F..................................... [ 17%]
+........................................................................ [ 25%]
+........................................................................ [ 34%]
+.................F...................................................... [ 43%]
+........................................................................ [ 51%]
+........................................................................ [ 60%]
+........................................................................ [ 69%]
+.....................ssssssssss......................................... [ 77%]
+........................................................................ [ 86%]
+........................................................................ [ 95%]
+........................................                                 [100%]
+=================================== FAILURES ===================================
+_____________ test_exhausted_reconnect_budget_is_transient_failure _____________
+tests/test_collect_daemon_exit_semantics.py:20: in test_exhausted_reconnect_budget_is_transient_failure
+    state = ConnectionState()
+            ^^^^^^^^^^^^^^^^^
+E   TypeError: ConnectionState.__init__() missing 1 required positional argument: 'heartbeat_timeout_seconds'
+_________ test_only_explicit_qualifying_days_receive_operation_points __________
+tests/test_data_platform_scorecard_operations_hardening.py:54: in test_only_explicit_qualifying_days_receive_operation_points
+    assert operation["points"] == pytest.approx(20 * 5 / 30)
+E   assert 3.33 == 3.3333333333333335 ± 3.3e-06
+E     
+E     comparison failed
+E     Obtained: 3.33
+E     Expected: 3.3333333333333335 ± 3.3e-06
+=========================== short test summary info ============================
+FAILED tests/test_collect_daemon_exit_semantics.py::test_exhausted_reconnect_budget_is_transient_failure - TypeError: ConnectionState.__init__() missing 1 required positional argument: 'heartbeat_timeout_seconds'
+FAILED tests/test_data_platform_scorecard_operations_hardening.py::test_only_explicit_qualifying_days_receive_operation_points - assert 3.33 == 3.3333333333333335 ± 3.3e-06
+  
+  comparison failed
+  Obtained: 3.33
+  Expected: 3.3333333333333335 ± 3.3e-06
+2 failed, 820 passed, 10 skipped in 82.93s (0:01:22)
