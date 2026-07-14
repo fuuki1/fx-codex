@@ -211,7 +211,6 @@ def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
         for source in bidask
         if source.get("collection_mode") == "live_stream" and source not in live
     ]
-    historical = [source for source in bidask if source.get("collection_mode") == "historical_download"]
     total_quotes = sum(int(source.get("quote_count", 0)) for source in bidask)
     pairs = {str(pair) for source in bidask for pair in source.get("instruments", [])}
 
@@ -435,7 +434,11 @@ def _score_operations(ev: Evidence, sb: ScoreBuilder) -> None:
 
 def _score_reproducibility(ev: Evidence, sb: ScoreBuilder) -> None:
     section = "reproducibility_audit"
-    if ev.replay is not None and ev.replay.get("status") == "match" and ev.replay.get("real_data") is True:
+    if (
+        ev.replay is not None
+        and ev.replay.get("status") == "match"
+        and ev.replay.get("real_data") is True
+    ):
         sb.award(
             section,
             5,
@@ -581,9 +584,7 @@ def render_markdown(result: dict[str, Any]) -> str:
         )
     if result["fatal_reasons"]:
         lines.extend(["", "## FATAL", ""])
-        lines.extend(
-            f"- {item['reason']} ({item['evidence']})" for item in result["fatal_reasons"]
-        )
+        lines.extend(f"- {item['reason']} ({item['evidence']})" for item in result["fatal_reasons"])
     if result["unmet_conditions"]:
         lines.extend(["", "## Unmet conditions", ""])
         lines.extend(f"- {item}" for item in result["unmet_conditions"])

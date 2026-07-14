@@ -30,9 +30,7 @@ def test_exhausted_reconnect_budget_is_transient_failure(
     terminal = json.loads((tmp_path / "state" / "last_run.json").read_text())
     assert terminal["status"] == "source_unavailable"
     assert terminal["exit_code"] == EX_UNAVAILABLE
-    incidents = list(
-        (tmp_path / "state" / "incidents").glob("collector_source_unavailable_*.json")
-    )
+    incidents = list((tmp_path / "state" / "incidents").glob("collector_source_unavailable_*.json"))
     assert len(incidents) == 1
     incident = json.loads(incidents[0].read_text())
     assert incident["severity"] == "critical"
