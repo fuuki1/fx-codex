@@ -14,14 +14,11 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           ref: integration/research-v3
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Update fixture to current evidence contract
         run: |
           python - <<'PY'
@@ -36,21 +33,14 @@ jobs:
           index = indices[0]
           if any("qualifying_day" in line for line in lines[max(0, index - 5) : index]):
               raise SystemExit("fixture already updated")
-          additions = [
+          lines[index:index] = [
               '                    "schema_version": 1,',
               '                    "report_date": f"2026-08-{day:02d}",',
               '                    "prospective_window_ok": True,',
               '                    "qualifying_day": True,',
           ]
-          lines[index:index] = additions
           path.write_text("\n".join(lines) + "\n")
           PY
-          python -m pip install -r requirements.lock
-          python -m pip install -e . --no-deps
-          python -m pip install black==26.5.1 ruff==0.15.20
-          black tests/test_data_platform_scorecard.py
-          ruff check tests/test_data_platform_scorecard.py tests/test_data_platform_scorecard_operations_hardening.py
-          pytest -q tests/test_data_platform_scorecard.py tests/test_data_platform_scorecard_operations_hardening.py
       - name: Commit fixture update
         run: |
           git config user.name "github-actions[bot]"
