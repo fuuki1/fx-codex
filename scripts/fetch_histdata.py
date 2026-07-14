@@ -90,13 +90,21 @@ def zip_to_frame(zip_bytes: bytes) -> pd.DataFrame:
 
 
 def resample(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """Resample to ``rule`` with OHLC aggregation; drop market-closed empty bins."""
+    """Resample to ``rule`` with OHLC aggregation; drop market-closed empty bins.
+
+    HistData M1 rows are stamped with the bar OPEN time, so aggregated bars
+    must keep ``label="left", closed="left"``: the 10:00 hourly bar covers
+    [10:00, 11:00) and is labelled 10:00. The original v1 exports used
+    ``label="right"`` which shifted every label +1h — measured against
+    Dukascopy/FXCM UTC hours (p50 mid diff 6.5 pips at lag 0 vs 1-2 pips at
+    -1h, uniform across months) and fixed in v2.
+    """
 
     if rule.lower() in {"m1", "1min", "1m", "none"}:
         out = frame.copy()
     else:
         out = (
-            frame.resample(rule, label="right", closed="right")
+            frame.resample(rule, label="left", closed="left")
             .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
             .dropna(subset=["open", "high", "low", "close"])
         )
@@ -117,6 +125,52 @@ def to_pipeline_csv(frame: pd.DataFrame, path: str) -> int:
     return len(out)
 
 
+def write_metadata(
+    path: str,
+    *,
+    pair: str,
+    year: int,
+    rule: str,
+    rows: int,
+    zip_sha256: str,
+) -> str:
+    """Write the sidecar declaring what the CSV prices MEAN. v2 provenance.
+
+    HistData ASCII quotes are BID prices (per the provider's FAQ) with no ask
+    and no real volume — the basis is declared here instead of being silently
+    assumed downstream. ``label_convention`` documents the v2 fix: bar labels
+    are the bar OPEN time in UTC (v1 files were labelled +1h, see
+    INC-20260714-M1 in reports/evidence/data-platform-maximization-20260714/).
+    """
+
+    import hashlib as _hashlib
+    import json as _json
+
+    meta_path = f"{path}.meta.json"
+    payload = {
+        "schema": "histdata_pipeline_csv_meta_v2",
+        "pair": pair.upper(),
+        "year": year,
+        "resample_rule": rule,
+        "rows": rows,
+        "price_basis": "bid",
+        "ask_available": False,
+        "volume_available": False,
+        "timezone_provenance": "provider US/Eastern (DST-aware, verified against "
+        "Dukascopy UTC hours), converted to UTC",
+        "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a "
+        "label='right' resample bug)",
+        "source": "histdata.com free ASCII M1",
+        "source_zip_sha256": zip_sha256,
+        "csv_sha256": _hashlib.sha256(open(path, "rb").read()).hexdigest(),
+        "research_only": True,
+        "promotion_admissible": False,
+    }
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        handle.write(_json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return meta_path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pair", required=True, help="e.g. USDJPY, EURUSD, GBPUSD")
@@ -125,13 +179,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resample", default="1h", help="pandas offset (e.g. 1h, 4h, 1d, M1)")
     args = parser.parse_args(argv)
 
+    import hashlib
+
     zip_bytes = download_zip(args.pair, args.year)
     frame = resample(zip_to_frame(zip_bytes), args.resample)
     rows = to_pipeline_csv(frame, args.out)
+    meta_path = write_metadata(
+        args.out,
+        pair=args.pair,
+        year=args.year,
+        rule=args.resample,
+        rows=rows,
+        zip_sha256=hashlib.sha256(zip_bytes).hexdigest(),
+    )
     lo, hi = frame["close"].min(), frame["close"].max()
     print(
-        f"{args.pair} {args.year}: {rows} {args.resample} bars -> {args.out} "
-        f"(close {lo:.3f}..{hi:.3f}). CLOSE-ONLY, research-only, not promotion-admissible."
+        f"{args.pair} {args.year}: {rows} {args.resample} bars -> {args.out} (+{meta_path}) "
+        f"(close {lo:.3f}..{hi:.3f}). BID-basis CLOSE-ONLY, research-only, "
+        "not promotion-admissible."
     )
     return 0
 

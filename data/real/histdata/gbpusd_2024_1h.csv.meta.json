@@ -1,0 +1,17 @@
+{
+  "ask_available": false,
+  "csv_sha256": "28c112c0d3662efcaef38d102d13b2a47dfede8170fc6661b7d7792f3c9ed3ba",
+  "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a label='right' resample bug)",
+  "pair": "GBPUSD",
+  "price_basis": "bid",
+  "promotion_admissible": false,
+  "resample_rule": "1h",
+  "research_only": true,
+  "rows": 6243,
+  "schema": "histdata_pipeline_csv_meta_v2",
+  "source": "histdata.com free ASCII M1",
+  "source_zip_sha256": "030b05b4c670c7e152bf4aa4112488c96695d2dcc2b31ca13a3b4834b8431077",
+  "timezone_provenance": "provider US/Eastern (DST-aware, verified against Dukascopy UTC hours), converted to UTC",
+  "volume_available": false,
+  "year": 2024
+}

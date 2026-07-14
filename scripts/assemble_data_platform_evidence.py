@@ -161,21 +161,27 @@ def build_divergence(datasets_root: Path, mirror_root: Path) -> dict[str, Any]:
             closes,
             secondary_provider="histdata",
             pip_size=pip,
-            close_basis_note="HistData M1-derived 1h closes AS COMMITTED (bid basis)",
+            close_basis_note="HistData 1h closes as committed (bid basis; v2 labels = bar "
+            "OPEN time UTC, see data/real/histdata/README.md)",
         )
         as_committed["window"] = "2024 full year, labels as committed"
-        shifted = {stamp - timedelta(hours=1): value for stamp, value in closes.items()}
-        corrected = compare_bars_to_close_series(
-            duk_hist,
-            shifted,
-            secondary_provider="histdata",
-            pip_size=pip,
-            close_basis_note="same closes with labels shifted -1h (root-cause verification)",
-        )
-        corrected["window"] = "2024 full year, labels corrected by -1h"
-        comparisons.extend([as_committed, corrected])
+        comparisons.append(as_committed)
         if as_committed["divergence_state"] == "quarantined":
+            # a quarantined close-only comparison historically meant a label
+            # shift (v1 files, INC-20260714-M1) — run the -1h root-cause check
+            # so the report explains the breach instead of just flagging it.
             breach_exercised = True
+            shifted = {stamp - timedelta(hours=1): value for stamp, value in closes.items()}
+            root_cause = compare_bars_to_close_series(
+                duk_hist,
+                shifted,
+                secondary_provider="histdata",
+                pip_size=pip,
+                close_basis_note="same closes with labels shifted -1h (root-cause check for "
+                "a v1-style +1h label shift)",
+            )
+            root_cause["window"] = "2024 full year, labels shifted -1h (root cause)"
+            comparisons.append(root_cause)
 
     return {
         "providers": ["dukascopy", "fxcm", "histdata"],

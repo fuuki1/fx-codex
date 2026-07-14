@@ -1,0 +1,17 @@
+{
+  "ask_available": false,
+  "csv_sha256": "d5c3b438b20976f7775219956e8bf8489c2ca0c9908366e165b160199544b091",
+  "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a label='right' resample bug)",
+  "pair": "EURUSD",
+  "price_basis": "bid",
+  "promotion_admissible": false,
+  "resample_rule": "1h",
+  "research_only": true,
+  "rows": 6243,
+  "schema": "histdata_pipeline_csv_meta_v2",
+  "source": "histdata.com free ASCII M1",
+  "source_zip_sha256": "58f074ba6b835eb2fbeaeb6678502a23b26768eefdfa509eb75ff5296bb2904d",
+  "timezone_provenance": "provider US/Eastern (DST-aware, verified against Dukascopy UTC hours), converted to UTC",
+  "volume_available": false,
+  "year": 2024
+}

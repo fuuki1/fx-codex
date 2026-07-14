@@ -1,0 +1,17 @@
+{
+  "ask_available": false,
+  "csv_sha256": "09e5970d2361a08e61a53c34314b263dfe2e25da297071987393244088b6d9f4",
+  "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a label='right' resample bug)",
+  "pair": "USDJPY",
+  "price_basis": "bid",
+  "promotion_admissible": false,
+  "resample_rule": "1h",
+  "research_only": true,
+  "rows": 6227,
+  "schema": "histdata_pipeline_csv_meta_v2",
+  "source": "histdata.com free ASCII M1",
+  "source_zip_sha256": "dc99fe4b3e0ae1b457f6bfccc5d36cf6f628812f704f5556aa0a74ff3e7e8c81",
+  "timezone_provenance": "provider US/Eastern (DST-aware, verified against Dukascopy UTC hours), converted to UTC",
+  "volume_available": false,
+  "year": 2024
+}

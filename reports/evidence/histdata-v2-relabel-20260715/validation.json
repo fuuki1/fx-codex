@@ -1,0 +1,190 @@
+{
+  "conclusion": "lag 0 is the best alignment on every pair after the v2 relabel; the v1 +1h label shift (INC-20260714-M1) is resolved at the source",
+  "fix": "scripts/fetch_histdata.py resample label='right'->'left', closed='right'->'left'; bar labels are now the bar OPEN time in UTC",
+  "generated_at": "2026-07-14T23:34:02.034643+00:00",
+  "pairs": [
+    {
+      "best_lag": "+0h",
+      "lag_scan_vs_dukascopy_2024": {
+        "+0h": {
+          "bid_p50_pips": 0.0,
+          "bid_p95_pips": 3.9,
+          "matched": 6223,
+          "mid_p50_pips": 0.3,
+          "mid_p95_pips": 5.25
+        },
+        "+1h": {
+          "bid_p50_pips": 6.7,
+          "bid_p95_pips": 36.2,
+          "matched": 6177,
+          "mid_p50_pips": 6.75,
+          "mid_p95_pips": 36.05
+        },
+        "+2h": {
+          "bid_p50_pips": 10.6,
+          "bid_p95_pips": 53.3,
+          "matched": 6123,
+          "mid_p50_pips": 10.55,
+          "mid_p95_pips": 53.45
+        },
+        "-1h": {
+          "bid_p50_pips": 7.6,
+          "bid_p95_pips": 37.5,
+          "matched": 6169,
+          "mid_p50_pips": 7.6,
+          "mid_p95_pips": 37.25
+        },
+        "-2h": {
+          "bid_p50_pips": 11.1,
+          "bid_p95_pips": 54.5,
+          "matched": 6115,
+          "mid_p50_pips": 11.1,
+          "mid_p95_pips": 54.25
+        }
+      },
+      "meta": {
+        "ask_available": false,
+        "csv_sha256": "09e5970d2361a08e61a53c34314b263dfe2e25da297071987393244088b6d9f4",
+        "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a label='right' resample bug)",
+        "pair": "USDJPY",
+        "price_basis": "bid",
+        "promotion_admissible": false,
+        "resample_rule": "1h",
+        "research_only": true,
+        "rows": 6227,
+        "schema": "histdata_pipeline_csv_meta_v2",
+        "source": "histdata.com free ASCII M1",
+        "source_zip_sha256": "dc99fe4b3e0ae1b457f6bfccc5d36cf6f628812f704f5556aa0a74ff3e7e8c81",
+        "timezone_provenance": "provider US/Eastern (DST-aware, verified against Dukascopy UTC hours), converted to UTC",
+        "volume_available": false,
+        "year": 2024
+      },
+      "pair": "USDJPY",
+      "v1_csv_sha256": "9e2b632decc8f9bfb1e77564b493b3d8711406a096c6ef3c119482d0c4823839",
+      "v2_csv_sha256": "09e5970d2361a08e61a53c34314b263dfe2e25da297071987393244088b6d9f4"
+    },
+    {
+      "best_lag": "+0h",
+      "lag_scan_vs_dukascopy_2024": {
+        "+0h": {
+          "bid_p50_pips": 0.0,
+          "bid_p95_pips": 1.9,
+          "matched": 6240,
+          "mid_p50_pips": 0.15,
+          "mid_p95_pips": 2.3
+        },
+        "+1h": {
+          "bid_p50_pips": 3.2,
+          "bid_p95_pips": 16.3,
+          "matched": 6193,
+          "mid_p50_pips": 3.15,
+          "mid_p95_pips": 16.25
+        },
+        "+2h": {
+          "bid_p50_pips": 4.8,
+          "bid_p95_pips": 23.4,
+          "matched": 6139,
+          "mid_p50_pips": 4.8,
+          "mid_p95_pips": 23.3
+        },
+        "-1h": {
+          "bid_p50_pips": 3.6,
+          "bid_p95_pips": 17.1,
+          "matched": 6186,
+          "mid_p50_pips": 3.6,
+          "mid_p95_pips": 17.1
+        },
+        "-2h": {
+          "bid_p50_pips": 5.0,
+          "bid_p95_pips": 24.5,
+          "matched": 6132,
+          "mid_p50_pips": 5.0,
+          "mid_p95_pips": 24.45
+        }
+      },
+      "meta": {
+        "ask_available": false,
+        "csv_sha256": "d5c3b438b20976f7775219956e8bf8489c2ca0c9908366e165b160199544b091",
+        "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a label='right' resample bug)",
+        "pair": "EURUSD",
+        "price_basis": "bid",
+        "promotion_admissible": false,
+        "resample_rule": "1h",
+        "research_only": true,
+        "rows": 6243,
+        "schema": "histdata_pipeline_csv_meta_v2",
+        "source": "histdata.com free ASCII M1",
+        "source_zip_sha256": "58f074ba6b835eb2fbeaeb6678502a23b26768eefdfa509eb75ff5296bb2904d",
+        "timezone_provenance": "provider US/Eastern (DST-aware, verified against Dukascopy UTC hours), converted to UTC",
+        "volume_available": false,
+        "year": 2024
+      },
+      "pair": "EURUSD",
+      "v1_csv_sha256": "799f3c9f1cbf86a6e56545d83f0220f6834c14727ad0a1a438eb583037eed668",
+      "v2_csv_sha256": "d5c3b438b20976f7775219956e8bf8489c2ca0c9908366e165b160199544b091"
+    },
+    {
+      "best_lag": "+0h",
+      "lag_scan_vs_dukascopy_2024": {
+        "+0h": {
+          "bid_p50_pips": 0.0,
+          "bid_p95_pips": 2.3,
+          "matched": 6239,
+          "mid_p50_pips": 0.4,
+          "mid_p95_pips": 3.7
+        },
+        "+1h": {
+          "bid_p50_pips": 4.1,
+          "bid_p95_pips": 20.6,
+          "matched": 6193,
+          "mid_p50_pips": 4.1,
+          "mid_p95_pips": 20.65
+        },
+        "+2h": {
+          "bid_p50_pips": 6.2,
+          "bid_p95_pips": 30.2,
+          "matched": 6140,
+          "mid_p50_pips": 6.25,
+          "mid_p95_pips": 30.15
+        },
+        "-1h": {
+          "bid_p50_pips": 4.7,
+          "bid_p95_pips": 22.1,
+          "matched": 6185,
+          "mid_p50_pips": 4.7,
+          "mid_p95_pips": 22.2
+        },
+        "-2h": {
+          "bid_p50_pips": 6.5,
+          "bid_p95_pips": 32.1,
+          "matched": 6131,
+          "mid_p50_pips": 6.5,
+          "mid_p95_pips": 32.0
+        }
+      },
+      "meta": {
+        "ask_available": false,
+        "csv_sha256": "28c112c0d3662efcaef38d102d13b2a47dfede8170fc6661b7d7792f3c9ed3ba",
+        "label_convention": "bar OPEN time, UTC (v2; v1 was shifted +1h by a label='right' resample bug)",
+        "pair": "GBPUSD",
+        "price_basis": "bid",
+        "promotion_admissible": false,
+        "resample_rule": "1h",
+        "research_only": true,
+        "rows": 6243,
+        "schema": "histdata_pipeline_csv_meta_v2",
+        "source": "histdata.com free ASCII M1",
+        "source_zip_sha256": "030b05b4c670c7e152bf4aa4112488c96695d2dcc2b31ca13a3b4834b8431077",
+        "timezone_provenance": "provider US/Eastern (DST-aware, verified against Dukascopy UTC hours), converted to UTC",
+        "volume_available": false,
+        "year": 2024
+      },
+      "pair": "GBPUSD",
+      "v1_csv_sha256": "98824aa825cf467215dd27bfef3ae1431213dd72029ea4d4221ae05ea666b639",
+      "v2_csv_sha256": "28c112c0d3662efcaef38d102d13b2a47dfede8170fc6661b7d7792f3c9ed3ba"
+    }
+  ],
+  "price_basis_finding": "bid basis confirmed: p50 |close - dukascopy_bid_close| = 0.00 pips on all pairs at lag 0, while vs mid_close p50 = 0.15-0.40 pips (half-spread)",
+  "reference_dataset": "data/real/dukascopy/{pair}_2019-2026_1h_bidask.csv.gz (2024 slice)",
+  "schema": "histdata_v2_relabel_validation_v1"
+}
