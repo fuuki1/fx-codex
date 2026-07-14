@@ -32,6 +32,7 @@ import json
 import os
 import random
 import socket
+import time
 
 from data_platform.collect.contract import CollectedQuote
 from data_platform.collect.raw_first import IngestResult, QuoteLog, ingest_payload
@@ -160,6 +161,8 @@ def parse_price_line(
 
 
 Transport = Callable[[str, str], Iterator[bytes]]
+Clock = Callable[[], datetime]
+StopPredicate = Callable[[], bool]
 """(url, token) -> iterator of raw stream lines. Injectable for replay tests.
 
 The production transport lives in :func:`requests_transport`; tests inject
@@ -171,20 +174,27 @@ caller and are never counted as real connection evidence.
 
 
 def requests_transport(url: str, token: str) -> Iterator[bytes]:  # pragma: no cover
-    """Production streaming transport (network). Excluded from unit coverage."""
+    """Production streaming transport with a heartbeat-bounded read timeout."""
 
     import requests
 
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        stream=True,
-        timeout=(10, 30),
-    )
-    if response.status_code in (401, 403):
-        raise TokenExpiredError(f"authorization rejected (HTTP {response.status_code})")
-    response.raise_for_status()
-    yield from response.iter_lines()
+    try:
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            stream=True,
+            timeout=(10, HEARTBEAT_TIMEOUT_SECONDS),
+        )
+        if response.status_code in (401, 403):
+            raise TokenExpiredError(f"authorization rejected (HTTP {response.status_code})")
+        response.raise_for_status()
+        yield from response.iter_lines()
+    except TokenExpiredError:
+        raise
+    except requests.exceptions.RequestException as error:
+        raise ConnectionError(
+            f"requests transport failed: {type(error).__name__}"
+        ) from error
 
 
 def stream_quotes(
@@ -199,32 +209,46 @@ def stream_quotes(
     max_reconnects: int = 5,
     rng: random.Random | None = None,
     sleeper: Callable[[float], None] | None = None,
+    clock: Clock | None = None,
+    should_stop: StopPredicate | None = None,
     max_messages: int | None = None,
 ) -> tuple[ConnectionState, list[IngestResult]]:
     """Run the stream through raw-first ingest with reconnect semantics.
 
     Returns the final connection state (gaps, reconnect count, stop reason)
     and the per-payload ingest results. Token expiry stops the collector
-    (fail-closed); transient transport errors reconnect with backoff+jitter
-    up to ``max_reconnects``.
+    (fail-closed); transient transport errors reconnect with real
+    backoff+jitter up to ``max_reconnects``. Heartbeat expiry opens an explicit
+    gap before any late quote can be treated as tradable. ``should_stop`` is
+    polled at connection and message boundaries for graceful daemon shutdown.
     """
 
     conn = state or ConnectionState(heartbeat_timeout_seconds=HEARTBEAT_TIMEOUT_SECONDS)
     policy = backoff or BackoffPolicy()
     randomness = rng or random.Random()
-    wait = sleeper or (lambda _seconds: None)
+    wait = sleeper or time.sleep
+    now_fn = clock or (lambda: datetime.now(UTC))
+    stop_requested = should_stop or (lambda: False)
     results: list[IngestResult] = []
     url = config.stream_url(instruments)
     attempt = 0
     messages_seen = 0
     while conn.stopped_reason is None:
-        connection_id = conn.mark_connected(datetime.now(UTC))
+        if stop_requested():
+            conn.stop("stop_requested")
+            break
+        connection_id = conn.mark_connected(now_fn())
         try:
             for line in transport(url, config.token):
+                if stop_requested():
+                    conn.stop("stop_requested")
+                    break
                 if not line:
                     continue
-                now = datetime.now(UTC)
-                conn.heartbeat(now)
+                now = now_fn()
+                alive = conn.check_alive(now)
+                if alive:
+                    conn.heartbeat(now)
                 messages_seen += 1
 
                 def _parser(raw: bytes, _cid: str = connection_id) -> list[CollectedQuote]:
@@ -232,22 +256,31 @@ def stream_quotes(
                         raw,
                         environment=config.environment,
                         connection_id=_cid,
-                        tradable_allowed=conn.tradable,
+                        tradable_allowed=alive and conn.tradable,
                     )
 
                 results.append(ingest_payload(line, parser=_parser, store=store, log=log))
+                if not alive:
+                    break
                 if max_messages is not None and messages_seen >= max_messages:
                     conn.stop("max_messages_reached")
                     break
             else:  # stream ended without error -> provider closed it
-                conn.mark_disconnected(datetime.now(UTC), reason="stream_closed")
+                conn.mark_disconnected(now_fn(), reason="stream_closed")
         except TokenExpiredError as error:
-            conn.mark_disconnected(datetime.now(UTC), reason="token_expired")
+            conn.mark_disconnected(now_fn(), reason="token_expired")
             conn.stop(f"token_expired: {error}")
             break
         except (OSError, ConnectionError) as error:
-            conn.mark_disconnected(datetime.now(UTC), reason=f"transport_error: {error}")
+            now = now_fn()
+            if conn.connected and not conn.check_alive(now):
+                pass  # check_alive already opened a heartbeat_timeout gap
+            elif conn.connected:
+                conn.mark_disconnected(now, reason=f"transport_error: {error}")
         if conn.stopped_reason is not None:
+            break
+        if stop_requested():
+            conn.stop("stop_requested")
             break
         if attempt >= max_reconnects:
             conn.stop("max_reconnects_exhausted")
