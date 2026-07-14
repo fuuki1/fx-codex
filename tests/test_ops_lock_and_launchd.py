@@ -184,6 +184,38 @@ def test_plist_template_renders_to_valid_xml(template, tmp_path):
     assert "WEBHOOK" not in rendered and "API_KEY" not in rendered
 
 
+def test_briefing_plist_runs_on_five_minute_boundaries():
+    raw = (_ROOT / "ops" / "launchd" / "com.fx-codex.briefing.plist.tmpl").read_text(
+        encoding="utf-8"
+    )
+    rendered = raw.replace("__FX_ROOT__", "/Users/example/srv/fx-codex").replace(
+        "__PYTHON__", "/Users/example/srv/fx-codex/.venv/bin/python"
+    )
+    root = ET.fromstring(rendered)
+    dictionary = root.find("dict")
+    assert dictionary is not None
+    children = list(dictionary)
+    schedule_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "StartCalendarInterval"
+    )
+    schedule = children[schedule_index + 1]
+    assert schedule.tag == "array"
+    minutes = []
+    for entry in schedule.findall("dict"):
+        fields = list(entry)
+        minute_index = next(
+            index
+            for index, node in enumerate(fields)
+            if node.tag == "key" and node.text == "Minute"
+        )
+        minutes.append(int(fields[minute_index + 1].text or "-1"))
+    assert minutes == list(range(0, 60, 5))
+    keys = [node.text for node in root.iter("key")]
+    assert "RunAtLoad" not in keys
+
+
 _ZSH = shutil.which("zsh")  # CI(ubuntu)にはzshが無いためスキップ。macOS実機で検証する
 
 
@@ -248,7 +280,7 @@ def test_restart_script_fails_if_any_service_is_not_loaded(tmp_path):
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
-def test_briefing_wrapper_runs_both_modes_and_propagates_failure(tmp_path):
+def test_briefing_wrapper_runs_one_signal_board_and_propagates_failure(tmp_path):
     root = tmp_path / "repo"
     scripts = root / "scripts"
     python_dir = root / ".venv" / "bin"
@@ -260,7 +292,7 @@ def test_briefing_wrapper_runs_both_modes_and_propagates_failure(tmp_path):
         "#!/bin/sh\n"
         'root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)\n'
         'printf "%s\\n" "$*" >> "$root/invocations.txt"\n'
-        'case "$*" in *--per-timeframe*) exit 0;; *) exit 7;; esac\n',
+        "exit 7\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
@@ -272,11 +304,15 @@ def test_briefing_wrapper_runs_both_modes_and_propagates_failure(tmp_path):
         timeout=10,
     )
 
-    assert result.returncode == 1
+    assert result.returncode == 7
     invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
-    assert len(invocations) == 2
-    assert "--per-timeframe" not in invocations[0]
-    assert "--per-timeframe" in invocations[1]
+    assert len(invocations) == 1
+    invocation = invocations[0]
+    assert "--signal-board" in invocation
+    assert "--no-price-write" in invocation
+    assert "--require-freshness" in invocation
+    assert "--per-timeframe" not in invocation
+    assert "GBPUSD EURUSD USDJPY" in invocation
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
