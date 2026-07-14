@@ -1,6 +1,6 @@
 """学習データ供給パイプラインの鮮度監視 + Discord通知(WARNING/CRITICAL/RECOVERY)。
 
-fx_tf_snapshot(5分毎)とfx_briefing(毎時:10)が書き続けるジャーナル・スナップショット・
+fx_tf_snapshotとfx_briefingが5分ごとに更新するジャーナル・スナップショット・
 学習ファイルの最終更新を監視し、停止を数分以内に検知してDiscordへ通知する。
 launchd(com.fx-codex.health)から5分間隔のワンショットで起動される前提。
 
@@ -360,14 +360,14 @@ def load_webhook_url(root: Path) -> str | None:
 
 
 def send_discord(webhook_url: str, payload: dict) -> bool:
-    """Discordへ送信。失敗してもFalseを返すだけで例外は伝播させない。"""
-    import requests
+    """Discordへ再試行付きで送信し、秘密URLをログへ出さない。"""
+    from fx_intel import discord_delivery
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=15)
-        return 200 <= response.status_code < 300
-    except Exception as exc:  # noqa: BLE001 - 通知失敗が監視を殺してはいけない
-        print(f"[freshness] Discord送信失敗: {exc}", file=sys.stderr)
+        discord_delivery.send_webhook(webhook_url, payload)
+        return True
+    except discord_delivery.DiscordDeliveryError as error:
+        print(f"[freshness] {error}", file=sys.stderr)
         return False
 
 

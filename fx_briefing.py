@@ -70,7 +70,6 @@ import sys
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
-import requests
 
 from fx_intel import (
     briefing,
@@ -79,6 +78,7 @@ from fx_intel import (
     decision_feedback,
     decision_log,
     decision_pipeline,
+    discord_delivery,
     freshness,
     journal,
     learning,
@@ -252,9 +252,7 @@ def load_strategy_params() -> tuple[int, int, float, str | None]:
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
-    response = requests.post(webhook_url, json=payload, timeout=15)
-    if response.status_code >= 300:
-        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
+    discord_delivery.send_webhook(webhook_url, payload)
 
 
 def score_trade_outcomes_cli(
