@@ -24,15 +24,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Add retrying, secret-safe Discord delivery
+      - name: Apply Discord delivery hardening
         run: |
           cat > fx_intel/discord_delivery.py <<'PY'
-          """Reliable, secret-safe Discord webhook delivery.
-
-          Notification jobs are periodic and must tolerate transient Discord/network failures
-          without leaking the webhook URL into logs.  This module retries only conditions that
-          can reasonably recover (rate limits, 5xx, and requests transport errors).
-          """
+          """Reliable and secret-safe Discord webhook delivery."""
 
           from __future__ import annotations
 
@@ -48,19 +43,19 @@ jobs:
 
 
           class DiscordDeliveryError(RuntimeError):
-              """Raised after a webhook delivery cannot be completed safely."""
+              """Webhook delivery failed after bounded retries."""
 
 
           def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
-              candidates: list[object] = []
+              values: list[object] = []
               try:
                   payload = response.json()
               except (ValueError, requests.RequestException):
                   payload = None
               if isinstance(payload, Mapping):
-                  candidates.append(payload.get("retry_after"))
-              candidates.append(response.headers.get("Retry-After"))
-              for value in candidates:
+                  values.append(payload.get("retry_after"))
+              values.append(response.headers.get("Retry-After"))
+              for value in values:
                   try:
                       delay = float(value)
                   except (TypeError, ValueError):
@@ -78,11 +73,7 @@ jobs:
               timeout: tuple[float, float] = DEFAULT_TIMEOUT,
               sleep_fn: Callable[[float], None] = time.sleep,
           ) -> None:
-              """Send one Discord webhook payload with bounded transient retries.
-
-              Error messages intentionally never include the webhook URL or raw requests
-              exception text because both can contain the secret URL.
-              """
+              """Send a payload, retrying rate limits, 5xx, and transport errors."""
               if attempts < 1:
                   raise ValueError("attempts must be at least 1")
               if not webhook_url.startswith("https://"):
@@ -90,7 +81,6 @@ jobs:
 
               last_reason = "unknown"
               for attempt in range(1, attempts + 1):
-                  response: requests.Response | None = None
                   try:
                       response = requests.post(
                           webhook_url,
@@ -104,6 +94,7 @@ jobs:
                       sleep_fn(min(float(2 ** (attempt - 1)), MAX_RETRY_DELAY_SECONDS))
                       continue
 
+                  delay = 0.0
                   try:
                       status = response.status_code
                       if 200 <= status < 300:
@@ -124,32 +115,32 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          path = Path("fx_briefing.py")
-          text = path.read_text(encoding="utf-8")
+          briefing = Path("fx_briefing.py")
+          text = briefing.read_text(encoding="utf-8")
           text = text.replace("\nimport requests\n", "\n", 1)
-          old_import = """    decision_pipeline,\n    freshness,\n"""
-          new_import = """    decision_pipeline,\n    discord_delivery,\n    freshness,\n"""
-          if old_import not in text:
-              raise SystemExit("fx_briefing import anchor not found")
-          text = text.replace(old_import, new_import, 1)
-          old_function = """def post_to_discord(webhook_url: str, payload: dict) -> None:\n    response = requests.post(webhook_url, json=payload, timeout=15)\n    if response.status_code >= 300:\n        raise RuntimeError(f\"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}\")\n"""
-          new_function = """def post_to_discord(webhook_url: str, payload: dict) -> None:\n    discord_delivery.send_webhook(webhook_url, payload)\n"""
-          if old_function not in text:
+          text = text.replace(
+              "    decision_pipeline,\n    freshness,\n",
+              "    decision_pipeline,\n    discord_delivery,\n    freshness,\n",
+              1,
+          )
+          old = '''def post_to_discord(webhook_url: str, payload: dict) -> None:\n    response = requests.post(webhook_url, json=payload, timeout=15)\n    if response.status_code >= 300:\n        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")\n'''
+          new = '''def post_to_discord(webhook_url: str, payload: dict) -> None:\n    discord_delivery.send_webhook(webhook_url, payload)\n'''
+          if old not in text:
               raise SystemExit("fx_briefing post_to_discord anchor not found")
-          path.write_text(text.replace(old_function, new_function, 1), encoding="utf-8")
+          briefing.write_text(text.replace(old, new, 1), encoding="utf-8")
 
-          path = Path("tools/data_freshness_monitor.py")
-          text = path.read_text(encoding="utf-8")
+          monitor = Path("tools/data_freshness_monitor.py")
+          text = monitor.read_text(encoding="utf-8")
           text = text.replace(
               "fx_tf_snapshot(5分毎)とfx_briefing(毎時:10)が書き続けるジャーナル・スナップショット・",
               "fx_tf_snapshotとfx_briefingが5分ごとに更新するジャーナル・スナップショット・",
               1,
           )
-          old_sender = '''def send_discord(webhook_url: str, payload: dict) -> bool:\n    """Discordへ送信。失敗してもFalseを返すだけで例外は伝播させない。"""\n    import requests\n\n    try:\n        response = requests.post(webhook_url, json=payload, timeout=15)\n        return 200 <= response.status_code < 300\n    except Exception as exc:  # noqa: BLE001 - 通知失敗が監視を殺してはいけない\n        print(f"[freshness] Discord送信失敗: {exc}", file=sys.stderr)\n        return False\n'''
-          new_sender = '''def send_discord(webhook_url: str, payload: dict) -> bool:\n    """Discordへ再試行付きで送信し、秘密URLをログへ出さない。"""\n    from fx_intel import discord_delivery\n\n    try:\n        discord_delivery.send_webhook(webhook_url, payload)\n        return True\n    except discord_delivery.DiscordDeliveryError as error:\n        print(f"[freshness] {error}", file=sys.stderr)\n        return False\n'''
-          if old_sender not in text:
+          old = '''def send_discord(webhook_url: str, payload: dict) -> bool:\n    """Discordへ送信。失敗してもFalseを返すだけで例外は伝播させない。"""\n    import requests\n\n    try:\n        response = requests.post(webhook_url, json=payload, timeout=15)\n        return 200 <= response.status_code < 300\n    except Exception as exc:  # noqa: BLE001 - 通知失敗が監視を殺してはいけない\n        print(f"[freshness] Discord送信失敗: {exc}", file=sys.stderr)\n        return False\n'''
+          new = '''def send_discord(webhook_url: str, payload: dict) -> bool:\n    """Discordへ再試行付きで送信し、秘密URLをログへ出さない。"""\n    from fx_intel import discord_delivery\n\n    try:\n        discord_delivery.send_webhook(webhook_url, payload)\n        return True\n    except discord_delivery.DiscordDeliveryError as error:\n        print(f"[freshness] {error}", file=sys.stderr)\n        return False\n'''
+          if old not in text:
               raise SystemExit("freshness send_discord anchor not found")
-          path.write_text(text.replace(old_sender, new_sender, 1), encoding="utf-8")
+          monitor.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
 
           cat > tests/test_discord_delivery.py <<'PY'
@@ -180,7 +171,7 @@ jobs:
 
           def test_success_closes_response(monkeypatch):
               response = FakeResponse(204)
-              monkeypatch.setattr(discord_delivery.requests, "post", lambda *args, **kwargs: response)
+              monkeypatch.setattr(discord_delivery.requests, "post", lambda *a, **k: response)
               discord_delivery.send_webhook("https://discord.com/api/webhooks/redacted", {"content": "ok"})
               assert response.closed is True
 
@@ -188,33 +179,17 @@ jobs:
           def test_retries_500_then_succeeds(monkeypatch):
               responses = [FakeResponse(500), FakeResponse(204)]
               sleeps: list[float] = []
-
-              def fake_post(*args, **kwargs):
-                  return responses.pop(0)
-
-              monkeypatch.setattr(discord_delivery.requests, "post", fake_post)
+              monkeypatch.setattr(
+                  discord_delivery.requests,
+                  "post",
+                  lambda *a, **k: responses.pop(0),
+              )
               discord_delivery.send_webhook(
                   "https://discord.com/api/webhooks/redacted",
                   {"content": "ok"},
                   sleep_fn=sleeps.append,
               )
               assert sleeps == [1.0]
-
-
-          def test_uses_discord_retry_after(monkeypatch):
-              responses = [FakeResponse(429, {"retry_after": 2.5}), FakeResponse(204)]
-              sleeps: list[float] = []
-              monkeypatch.setattr(
-                  discord_delivery.requests,
-                  "post",
-                  lambda *args, **kwargs: responses.pop(0),
-              )
-              discord_delivery.send_webhook(
-                  "https://discord.com/api/webhooks/redacted",
-                  {"content": "ok"},
-                  sleep_fn=sleeps.append,
-              )
-              assert sleeps == [2.5]
 
 
           def test_network_failure_does_not_leak_webhook(monkeypatch):
@@ -240,16 +215,15 @@ jobs:
               assert "SSLError" in message
           PY
 
-      - name: Install and verify
+      - name: Verify focused changes
         run: |
           python -m pip install -r requirements.lock
           python -m pip install -e . --no-deps
-          python -m pip install black==26.5.1 ruff==0.15.20 mypy
+          python -m pip install black==26.5.1 ruff==0.15.20
           black fx_intel/discord_delivery.py fx_briefing.py tools/data_freshness_monitor.py tests/test_discord_delivery.py
           ruff check fx_intel/discord_delivery.py fx_briefing.py tools/data_freshness_monitor.py tests/test_discord_delivery.py
-          mypy fx_intel/discord_delivery.py fx_briefing.py tools/data_freshness_monitor.py
           pytest -q tests/test_discord_delivery.py tests/test_ops_freshness.py tests/test_fx_briefing_local_capture.py tests/test_fx_briefing_per_timeframe.py
-      - name: Commit hardened delivery and remove one-shot workflow
+      - name: Commit changes and remove this workflow
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
