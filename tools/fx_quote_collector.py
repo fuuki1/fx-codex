@@ -10,6 +10,7 @@ scope.
 Fail-closed rules:
 - missing credentials -> exit 78 (EX_CONFIG) without touching the quote log
 - lock already held -> exit 75 (EX_TEMPFAIL), incident and terminal state logged
+- source unavailable after reconnect budget -> exit 69 (EX_UNAVAILABLE)
 - token expiry mid-stream -> stop (no retry), exit 77 (EX_NOPERM)
 - I/O failure -> exit 74 (EX_IOERR), incident and terminal state attempted
 - unexpected runtime failure -> exit 70 (EX_SOFTWARE), incident recorded
@@ -51,9 +52,10 @@ from data_platform.raw.immutable_store import ImmutableRawStore  # noqa: E402
 from tools.run_exclusive import ExclusiveLock  # noqa: E402
 
 EX_OK = 0
+EX_UNAVAILABLE = 69
 EX_SOFTWARE = 70
-EX_TEMPFAIL = 75
 EX_IOERR = 74
+EX_TEMPFAIL = 75
 EX_NOPERM = 77
 EX_CONFIG = 78
 
@@ -305,13 +307,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         accepted = sum(result.accepted_count for result in results)
         quarantined = sum(len(result.quarantined) for result in results)
-        exit_code = (
-            EX_NOPERM if state.stopped_reason and "token_expired" in state.stopped_reason else EX_OK
-        )
+        stopped_reason = state.stopped_reason or "stream_returned"
+        if "token_expired" in stopped_reason:
+            exit_code = EX_NOPERM
+            status = "authorization_failed"
+            _record_incident(
+                args.output_root,
+                incident_type="collector_authorization_failure",
+                severity="critical",
+                detail=stopped_reason,
+                started=started,
+            )
+        elif stopped_reason == "max_reconnects_exhausted":
+            exit_code = EX_UNAVAILABLE
+            status = "source_unavailable"
+            _record_incident(
+                args.output_root,
+                incident_type="collector_source_unavailable",
+                severity="critical",
+                detail=stopped_reason,
+                started=started,
+            )
+        else:
+            exit_code = EX_OK
+            status = "stopped"
         _persist_terminal_state(
             args.output_root,
             started=started,
-            status="stopped" if exit_code == EX_OK else "authorization_failed",
+            status=status,
             exit_code=exit_code,
             state=state,
             accepted=accepted,
