@@ -126,6 +126,7 @@ jobs:
 
           path = Path("fx_briefing.py")
           text = path.read_text(encoding="utf-8")
+          text = text.replace("\nimport requests\n", "\n", 1)
           old_import = """    decision_pipeline,\n    freshness,\n"""
           new_import = """    decision_pipeline,\n    discord_delivery,\n    freshness,\n"""
           if old_import not in text:
