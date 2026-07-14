@@ -24,16 +24,13 @@ finish_expected_stop() {
   exit "$code"
 }
 
-if [ ! -x "$PYTHON" ]; then
-  PYTHON=$(command -v python3 || true)
-fi
-if [ -z "${PYTHON:-}" ] || [ ! -x "$PYTHON" ]; then
-  echo "[collector-wrapper] no usable Python interpreter" >&2
-  exit 70
-fi
-
 if [ ! -f "$ENV_FILE" ]; then
   finish_expected_stop 78 "configuration file missing: $ENV_FILE"
+fi
+
+if [ ! -x "$PYTHON" ]; then
+  echo "[collector-wrapper] approved Python interpreter is not executable: $PYTHON" >&2
+  exit 70
 fi
 
 case "$(uname -s)" in
