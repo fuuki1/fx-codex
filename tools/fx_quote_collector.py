@@ -22,9 +22,11 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import signal
 import sys
+import time
 from types import FrameType
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -76,8 +78,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _write_state(path: Path, payload: dict[str, object]) -> None:
+    """Durably replace one JSON state file without exposing partial content."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _lock_collision_incident_path(output_root: Path) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return output_root / "state" / "incidents" / f"lock_collision_{stamp}_{os.getpid()}.json"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,6 +122,17 @@ def main(argv: list[str] | None = None) -> int:
 
     lock = ExclusiveLock("quote-collector", locks_dir=args.output_root / "state")
     if not lock.acquire():
+        incident = {
+            "occurred_at": datetime.now(UTC).isoformat(),
+            "type": "duplicate_writer_rejected",
+            "severity": "critical",
+            "writer_pid": os.getpid(),
+            "output_root": str(args.output_root),
+        }
+        try:
+            _write_state(_lock_collision_incident_path(args.output_root), incident)
+        except OSError as error:
+            print(f"[collector] failed to persist lock incident: {error}", file=sys.stderr)
         print("[collector] another writer holds the lock; refusing to double-write")
         return EX_TEMPFAIL
     try:
@@ -112,6 +142,14 @@ def main(argv: list[str] | None = None) -> int:
 
         def _graceful(_signum: int, _frame: FrameType | None) -> None:
             stop_requested["flag"] = True
+
+        def _sleep_interruptibly(seconds: float) -> None:
+            deadline = time.monotonic() + max(0.0, seconds)
+            while not stop_requested["flag"]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return
+                time.sleep(min(0.25, remaining))
 
         signal.signal(signal.SIGTERM, _graceful)
         signal.signal(signal.SIGINT, _graceful)
@@ -123,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
             log=log,
             transport=requests_transport,
             max_messages=args.max_messages,
+            sleeper=_sleep_interruptibly,
+            should_stop=lambda: stop_requested["flag"],
         )
         accepted = sum(result.accepted_count for result in results)
         quarantined = sum(len(result.quarantined) for result in results)
