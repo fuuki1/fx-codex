@@ -94,6 +94,80 @@ def load_price_csv(
     return output
 
 
+#: canonical column set written by data_platform.materialize.candle_bars
+BIDASK_BARS_COLUMNS = {
+    "instrument",
+    "provider",
+    "interval",
+    "open_time",
+    "close_time",
+    "bid_open",
+    "bid_high",
+    "bid_low",
+    "bid_close",
+    "ask_open",
+    "ask_high",
+    "ask_low",
+    "ask_close",
+    "spread_open",
+    "spread_close",
+}
+
+
+def load_bidask_bars_csv(path: str | Path, symbol: str | None = None) -> dict[str, pd.DataFrame]:
+    """Load a canonical bid/ask candle-bar dataset (data_platform CSV/.gz).
+
+    Price basis is EXPLICIT, never guessed:
+
+    - ``open/high/low/close`` are the BID side — all four values are
+      provider-real per-side OHLC. No mid high/low exists in candle data and
+      none is fabricated here.
+    - ``spread_price``   = ``spread_open`` (price units): the measured book
+      width at the bar's opening boundary — the spread a market order pays
+      when it executes at that bar's open (the pipeline enters with
+      ``entry_lag_bars=1``, i.e. at the NEXT bar's open).
+    - ``spread_close``   is carried along for reference/QA.
+
+    Fail-closed: unknown schema, mixed instruments, non-positive spreads and
+    duplicate timestamps are errors, not repairs.
+    """
+
+    frame = pd.read_csv(path)
+    missing = BIDASK_BARS_COLUMNS - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is not a canonical bid/ask bars CSV; missing {sorted(missing)}")
+    instruments = sorted(set(frame["instrument"].astype(str)))
+    if len(instruments) != 1:
+        raise ValueError(f"{path} mixes instruments {instruments}; one dataset per instrument")
+    resolved = normalize_symbol(symbol or instruments[0])
+    if normalize_symbol(instruments[0]) != resolved:
+        raise ValueError(f"{path} contains {instruments[0]}, not the requested symbol {resolved}")
+    instrument_for(resolved)
+
+    out = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(frame["open_time"], utc=True),
+            "open": frame["bid_open"].astype(float),
+            "high": frame["bid_high"].astype(float),
+            "low": frame["bid_low"].astype(float),
+            "close": frame["bid_close"].astype(float),
+            "spread_price": frame["spread_open"].astype(float),
+            "spread_close": frame["spread_close"].astype(float),
+        }
+    ).set_index("timestamp")
+    if out.index.has_duplicates:
+        duplicates = out.index[out.index.duplicated()].unique()
+        raise ValueError(f"{resolved} has duplicate timestamps: {duplicates[:3].tolist()}")
+    out = out.sort_index()
+    bad_spread = out[(out["spread_price"] <= 0) | (out["spread_close"] <= 0)]
+    if not bad_spread.empty:
+        raise ValueError(
+            f"{resolved} has non-positive spreads at {bad_spread.index[:3].tolist()} — "
+            "crossed/zero-width rows must be excluded at materialization, not here"
+        )
+    return {resolved: out}
+
+
 def load_price_csvs(paths: list[str | Path]) -> dict[str, pd.DataFrame]:
     loaded: dict[str, pd.DataFrame] = {}
     for path in paths:

@@ -32,14 +32,14 @@ _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 _PYTHON_VERSION = re.compile(r"^3\.\d{1,2}$")
 
 REQUIRED_STRESS_MULTIPLIERS = (1.0, 1.25, 1.5, 2.0)
-SUPPORTED_SOURCE_KINDS = frozenset({"price_csv"})
+SUPPORTED_SOURCE_KINDS = frozenset({"price_csv", "bidask_bars_csv"})
 SUPPORTED_AVAILABILITY_RULES = frozenset({"completed_bar_close"})
 SUPPORTED_LABEL_TYPES = frozenset({"triple_barrier"})
 SUPPORTED_SAME_BAR_POLICIES = frozenset({"stop_first"})
 SUPPORTED_GAP_POLICIES = frozenset({"adverse_open"})
 SUPPORTED_SPLIT_METHODS = frozenset({"chronological_five_way"})
 SUPPORTED_CALIBRATION_METHODS = frozenset({"platt", "isotonic", "beta"})
-SUPPORTED_COST_MODEL_VERSIONS = frozenset({"declared_static_v1"})
+SUPPORTED_COST_MODEL_VERSIONS = frozenset({"declared_static_v1", "measured_bar_spread_v1"})
 SUPPORTED_PRIMARY_METRICS = frozenset({"net_expectancy_r"})
 SUPPORTED_MULTIPLE_TESTING = frozenset({"holm"})
 SUPPORTED_LOCKBOX_POLICIES = frozenset({"single_use"})
@@ -912,6 +912,18 @@ def parse_experiment_manifest(payload: Any) -> ExperimentManifest:
             None if policy_path_raw is None else _text(policy_path_raw, "promotion.policy_path")
         ),
     )
+
+    if costs.cost_model_version == "measured_bar_spread_v1":
+        non_bidask = sorted(
+            source.source_id for source in data.sources if source.kind != "bidask_bars_csv"
+        )
+        if non_bidask:
+            raise _invalid(
+                "costs.cost_model_version=measured_bar_spread_v1 requires every data source "
+                "to be kind=bidask_bars_csv (per-bar measured spreads); a close-only source "
+                "has no spread to measure",
+                offending_sources=non_bidask,
+            )
 
     return ExperimentManifest(
         schema_version=schema_version,

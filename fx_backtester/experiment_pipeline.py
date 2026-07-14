@@ -39,7 +39,7 @@ from fx_backtester.calibration import (
     calibration_metrics,
     fit_calibrator,
 )
-from fx_backtester.data import load_price_csv
+from fx_backtester.data import load_bidask_bars_csv, load_price_csv
 from fx_backtester.experiment_manifest import (
     ExperimentManifest,
     ModelCandidate,
@@ -225,7 +225,10 @@ def _load_symbol_frame(manifest: ExperimentManifest, repository_root: Path) -> p
                     "observed": observed,
                 },
             )
-        loaded = load_price_csv(source_path, timezone="UTC")
+        if source.kind == "bidask_bars_csv":
+            loaded = load_bidask_bars_csv(source_path, symbol=manifest.data.symbol)
+        else:
+            loaded = load_price_csv(source_path, timezone="UTC")
         if manifest.data.symbol not in loaded:
             raise TypedFailure(
                 FailureReason.INCOMPLETE,
@@ -278,6 +281,22 @@ def _load_symbol_frame(manifest: ExperimentManifest, repository_root: Path) -> p
                 "as_of_cutoff": manifest.data.as_of_cutoff.isoformat(),
             },
         )
+    if manifest.costs.cost_model_version == "measured_bar_spread_v1":
+        # fail-closed: the measured cost model may never fall back to a
+        # declared value where the measurement is missing.
+        if "spread_price" not in window.columns:
+            raise TypedFailure(
+                FailureReason.INCOMPLETE,
+                "measured_bar_spread_v1 requires per-bar spread_price from the sources",
+                context={"columns": sorted(window.columns)},
+            )
+        missing_spread = int(window["spread_price"].isna().sum())
+        if missing_spread:
+            raise TypedFailure(
+                FailureReason.INCOMPLETE,
+                "some bars carry no measured spread; unknown costs are never zero-filled",
+                context={"bars_missing_spread": missing_spread},
+            )
     return window
 
 
@@ -293,6 +312,9 @@ def _check_data_quality(manifest: ExperimentManifest, frame: pd.DataFrame) -> di
 
 
 def _normalized_dataset_hash(frame: pd.DataFrame) -> str:
+    # spread_price feeds the measured cost model, so when present it is part
+    # of the dataset identity (a spread change must change the hash).
+    has_spread = "spread_price" in frame.columns
     records = [
         {
             "timestamp": timestamp.isoformat(),
@@ -300,6 +322,7 @@ def _normalized_dataset_hash(frame: pd.DataFrame) -> str:
             "high": float(row["high"]),
             "low": float(row["low"]),
             "close": float(row["close"]),
+            **({"spread_price": float(row["spread_price"])} if has_spread else {}),
         }
         for timestamp, row in frame.iterrows()
     ]
@@ -430,8 +453,21 @@ def build_dataset_rows(
         same_bar_policy="stop_first",
         cost_r=0.0,
     )
+    measured_costs = manifest.costs.cost_model_version == "measured_bar_spread_v1"
+    has_spread = "spread_price" in frame.columns
+    if measured_costs and not has_spread:
+        raise TypedFailure(
+            FailureReason.INVALID,
+            "measured_bar_spread_v1 requires a bid/ask source with per-bar spread_price",
+            context={"columns": sorted(frame.columns)},
+        )
     rows: list[dict[str, Any]] = []
-    excluded = {"missing_feature": 0, "missing_volatility": 0, "unresolved_label": 0}
+    excluded = {
+        "missing_feature": 0,
+        "missing_volatility": 0,
+        "unresolved_label": 0,
+        "missing_entry_spread": 0,
+    }
     for position in range(len(frame)):
         feature_row = features.iloc[position]
         if not bool(np.isfinite(feature_row.to_numpy(dtype=float)).all()):
@@ -469,12 +505,26 @@ def build_dataset_rows(
         label_end = max(
             pd.Timestamp(long_label.label_end_time), pd.Timestamp(short_label.label_end_time)
         )
+        # entry executes at the NEXT bar's open (entry_lag_bars=1): the spread
+        # a trade pays is that bar's opening book width, known only at entry
+        # time — a cost input, never a prediction feature.
+        entry_spread: float | None = None
+        if has_spread:
+            entry_position = position + 1
+            if entry_position < len(frame):
+                candidate = float(frame["spread_price"].iloc[entry_position])
+                if np.isfinite(candidate) and candidate > 0:
+                    entry_spread = candidate
+            if entry_spread is None:
+                excluded["missing_entry_spread"] += 1
+                continue
         rows.append(
             {
                 "symbol": manifest.data.symbol,
                 "position": position,
                 "prediction_time": frame.index[position].isoformat(),
                 "label_end_time": label_end.isoformat(),
+                **({"entry_spread_price": entry_spread} if entry_spread is not None else {}),
                 "features": {
                     name: float(feature_row[name]) for name in manifest.features.definitions
                 },
@@ -506,11 +556,27 @@ def build_dataset_rows(
 
 
 def _cost_r(
-    manifest: ExperimentManifest, volatility: float, bars_to_exit: int, multiplier: float
+    manifest: ExperimentManifest,
+    volatility: float,
+    bars_to_exit: int,
+    multiplier: float,
+    *,
+    measured_spread_price: float | None = None,
 ) -> float:
     costs = manifest.costs
     risk_distance = volatility * manifest.labels.stop_vol_multiple
-    spread_slippage_r = ((costs.spread_pips + costs.slippage_pips) * costs.pip_size) / risk_distance
+    if costs.cost_model_version == "measured_bar_spread_v1":
+        if measured_spread_price is None or measured_spread_price <= 0:
+            raise TypedFailure(
+                FailureReason.INCOMPLETE,
+                "measured_bar_spread_v1 cost requested without a measured entry spread; "
+                "unknown costs are never zero-filled or defaulted",
+                context={"measured_spread_price": measured_spread_price},
+            )
+        spread_component = measured_spread_price
+    else:
+        spread_component = costs.spread_pips * costs.pip_size
+    spread_slippage_r = (spread_component + costs.slippage_pips * costs.pip_size) / risk_distance
     financing_r = costs.financing_r_per_bar * bars_to_exit
     return (spread_slippage_r + costs.commission_r_per_trade + financing_r) * multiplier
 
@@ -526,7 +592,14 @@ def trade_net_r(
         bars = int(row["short_bars_to_exit"])
     else:
         raise ValueError(f"unknown trade side: {side}")
-    return gross - _cost_r(manifest, float(row["volatility"]), bars, multiplier)
+    raw_spread = row.get("entry_spread_price")
+    return gross - _cost_r(
+        manifest,
+        float(row["volatility"]),
+        bars,
+        multiplier,
+        measured_spread_price=None if raw_spread is None else float(raw_spread),
+    )
 
 
 # ---------------------------------------------------------------------------
