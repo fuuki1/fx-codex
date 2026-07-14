@@ -7,17 +7,12 @@ It is a superset of :class:`data_platform.contracts.market_quote.MarketQuote`
 into the existing bar pipeline without touching that contract.
 
 Honesty rules enforced at construction (fail-closed, never repaired):
-- bid/ask must be finite and positive; ``bid >= ask`` is rejected (a crossed or
-  zero-width book is quarantined upstream, never "fixed")
-- ``mid`` and ``spread`` are always computed from bid/ask, never accepted from
-  the provider
-- naive datetimes are rejected; ``provider_event_time`` in the future relative
-  to ``received_at`` (beyond a small declared clock-skew allowance) is rejected
-- fields the provider does not supply stay ``None`` and are flagged
-  ``provider_does_not_supply_<field>`` — they are never zero-filled or guessed
-
-This package is import-isolated from any order/execution path; see
-``tests/test_collect_no_order_path.py``.
+- bid/ask must be finite and positive; ``bid >= ask`` is rejected
+- ``mid`` and ``spread`` are computed from bid/ask
+- naive datetimes are rejected; future provider timestamps are bounded
+- missing provider fields remain ``None`` and are flagged
+- booleans stay booleans; stringly-typed truth values are rejected
+- raw hashes must be lowercase 64-character hexadecimal SHA-256 values
 """
 
 from __future__ import annotations
@@ -26,20 +21,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import math
+import re
 from typing import Any
 
 from data_platform.quality.state import QualityState
 
 COLLECT_SCHEMA_VERSION = 1
 INGEST_VERSION = "collect_v1"
-# Provider clocks may run slightly ahead of ours; beyond this the event time is
-# treated as a future-data violation and the quote is rejected.
 MAX_PROVIDER_CLOCK_AHEAD_SECONDS = 2.0
 
 FLAG_NO_BID_SIZE = "provider_does_not_supply_bid_size"
 FLAG_NO_ASK_SIZE = "provider_does_not_supply_ask_size"
 FLAG_NO_SEQUENCE = "provider_does_not_supply_sequence_id"
 FLAG_NO_EVENT_TIME = "provider_does_not_supply_event_time"
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class QuoteContractError(ValueError):
@@ -77,7 +73,7 @@ class CollectedQuote:
     """One normalized, provenance-complete quote from a read-only source."""
 
     provider: str
-    account_environment: str  # "live" | "practice" | "datafeed" (public feed)
+    account_environment: str
     instrument: str
     provider_event_time: datetime | None
     received_at: datetime
@@ -91,8 +87,8 @@ class CollectedQuote:
     writer_id: str
     revision_id: str | None
     raw_payload_sha256: str
-    source_endpoint_class: str  # "streaming_pricing" | "historical_datafeed" | "replay_fixture"
-    collection_mode: str  # "live_stream" | "historical_download" | "replay"
+    source_endpoint_class: str
+    collection_mode: str
     quality_state: QualityState = QualityState.USABLE
     quality_flags: tuple[str, ...] = field(default_factory=tuple)
     schema_version: int = COLLECT_SCHEMA_VERSION
@@ -104,11 +100,15 @@ class CollectedQuote:
                 raise QuoteContractError(f"{name} must be non-empty")
         if self.account_environment not in ("live", "practice", "datafeed"):
             raise QuoteContractError(
-                f"account_environment must be live/practice/datafeed, got "
+                "account_environment must be live/practice/datafeed, got "
                 f"{self.account_environment!r}"
             )
-        if len(self.raw_payload_sha256) != 64:
-            raise QuoteContractError("raw_payload_sha256 must be a hex sha256")
+        if not _SHA256_RE.fullmatch(self.raw_payload_sha256):
+            raise QuoteContractError(
+                "raw_payload_sha256 must be a lowercase 64-character hexadecimal sha256"
+            )
+        if not isinstance(self.tradable, bool):
+            raise QuoteContractError("tradable must be a bool")
         bid = _finite_positive(self.bid, "bid")
         ask = _finite_positive(self.ask, "ask")
         if bid >= ask:
@@ -147,7 +147,7 @@ class CollectedQuote:
 
     @property
     def spread(self) -> float:
-        """Measured spread only — always ``ask - bid``, never provider-supplied."""
+        """Measured spread only — always ``ask - bid``."""
 
         return self.ask - self.bid
 
@@ -201,7 +201,7 @@ class CollectedQuote:
             ask=float(payload["ask"]),
             bid_size=payload.get("bid_size"),
             ask_size=payload.get("ask_size"),
-            tradable=bool(payload["tradable"]),
+            tradable=payload["tradable"],
             sequence_id=payload.get("sequence_id"),
             connection_id=str(payload["connection_id"]),
             writer_id=str(payload["writer_id"]),
