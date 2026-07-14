@@ -1,13 +1,13 @@
 #!/bin/zsh
-# fx-codexの学習データ収集をlaunchd常駐サービスとしてインストールする。
+# fx-codexの学習データ収集とDiscord通知をlaunchd常駐サービスとしてインストールする。
 #
 #   ./scripts/install_launchd.sh            # インストール(既存の同名サービスは置換)
 #   ./scripts/install_launchd.sh --dry-run  # 生成されるplistを表示するだけ(変更なし)
 #
 # インストールされるLaunchAgent(gui/$UID):
 #   com.fx-codex.snapshot  5分毎の価格スナップショット
-#   com.fx-codex.briefing  毎時:10のブリーフィング(融合+時間足別)
-#   com.fx-codex.health    5分毎のデータ鮮度監視+Discord通知
+#   com.fx-codex.briefing  5分毎の単一FXシグナルボードDiscord通知
+#   com.fx-codex.health    5分毎のデータ鮮度監視+異常時Discord通知
 #
 # 設計メモ:
 # - LaunchAgent(ユーザーセッション)を使う。LaunchDaemonにしないのは、.envや
