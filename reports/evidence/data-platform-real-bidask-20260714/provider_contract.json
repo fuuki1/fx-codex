@@ -1,0 +1,53 @@
+{
+  "dukascopy": {
+    "endpoint": "https://datafeed.dukascopy.com/datafeed/{PAIR}/{YYYY}/{MM-1}/{DD}/{HH}h_ticks.bi5",
+    "auth": "none (public datafeed)",
+    "format": "LZMA; 20B big-endian records (ms u32, ask u32, bid u32, ask_vol f32, bid_vol f32)",
+    "point_scale": {
+      "JPY_pairs": 0.001,
+      "others": 1e-05
+    },
+    "fields_supplied": [
+      "bid",
+      "ask",
+      "bid_size",
+      "ask_size",
+      "event_time_ms"
+    ],
+    "fields_not_supplied": [
+      "sequence_id",
+      "tradable"
+    ],
+    "read_only": true
+  },
+  "oanda": {
+    "endpoint": "GET /v3/accounts/{id}/pricing/stream (stream-fxpractice|stream-fxtrade)",
+    "auth": "Bearer token via FX_OANDA_API_TOKEN (never logged; repr masked)",
+    "fields_supplied": [
+      "bid",
+      "ask",
+      "liquidity(top)",
+      "time",
+      "tradeable"
+    ],
+    "fields_not_supplied": [
+      "sequence_id"
+    ],
+    "read_only": true,
+    "probe": "unauthenticated request rejected HTTP 400 (fail-closed verified 2026-07-14)"
+  },
+  "alfred": {
+    "endpoint": "https://alfred.stlouisfed.org/graph/alfredgraph.csv?id=..&vintage_date=..",
+    "auth": "none",
+    "pit_guarantee": "vintage-stamped column header required by parser; plain fredgraph.csv FORBIDDEN (vintage_date silently ignored - proven 2026-07-14)",
+    "fields_not_supplied": [
+      "scheduled_at",
+      "provider_released_at(intraday)"
+    ],
+    "read_only": true
+  },
+  "histdata": {
+    "role": "independent secondary (close-only 1h bars, already committed under data/real/histdata/)",
+    "read_only": true
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "critical_incidents": 0,
+  "incidents": [
+    {
+      "id": "INC-20260714-1",
+      "severity": "minor",
+      "summary": "Dukascopy datafeed intermittent 60s read-timeouts during first bulk fetch; run exceeded the 10-minute session budget and was terminated (SIGTERM)",
+      "impact": "4 of 9 hour-files initially missing; no data corruption (raw-first, append-only)",
+      "resolution": "re-fetch with 20s timeout x6 attempts completed all 9 files; duplicate protection verified across process restart",
+      "acknowledged_by": "session operator"
+    },
+    {
+      "id": "INC-20260714-2",
+      "severity": "informational",
+      "summary": "16,273 quotes flagged out_of_order_quote (degraded)",
+      "impact": "USDJPY 12h/13h and GBPUSD backfill ingested AFTER a later hour; flags record ingestion-vs-event order honestly. Event times inside each raw blob are monotonic; replay reproduces identical content",
+      "resolution": "expected behaviour for backfill; documented in README",
+      "acknowledged_by": "session operator"
+    }
+  ]
+}

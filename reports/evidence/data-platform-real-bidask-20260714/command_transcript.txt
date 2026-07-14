@@ -1,0 +1,43 @@
+# Command transcript — data-platform-real-bidask-20260714 (all executed this session)
+
+## 1. Real Dukascopy collection (raw-first ingest_hour, requests fetcher)
+3 pairs x 3 hours (2024-01-10 12:00-15:00 UTC) -> 52,732 accepted quotes, 0 quarantined, 9 raw blobs
+  USDJPY 12h:7161 13h:9112 14h:9905 / EURUSD 12h:3083 13h:4963 14h:5576 / GBPUSD 12h:3499 13h:4752 14h:4681
+Incident: first bulk run hit 60s read-timeouts (session budget exceeded, SIGTERM);
+re-fetch with 20s timeout x6 attempts completed the 4 missing files. Duplicate
+protection verified across the process restart.
+
+## 2. Deterministic replay (real raw bytes)
+re-parse 9 blobs -> sorted data-derived fields hash
+  fedc… session: cdca393e2e7a484f… == accepted-log hash  => MATCH (52,732 rows)
+
+## 3. Independent reproduction (fresh detached worktree, same commit)
+  hash cdca393e2e7a484f… == original  => MATCH
+
+## 4. Cross-source divergence (real, independent providers)
+Dukascopy last-tick-mid vs HistData 1h close, 9 bars x 3 pairs:
+  USDJPY [2.80, 0.75, 0.40] pips / EURUSD [1.75, 0.40, 0.35] / GBPUSD [2.15, 0.15, 2.15]
+  max 2.80 pips => divergence_state usable (no averaging performed)
+
+## 5. Real ALFRED macro PIT (keyless alfredgraph.csv, vintage-stamped columns)
+  GDPC1 vintage=2024-02-01: 2023Q3 22490.692, 2023Q4 22672.859
+  GDPC1 vintage=2024-04-05: 2023Q3 22490.692, 2023Q4 22679.255  (revision separated)
+  CPIAUCSL vintages 2024-02-15 / 2024-04-15: 4 obs each; UNRATE 2024-02-15: 4 obs
+  as_of(before first capture) = 0 rows (PIT correct); as_of(now) = latest vintage
+  NOTE: plain fredgraph.csv IGNORES vintage_date (probe returned post-vintage data) -> forbidden in parser
+
+## 6. Fault injection (fixtures/injectable transports; junitxml-parsed outcomes)
+  23/23 scenarios pass (see fault_injection_report.json for node ids)
+
+## 7. Secrets / no-order-path (executed as tests)
+  tracked-file credential scan: 0 leaks; .env not tracked; collect imports no trader/executor module
+
+## 8. launchd dry-run (real machine)
+  plutil -lint: OK; daemon --dry-run without credentials -> EX_CONFIG(78) with env-var NAMES only
+
+## 9. Machine-judged scorecard (evidence-only)
+  status=capped score=61.0/100 raw=61.0 hard_cap=75
+  caps: <=75 no live market data (historical only); <=85 fewer than 30 trading days (0)
+  NOTE: an earlier scorecard bug awarded 15pt to the 0-quote OANDA adapter (78/100);
+  fixed so zero-quote sources earn nothing (test_zero_quote_live_adapter_earns_nothing)
+  and null metrics earn nothing (test_null_divergence_metrics_earn_nothing).

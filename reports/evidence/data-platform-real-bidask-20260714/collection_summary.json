@@ -1,0 +1,37 @@
+{
+  "sources": [
+    {
+      "provider": "dukascopy",
+      "collection_mode": "historical_download",
+      "account_environment": "datafeed",
+      "has_bid_ask": true,
+      "quote_count": 52732,
+      "instruments": [
+        "USDJPY",
+        "EURUSD",
+        "GBPUSD"
+      ],
+      "window_utc": "2024-01-10T12:00 .. 2024-01-10T15:00 (3 hours x 3 pairs)",
+      "sizes_present": true,
+      "raw_first_verified": true,
+      "raw_blob_count": 9,
+      "synthetic": false,
+      "replay_fixture": false
+    },
+    {
+      "provider": "oanda",
+      "collection_mode": "live_stream",
+      "account_environment": "live",
+      "has_bid_ask": true,
+      "quote_count": 0,
+      "instruments": [],
+      "implemented_not_connected": true,
+      "reason": "no credentials available (FX_OANDA_API_TOKEN/ACCOUNT_ID/ENV unset); adapter fails closed; replay-tested only",
+      "sizes_flagged_absent": true,
+      "raw_first_verified": true,
+      "synthetic": false,
+      "replay_fixture": false
+    }
+  ],
+  "synthetic_or_replay_counted_as_real": false
+}

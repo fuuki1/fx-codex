@@ -1,0 +1,14 @@
+{
+  "future_timestamp_accepted": 0,
+  "raw_hash_mismatch_count": 0,
+  "stale_used_as_tradable_count": 0,
+  "accepted_quotes": 52732,
+  "quarantined_records": 0,
+  "duplicate_count": 0,
+  "out_of_order_count": 16273,
+  "quality_flag_counts": {
+    "provider_does_not_supply_sequence_id": 52732,
+    "out_of_order_quote": 16273
+  },
+  "note": "all quotes tradable=false (historical download); raw hash re-verified on every store.get"
+}
