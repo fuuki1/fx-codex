@@ -28,30 +28,22 @@ jobs:
           from pathlib import Path
 
           path = Path("tests/test_data_platform_scorecard.py")
-          text = path.read_text()
-          old = '''                {
-                              "raw_hash_verified": True,
-                              "replay_ok": True,
-                              "critical_incidents": 0,
-                              "primary_up": True,
-                              "secondary_up": True,
-                          }
-          '''
-          new = '''                {
-                              "schema_version": 1,
-                              "report_date": f"2026-08-{day:02d}",
-                              "prospective_window_ok": True,
-                              "qualifying_day": True,
-                              "raw_hash_verified": True,
-                              "replay_ok": True,
-                              "critical_incidents": 0,
-                              "primary_up": True,
-                              "secondary_up": True,
-                          }
-          '''
-          if old not in text:
-              raise SystemExit("legacy scorecard fixture block not found")
-          path.write_text(text.replace(old, new, 1))
+          lines = path.read_text().splitlines()
+          anchor = '                    "raw_hash_verified": True,'
+          indices = [index for index, line in enumerate(lines) if line == anchor]
+          if not indices:
+              raise SystemExit("legacy scorecard fixture anchor not found")
+          index = indices[0]
+          if any("qualifying_day" in line for line in lines[max(0, index - 5) : index]):
+              raise SystemExit("fixture already updated")
+          additions = [
+              '                    "schema_version": 1,',
+              '                    "report_date": f"2026-08-{day:02d}",',
+              '                    "prospective_window_ok": True,',
+              '                    "qualifying_day": True,',
+          ]
+          lines[index:index] = additions
+          path.write_text("\n".join(lines) + "\n")
           PY
           python -m pip install -r requirements.lock
           python -m pip install -e . --no-deps
