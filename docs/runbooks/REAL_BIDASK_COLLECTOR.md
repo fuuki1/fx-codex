@@ -53,6 +53,7 @@ The command must fail when:
 - its mode is not `0600`
 - a required key is missing
 - an unknown or duplicate key exists
+- the approved virtual-environment Python is unavailable
 - the plist is malformed
 - the Python collector configuration is invalid
 
@@ -69,7 +70,7 @@ scripts/quote_collector_launchd.sh uninstall
 
 The plist launches `/bin/sh scripts/run_quote_collector.sh --launchd ...`.
 The wrapper loads the mode-600 credential file through the daemon's narrow
-`--env-file` parser.
+`--env-file` parser and refuses to fall back to an unreviewed system Python.
 
 Expected operator-action exits are translated to wrapper exit 0 so launchd does
 not loop:
@@ -80,8 +81,14 @@ not loop:
 | 77 | token rejected/expired | stop; replace credentials |
 | 78 | invalid/missing configuration | stop; repair configuration |
 
-Unexpected I/O/runtime failures remain nonzero and are eligible for launchd
-restart after `ThrottleInterval`.
+Transient or unexpected failures remain nonzero and are eligible for launchd
+restart after `ThrottleInterval`:
+
+| Daemon code | Meaning |
+|---:|---|
+| 69 | source unavailable after consecutive reconnect budget |
+| 70 | unexpected software failure |
+| 74 | I/O or storage failure |
 
 ## 5. Raw-first data path
 
@@ -121,11 +128,12 @@ Recorded terminal categories include:
 
 - duplicate writer rejection
 - authorization failure
+- source unavailable after reconnect exhaustion
 - I/O failure
 - unexpected runtime failure
 - graceful stop
 
-State files use temp-write, file fsync, atomic replace, and directory fsync.
+State files use temp-write, file fsync, atomic replace and directory fsync.
 Incident/state persistence may itself fail during disk exhaustion; launchd
 stderr remains the fallback evidence in that case.
 
@@ -137,6 +145,8 @@ HEARTBEAT message resets the consecutive-failure budget. The lifetime
 
 Each disconnect opens an explicit gap. Heartbeat timeout marks the connection
 non-tradable before a late quote is processed. Token rejection never retries.
+Exhausting the transient reconnect budget exits 69 so launchd may restart the
+process rather than silently treating source loss as a successful stop.
 
 ## 8. Prospective daily report
 
@@ -146,12 +156,17 @@ Generate a report after the trading day closes:
 python -m tools.data_platform_daily_report \
   --collection-root "$HOME/srv/fx-codex/collect" \
   --date 2026-07-14 \
+  --primary-evidence /path/to/primary_health_2026-07-14.json \
   --secondary-evidence /path/to/secondary_health_2026-07-14.json \
   --replay-evidence /path/to/replay_health_2026-07-14.json \
   --output-dir "$HOME/srv/fx-codex/collect/operations"
 ```
 
-The supporting files must be same-day JSON objects:
+The three supporting files must be same-day JSON objects:
+
+```json
+{"report_date": "2026-07-14", "primary_up": true}
+```
 
 ```json
 {"report_date": "2026-07-14", "secondary_up": true}
@@ -161,10 +176,16 @@ The supporting files must be same-day JSON objects:
 {"report_date": "2026-07-14", "replay_ok": true}
 ```
 
-The generator computes primary live-pair coverage, quote counts, freshness,
-quarantine flags, immutable raw verification, critical incidents and disk
-headroom. Missing secondary/replay evidence produces a report with
-`qualifying_day=false`; it is never inferred or backfilled.
+The generator binds each file by SHA-256 and independently verifies that the
+accepted log contains usable live OANDA quotes for USDJPY, EURUSD and GBPUSD.
+A single quote or a health declaration without three-pair coverage does not make
+`primary_up=true`.
+
+The generator also checks immutable raw blobs, quote counts, freshness,
+quarantine flags, critical incidents and disk headroom. Missing, stale or
+contradictory evidence produces `qualifying_day=false`; it is never inferred.
+Reports older than the prospective generation window are non-qualifying, which
+prevents retrospective construction of operational history.
 
 Exit codes:
 
@@ -172,28 +193,32 @@ Exit codes:
 - `2`: non-qualifying report written
 - `1`: malformed input; no valid report
 
-The scorecard counts a day only when all five fields pass:
+The scorecard validates a unique ISO report date and exact filename, then counts
+a day only when all conditions pass:
 
 ```text
-raw_hash_verified
-replay_ok
+qualifying_day is true
+prospective_window_ok is true
+raw_hash_verified is true
+replay_ok is true
 critical_incidents == 0
-primary_up
-secondary_up
+primary_up is true
+secondary_up is true
 ```
 
-Historical bundles cannot be renamed or copied into the prospective operations
-directory to manufacture qualifying days.
+Renaming or copying a report to manufacture another day is rejected because the
+filename must equal `daily_report_<report_date>.json`.
 
 ## 9. Known remaining operational blockers
 
 Before the 30-day clock can legitimately start:
 
 1. connect an approved live non-demo OANDA read-only stream
-2. connect an independent prospective secondary source
-3. generate same-day replay evidence
-4. schedule the daily-report command under a reviewed single-writer service
-5. connect alerting for token failure, incidents, stale data and non-qualifying days
-6. confirm clock synchronization and backup/retention on the Mac mini
+2. create an independently measured same-day primary-health artifact
+3. connect an independent prospective secondary source
+4. generate same-day deterministic replay evidence
+5. schedule the daily-report command under a reviewed single-writer service
+6. connect alerting for token failure, incidents, stale data and non-qualifying days
+7. confirm clock synchronization and backup/retention on the Mac mini
 
 Until these are complete, the data-platform score remains evidence-capped.
