@@ -1,0 +1,224 @@
+name: Harden operations evidence
+
+on:
+  push:
+    branches: ["integration/research-v3"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: harden-operations-evidence
+  cancel-in-progress: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: integration/research-v3
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply evidence-counting hardening
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          scorecard = Path("tools/data_platform_scorecard.py")
+          text = scorecard.read_text()
+          text = text.replace(
+              'from dataclasses import dataclass, field\nimport json\n',
+              'from dataclasses import dataclass, field\nfrom datetime import date\nimport json\n',
+          )
+          text = text.replace('SCORECARD_VERSION = "1.0.0"', 'SCORECARD_VERSION = "1.1.0"')
+          old_load = '''        daily: list[dict[str, Any]] = []
+          if operations_dir is not None:
+              if not operations_dir.is_dir():
+                  raise ScorecardInputError(f"operations directory not found: {operations_dir}")
+              for report in sorted(operations_dir.glob("daily_report_*.json")):
+                  loaded = _load_json(report)
+                  if loaded is not None:
+                      daily.append(loaded)
+          '''
+          new_load = '''        daily: list[dict[str, Any]] = []
+          seen_report_dates: set[str] = set()
+          if operations_dir is not None:
+              if not operations_dir.is_dir():
+                  raise ScorecardInputError(f"operations directory not found: {operations_dir}")
+              for report in sorted(operations_dir.glob("daily_report_*.json")):
+                  loaded = _load_json(report)
+                  if loaded is None:
+                      continue
+                  report_date = loaded.get("report_date")
+                  if not isinstance(report_date, str):
+                      raise ScorecardInputError(f"daily report missing report_date: {report}")
+                  try:
+                      date.fromisoformat(report_date)
+                  except ValueError as error:
+                      raise ScorecardInputError(
+                          f"daily report has invalid report_date {report_date!r}: {report}"
+                      ) from error
+                  expected_name = f"daily_report_{report_date}.json"
+                  if report.name != expected_name:
+                      raise ScorecardInputError(
+                          f"daily report filename/date mismatch: {report.name} != {expected_name}"
+                      )
+                  if report_date in seen_report_dates:
+                      raise ScorecardInputError(f"duplicate daily report date: {report_date}")
+                  seen_report_dates.add(report_date)
+                  daily.append(loaded)
+          '''
+          if old_load not in text:
+              raise SystemExit("scorecard daily-load target not found")
+          text = text.replace(old_load, new_load)
+          old_score = '''def _score_operations(ev: Evidence, sb: ScoreBuilder) -> None:
+              section = "continuous_operation"
+              valid_days = 0
+              for report in ev.daily_reports:
+                  ok = (
+                      bool(report.get("raw_hash_verified", False))
+                      and bool(report.get("replay_ok", False))
+                      and int(report.get("critical_incidents", 0)) == 0
+                      and bool(report.get("primary_up", False))
+                      and bool(report.get("secondary_up", False))
+                  )
+                  if ok:
+                      valid_days += 1
+              if valid_days >= REQUIRED_TRADING_DAYS:
+                  sb.award(
+                      section,
+                      20,
+                      20,
+                      f"{valid_days} qualifying trading days of continuous collection",
+                      "daily_report_*.json",
+                  )
+              elif valid_days > 0:
+                  sb.award(
+                      section,
+                      20 * valid_days / REQUIRED_TRADING_DAYS,
+                      20,
+                      f"only {valid_days}/{REQUIRED_TRADING_DAYS} qualifying trading days",
+                      "daily_report_*.json",
+                  )
+                  sb.cap(85, f"fewer than {REQUIRED_TRADING_DAYS} trading days ({valid_days})")
+              else:
+                  sb.miss(section, 20, "no qualifying trading days of continuous operation")
+                  sb.cap(85, f"fewer than {REQUIRED_TRADING_DAYS} trading days (0)")
+          '''
+          new_score = '''def _score_operations(ev: Evidence, sb: ScoreBuilder) -> None:
+              section = "continuous_operation"
+              valid_days = 0
+              for report in ev.daily_reports:
+                  ok = (
+                      report.get("qualifying_day") is True
+                      and report.get("prospective_window_ok") is True
+                      and report.get("raw_hash_verified") is True
+                      and report.get("replay_ok") is True
+                      and int(report.get("critical_incidents", 0)) == 0
+                      and report.get("primary_up") is True
+                      and report.get("secondary_up") is True
+                  )
+                  if ok:
+                      valid_days += 1
+              if valid_days >= REQUIRED_TRADING_DAYS:
+                  sb.award(
+                      section,
+                      20,
+                      20,
+                      f"{valid_days} unique prospective qualifying trading days",
+                      "daily_report_*.json",
+                  )
+              elif valid_days > 0:
+                  sb.award(
+                      section,
+                      20 * valid_days / REQUIRED_TRADING_DAYS,
+                      20,
+                      f"only {valid_days}/{REQUIRED_TRADING_DAYS} prospective qualifying days",
+                      "daily_report_*.json",
+                  )
+                  sb.cap(85, f"fewer than {REQUIRED_TRADING_DAYS} trading days ({valid_days})")
+              else:
+                  sb.miss(section, 20, "no prospective qualifying days of continuous operation")
+                  sb.cap(85, f"fewer than {REQUIRED_TRADING_DAYS} trading days (0)")
+          '''
+          if old_score not in text:
+              raise SystemExit("scorecard operations target not found")
+          scorecard.write_text(text.replace(old_score, new_score))
+
+          tests = Path("tests/test_data_platform_scorecard.py")
+          test_text = tests.read_text()
+          old_fixture = '''                {
+                              "raw_hash_verified": True,
+                              "replay_ok": True,
+                              "critical_incidents": 0,
+                              "primary_up": True,
+                              "secondary_up": True,
+                          }
+          '''
+          new_fixture = '''                {
+                              "schema_version": 1,
+                              "report_date": f"2026-08-{day:02d}",
+                              "prospective_window_ok": True,
+                              "qualifying_day": True,
+                              "raw_hash_verified": True,
+                              "replay_ok": True,
+                              "critical_incidents": 0,
+                              "primary_up": True,
+                              "secondary_up": True,
+                          }
+          '''
+          if old_fixture not in test_text:
+              raise SystemExit("scorecard fixture target not found")
+          test_text = test_text.replace(old_fixture, new_fixture)
+          marker = '''def test_zero_quote_live_adapter_earns_nothing(tmp_path: Path) -> None:
+          '''
+          additions = '''def test_nonqualifying_daily_reports_do_not_count(tmp_path: Path) -> None:
+              bundle, ops = tmp_path / "bundle", tmp_path / "ops"
+              _full_green_bundle(bundle, ops)
+              for report in sorted(ops.glob("daily_report_*.json"))[5:]:
+                  payload = json.loads(report.read_text())
+                  payload["qualifying_day"] = False
+                  report.write_text(json.dumps(payload))
+              result = compute_scorecard(Evidence.load(bundle, ops))
+              assert result["hard_cap"] == 85
+              operation_awards = [
+                  award for award in result["awards"] if award["section"] == "continuous_operation"
+              ]
+              assert operation_awards[0]["points"] == pytest.approx(20 * 5 / 30)
+
+
+          def test_daily_report_filename_must_match_report_date(tmp_path: Path) -> None:
+              bundle, ops = tmp_path / "bundle", tmp_path / "ops"
+              _full_green_bundle(bundle, ops)
+              source = ops / "daily_report_2026-08-01.json"
+              (ops / "daily_report_copy.json").write_text(source.read_text())
+              with pytest.raises(ScorecardInputError, match="filename/date mismatch"):
+                  Evidence.load(bundle, ops)
+
+
+          '''
+          if marker not in test_text:
+              raise SystemExit("scorecard insertion marker not found")
+          tests.write_text(test_text.replace(marker, additions + marker))
+          PY
+      - name: Format and focused verification
+        run: |
+          python -m pip install black==26.5.1 ruff==0.15.20 pytest==9.0.3
+          black tools/data_platform_scorecard.py tests/test_data_platform_scorecard.py
+          ruff check tools/data_platform_scorecard.py tests/test_data_platform_scorecard.py
+          pytest -q tests/test_data_platform_scorecard.py tests/test_data_platform_daily_report.py
+      - name: Commit patch once
+        run: |
+          if git diff --quiet; then
+            echo "Evidence hardening already applied."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/data_platform_scorecard.py tests/test_data_platform_scorecard.py
+          git commit -m "fix(data): prevent operations evidence day inflation"
+          git push origin HEAD:integration/research-v3
