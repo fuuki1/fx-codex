@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Read-only FX quote collector (data_platform.collect). No order path.
-       Credentials come from the login Keychain-backed environment file loaded
-       by the wrapper script — NEVER templated into this plist. -->
+  <!-- Read-only FX quote collector. The wrapper loads collector.env at runtime;
+       credential values are never templated into this plist. -->
   <key>Label</key>
   <string>com.fx-codex.quote-collector</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__PYTHON__</string>
-    <string>__ROOT__/tools/fx_quote_collector.py</string>
+    <string>/bin/sh</string>
+    <string>__ROOT__/scripts/run_quote_collector.sh</string>
+    <string>--launchd</string>
     <string>--output-root</string>
     <string>__HOME__/srv/fx-codex/collect</string>
   </array>
@@ -20,8 +21,8 @@
   <true/>
   <key>KeepAlive</key>
   <dict>
-    <!-- restart on crash, but NOT on config errors (EX_CONFIG=78) or
-         token expiry (EX_NOPERM=77): those need a human. -->
+    <!-- The wrapper maps expected operator-action stops (75/77/78) to success,
+         so only unexpected failures are restarted. -->
     <key>SuccessfulExit</key>
     <false/>
   </dict>
