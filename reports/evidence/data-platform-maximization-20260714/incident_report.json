@@ -1,0 +1,30 @@
+{
+  "collector_incident_files": [],
+  "critical_incidents": 0,
+  "incidents": [
+    {
+      "acknowledged_by": "session operator",
+      "id": "INC-20260714-M1",
+      "impact": "close-only research datasets mislabel bar boundaries by one hour; leak-freedom of past pipeline evidence is unaffected (uniform shift), but session alignment (e.g. news windows) would be wrong",
+      "resolution": "documented; dukascopy bid/ask datasets supersede histdata for research; histdata regeneration deferred to a follow-up",
+      "severity": "minor",
+      "summary": "committed HistData 1h CSVs carry a uniform +1h timestamp-label shift vs Dukascopy/FXCM UTC (measured: p50 mid diff 6.5 pips at lag 0 vs 1-2 pips at -1h, consistent across months)"
+    },
+    {
+      "acknowledged_by": "session operator",
+      "id": "INC-20260714-M2",
+      "impact": "2021-2022 unusable as a trusted comparison source",
+      "resolution": "years excluded by measurement (build_candle_datasets.FXCM_YEARS); parser additionally fail-closes any file with >1% crossed rows",
+      "severity": "minor",
+      "summary": "FXCM archive 2021 weekly files carry 2.3-6.3% crossed-boundary rows (up to 10 pips inverted), 2022 up to 0.7%; 2023-2025 measured clean"
+    },
+    {
+      "acknowledged_by": "session operator",
+      "id": "INC-20260714-M3",
+      "impact": "honest gaps recorded in the mirror manifest; retries completed the mirror with 0 failed urls",
+      "resolution": "empty week = honest absence in the parser; backoff+retry in the fetcher",
+      "severity": "informational",
+      "summary": "FXCM serves empty gzip files for 2024 weeks 35/51/52 (all pairs); Dukascopy datafeed returned intermittent 503/timeouts during bulk mirror"
+    }
+  ]
+}

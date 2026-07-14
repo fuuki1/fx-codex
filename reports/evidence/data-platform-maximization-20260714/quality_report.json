@@ -1,0 +1,21 @@
+{
+  "dukascopy_candles_accepted": 2516558,
+  "dukascopy_padding_excluded": 1038466,
+  "future_timestamp_accepted": 0,
+  "fxcm_candles_accepted": 107144,
+  "fxcm_crossed_excluded": 0,
+  "fxcm_zero_width_excluded": 0,
+  "note": "contracts reject future timestamps/crossed books at construction; padding, zero-width and crossed exclusions are counted per payload, never silent; truefx quotes are always tradable=false (aggregator)",
+  "raw_hash_mismatch_count": 0,
+  "stale_used_as_tradable_count": 0,
+  "tradable_true_accepted_truefx": 0,
+  "truefx_quarantine_reasons": {
+    "duplicate_quote": 110,
+    "provider_does_not_supply_ask_size": 110,
+    "provider_does_not_supply_bid_size": 110,
+    "provider_does_not_supply_sequence_id": 110,
+    "schema_validation_failed": 659
+  },
+  "truefx_quarantined": 769,
+  "truefx_quotes_accepted": 655
+}

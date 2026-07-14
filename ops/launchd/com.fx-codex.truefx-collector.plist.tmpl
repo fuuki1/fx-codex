@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Read-only LIVE market-data poller: TrueFX unauthenticated aggregator
+       snapshot (data_platform.collect.truefx). Requires NO credentials of any
+       kind; quotes are indicative and always tradable=false. No order path.
+       Single-writer lock shares the collect root with the OANDA collector, so
+       run them under DIFFERENT output roots. -->
+  <key>Label</key>
+  <string>com.fx-codex.truefx-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/tools/fx_quote_collector.py</string>
+    <string>--source</string>
+    <string>truefx</string>
+    <string>--output-root</string>
+    <string>__HOME__/srv/fx-codex/collect-truefx</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <!-- restart on crash; a clean exit (bounded run / graceful stop) stays down -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/srv/fx-codex/collect-truefx/logs/collector.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/srv/fx-codex/collect-truefx/logs/collector.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

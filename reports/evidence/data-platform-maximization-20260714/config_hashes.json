@@ -1,0 +1,14 @@
+{
+  "data_platform/collect/candles.py": "348b1a7a0ad055d814c5dfd6789f7c923c5221b03e1f6f669f7c78868d7c9a04",
+  "data_platform/collect/divergence_bars.py": "7ea0bbbe9e4bcb0dc4fd3bb615ef97619d4cb83742f328ee27f4a29eb1845457",
+  "data_platform/collect/dukascopy_candles.py": "115db2b0740669b1f0fc67a7e12eb2fa0c5c9d91f7c799a29aff728d9575483b",
+  "data_platform/collect/fxcm_candles.py": "12f1a3091152ce5c01044422ceb9e1dc7924cca6bb91698f643187f973a2dcfe",
+  "data_platform/collect/truefx.py": "114b166aef991ab5df172367f19080f4048b2d028c1db64378e9406fa812d755",
+  "data_platform/materialize/candle_bars.py": "8f18e299ed14f230152ad60250184edb8545e0a0d402b8ba91f9787b5f7c61c1",
+  "scripts/assemble_data_platform_evidence.py": "e57502615d4e480ad8fdfc293349f58b65f1a574083dc450d1fa78370184c327",
+  "scripts/build_candle_datasets.py": "0db58b9147b9182ae2b4d392007a27b832d3050ed67624c49d3657600a680b98",
+  "scripts/fetch_public_candles.py": "2be2d439615828866895f94919f2ed7f144ccfb591f3dcaee60bd74678cddb7a",
+  "tools/data_platform_daily_report.py": "796f75c906d40f7073d16b4d999e44a6e87b4286c70c4fd04e9e5f4d995a3964",
+  "tools/data_platform_scorecard.py": "ac37afa6372786db9b30bbb76537468489378bd8ed22ba90f78462668fe5c54f",
+  "tools/fx_quote_collector.py": "a92f3454f699c1bc852ecd84cb59cb72245f23eddf8df717bfd4a5fb5ce405eb"
+}

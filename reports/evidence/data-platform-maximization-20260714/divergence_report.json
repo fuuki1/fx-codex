@@ -1,0 +1,432 @@
+{
+  "all_inputs_real": true,
+  "breach_policy_evidence": "real thresholds on real data: worst-bar mid divergence exceeded the 10-pip quarantine limit (news/rollover hours) and the histdata as-committed labels quarantined with p50 ~6.5 pips; the -1h corrected comparison drops p50 to ~1-2 pips, isolating a +1h label shift in the committed histdata CSVs. values were never averaged; states degraded/quarantined instead",
+  "breach_policy_exercised": true,
+  "comparisons": [
+    {
+      "breach_counts": {
+        "mid_over_quarantine": 7,
+        "mid_over_threshold": 71,
+        "spread_over_threshold": 20
+      },
+      "collection_context": "bar sources are downloads/snapshots; receive_time_skew_ms measures the pipeline's receive alignment, not market latency",
+      "comparison_basis": "boundary_close_mid_and_spread",
+      "divergence_reason": [
+        "mid_diff_19.80pips_exceeds_quarantine",
+        "spread_diff_exceeds_threshold"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "USDJPY",
+      "interval": "1h",
+      "matched_bars": 5896,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 5896.0,
+          "max": 19.80000000000075,
+          "p50": 0.10000000000047748,
+          "p95": 0.899999999998613,
+          "p99": 3.350000000000364
+        },
+        "receive_time_skew_ms": {
+          "count": 5896.0,
+          "max": 557460.829,
+          "p50": 478848.537,
+          "p95": 544746.579,
+          "p99": 550315.3620000001
+        },
+        "spread_diff_pips": {
+          "count": 5896.0,
+          "max": 21.3,
+          "p50": 0.2,
+          "p95": 1.1000000000000003,
+          "p99": 2.905000000000001
+        }
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "fxcm"
+      ],
+      "secondary_provider": "fxcm",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 354,
+      "unmatched_secondary": 0,
+      "window": "2024 full year"
+    },
+    {
+      "comparison_basis": "mid_close_vs_close_only (HistData M1-derived 1h closes AS COMMITTED (bid basis))",
+      "divergence_reason": [
+        "mid_diff_311.00pips_exceeds_quarantine"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "USDJPY",
+      "interval": "1h",
+      "matched_bars": 6213,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 6213.0,
+          "max": 310.9999999999985,
+          "p50": 6.54999999999859,
+          "p95": 35.29999999999916,
+          "p99": 66.77999999999872
+        },
+        "receive_time_skew_ms": {},
+        "spread_diff_pips": {}
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "histdata"
+      ],
+      "secondary_provider": "histdata",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 37,
+      "unmatched_secondary": 52,
+      "window": "2024 full year, labels as committed"
+    },
+    {
+      "comparison_basis": "mid_close_vs_close_only (same closes with labels shifted -1h (root-cause verification))",
+      "divergence_reason": [
+        "mid_diff_102.20pips_exceeds_quarantine"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "USDJPY",
+      "interval": "1h",
+      "matched_bars": 6231,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 6231.0,
+          "max": 102.19999999999914,
+          "p50": 1.649999999997931,
+          "p95": 9.400000000002251,
+          "p99": 25.125000000000174
+        },
+        "receive_time_skew_ms": {},
+        "spread_diff_pips": {}
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "histdata"
+      ],
+      "secondary_provider": "histdata",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 19,
+      "unmatched_secondary": 34,
+      "window": "2024 full year, labels corrected by -1h"
+    },
+    {
+      "breach_counts": {
+        "mid_over_quarantine": 0,
+        "mid_over_threshold": 7,
+        "spread_over_threshold": 11
+      },
+      "collection_context": "bar sources are downloads/snapshots; receive_time_skew_ms measures the pipeline's receive alignment, not market latency",
+      "comparison_basis": "boundary_close_mid_and_spread",
+      "divergence_reason": [
+        "mid_diff_5.05pips_exceeds_threshold",
+        "spread_diff_exceeds_threshold"
+      ],
+      "divergence_state": "degraded",
+      "instrument": "EURUSD",
+      "interval": "1h",
+      "matched_bars": 5896,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 5896.0,
+          "max": 5.049999999999777,
+          "p50": 0.05000000000032756,
+          "p95": 0.40000000000040004,
+          "p99": 1.100000000000545
+        },
+        "receive_time_skew_ms": {
+          "count": 5896.0,
+          "max": 948015.89,
+          "p50": 805510.51,
+          "p95": 873727.9839999999,
+          "p99": 881948.075
+        },
+        "spread_diff_pips": {
+          "count": 5896.0,
+          "max": 7.7,
+          "p50": 0.1,
+          "p95": 0.5000000000000002,
+          "p99": 1.7999999999999998
+        }
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "fxcm"
+      ],
+      "secondary_provider": "fxcm",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 354,
+      "unmatched_secondary": 43,
+      "window": "2024 full year"
+    },
+    {
+      "comparison_basis": "mid_close_vs_close_only (HistData M1-derived 1h closes AS COMMITTED (bid basis))",
+      "divergence_reason": [
+        "mid_diff_94.60pips_exceeds_quarantine"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "EURUSD",
+      "interval": "1h",
+      "matched_bars": 6242,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 6242.0,
+          "max": 94.60000000000024,
+          "p50": 3.0999999999981043,
+          "p95": 15.899999999999805,
+          "p99": 29.868000000000276
+        },
+        "receive_time_skew_ms": {},
+        "spread_diff_pips": {}
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "histdata"
+      ],
+      "secondary_provider": "histdata",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 8,
+      "unmatched_secondary": 53,
+      "window": "2024 full year, labels as committed"
+    },
+    {
+      "comparison_basis": "mid_close_vs_close_only (same closes with labels shifted -1h (root-cause verification))",
+      "divergence_reason": [
+        "mid_diff_47.35pips_exceeds_quarantine"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "EURUSD",
+      "interval": "1h",
+      "matched_bars": 6244,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 6244.0,
+          "max": 47.35000000000156,
+          "p50": 0.7999999999985796,
+          "p95": 4.299999999999304,
+          "p99": 11.200000000001364
+        },
+        "receive_time_skew_ms": {},
+        "spread_diff_pips": {}
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "histdata"
+      ],
+      "secondary_provider": "histdata",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 6,
+      "unmatched_secondary": 51,
+      "window": "2024 full year, labels corrected by -1h"
+    },
+    {
+      "breach_counts": {
+        "mid_over_quarantine": 0,
+        "mid_over_threshold": 19,
+        "spread_over_threshold": 33
+      },
+      "collection_context": "bar sources are downloads/snapshots; receive_time_skew_ms measures the pipeline's receive alignment, not market latency",
+      "comparison_basis": "boundary_close_mid_and_spread",
+      "divergence_reason": [
+        "mid_diff_7.85pips_exceeds_threshold",
+        "spread_diff_exceeds_threshold"
+      ],
+      "divergence_state": "degraded",
+      "instrument": "GBPUSD",
+      "interval": "1h",
+      "matched_bars": 5896,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 5896.0,
+          "max": 7.849999999998136,
+          "p50": 0.10000000000065512,
+          "p95": 0.700000000000145,
+          "p99": 1.7999999999984695
+        },
+        "receive_time_skew_ms": {
+          "count": 5896.0,
+          "max": 1238500.526,
+          "p50": 947321.9090000001,
+          "p95": 1009265.7860000001,
+          "p99": 1017562.316
+        },
+        "spread_diff_pips": {
+          "count": 5896.0,
+          "max": 15.899999999999997,
+          "p50": 0.4,
+          "p95": 1.2000000000000002,
+          "p99": 3.5999999999999996
+        }
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "fxcm"
+      ],
+      "secondary_provider": "fxcm",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 354,
+      "unmatched_secondary": 4,
+      "window": "2024 full year"
+    },
+    {
+      "comparison_basis": "mid_close_vs_close_only (HistData M1-derived 1h closes AS COMMITTED (bid basis))",
+      "divergence_reason": [
+        "mid_diff_94.60pips_exceeds_quarantine"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "GBPUSD",
+      "interval": "1h",
+      "matched_bars": 6229,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 6229.0,
+          "max": 94.60000000000024,
+          "p50": 4.100000000000215,
+          "p95": 19.649999999999945,
+          "p99": 36.12199999999967
+        },
+        "receive_time_skew_ms": {},
+        "spread_diff_pips": {}
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "histdata"
+      ],
+      "secondary_provider": "histdata",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 21,
+      "unmatched_secondary": 52,
+      "window": "2024 full year, labels as committed"
+    },
+    {
+      "comparison_basis": "mid_close_vs_close_only (same closes with labels shifted -1h (root-cause verification))",
+      "divergence_reason": [
+        "mid_diff_63.35pips_exceeds_quarantine"
+      ],
+      "divergence_state": "quarantined",
+      "instrument": "GBPUSD",
+      "interval": "1h",
+      "matched_bars": 6246,
+      "metrics": {
+        "mid_diff_pips": {
+          "count": 6246.0,
+          "max": 63.349999999999795,
+          "p50": 1.100000000000545,
+          "p95": 5.999999999999339,
+          "p99": 17.087500000000922
+        },
+        "receive_time_skew_ms": {},
+        "spread_diff_pips": {}
+      },
+      "policy": "values are never averaged on divergence; state degrades instead",
+      "primary_provider": "dukascopy",
+      "providers": [
+        "dukascopy",
+        "histdata"
+      ],
+      "secondary_provider": "histdata",
+      "thresholds": {
+        "max_mid_diff_pips": 3.0,
+        "max_receive_skew_ms": 5000.0,
+        "max_spread_diff_pips": 5.0,
+        "quarantine_mid_diff_pips": 10.0
+      },
+      "unmatched_primary": 4,
+      "unmatched_secondary": 35,
+      "window": "2024 full year, labels corrected by -1h"
+    }
+  ],
+  "instruments": [
+    "USDJPY",
+    "EURUSD",
+    "GBPUSD"
+  ],
+  "metrics": {
+    "mid_diff_pips": {
+      "count": 5896.0,
+      "max": 19.80000000000075,
+      "p50": 0.10000000000047748,
+      "p95": 0.899999999998613,
+      "p99": 3.350000000000364
+    },
+    "receive_time_skew_ms": {
+      "count": 5896.0,
+      "max": 1238500.526,
+      "p50": 947321.9090000001,
+      "p95": 1009265.7860000001,
+      "p99": 1017562.316
+    },
+    "spread_diff_pips": {
+      "count": 5896.0,
+      "max": 21.3,
+      "p50": 0.2,
+      "p95": 1.1000000000000003,
+      "p99": 2.905000000000001
+    }
+  },
+  "metrics_basis": "per metric, the per-pair dukascopy-vs-fxcm comparison with the largest max (conservative); per-pair detail in comparisons[]",
+  "providers": [
+    "dukascopy",
+    "fxcm",
+    "histdata"
+  ],
+  "providers_independent": true
+}

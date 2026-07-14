@@ -1,0 +1,33 @@
+{
+  "as_of_evidence": "as_of(2024-01-01, before first capture availability) returned 0 rows; as_of(now) returned 2 rows",
+  "as_of_query_verified": true,
+  "provider": "alfred",
+  "quality_flags_on_every_record": [
+    "availability_normalized_to_capture_time",
+    "provider_does_not_supply_release_time",
+    "provider_does_not_supply_scheduled_time",
+    "vintage_from_alfredgraph_keyless"
+  ],
+  "real_data": true,
+  "record_count": 14,
+  "revision_separation_verified": true,
+  "series": [
+    "CPIAUCSL",
+    "GDPC1",
+    "UNRATE"
+  ],
+  "vintage_correct": true,
+  "vintage_evidence": {
+    "GDPC1_2023Q4_across_vintages": [
+      [
+        "2024-02-01",
+        22672.859
+      ],
+      [
+        "2024-04-05",
+        22679.255
+      ]
+    ],
+    "note": "same period stored once per vintage; values differ across vintages = revisions kept separate"
+  }
+}

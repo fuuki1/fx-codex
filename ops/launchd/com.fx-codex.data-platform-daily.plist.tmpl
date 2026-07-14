@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Daily continuous-operation report for the data platform
+       (tools.data_platform_daily_report): verifies raw hashes + replay of the
+       day's live quotes and writes daily_report_YYYY-MM-DD.json. The scorecard
+       counts a qualifying day ONLY from this recomputed evidence. Runs at
+       23:50 local time; pass an explicit UTC --date if local midnight differs
+       from the UTC day being scored. -->
+  <key>Label</key>
+  <string>com.fx-codex.data-platform-daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>tools.data_platform_daily_report</string>
+    <string>--live-root</string>
+    <string>__HOME__/srv/fx-codex/collect-truefx</string>
+    <string>--mirror-root</string>
+    <string>__HOME__/srv/fx-codex/mirror</string>
+    <string>--ops-dir</string>
+    <string>__HOME__/srv/fx-codex/ops</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>23</integer>
+    <key>Minute</key>
+    <integer>50</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/srv/fx-codex/ops/logs/daily-report.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/srv/fx-codex/ops/logs/daily-report.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

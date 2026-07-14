@@ -1,0 +1,14 @@
+{
+  "dataset_rebuild": {
+    "datasets_compared": 12,
+    "hash_mismatches": {},
+    "missing": [],
+    "performed": true
+  },
+  "method": "full second materialization of every dataset from the mirrored raw files in a temp directory, hashes compared to the registered lineage; plus re-parse of every TrueFX raw blob against the accepted quote log",
+  "real_data": true,
+  "result_sha256": "4ebadf62512927e9cde082defa88a021e57bcbc30672836c7023d9ebb278888d",
+  "status": "match",
+  "truefx_raw_blobs_verified": 277,
+  "truefx_rows_compared": 722
+}

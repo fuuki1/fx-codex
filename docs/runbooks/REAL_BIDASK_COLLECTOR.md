@@ -7,9 +7,12 @@
 
 | 役割 | provider | 認証 | 状態 |
 |---|---|---|---|
-| Primary(live) | OANDA v3 pricing stream | `FX_OANDA_API_TOKEN` / `FX_OANDA_ACCOUNT_ID` / `FX_OANDA_ENV` | **実装済・未接続**（credentials未保有。無しでは fail-closed EX_CONFIG=78） |
-| 実bid/ask(historical) | Dukascopy datafeed (.bi5) | 不要 | **実証済**（52,732 quote / 3pair、503リトライ実装） |
-| Secondary照合 | HistData 1h bars | 不要 | 実証済（bar-mid照合） |
+| Primary(live, broker) | OANDA v3 pricing stream | `FX_OANDA_API_TOKEN` / `FX_OANDA_ACCOUNT_ID` / `FX_OANDA_ENV` | **実装済・未接続**（credentials未保有。無しでは fail-closed EX_CONFIG=78） |
+| Live(aggregator) | TrueFX webrates (無認証) | **不要** | **実証済**（`--source truefx`。indicative・常に`tradable=false`・scorecardはaggregator枠=部分加点+cap80） |
+| 実bid/ask tick(historical) | Dukascopy datafeed ticks (.bi5) | 不要 | 実証済（52,732 quote / 3pair、503リトライ実装） |
+| 実bid/ask candle(historical) | Dukascopy datafeed m1/h1 candles (.bi5) | 不要 | **実証済**（2019-2026 h1 + 2024通年m1 ×3pair → 5m/1h バー実体化） |
+| 独立第2 bid/ask(historical) | FXCM candledata (H1 週次csv.gz) | 不要 | **実証済**（2023-2025のみ採用。2021-22はcrossed-book 2.3-6.3%を計測し除外） |
+| Secondary照合 | HistData 1h bars | 不要 | 実証済（bar-mid照合。**既存コミットCSVは+1hラベルずれを計測** → incident参照、研究はDukascopyバーを使用） |
 | macro PIT | ALFRED alfredgraph.csv | 不要 | **実証済**（vintage刻印列を必須化。素のfredgraph.csvはvintage無視のため使用禁止） |
 
 practice/demo は接続技術の実証にのみ使い、本番実証に数えない（scorecard cap 90）。

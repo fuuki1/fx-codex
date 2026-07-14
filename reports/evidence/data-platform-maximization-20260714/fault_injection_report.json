@@ -1,0 +1,222 @@
+{
+  "exit_code": 0,
+  "method": "fail-closed behaviours executed as pytest scenarios (fault injected via fixtures: corrupt payloads, crossed books, stale/duplicate quotes, transport failures, tampered raw blobs, lock collisions)",
+  "scenarios": [
+    {
+      "name": "tests/test_collect_candles.py::TestCandleContract::test_incoherent_ohlc_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleContract::test_low_above_close_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleContract::test_naive_datetime_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleContract::test_future_open_time_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleContract::test_missing_volume_flagged_never_zero_filled",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleContract::test_bad_side_and_interval_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestDukascopyCandles::test_wrong_record_count_fails_closed",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestDukascopyCandles::test_off_grid_offset_fails_closed",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestFxcmCandles::test_isolated_crossed_row_is_excluded_and_counted",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestFxcmCandles::test_pervasively_crossed_file_fails_closed",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestFxcmCandles::test_bad_header_fails_closed",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestFxcmCandles::test_empty_week_file_is_an_honest_gap",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestTruefx::test_poll_once_ingests_and_second_identical_poll_is_duplicate",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestTruefx::test_stale_event_time_is_quarantined_not_accepted",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestTruefx::test_http_error_fails_closed",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestTruefx::test_run_poller_opens_gap_on_transport_failure_and_bounds_polls",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleIngest::test_parse_failure_quarantines_but_keeps_raw",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleIngest::test_candle_log_flags_duplicates",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleBars::test_unpaired_and_crossed_are_counted_not_repaired",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleBars::test_finer_target_than_source_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleBars::test_mixed_providers_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestCandleBars::test_gap_audit_reports_missing_buckets",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestBarDivergence::test_same_provider_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestBarDivergence::test_breach_degrades_then_quarantines_never_averages",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_candles.py::TestBarDivergence::test_close_only_series_spread_is_honestly_unmeasured",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_data_platform_daily_report.py::TestDailyReport::test_down_day_is_reported_down_not_skipped",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_data_platform_daily_report.py::TestDailyReport::test_tampered_raw_blob_fails_verification",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_daemon.py::TestDiskFull::test_unwritable_raw_store_fails_closed",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_daemon.py::TestMultiWriter::test_second_writer_cannot_acquire_lock",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_daemon.py::TestMultiWriter::test_lock_released_after_crash_is_reacquirable",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_no_order_path.py::test_collect_never_imports_order_or_executor_modules",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_no_order_path.py::test_no_order_like_public_methods",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_no_order_path.py::test_source_contains_no_order_endpoint_or_live_switch",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_no_order_path.py::test_tracked_files_leak_no_credentials",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_no_order_path.py::test_env_files_are_not_tracked",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_crossed_book_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_zero_width_book_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_nan_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_negative_price_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_naive_received_at_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_future_event_time_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_small_clock_skew_tolerated",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_negative_size_rejected",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestContractRejections::test_bool_is_not_a_price",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestHonestMissingFields::test_missing_fields_flagged_not_zero_filled",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestHonestMissingFields::test_mid_and_spread_are_computed_only",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestHonestMissingFields::test_round_trip_serialization",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestRawFirstOrder::test_parse_failure_keeps_raw_and_quarantines",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestRawFirstOrder::test_quote_citing_wrong_raw_hash_is_quarantined",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestRawFirstOrder::test_raw_tamper_detected_on_read",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestDuplicateOrderingStale::test_duplicate_quarantined_not_dropped",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestDuplicateOrderingStale::test_out_of_order_flagged_degraded",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestDuplicateOrderingStale::test_stale_live_quote_quarantined_never_tradable",
+      "outcome": "pass"
+    },
+    {
+      "name": "tests/test_collect_contract.py::TestDuplicateOrderingStale::test_log_state_survives_restart",
+      "outcome": "pass"
+    }
+  ]
+}

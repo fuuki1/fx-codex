@@ -1,0 +1,91 @@
+{
+  "sources": [
+    {
+      "account_environment": "datafeed",
+      "collection_mode": "historical_download",
+      "has_bid_ask": true,
+      "instruments": [
+        "USDJPY",
+        "EURUSD",
+        "GBPUSD"
+      ],
+      "provider": "dukascopy",
+      "provider_type": "bank",
+      "quote_count": 2516558,
+      "raw_first_verified": true,
+      "record_unit": "single_side_bid_or_ask_candle_records (1m/1h)",
+      "replay_fixture": false,
+      "sizes_note": "provider-reported per-side volumes on every non-padding candle",
+      "sizes_present": true,
+      "synthetic": false,
+      "window_utc": "h1: 2019-01 .. 2026-06; m1: 2024 full year (3 pairs)"
+    },
+    {
+      "account_environment": "datafeed",
+      "collection_mode": "historical_download",
+      "has_bid_ask": true,
+      "instruments": [
+        "USDJPY",
+        "EURUSD",
+        "GBPUSD"
+      ],
+      "provider": "fxcm",
+      "provider_type": "broker",
+      "quote_count": 107144,
+      "raw_first_verified": true,
+      "record_unit": "single_side_bid_or_ask_candle_records (1h)",
+      "replay_fixture": false,
+      "sizes_flagged_absent": true,
+      "synthetic": false,
+      "window_utc": "2023-01 .. 2026-01 (2021-2022 excluded: measured crossed-book prevalence 2.3-6.3%)"
+    },
+    {
+      "account_environment": "datafeed",
+      "collection_mode": "live_stream",
+      "has_bid_ask": true,
+      "instruments": [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY"
+      ],
+      "provider": "truefx",
+      "provider_type": "aggregator",
+      "quote_count": 655,
+      "raw_first_verified": true,
+      "receive_lag_seconds_p50": 0.384,
+      "receive_lag_seconds_p95": 1.837,
+      "record_unit": "top_of_book_quotes (unauthenticated public feed)",
+      "replay_fixture": false,
+      "sizes_flagged_absent": true,
+      "synthetic": false,
+      "tradable": false
+    },
+    {
+      "account_environment": "live",
+      "collection_mode": "live_stream",
+      "has_bid_ask": true,
+      "implemented_not_connected": true,
+      "instruments": [],
+      "provider": "oanda",
+      "provider_type": "broker",
+      "quote_count": 0,
+      "raw_first_verified": true,
+      "reason": "no credentials available (FX_OANDA_API_TOKEN/ACCOUNT_ID/ENV unset); adapter fails closed; replay-tested only",
+      "replay_fixture": false,
+      "sizes_flagged_absent": true,
+      "synthetic": false
+    },
+    {
+      "account_environment": "datafeed",
+      "collection_mode": "historical_download",
+      "has_bid_ask": false,
+      "note": "close-only 1h bars retained for divergence checks; committed labels carry a +1h shift (see incident_report); superseded for research by the dukascopy bid/ask datasets",
+      "provider": "histdata",
+      "provider_type": "aggregator",
+      "quote_count": 0,
+      "replay_fixture": false,
+      "synthetic": false
+    }
+  ],
+  "synthetic_or_replay_counted_as_real": false
+}

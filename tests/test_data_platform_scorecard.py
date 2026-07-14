@@ -36,6 +36,7 @@ def _full_green_bundle(bundle: Path, ops: Path) -> None:
             "sources": [
                 {
                     "provider": "broker-x",
+                    "provider_type": "broker",
                     "collection_mode": "live_stream",
                     "account_environment": "live",
                     "has_bid_ask": True,
@@ -46,6 +47,7 @@ def _full_green_bundle(bundle: Path, ops: Path) -> None:
                 },
                 {
                     "provider": "provider-y",
+                    "provider_type": "broker",
                     "collection_mode": "live_stream",
                     "account_environment": "live",
                     "has_bid_ask": True,

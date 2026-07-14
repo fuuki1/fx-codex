@@ -18,6 +18,7 @@ Sections (100 total)
 Hard caps (the minimum applicable cap wins; fatal conditions zero the score):
     no real broker bid/ask quotes ............ cap 65
     no live market data (historical only) .... cap 75
+    live from non-broker aggregator only ..... cap 80
     fewer than 30 trading days ............... cap 85
     practice/demo data only .................. cap 90
     no independent second source ............. cap 90
@@ -27,6 +28,13 @@ Hard caps (the minimum applicable cap wins; fatal conditions zero the score):
     stale quote used as tradable ............. score 0, status=failed
     synthetic/replay counted as real ......... score 0, status=failed
     secret leakage ........................... score 0, status=failed
+
+Live-source credit distinguishes WHO serves the live stream via each source
+row's ``provider_type`` (``broker`` vs anything else / absent = non-broker,
+fail-closed): a live non-demo BROKER stream earns the full live award, while a
+live non-broker aggregator (e.g. an unauthenticated indicative-rates feed)
+earns partial credit and caps the total at 80 — live aggregator data proves
+liveness of the pipeline but not broker-grade tradable pricing.
 
 Usage:
     python3 -m tools.data_platform_scorecard --evidence-dir <bundle> \
@@ -45,7 +53,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-SCORECARD_VERSION = "1.0.0"
+SCORECARD_VERSION = "1.1.0"
 REQUIRED_PAIRS = 3
 REQUIRED_TRADING_DAYS = 30
 
@@ -228,6 +236,9 @@ def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
         if s.get("collection_mode") == "live_stream"
         and s.get("account_environment") not in ("practice", "demo")
     ]
+    # provider_type declares WHO serves the stream; absent = non-broker (fail-closed).
+    broker_live = [s for s in live if s.get("provider_type") == "broker"]
+    aggregator_live = [s for s in live if s not in broker_live]
     demo_live = [s for s in bidask if s.get("collection_mode") == "live_stream" and s not in live]
     historical = [s for s in bidask if s.get("collection_mode") == "historical_download"]
     total_quotes = sum(int(s.get("quote_count", 0)) for s in bidask)
@@ -239,18 +250,32 @@ def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.cap(75, "no live market data (historical download and/or demo only)")
         if demo_live and not historical:
             sb.cap(90, "practice/demo live stream only")
+    elif not broker_live:
+        sb.cap(80, "live market data from non-broker aggregator only (no broker live stream)")
 
-    # live stream from a non-demo broker (15)
-    if live:
-        live_quotes = sum(int(s.get("quote_count", 0)) for s in live)
+    # live stream from a non-demo broker (15); a live non-broker aggregator
+    # proves pipeline liveness but not broker-grade pricing -> partial credit.
+    if broker_live:
+        live_quotes = sum(int(s.get("quote_count", 0)) for s in broker_live)
         sb.award(
             section,
             15,
             15,
             f"live non-demo broker stream: {live_quotes} quotes from "
-            f"{sorted(str(s.get('provider')) for s in live)}",
+            f"{sorted(str(s.get('provider')) for s in broker_live)}",
             "collection_summary.json",
         )
+    elif aggregator_live:
+        live_quotes = sum(int(s.get("quote_count", 0)) for s in aggregator_live)
+        sb.award(
+            section,
+            7,
+            15,
+            f"live NON-BROKER aggregator stream: {live_quotes} quotes from "
+            f"{sorted(str(s.get('provider')) for s in aggregator_live)}",
+            "collection_summary.json",
+        )
+        sb.unmet.append(f"[{section}] no live broker bid/ask stream (aggregator only)")
     else:
         sb.miss(section, 15, "no live non-demo broker bid/ask stream collected")
 
