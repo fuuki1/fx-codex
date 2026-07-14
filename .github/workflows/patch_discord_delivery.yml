@@ -3,6 +3,8 @@ name: Patch Discord delivery hardening
 on:
   push:
     branches: ["integration/research-v3"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: write
