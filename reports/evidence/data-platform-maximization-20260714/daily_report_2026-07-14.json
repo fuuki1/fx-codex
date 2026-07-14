@@ -1,0 +1,20 @@
+{
+  "accepted_quotes": 1765,
+  "critical_incidents": 0,
+  "date": "2026-07-14",
+  "generated_at": "2026-07-14T15:05:57.093495+00:00",
+  "primary_provider": "truefx",
+  "primary_provider_type": "aggregator",
+  "primary_up": true,
+  "raw_hash_verified": true,
+  "replay_ok": true,
+  "schema": "data_platform_daily_report_v1",
+  "secondary_files": 2734,
+  "secondary_source_prefix": "dukascopy",
+  "secondary_up": true,
+  "semantics": "primary_up = live poller accepted >=1 quote this UTC day; secondary_up = independent mirror fetched/verified >=1 file this day; raw/replay recomputed from the content-addressed store, never trusted from memory",
+  "verify_detail": {
+    "raw_blobs_checked": 664,
+    "raw_blobs_cited": 664
+  }
+}

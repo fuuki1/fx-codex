@@ -1,0 +1,188 @@
+{
+  "awards": [
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 15,
+      "points": 7,
+      "reason": "live NON-BROKER aggregator stream: 655 quotes from ['truefx']",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 7,
+      "points": 7,
+      "reason": "real bid/ask quotes ingested: 2624357 (modes: ['historical_download', 'live_stream'])",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 4,
+      "points": 4,
+      "reason": "pair coverage: ['EURUSD', 'GBPUSD', 'USDJPY']",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "bid/ask sizes present or honestly flagged provider_does_not_supply_*",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "raw-first storage verified (raw sha256 recorded before normalization)",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "divergence_report.json",
+      "max_points": 8,
+      "points": 8,
+      "reason": "independent providers compared: ['dukascopy', 'fxcm', 'histdata']",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "divergence_report.json",
+      "max_points": 3,
+      "points": 3,
+      "reason": "compared pairs: ['EURUSD', 'GBPUSD', 'USDJPY']",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "divergence_report.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "required divergence metrics measured",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "divergence_report.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "breach policy exercised (no averaging; degraded/quarantined transition observed)",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "macro_pit_report.json",
+      "max_points": 8,
+      "points": 8,
+      "reason": "real macro records: 14 from alfred (vintage_correct=True)",
+      "section": "macro_event_pit"
+    },
+    {
+      "evidence": "macro_pit_report.json",
+      "max_points": 4,
+      "points": 4,
+      "reason": "as-of query verified on real data (pre-availability blocked)",
+      "section": "macro_event_pit"
+    },
+    {
+      "evidence": "macro_pit_report.json",
+      "max_points": 3,
+      "points": 3,
+      "reason": "initial vs revised values stored separately (vintage evidence)",
+      "section": "macro_event_pit"
+    },
+    {
+      "evidence": "daily_report_*.json",
+      "max_points": 20,
+      "points": 0.67,
+      "reason": "only 1/30 qualifying trading days",
+      "section": "continuous_operation"
+    },
+    {
+      "evidence": "replay_report.json",
+      "max_points": 5,
+      "points": 5,
+      "reason": "deterministic replay on real data (hash 4ebadf625129\u2026)",
+      "section": "reproducibility_audit"
+    },
+    {
+      "evidence": "independent_reproduction.json",
+      "max_points": 5,
+      "points": 5,
+      "reason": "independent-environment reproduction matched on real data",
+      "section": "reproducibility_audit"
+    },
+    {
+      "evidence": "fault_injection_report.json",
+      "max_points": 6,
+      "points": 6.0,
+      "reason": "fault injection: 54/54 scenarios fail-closed",
+      "section": "fault_tolerance_secrets"
+    },
+    {
+      "evidence": "secrets_scan.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "secrets scan clean (0 leaks)",
+      "section": "fault_tolerance_secrets"
+    },
+    {
+      "evidence": "secrets_scan.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "collector verified to import no order/executor path",
+      "section": "fault_tolerance_secrets"
+    }
+  ],
+  "daily_report_count": 1,
+  "evidence_bundle": "reports/evidence/data-platform-maximization-20260714",
+  "evidence_paths": [
+    "collection_summary.json",
+    "daily_report_*.json",
+    "divergence_report.json",
+    "fault_injection_report.json",
+    "independent_reproduction.json",
+    "macro_pit_report.json",
+    "replay_report.json",
+    "secrets_scan.json"
+  ],
+  "fatal_reasons": [],
+  "hard_cap": 80,
+  "hard_cap_reasons": [
+    {
+      "limit": 80,
+      "reason": "live market data from non-broker aggregator only (no broker live stream)"
+    },
+    {
+      "limit": 85,
+      "reason": "fewer than 30 trading days (1)"
+    }
+  ],
+  "max_score": 100,
+  "raw_score": 72.67,
+  "score": 72.67,
+  "scorecard_version": "1.1.0",
+  "sections": {
+    "continuous_operation": {
+      "max_points": 20.0,
+      "points": 0.67
+    },
+    "dual_source_verification": {
+      "max_points": 15.0,
+      "points": 15.0
+    },
+    "fault_tolerance_secrets": {
+      "max_points": 10.0,
+      "points": 10.0
+    },
+    "macro_event_pit": {
+      "max_points": 15.0,
+      "points": 15.0
+    },
+    "reproducibility_audit": {
+      "max_points": 10.0,
+      "points": 10.0
+    },
+    "trading_market_data": {
+      "max_points": 30.0,
+      "points": 22.0
+    }
+  },
+  "status": "capped",
+  "unmet_conditions": [
+    "[trading_market_data] no live broker bid/ask stream (aggregator only)"
+  ]
+}

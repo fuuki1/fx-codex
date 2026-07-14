@@ -1,0 +1,26 @@
+{
+  "commit": "22b9f5e53340de16fda8bb7f279627b2e27811b7",
+  "dataset_sha256": {
+    "dukascopy_eurusd_1h_2019-2026_v1": "a7499c1764791e1bf5d7e0b2d4a6582cd20ccebc2437e5cb6912334310e2f1be",
+    "dukascopy_eurusd_1h_from_m1_2024_v1": "e9b0b7076183e3f00d6b3e89bca9e576431e60c6b89f34a593d2e8aade5218b8",
+    "dukascopy_eurusd_5m_from_m1_2024_v1": "86b57e99776147063fe9915010fe4e75fee0268d6ca3d08eff168ae1c2ce73c8",
+    "dukascopy_gbpusd_1h_2019-2026_v1": "7ed836265263beb7185e249d46fce5735fa115756f7b67263bf5366ca153dd17",
+    "dukascopy_gbpusd_1h_from_m1_2024_v1": "f62e39c9e98cc2aa325f1a521491eaf3e56c8956fadcfd80202f3747d77140ce",
+    "dukascopy_gbpusd_5m_from_m1_2024_v1": "146cc91fe966e055ddda2d090a7fc601907166ad4b83e9726867ccbefeb9f056",
+    "dukascopy_usdjpy_1h_2019-2026_v1": "ae2bd8c65b71e4c80d14807dff89919feecafb4d9f6f28c91c3ec0d7db13e4aa",
+    "dukascopy_usdjpy_1h_from_m1_2024_v1": "4e8b30881b320fe0bc2148c6a2634a316cfc7af769c5c1eb674414e9b205f00f",
+    "dukascopy_usdjpy_5m_from_m1_2024_v1": "66dc107fa89f171d1929f73874bdc2d195b4af7601a2dcd62ef793c85db0c299",
+    "fxcm_eurusd_1h_2023-2026_v1": "9632836263fde0bac3464f55f894f05feebb996da7106d0acdcf606409d6ed7d",
+    "fxcm_gbpusd_1h_2023-2026_v1": "62f95efda0b628019bf9c9e82d4a0c63c44e17cd9bdc40697d07146ef312ceb2",
+    "fxcm_usdjpy_1h_2023-2026_v1": "1a115553fa41a55b7c5ca69f395311f74e6fdd92b55ce6fbe37996ff9b0e246d"
+  },
+  "datasets_reproduced": 12,
+  "environment": "fresh detached git worktree at the same commit, separate working directory and raw store; same immutable mirror as input",
+  "generated_at": "2026-07-14T15:05:39.999053+00:00",
+  "hash_mismatches": {},
+  "independent_environment": true,
+  "missing": [],
+  "real_data": true,
+  "result_sha256": "4ebadf62512927e9cde082defa88a021e57bcbc30672836c7023d9ebb278888d",
+  "status": "match"
+}
