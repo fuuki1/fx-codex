@@ -51,7 +51,7 @@ def test_only_explicit_qualifying_days_receive_operation_points(tmp_path: Path) 
     operation = next(
         award for award in result["awards"] if award["section"] == "continuous_operation"
     )
-    assert operation["points"] == pytest.approx(20 * 5 / 30)
+    assert operation["points"] == round(20 * 5 / 30, 2)
     assert result["hard_cap"] <= 85
 
 
