@@ -53,10 +53,10 @@ class TestMultiWriter:
         the restarted collector."""
 
         code = (
-            "import sys; sys.path.insert(0, %r); "
+            f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r}); "
             "from tools.run_exclusive import ExclusiveLock; "
-            "lock = ExclusiveLock('quote-collector', locks_dir=%r); assert lock.acquire()"
-            % (str(REPO_ROOT), str(tmp_path))
+            f"lock = ExclusiveLock('quote-collector', locks_dir={str(tmp_path)!r}); "
+            "assert lock.acquire()"
         )
         subprocess.run([sys.executable, "-c", code], check=True)  # exits -> lock freed
         restarted = ExclusiveLock("quote-collector", locks_dir=tmp_path)
