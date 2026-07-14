@@ -9,6 +9,7 @@ switch, (4) tracked files leak no credential-shaped strings.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -34,14 +35,27 @@ ORDER_METHOD_PATTERN = re.compile(
 
 
 def test_collect_never_imports_order_or_executor_modules() -> None:
-    for name in COLLECT_MODULES:
-        importlib.import_module(name)
-    loaded = sorted(sys.modules)
-    offenders = [
-        module
-        for module in loaded
-        if module.split(".")[0] == "trader" or "executor" in module.split(".")[-1]
-    ]
+    """Import the collect package in an ISOLATED interpreter and assert no
+    order-path module gets loaded. (A shared pytest session's ``sys.modules``
+    is polluted by unrelated tests, so the check must run in a subprocess.)"""
+
+    repo_root = Path(__file__).resolve().parents[1]
+    code = (
+        "import importlib, json, sys\n"
+        f"for name in {COLLECT_MODULES!r}:\n"
+        "    importlib.import_module(name)\n"
+        "offenders = [m for m in sorted(sys.modules)\n"
+        "             if m.split('.')[0] == 'trader' or 'executor' in m.split('.')[-1]]\n"
+        "print(json.dumps(offenders))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    offenders = json.loads(result.stdout.strip())
     assert offenders == [], f"collector imported order-path modules: {offenders}"
 
 

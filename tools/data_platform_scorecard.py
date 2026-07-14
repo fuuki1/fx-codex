@@ -215,7 +215,13 @@ def _score_market_data(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.cap(75, "no live market data evidence")
         return
     real_sources = _real_source_rows(collection)
-    bidask = [s for s in real_sources if bool(s.get("has_bid_ask", False))]
+    # A source only counts in ANY category with actually-collected quotes:
+    # an implemented-but-unconnected adapter (quote_count 0) earns nothing.
+    bidask = [
+        s
+        for s in real_sources
+        if bool(s.get("has_bid_ask", False)) and int(s.get("quote_count", 0)) > 0
+    ]
     live = [
         s
         for s in bidask
@@ -342,10 +348,16 @@ def _score_dual_source(ev: Evidence, sb: ScoreBuilder) -> None:
         sb.miss(section, 3, "no instruments compared")
     metrics = report.get("metrics", {})
     wanted = {"mid_diff_pips", "spread_diff_pips", "receive_time_skew_ms"}
-    if isinstance(metrics, dict) and wanted.issubset(metrics.keys()):
-        sb.award(section, 2, 2, "required divergence metrics present", "divergence_report.json")
+    populated = (
+        isinstance(metrics, dict)
+        and wanted.issubset(metrics.keys())
+        # a null metric is an honest "could not measure" — it earns nothing
+        and all(isinstance(metrics[name], dict) and metrics[name] for name in wanted)
+    )
+    if populated:
+        sb.award(section, 2, 2, "required divergence metrics measured", "divergence_report.json")
     else:
-        sb.miss(section, 2, f"divergence metrics incomplete (need {sorted(wanted)})")
+        sb.miss(section, 2, f"divergence metrics not all measured (need {sorted(wanted)})")
     if bool(report.get("breach_policy_exercised", False)):
         sb.award(
             section,

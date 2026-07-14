@@ -76,9 +76,9 @@ def _full_green_bundle(bundle: Path, ops: Path) -> None:
             "all_inputs_real": True,
             "instruments": ["USDJPY", "EURUSD", "GBPUSD"],
             "metrics": {
-                "mid_diff_pips": {},
-                "spread_diff_pips": {},
-                "receive_time_skew_ms": {},
+                "mid_diff_pips": {"count": 9, "p50": 0.4, "max": 1.2},
+                "spread_diff_pips": {"count": 9, "p50": 0.1, "max": 0.5},
+                "receive_time_skew_ms": {"count": 9, "p50": 12.0, "max": 40.0},
             },
             "breach_policy_exercised": True,
         },
@@ -195,6 +195,52 @@ def test_under_30_days_capped_at_85(tmp_path: Path) -> None:
     result = compute_scorecard(Evidence.load(bundle, ops))
     assert result["hard_cap"] == 85
     assert result["score"] <= 85
+
+
+def test_zero_quote_live_adapter_earns_nothing(tmp_path: Path) -> None:
+    """An implemented-but-unconnected live adapter (quote_count=0) must not be
+    treated as live market data — code existence never scores."""
+
+    bundle, ops = tmp_path / "bundle", tmp_path / "ops"
+    _full_green_bundle(bundle, ops)
+    summary = json.loads((bundle / "collection_summary.json").read_text())
+    summary["sources"] = [
+        {  # real historical quotes
+            "provider": "dukascopy",
+            "collection_mode": "historical_download",
+            "account_environment": "datafeed",
+            "has_bid_ask": True,
+            "quote_count": 50_000,
+            "instruments": ["USDJPY", "EURUSD", "GBPUSD"],
+            "sizes_present": True,
+            "raw_first_verified": True,
+        },
+        {  # implemented live adapter, ZERO quotes
+            "provider": "oanda",
+            "collection_mode": "live_stream",
+            "account_environment": "live",
+            "has_bid_ask": True,
+            "quote_count": 0,
+            "instruments": [],
+            "sizes_flagged_absent": True,
+            "raw_first_verified": True,
+        },
+    ]
+    _write(bundle, "collection_summary.json", summary)
+    result = compute_scorecard(Evidence.load(bundle, ops))
+    assert result["hard_cap"] <= 75  # no live market data
+    live_awards = [a for a in result["awards"] if "live non-demo broker stream" in a["reason"]]
+    assert live_awards == []  # zero-quote live earns nothing
+
+
+def test_null_divergence_metrics_earn_nothing(tmp_path: Path) -> None:
+    bundle, ops = tmp_path / "bundle", tmp_path / "ops"
+    _full_green_bundle(bundle, ops)
+    report = json.loads((bundle / "divergence_report.json").read_text())
+    report["metrics"]["spread_diff_pips"] = None  # honest could-not-measure
+    _write(bundle, "divergence_report.json", report)
+    result = compute_scorecard(Evidence.load(bundle, ops))
+    assert any("not all measured" in u for u in result["unmet_conditions"])
 
 
 def test_synthetic_sources_never_count(tmp_path: Path) -> None:
