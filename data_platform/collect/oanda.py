@@ -192,9 +192,7 @@ def requests_transport(url: str, token: str) -> Iterator[bytes]:  # pragma: no c
     except TokenExpiredError:
         raise
     except requests.exceptions.RequestException as error:
-        raise ConnectionError(
-            f"requests transport failed: {type(error).__name__}"
-        ) from error
+        raise ConnectionError(f"requests transport failed: {type(error).__name__}") from error
 
 
 def stream_quotes(
