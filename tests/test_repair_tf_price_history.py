@@ -60,7 +60,9 @@ def test_audit_keeps_earliest_available_conflicting_snapshot(tmp_path: Path) -> 
     assert len(quarantine) == 2
 
 
-def test_apply_repair_backs_up_quarantines_and_restores_writable_file(tmp_path: Path) -> None:
+def test_apply_repair_backs_up_quarantines_and_restores_writable_file(
+    tmp_path: Path,
+) -> None:
     tool = _load_tool()
     path = tmp_path / "prices.jsonl"
     path.write_text(
