@@ -9,7 +9,6 @@ import sys
 
 from fx_intel import price_history
 
-
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools" / "repair_tf_price_history.py"
 
