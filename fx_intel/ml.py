@@ -37,9 +37,11 @@ from collections.abc import Mapping, Sequence
 from .gbm import (
     CalibrationResult,
     GradientBoostingClassifier,
+    GradientBoostingRegressor,
     brier_score,
     log_loss,
     platt_calibrate,
+    rmse,
 )
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
@@ -76,6 +78,15 @@ MIN_PARTITION_ROWS = 30
 # ミッションクリティカル用途では「勝ったかもしれない」を「有効」と扱わない
 MIN_BRIER_IMPROVEMENT = 0.02  # 2%以上の改善を要求
 MIN_TEST_AUC = 0.55  # 基準率シフトだけでは得られない順位識別力を要求
+
+# 収益ヘッド(回帰/分位点)のゲート。realized_net_r が欠損(コスト不明)する行は
+# 学習・評価から除くため、二値ヘッドとは別に最低件数を課す。
+MIN_RETURN_TRAIN_ROWS = 40  # 回帰ヘッドの学習に必要な realized_net_r 付きサンプル
+MIN_RETURN_TEST_ROWS = 20  # OOS純Rの有意判定に必要なtest件数
+# 「test区間の平均純Rが有意に正」で return_usable にする。t = mean/(sd/√n) が
+# この値を超えることを要求(片側、ゆるめの2.0=およそ95%水準の目安)。
+MIN_RETURN_T_STAT = 2.0
+QUANTILE_LEVELS = {"p10": 0.10, "p50": 0.50, "p90": 0.90}
 
 DEFAULT_MODEL_PATH = "logs/ml_model.json"
 
@@ -234,6 +245,56 @@ class MLArtifact:
     model: GradientBoostingClassifier | None = None
     calibration: CalibrationResult = field(default_factory=CalibrationResult)
     importance_by_name: dict[str, float] = field(default_factory=dict)
+    # 収益ヘッド(shadow=保存のみ、当面は委員会の判断に不参加)。期待R回帰と分位点。
+    # 教師は realized_net_r。二値ヘッド(model/usable)とは独立に評価・保存する。
+    return_model: GradientBoostingRegressor | None = None
+    quantile_models: dict[str, GradientBoostingRegressor] = field(default_factory=dict)
+    n_return_train: int = 0
+    n_return_test: int = 0
+    return_val_rmse: float | None = None  # 回帰ヘッドのtest RMSE
+    return_oos_mean_net_r: float | None = None  # test区間の平均実測純R(=収益の実体)
+    return_oos_r_tstat: float | None = None  # 平均純R>0 のt統計量(有意性の目安)
+    return_usable: bool = False  # 回帰ヘッドを判断に使ってよいか(OOS純Rが有意に正)
+    return_reasons: list[str] = field(default_factory=list)
+
+    def expected_net_r(
+        self,
+        direction: str,
+        tech_score: float,
+        news_score: float,
+        chart: Mapping[str, float],
+        data_quality: float | None = None,
+    ) -> float | None:
+        """期待純R(コスト控除後)。return_usableでない・回帰モデル無しはNone。"""
+        if (
+            not self.return_usable
+            or self.return_model is None
+            or direction not in ("long", "short")
+        ):
+            return None
+        row = direction_features(direction, tech_score, news_score, chart, data_quality)
+        return round(self.return_model.predict(vectorize(row, self.medians)), 4)
+
+    def net_r_interval(
+        self,
+        direction: str,
+        tech_score: float,
+        news_score: float,
+        chart: Mapping[str, float],
+        data_quality: float | None = None,
+    ) -> dict[str, float] | None:
+        """分位点予測(p10/p50/p90)の純R。ダウンサイド把握用。モデル無しはNone。"""
+        if (
+            self.return_model is None
+            or not self.quantile_models
+            or direction not in ("long", "short")
+        ):
+            return None
+        row = vectorize(
+            direction_features(direction, tech_score, news_score, chart, data_quality),
+            self.medians,
+        )
+        return {name: round(model.predict(row), 4) for name, model in self.quantile_models.items()}
 
     def predict_hit_probability(
         self,
@@ -401,7 +462,99 @@ def train_artifact(
             f" / 特徴量識別 {'あり' if has_feature_signal else 'なし'}"
             f"(Brier {artifact.val_brier:.3f} vs {artifact.baseline_brier:.3f})"
         )
+
+    _train_return_heads(artifact, rows, r_labels, medians, train_idx, test_idx)
     return artifact
+
+
+def _train_return_heads(
+    artifact: MLArtifact,
+    rows: Sequence[Mapping[str, float | None]],
+    r_labels: Sequence[float | None],
+    medians: Mapping[str, float],
+    train_idx: Sequence[int],
+    test_idx: Sequence[int],
+) -> None:
+    """収益ヘッド(期待R回帰+分位点)を二値ヘッドと同じ分割で学習する。
+
+    教師は realized_net_r(コスト控除後の実測R)。欠損(コスト不明)する行は除く。
+    委員会の判断には当面参加させない(shadow=保存のみ)。return_usable は
+    「test区間の平均実測純Rが有意に正」で判定する。データ不足は例外にせず
+    理由付きで return_usable=False。
+    """
+
+    def _labeled(indices: Sequence[int]) -> tuple[list[list[float]], list[float]]:
+        """realized_net_r 付きの行だけを (特徴ベクトル, 純R) に整える(欠損は除外)。"""
+        features: list[list[float]] = []
+        targets: list[float] = []
+        for i in indices:
+            label = r_labels[i]
+            if label is None:
+                continue
+            features.append(vectorize(rows[i], medians))
+            targets.append(float(label))
+        return features, targets
+
+    x_train_r, y_train_r = _labeled(train_idx)
+    x_test_r, y_test_r = _labeled(test_idx)
+    artifact.n_return_train = len(x_train_r)
+    artifact.n_return_test = len(x_test_r)
+    if len(x_train_r) < MIN_RETURN_TRAIN_ROWS:
+        artifact.return_reasons.append(
+            f"収益ヘッド学習サンプル不足(realized_net_r付き{len(x_train_r)}件"
+            f" < {MIN_RETURN_TRAIN_ROWS}件)"
+        )
+        return
+    if len(x_test_r) < MIN_RETURN_TEST_ROWS:
+        artifact.return_reasons.append(
+            f"収益ヘッドOOS評価サンプル不足({len(x_test_r)}件 < {MIN_RETURN_TEST_ROWS}件)"
+        )
+        return
+
+    # 期待R回帰(二乗誤差)
+    regressor = GradientBoostingRegressor(objective="squared", seed=artifact_seed(artifact))
+    regressor.fit(x_train_r, y_train_r)
+    artifact.return_model = regressor
+    preds = regressor.predict_many(x_test_r)
+    artifact.return_val_rmse = round(rmse(y_test_r, preds), 6)
+
+    # 分位点(p10/p50/p90): ダウンサイド〜アップサイドの純R帯
+    for name, q in QUANTILE_LEVELS.items():
+        head = GradientBoostingRegressor(
+            objective="quantile", quantile=q, seed=artifact_seed(artifact)
+        )
+        head.fit(x_train_r, y_train_r)
+        artifact.quantile_models[name] = head
+
+    # OOSの実測純R: 平均が有意に正か(収益の実体そのもの)
+    mean_net_r = sum(y_test_r) / len(y_test_r)
+    artifact.return_oos_mean_net_r = round(mean_net_r, 4)
+    t_stat = _one_sample_t(y_test_r)
+    artifact.return_oos_r_tstat = round(t_stat, 4) if t_stat is not None else None
+    if t_stat is not None and t_stat >= MIN_RETURN_T_STAT:
+        artifact.return_usable = True
+    else:
+        artifact.return_reasons.append(
+            f"収益ヘッド未採用: OOS平均純R {mean_net_r:+.3f}R の有意性不足"
+            f"(t={t_stat:.2f} < {MIN_RETURN_T_STAT} 要, n={len(y_test_r)})"
+        )
+
+
+def artifact_seed(artifact: MLArtifact) -> int:
+    """収益ヘッドの乱数種。分類器と同じ既定(7)で決定論を保つ。"""
+    return 7
+
+
+def _one_sample_t(values: Sequence[float]) -> float | None:
+    """H0: 平均=0 に対する片側t統計量。分散0や1件以下は None。"""
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    if variance <= 0:
+        return None
+    return mean / math.sqrt(variance / n)
 
 
 def _temporal_partitions(stamps: Sequence[datetime]) -> dict[str, list[int]]:
@@ -490,6 +643,19 @@ def save_artifact(artifact: MLArtifact, path: str | Path) -> None:
         },
         "importance_by_name": artifact.importance_by_name,
         "model": artifact.model.to_dict() if artifact.model is not None else None,
+        "return_head": {
+            "n_train": artifact.n_return_train,
+            "n_test": artifact.n_return_test,
+            "val_rmse": artifact.return_val_rmse,
+            "oos_mean_net_r": artifact.return_oos_mean_net_r,
+            "oos_r_tstat": artifact.return_oos_r_tstat,
+            "usable": artifact.return_usable,
+            "reasons": artifact.return_reasons,
+            "model": artifact.return_model.to_dict() if artifact.return_model is not None else None,
+            "quantile_models": {
+                name: head.to_dict() for name, head in artifact.quantile_models.items()
+            },
+        },
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -546,6 +712,28 @@ def load_artifact(path: str | Path) -> MLArtifact:
             artifact.model = GradientBoostingClassifier.from_dict(model_raw)
         elif artifact.usable:
             return MLArtifact(reasons=["usableなのにモデル本体が無い(破損)"])
+
+        return_head = payload.get("return_head")
+        if isinstance(return_head, Mapping):
+            artifact.n_return_train = int(return_head.get("n_train", 0))
+            artifact.n_return_test = int(return_head.get("n_test", 0))
+            artifact.return_val_rmse = _maybe_float(return_head.get("val_rmse"))
+            artifact.return_oos_mean_net_r = _maybe_float(return_head.get("oos_mean_net_r"))
+            artifact.return_oos_r_tstat = _maybe_float(return_head.get("oos_r_tstat"))
+            artifact.return_usable = bool(return_head.get("usable", False))
+            artifact.return_reasons = [str(r) for r in return_head.get("reasons", [])]
+            return_model_raw = return_head.get("model")
+            if return_model_raw is not None:
+                artifact.return_model = GradientBoostingRegressor.from_dict(return_model_raw)
+            elif artifact.return_usable:
+                return MLArtifact(reasons=["return_usableなのに回帰モデルが無い(破損)"])
+            quantile_raw = return_head.get("quantile_models", {})
+            if isinstance(quantile_raw, Mapping):
+                artifact.quantile_models = {
+                    str(name): GradientBoostingRegressor.from_dict(head)
+                    for name, head in quantile_raw.items()
+                    if isinstance(head, Mapping)
+                }
         return artifact
     except (KeyError, TypeError, ValueError) as error:
         return MLArtifact(reasons=[f"モデルファイル破損: {error}"])
