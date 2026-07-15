@@ -138,9 +138,7 @@ def audit(
                     }
                 )
 
-    ordered = sorted(
-        kept.values(), key=lambda item: (item.available_at, item.line_number)
-    )
+    ordered = sorted(kept.values(), key=lambda item: (item.available_at, item.line_number))
     counts["kept_rows"] = len(ordered)
     return ordered, quarantine, counts
 
@@ -179,9 +177,7 @@ def apply_repair(
     temp = path.with_name(f".{path.name}.repair-{os.getpid()}.tmp")
     with temp.open("w", encoding="utf-8") as handle:
         for candidate in rows:
-            handle.write(
-                json.dumps(candidate.row, ensure_ascii=False, sort_keys=True) + "\n"
-            )
+            handle.write(json.dumps(candidate.row, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(temp, mode)
@@ -205,13 +201,9 @@ def apply_repair(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="時間足別価格JSONLの重複衝突を監査・修復"
-    )
+    parser = argparse.ArgumentParser(description="時間足別価格JSONLの重複衝突を監査・修復")
     parser.add_argument("--path", type=Path, default=DEFAULT_PATH)
-    parser.add_argument(
-        "--apply", action="store_true", help="バックアップ後に修復を適用"
-    )
+    parser.add_argument("--apply", action="store_true", help="バックアップ後に修復を適用")
     parser.add_argument("--backup-dir", type=Path, default=None)
     args = parser.parse_args(argv)
 
