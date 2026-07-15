@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import time
+from typing import Any
 
 import requests
 
@@ -27,6 +28,8 @@ def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
         values.append(payload.get("retry_after"))
     values.append(response.headers.get("Retry-After"))
     for value in values:
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            continue
         try:
             delay = float(value)
         except (TypeError, ValueError):
@@ -38,7 +41,7 @@ def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
 
 def send_webhook(
     webhook_url: str,
-    payload: Mapping[str, object],
+    payload: Mapping[str, Any],
     *,
     attempts: int = DEFAULT_ATTEMPTS,
     timeout: tuple[float, float] = DEFAULT_TIMEOUT,

@@ -88,12 +88,13 @@ def test_each_field_shows_its_own_horizon() -> None:
     assert "24時間後" in daily
 
 
-def test_content_mentions_per_timeframe_scoring() -> None:
+def test_content_mentions_integrated_conclusion() -> None:
     payload = build_timeframe_discord_payload(
         {"USDJPY": _plans()}, _analysis(), [], ["USD"], now=NOW
     )
-    assert "時間足別" in payload["content"]
-    assert "15分後" in payload["content"]
+    assert "FX統合ブリーフィング" in payload["content"]
+    assert "結論" in payload["content"]
+    assert "即時エントリーは避ける" in payload["content"]
 
 
 def test_learning_note_appears_in_header() -> None:
