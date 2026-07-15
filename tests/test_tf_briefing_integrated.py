@@ -11,7 +11,9 @@ from fx_intel.timeframe import PRIMARY_HORIZON_HOURS, TimeframePlan
 NOW = datetime(2026, 7, 15, 7, 10, tzinfo=UTC)
 
 
-def _plan(symbol: str, timeframe: str, score: float, direction: str, conviction: int) -> TimeframePlan:
+def _plan(
+    symbol: str, timeframe: str, score: float, direction: str, conviction: int
+) -> TimeframePlan:
     close = 162.367 if symbol.endswith("JPY") else 1.13860
     distance = 0.130 if symbol.endswith("JPY") else 0.00130
     side = 1.0 if score >= 0 else -1.0
