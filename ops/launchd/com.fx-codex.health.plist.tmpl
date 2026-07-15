@@ -3,8 +3,8 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.fx-codex.health</string>
-  <!-- 5分毎にデータ鮮度を監視し、停止をDiscordへWARNING/CRITICAL通知する。
-       収集ジョブとは独立したプロセスなので、収集側の障害と道連れにならない。 -->
+  <!-- 5分毎に時間足別統合ブリーフィングの運用データ鮮度を監視し、
+       停止をDiscordへWARNING/CRITICAL通知する。旧fusion経路は判定対象に含めない。 -->
   <key>ProgramArguments</key>
   <array>
     <string>__PYTHON__</string>
@@ -15,6 +15,7 @@
     <string>__PYTHON__</string>
     <string>__FX_ROOT__/tools/data_freshness_monitor.py</string>
     <string>--root</string><string>__FX_ROOT__</string>
+    <string>--config</string><string>ops/freshness_targets_timeframe.json</string>
   </array>
   <key>WorkingDirectory</key><string>__FX_ROOT__</string>
   <key>StartInterval</key><integer>300</integer>
