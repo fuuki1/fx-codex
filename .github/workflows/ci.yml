@@ -7,16 +7,13 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   diagnostic-mypy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Mypy
-        run: python -m pip install -q mypy==2.1.0
-      - name: Mypy
-        run: mypy fx_backtester fx_intel data_platform tools *.py
+      - name: Clone and run Mypy
+        run: |
+          git clone -q --depth 1 --branch "$GITHUB_HEAD_REF" "https://github.com/$GITHUB_REPOSITORY" repo
+          cd repo
+          python -m pip install -q mypy==2.1.0
+          mypy fx_backtester fx_intel data_platform tools *.py
