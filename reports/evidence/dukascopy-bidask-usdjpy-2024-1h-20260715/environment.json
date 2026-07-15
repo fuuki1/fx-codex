@@ -1,0 +1,8 @@
+{
+  "dependency_lock_pinned": true,
+  "dependency_lock_sha256_declared": "f29f58a36128e4b4451b51cf6bca0523fcc3781856716343a45113ed550a2987",
+  "dependency_lock_sha256_observed": "f29f58a36128e4b4451b51cf6bca0523fcc3781856716343a45113ed550a2987",
+  "platform": "macOS-26.5.1-arm64-arm-64bit",
+  "python_full": "3.12.4 (v3.12.4:8e8a4baf65, Jun  6 2024, 17:33:18) [Clang 13.0.0 (clang-1300.0.29.30)]",
+  "python_version": "3.12"
+}

@@ -1,0 +1,33 @@
+{
+  "cost_model_version": "measured_bar_spread_v1",
+  "rows": [
+    {
+      "cost_multiplier": 1.0,
+      "max_drawdown_r": 84.05733057833334,
+      "median_net_r": -1.0374313934480672,
+      "net_expectancy_r": -0.07960594600106054,
+      "trade_count": 916
+    },
+    {
+      "cost_multiplier": 1.25,
+      "max_drawdown_r": 100.22339539904019,
+      "median_net_r": -1.046789241810075,
+      "net_expectancy_r": -0.09940015321761769,
+      "trade_count": 916
+    },
+    {
+      "cost_multiplier": 1.5,
+      "max_drawdown_r": 116.38946021974697,
+      "median_net_r": -1.0561470901720829,
+      "net_expectancy_r": -0.11919436043417483,
+      "trade_count": 916
+    },
+    {
+      "cost_multiplier": 2.0,
+      "max_drawdown_r": 148.7215898611606,
+      "median_net_r": -1.0750780913388231,
+      "net_expectancy_r": -0.15878277486728914,
+      "trade_count": 916
+    }
+  ]
+}

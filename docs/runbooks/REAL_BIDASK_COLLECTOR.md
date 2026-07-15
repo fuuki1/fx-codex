@@ -84,3 +84,17 @@ SLO は [config/data_platform_slo_v1.json](../../config/data_platform_slo_v1.jso
 
 - Dukascopy: pair×hour単位で公開再取得可（`reproduce.sh`）
 - deterministic replay: raw blob→re-parse→data-hash一致（本セッションで実データ52,732行一致を実証、独立worktreeでも一致）
+
+## 9. 研究側への接続（bid/askバー → authoritative pipeline、2026-07-15）
+
+- dataset: `data/real/dukascopy/*.csv.gz`（正準CandleBar CSV。lineageは同ディレクトリの
+  `dataset_registry.jsonl`）。読み込みは `fx_backtester.data.load_bidask_bars_csv` —
+  **価格基準はbid側OHLC + `spread_price`=バー始端の実測スプレッド**（mid高値/安値は捏造しない）
+- manifest: `data.sources[].kind = "bidask_bars_csv"`、
+  `costs.cost_model_version = "measured_bar_spread_v1"`（entry_lag=1に合わせ
+  **エントリーバー始端の実測スプレッド**をトレード毎コストに使用。計測欠落はfail-closed、
+  close-onlyソースとの併用はmanifest段階で拒否）
+- 実証: `reports/evidence/dukascopy-bidask-usdjpy-2024-1h-20260715/`
+  （USD/JPY 2024・916トレード・net −0.0796R・昇格DENIED・決定論2回一致）
+- HistData CSVは補助照合用（v2でラベル修正済み・bid基準宣言、
+  `data/real/histdata/README.md`）。研究入力はDukascopyバーを第一選択とする

@@ -1,0 +1,26 @@
+{
+  "artifacts": {
+    "cost_stress.json": "eb99d1048aa32718505be04656e9b1462bc622f95f087fd3b28475bc33049b75",
+    "data_lineage.json": "884ec58e4e8fdf2923ff6355e13f331a3a526fcc9070874ed07cbf90229222ec",
+    "dataset_rows.jsonl": "b95a8a5c157ca203393c30e40755701e07be51644872a32b1876aa5dd4e09b81",
+    "environment.json": "484348fd3ffcbd3c7ccbce94c336c1683189acd38463888790505af9bf2e0813",
+    "evaluation.json": "0d7994abe64741399b0cf94b6070105eba2d89b682929fd7c42a116f978c95cb",
+    "git.json": "47f51a4ce996fdd7e9506d99672a747e1dc41bf11440f633d558a2df34c3becf",
+    "lockbox.json": "58665c78cb54299a7e281dded7329adce7416332dbdb66d0078c9449fa11811b",
+    "manifest.json": "78f5350e4a7f65113ec2d40d28187bef22efef6354aad20e0a818a46656dd404",
+    "promotion_decision.json": "84f47b4dacb8a1a6a61e4492f864470323b48dc19d9b167943858df1e9fbfb3f",
+    "run_info.json": "f8a377e1a0a6e0156d238e94744b31cc5d5ffe1dece8aedcbaf0902890ff7a4a",
+    "trial_ledger_snapshot.jsonl": "b9606decfd5d992bd7fe5539122aae79e1a7125d4f0fe0df5035f5eefe945f13"
+  },
+  "deterministic_artifacts": [
+    "manifest.json",
+    "data_lineage.json",
+    "dataset_rows.jsonl",
+    "lockbox.json",
+    "evaluation.json",
+    "cost_stress.json",
+    "promotion_decision.json"
+  ],
+  "deterministic_result_sha256": "8ddab7361b4b93d156e78ba3958f984e5d09689ddb51e1e2b3310585530fc69d",
+  "evidence_bundle_sha256": "dc50b07e5dba2fa897a256feac05d8a71cba553482ba7f102cd8efb73847cb06"
+}

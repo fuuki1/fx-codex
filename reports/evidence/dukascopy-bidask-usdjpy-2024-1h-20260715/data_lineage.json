@@ -1,0 +1,48 @@
+{
+  "chain": [
+    {
+      "artifact": "manifest",
+      "sha256": "64a020ebe9eedb56ddbaab94ce62b7a79395070ece2970bb34b32cbad71c493e"
+    },
+    {
+      "artifact": "raw:dukascopy_usdjpy_2024_m1_bidask_1h",
+      "sha256": "a78875862608478db80f316c212add4c2f739da9c4eafb82dbb96fc4273f9cc9"
+    },
+    {
+      "artifact": "normalized_dataset",
+      "sha256": "4344d013f7ec9fff37ab9c44ff42449247b4911ebb957f48d60cf0b8acd87afa"
+    },
+    {
+      "artifact": "feature_dataset",
+      "sha256": "79c1566e0fa0dbcf362e108324f48cd76dfbf4fb3bdefefb73351060001a99a4"
+    },
+    {
+      "artifact": "label_dataset",
+      "sha256": "0d1b4274ec5134f85642fddaefec67465ca265eb8c0fa7dbab263d8eb0e56e6f"
+    },
+    {
+      "artifact": "split",
+      "sha256": "58d6828c5842e4c2a495b2029b72e6f6c7de76348768db2b29e9eda245fad921"
+    },
+    {
+      "artifact": "trained_model",
+      "sha256": "9046261a00c785ec1bba47ed2ebe282d32ffadacd100fcf8c21be03482b18446"
+    },
+    {
+      "artifact": "test_predictions",
+      "sha256": "f5569e15a41a33e4e789503941da2f419d1bb3e3dd44b92f9b78b90f00dd5115"
+    },
+    {
+      "artifact": "evaluation",
+      "sha256": "211dbbfbc07e89ca6d1950f6be6c5aaa47ebd6215be3ada2d80251911b7b519f"
+    },
+    {
+      "artifact": "cost_stress",
+      "sha256": "4cdd64690289a86679416859cbd08b497bd533e0c3152ff6c40c713b8c351297"
+    },
+    {
+      "artifact": "promotion_decision",
+      "sha256": "b5593ca992507a80f7263e6c22ca91deef4d86ff50b4619df89e0578b511898d"
+    }
+  ]
+}
