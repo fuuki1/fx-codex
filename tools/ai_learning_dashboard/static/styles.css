@@ -576,3 +576,28 @@ th {
     text-align: left;
   }
 }
+
+/* 学習の推移グラフ */
+.curve-note {
+  margin: 0 0 12px;
+}
+
+.curve-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+#curveCanvas {
+  display: block;
+  width: 100%;
+  min-width: 320px;
+  height: 240px;
+}
+
+.curve-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+}

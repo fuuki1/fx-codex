@@ -195,6 +195,136 @@ function renderFlow(data) {
   );
 }
 
+// 直近描画したcurveを保持し、ウィンドウリサイズ時に再描画する(canvasは物理px依存)。
+let lastCurve = [];
+
+function cssVar(name, fallback) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function renderCurve(data) {
+  const curve = Array.isArray(data.evaluation?.curve) ? data.evaluation.curve : [];
+  lastCurve = curve;
+  const canvas = $("curveCanvas");
+  const emptyEl = $("curveEmpty");
+  const summaryEl = $("curveSummary");
+  if (!canvas) return;
+
+  if (!curve.length) {
+    canvas.hidden = true;
+    if (emptyEl) emptyEl.hidden = false;
+    if (summaryEl) summaryEl.textContent = "採点待ち";
+    return;
+  }
+  canvas.hidden = false;
+  if (emptyEl) emptyEl.hidden = true;
+
+  const last = curve[curve.length - 1];
+  if (summaryEl) {
+    summaryEl.textContent = `採点 ${last.scored}件 / 累積的中率 ${pct(last.hit_rate)}`;
+  }
+  drawCurve(canvas, curve);
+}
+
+function drawCurve(canvas, curve) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // 高解像度対応: CSSサイズ×devicePixelRatio の物理pxで描く
+  const ratio = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 640;
+  const cssHeight = 240;
+  canvas.width = Math.round(cssWidth * ratio);
+  canvas.height = Math.round(cssHeight * ratio);
+  canvas.style.height = `${cssHeight}px`;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const padL = 44;
+  const padR = 44;
+  const padT = 16;
+  const padB = 28;
+  const plotW = cssWidth - padL - padR;
+  const plotH = cssHeight - padT - padB;
+
+  const line = cssVar("--line", "#3c3f37");
+  const muted = cssVar("--muted", "#aaa79c");
+  const cyan = cssVar("--cyan", "#66b7c9");
+  const green = cssVar("--green", "#5dc98c");
+  const text = cssVar("--text", "#f3f1e9");
+
+  const n = curve.length;
+  const maxScored = Math.max(1, ...curve.map((p) => p.scored));
+  const xFor = (i) => padL + (n === 1 ? plotW / 2 : (plotW * i) / (n - 1));
+  const yRate = (rate) => padT + plotH * (1 - rate); // 0..1 を上下反転
+  const yScored = (s) => padT + plotH * (1 - s / maxScored);
+
+  // グリッド(0/25/50/75/100%)と左軸ラベル
+  ctx.strokeStyle = line;
+  ctx.fillStyle = muted;
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  ctx.textBaseline = "middle";
+  [0, 0.25, 0.5, 0.75, 1].forEach((r) => {
+    const y = yRate(r);
+    ctx.globalAlpha = r === 0.5 ? 0.55 : 0.25;
+    ctx.beginPath();
+    if (r === 0.5) ctx.setLineDash([4, 4]);
+    else ctx.setLineDash([]);
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
+    ctx.textAlign = "right";
+    ctx.fillText(`${Math.round(r * 100)}%`, padL - 8, y);
+  });
+
+  // 累積採点数の棒(薄いシアン)。右軸スケール
+  const barW = Math.max(2, Math.min(18, (plotW / n) * 0.5));
+  ctx.fillStyle = cyan;
+  ctx.globalAlpha = 0.22;
+  curve.forEach((p, i) => {
+    const x = xFor(i);
+    const y = yScored(p.scored);
+    ctx.fillRect(x - barW / 2, y, barW, padT + plotH - y);
+  });
+  ctx.globalAlpha = 1;
+  // 右軸(採点数)の上端ラベル
+  ctx.fillStyle = cyan;
+  ctx.textAlign = "left";
+  ctx.fillText(`${maxScored}件`, padL + plotW + 8, yScored(maxScored));
+  ctx.fillStyle = muted;
+  ctx.fillText("0", padL + plotW + 8, padT + plotH);
+
+  // 累積的中率の折れ線(緑)
+  ctx.strokeStyle = green;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  curve.forEach((p, i) => {
+    const x = xFor(i);
+    const y = yRate(p.hit_rate);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  // 各採点点のマーカー
+  ctx.fillStyle = green;
+  curve.forEach((p, i) => {
+    ctx.beginPath();
+    ctx.arc(xFor(i), yRate(p.hit_rate), n > 40 ? 1.5 : 3, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // 最新値のラベル
+  const lp = curve[curve.length - 1];
+  ctx.fillStyle = text;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.font = "600 12px system-ui, sans-serif";
+  ctx.fillText(pct(lp.hit_rate), padL + plotW, yRate(lp.hit_rate) - 6);
+}
+
 function renderMetrics(data) {
   setText("journalTotal", String(data.journal.total));
   setText("journalLatest", shortDate(data.journal.latest_ts));
@@ -686,6 +816,7 @@ function render(data) {
   renderReality(data);
   renderMetrics(data);
   renderFlow(data);
+  renderCurve(data);
   renderWeights(data);
   renderStages(data);
   renderSymbolBars(data);
@@ -731,6 +862,14 @@ async function load() {
 }
 
 $("refreshBtn").addEventListener("click", load);
+
+// ウィンドウ幅が変わったら学習推移グラフだけ再描画(canvasは物理px依存のため)
+let curveResizeTimer = null;
+window.addEventListener("resize", () => {
+  if (!lastCurve.length) return;
+  window.clearTimeout(curveResizeTimer);
+  curveResizeTimer = window.setTimeout(() => drawCurve($("curveCanvas"), lastCurve), 150);
+});
 $("logDir").addEventListener("keydown", (event) => {
   if (event.key === "Enter") load();
 });
