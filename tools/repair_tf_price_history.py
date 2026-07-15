@@ -22,7 +22,6 @@ from collections.abc import Mapping
 
 from fx_intel.price_history import PriceHistoryWriteError, _same_snapshot, _snapshot_key
 
-
 DEFAULT_PATH = Path("logs/briefing_tf_prices.jsonl")
 
 
