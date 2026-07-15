@@ -22,9 +22,11 @@ def test_timeframe_freshness_config_contains_only_active_gating_targets() -> Non
 
 
 def test_health_launchd_selects_timeframe_freshness_config() -> None:
-    rendered = PLIST.read_text(encoding="utf-8").replace(
-        "__FX_ROOT__", "/Users/example/srv/fx-codex"
-    ).replace("__PYTHON__", "/Users/example/srv/fx-codex/.venv/bin/python")
+    rendered = (
+        PLIST.read_text(encoding="utf-8")
+        .replace("__FX_ROOT__", "/Users/example/srv/fx-codex")
+        .replace("__PYTHON__", "/Users/example/srv/fx-codex/.venv/bin/python")
+    )
     root = ET.fromstring(rendered)
     arguments = [node.text or "" for node in root.iter("string")]
 
