@@ -433,7 +433,13 @@ def test_repo_default_config_is_valid(monitor):
         target.require_content_hash for target in targets if target.name in required_hash_names
     )
     price_target = next(target for target in targets if target.name == "tf_price_snapshot")
-    assert price_target.source_timestamp_missing_status == "critical"
+    # 価格スナップショットには source_time 監視を課さない。唯一のソースである
+    # TradingView スキャナーは現在値スナップショットのみで event 時刻(source_time)を
+    # 構造的に提供できず(close-only は既知の恒久制約)、課すと収集が完璧でも各レコードの
+    # source_time 欠落で overall が永久に critical になる。鮮度はファイル書込み(ts)と
+    # expected_keys/unchanged_value で監視する。OHLC 履歴ソースを price_history.py へ
+    # 注入したら source_timestamp 監視の再導入を検討する。
+    assert not price_target.source_timestamp_field
     for target in targets:
         assert target.timestamp_field
         assert target.warn_after_seconds > target.expected_interval_seconds

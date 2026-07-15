@@ -423,12 +423,16 @@ def _snapshot_row(
     source_time = _aware_optional_timestamp(
         snapshot.get("source_time") if isinstance(snapshot, Mapping) else None
     )
-    available_time = _aware_optional_timestamp(
-        snapshot.get("available_time") if isinstance(snapshot, Mapping) else None
-    ) or datetime.fromisoformat(stamp)
-    ingested_time = _aware_optional_timestamp(
-        snapshot.get("ingested_time") if isinstance(snapshot, Mapping) else None
-    ) or datetime.fromisoformat(stamp)
+    # available_time/ingested_time はこの1バッチ(同一 capture_slot・同一 ts)の確定時刻
+    # stamp に揃える。TradingView から各ペア/各足を順番に取得するため、行ごとの
+    # acquired_at をそのまま使うと symbol 境界で available_time が後退し、書き込み側の
+    # JOURNAL_ORDER_CLOCK_FIELDS 単調性チェック(_regressed_journal_clock)に必ず引っかかる。
+    # PIT 的にも、ペア個別の取得時刻より遅い「バッチが揃った時刻」を可用時刻とみなすのは
+    # 保守的方向(将来情報を混入させない)なので安全。snapshot 側が持ち込む
+    # available_time/ingested_time は同 slot バッチでは採用しない。
+    batch_time = datetime.fromisoformat(stamp)
+    available_time = batch_time
+    ingested_time = batch_time
     source_record_id = (
         str(snapshot.get("source_record_id") or "").strip() if isinstance(snapshot, Mapping) else ""
     )

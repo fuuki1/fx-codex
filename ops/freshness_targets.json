@@ -9,10 +9,7 @@
       "kind": "jsonl",
       "timestamp_field": "ts",
       "require_content_hash": true,
-      "source_timestamp_field": "source_time",
-      "source_timestamp_missing_status": "critical",
-      "source_warn_after_seconds": 900,
-      "source_critical_after_seconds": 2700,
+      "comment_source_ja": "source_time監視は課さない。価格ソースはTradingViewスキャナーの現在値スナップショットのみで、イベント時刻(source_time)を構造的に提供できない(close-onlyは既知の恒久制約: CLAUDE.md/docs/ISSUES.md)。source_timestamp_fieldを課すと収集が完璧でも各レコードのsource_time欠落で永久にcriticalになるため外す。鮮度はファイル書込み(ts)とexpected_keys/unchanged_valueで監視する。OHLC履歴ソースをprice_history.pyへ注入したら再導入を検討。",
       "expected_key_fields": ["symbol", "timeframe"],
       "expected_keys": [
         ["USDJPY", "15m"], ["USDJPY", "1h"], ["USDJPY", "4h"], ["USDJPY", "1d"],
