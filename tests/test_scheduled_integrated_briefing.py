@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "fx_briefing_once.sh"
 
