@@ -147,11 +147,18 @@ def thin_calls(
 
 def build_dataset(
     calls: Sequence[EvaluatedCall],
-) -> tuple[list[dict[str, float | None]], list[int], list[datetime]]:
-    """採点済み判断(hit/miss)を特徴量辞書・ラベル・時刻の3列に変換する。"""
+) -> tuple[list[dict[str, float | None]], list[int], list[datetime], list[float | None]]:
+    """採点済み判断を特徴量辞書・二値ラベル・時刻・収益ラベルの4列に変換する。
+
+    - 二値ラベル(既存): hit=1 / miss=0(方向的中)。分類ヘッドの教師。
+    - 収益ラベル r_labels(追加): realized_net_r(コスト控除後の実現R)。回帰・分位点
+      ヘッドの教師。コスト不明などで realized_net_r が無い行は None(回帰側で除外、
+      二値側は従来どおり hit/miss があれば使う)。行の並びは全ラベルで共通。
+    """
     rows: list[dict[str, float | None]] = []
     labels: list[int] = []
     stamps: list[datetime] = []
+    r_labels: list[float | None] = []
     for call in calls:
         if call.outcome not in ("hit", "miss") or call.direction not in ("long", "short"):
             continue
@@ -169,7 +176,8 @@ def build_dataset(
         )
         labels.append(1 if call.outcome == "hit" else 0)
         stamps.append(ts)
-    return rows, labels, stamps
+        r_labels.append(call.realized_net_r)
+    return rows, labels, stamps, r_labels
 
 
 def _median(values: Sequence[float]) -> float:
@@ -286,7 +294,7 @@ def train_artifact(
     artifact = MLArtifact(trained_at=now.isoformat())
 
     thinned = thin_calls(calls)
-    rows, labels, stamps = build_dataset(thinned)
+    rows, labels, stamps, r_labels = build_dataset(thinned)
     if len(rows) < min_train_rows:
         artifact.reasons.append(f"学習サンプル不足(間引き後{len(rows)}件 < {min_train_rows}件)")
         return artifact
@@ -304,6 +312,7 @@ def train_artifact(
     rows = [rows[i] for i in order]
     labels = [labels[i] for i in order]
     stamps = [stamps[i] for i in order]
+    r_labels = [r_labels[i] for i in order]
     partitions = _temporal_partitions(stamps)
     for name in ("train", "tune", "calibration", "test", "lockbox"):
         if len(partitions[name]) < MIN_PARTITION_ROWS:
