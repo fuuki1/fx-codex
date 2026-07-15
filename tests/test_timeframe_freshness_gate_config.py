@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "ops" / "freshness_targets_timeframe.json"
 PLIST = ROOT / "ops" / "launchd" / "com.fx-codex.health.plist.tmpl"
