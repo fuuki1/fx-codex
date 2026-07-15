@@ -384,3 +384,43 @@ def test_learning_curve_excludes_flat(server) -> None:
     assert result["flat"] == 1
     assert result["evaluated"] == 0
     assert result["curve"] == []
+
+
+def test_learning_curve_accumulates_net_r_from_execution_cost(server) -> None:
+    """execution_cost_r 付きの判断から、curve に累積純R(コスト控除後)が乗る。"""
+    # long判断 close=100 atr=1.0 cost=0.15、1h後 close=101(+1R方向)→ 純R +0.85R
+    entries = [
+        {
+            "ts": START.isoformat(),
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "horizon_hours": 1.0,
+            "direction": "long",
+            "action": "long",
+            "conviction": 55,
+            "close": 100.0,
+            "atr": 1.0,
+            "execution_cost_r": 0.15,
+        },
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 101.0, atr=1.0),
+    ]
+    result = server._evaluate_journal(entries)
+    curve = result["curve"]
+    assert curve, "採点済みが1件以上あるはず"
+    last = curve[-1]
+    # cum_net_r = move_atr(+1.0) - cost(0.15) = 0.85
+    assert last["net_r_points"] >= 1
+    assert last["cum_net_r"] == pytest.approx(0.85, abs=1e-4)
+
+
+def test_learning_curve_net_r_absent_without_cost(server) -> None:
+    """execution_cost_r が無い判断は純Rを算出しない(cum_net_r=0, net_r_points=0)。"""
+    entries = [
+        _row(START, "1h", 1.0, "long", 100.0, atr=1.0),
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 101.0, atr=1.0),
+    ]
+    result = server._evaluate_journal(entries)
+    curve = result["curve"]
+    assert curve
+    assert curve[-1]["net_r_points"] == 0
+    assert curve[-1]["cum_net_r"] == 0.0
