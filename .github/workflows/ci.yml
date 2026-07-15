@@ -11,9 +11,11 @@ jobs:
   diagnostic-mypy:
     runs-on: ubuntu-latest
     steps:
-      - name: Clone and run Mypy
+      - name: Clone, install, and run Mypy
         run: |
           git clone -q --depth 1 --branch "$GITHUB_HEAD_REF" "https://github.com/$GITHUB_REPOSITORY" repo
           cd repo
+          python -m pip install -q -r requirements.lock
+          python -m pip install -q -e . --no-deps
           python -m pip install -q mypy==2.1.0
           mypy fx_backtester fx_intel data_platform tools *.py
