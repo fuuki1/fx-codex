@@ -1,21 +1,77 @@
 name: CI
 
 on:
+  push:
+    branches: ["main", "integration/research-v3"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  diagnostic-tests:
+  test:
+    name: test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package and dev tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps
+          python -m pip install ruff==0.15.20 black==26.5.1 mypy==2.1.0
+      - name: Ruff
+        run: ruff check .
+      - name: Black
+        run: black --check .
+      - name: Mypy
+        run: mypy fx_backtester fx_intel data_platform tools *.py
+      - name: Shell syntax
+        run: sh -n scripts/run_quote_collector.sh
+      - name: Conflict markers
+        run: |
+          if git grep -nE '^(<<<<<<< |>>>>>>> |={7}$)' -- '*.py' '*.md' '*.yml' '*.yaml' '*.toml' '*.sh'; then
+            echo "::error::merge conflict markers found"; exit 1
+          fi
+      - name: Tests
+        run: pytest
+      - name: Safety invariants (fail-closed gates)
+        run: >
+          pytest -q
+          tests/test_governance.py
+          tests/test_lockbox.py
+          tests/test_trial_ledger.py
+          tests/test_experiment_pipeline.py
+          tests/test_no_live_execution_surface.py
+          tests/test_collect_runtime_regressions.py
+          tests/test_data_platform_daily_report.py
+
+  required-ci:
+    name: required-ci
+    if: always()
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
-      - name: Clone, install, and run briefing tests
+      - name: Require every matrix job to pass
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
         run: |
-          git clone -q --depth 1 --branch "$GITHUB_HEAD_REF" "https://github.com/$GITHUB_REPOSITORY" repo
-          cd repo
-          python -m pip install -q -r requirements.lock
-          python -m pip install -q -e . --no-deps
-          python -m pip install -q pytest==9.0.3
-          pytest -q tests/test_tf_briefing.py tests/test_tf_briefing_integrated.py
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "::error::One or more CI matrix jobs failed or were cancelled"
+            exit 1
+          fi
+          echo "All CI quality and safety gates passed."
