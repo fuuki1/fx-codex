@@ -203,8 +203,7 @@ def _evidence(
     strengths: list[str] = []
     blockers: list[str] = []
     if side in ("long", "short") and all(
-        plan.tf_score >= 0.15 if side == "long" else plan.tf_score <= -0.15
-        for plan in plans
+        plan.tf_score >= 0.15 if side == "long" else plan.tf_score <= -0.15 for plan in plans
     ):
         strengths.append(f"15分足〜日足まで{_word(side)}方向が一致")
     if news == side and side in ("long", "short"):
@@ -220,9 +219,7 @@ def _evidence(
     if adx and max(adx) >= 25:
         strengths.append(f"ADX最大{max(adx):.0f}で一定のトレンド強度")
     weak = [
-        plan
-        for plan in plans
-        if plan.direction not in ("long", "short") or plan.conviction < 50
+        plan for plan in plans if plan.direction not in ("long", "short") or plan.conviction < 50
     ]
     if weak:
         blockers.append(f"4時間足中{len(weak)}本が見送りまたは確信度50未満")
@@ -243,8 +240,10 @@ def _evidence(
     strengths = strengths or ["明確な優位性を確認できる材料は不足"]
     blockers = blockers or ["条件成立前の先回りは避ける"]
     heading = "強気材料" if side == "long" else "弱気材料" if side == "short" else "方向材料"
-    return heading, "\n".join(f"・{item}" for item in strengths[:4]), "\n".join(
-        f"・{item}" for item in blockers[:6]
+    return (
+        heading,
+        "\n".join(f"・{item}" for item in strengths[:4]),
+        "\n".join(f"・{item}" for item in blockers[:6]),
     )
 
 
@@ -366,7 +365,11 @@ def build_timeframe_discord_payload(
         _summary_line(symbol, plans, analysis) for symbol, plans in plans_by_symbol.items()
     ]
     candidate = any("条件成立後" in line for line in summaries)
-    conclusion = "条件付き候補あり。ただし即時エントリーは避ける" if candidate else "新規エントリーは見送り優先"
+    conclusion = (
+        "条件付き候補あり。ただし即時エントリーは避ける"
+        if candidate
+        else "新規エントリーは見送り優先"
+    )
     content = (
         f"📊 **FX統合ブリーフィング｜{now.astimezone(JST):%m/%d %H:%M} JST**\n"
         f"対象：{' / '.join(plans_by_symbol)}\n"
@@ -406,16 +409,26 @@ def build_timeframe_discord_payload(
         ]
     )
     if journal_note:
-        macro_fields.append({"name": "判断の検証（自己採点）", "value": journal_note, "inline": False})
+        macro_fields.append(
+            {"name": "判断の検証（自己採点）", "value": journal_note, "inline": False}
+        )
     macro_fields.extend(
         [
-            {"name": "🧠 自動学習の信頼性", "value": _clip(reliability, MAX_FIELD), "inline": False},
+            {
+                "name": "🧠 自動学習の信頼性",
+                "value": _clip(reliability, MAX_FIELD),
+                "inline": False,
+            },
             {
                 "name": "⚠️ データ品質・運用制限",
                 "value": _quality_note(plans_by_symbol, fetch_warnings),
                 "inline": False,
             },
-            {"name": "✅ 最終アクション", "value": _clip("\n\n".join(actions), MAX_FIELD), "inline": False},
+            {
+                "name": "✅ 最終アクション",
+                "value": _clip("\n\n".join(actions), MAX_FIELD),
+                "inline": False,
+            },
         ]
     )
     embeds = [
