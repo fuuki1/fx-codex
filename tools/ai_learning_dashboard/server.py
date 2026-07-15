@@ -470,7 +470,35 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_symbol": by_symbol,
         "by_timeframe": by_timeframe,
         "recent_outcomes": outcomes[-20:],
+        "curve": _learning_curve(outcomes),
     }
+
+
+def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """採点済み判断を時系列に並べ、累積の採点数と累積的中率の推移を返す。
+
+    学習プロファイル(briefing_learning.json)は毎回上書きされ履歴が残らないため、
+    「学習が進んでいるか」の推移は append-only の判断ログから再構築する。各点は
+    その判断までの累積で、flat(小動き)は的中率の分母から除く(hits/evaluated と同義)。
+    データが1日分でも点が増えるほど曲線が伸び、的中率が基準に収束していく様子が見える。
+    """
+    scored = sorted(
+        (o for o in outcomes if o.get("outcome") in {"hit", "miss"}),
+        key=lambda o: str(o.get("ts") or ""),
+    )
+    curve: list[dict[str, Any]] = []
+    cumulative_hits = 0
+    for index, outcome in enumerate(scored, start=1):
+        cumulative_hits += int(outcome.get("outcome") == "hit")
+        curve.append(
+            {
+                "ts": outcome.get("ts"),
+                "scored": index,
+                "hits": cumulative_hits,
+                "hit_rate": round(cumulative_hits / index, 4),
+            }
+        )
+    return curve
 
 
 def _journal_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
