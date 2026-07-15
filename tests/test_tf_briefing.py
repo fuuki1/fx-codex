@@ -94,7 +94,7 @@ def test_content_mentions_integrated_conclusion() -> None:
     )
     assert "FX統合ブリーフィング" in payload["content"]
     assert "結論" in payload["content"]
-    assert "見送り" in payload["content"]
+    assert "即時エントリーは避ける" in payload["content"]
 
 
 def test_learning_note_appears_in_header() -> None:
