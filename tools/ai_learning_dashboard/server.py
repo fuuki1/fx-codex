@@ -435,6 +435,14 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         move = future - close
         signed = move if direction == "long" else -move
         threshold = (atr or 0.0) * 0.1
+        # 収益R: 判断方向の値動きをATR換算(=learning.move_atr相当)し、判断時に保存した
+        # 執行コスト(R換算)を引いてコスト控除後の実現Rにする。atr・コストが揃う時だけ。
+        net_r: float | None = None
+        if atr and atr > 0:
+            realized_r_atr = signed / atr
+            cost_r = _number(entry.get("execution_cost_r"))
+            if cost_r is not None:
+                net_r = round(realized_r_atr - cost_r, 4)
         if abs(signed) <= threshold:
             flat += 1
             outcome = "flat"
@@ -458,6 +466,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 "direction": direction,
                 "outcome": outcome,
                 "move": round(move, 6),
+                "net_r": net_r,
             }
         )
     return {
@@ -481,6 +490,11 @@ def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     「学習が進んでいるか」の推移は append-only の判断ログから再構築する。各点は
     その判断までの累積で、flat(小動き)は的中率の分母から除く(hits/evaluated と同義)。
     データが1日分でも点が増えるほど曲線が伸び、的中率が基準に収束していく様子が見える。
+
+    的中率(方向)に加え、コスト控除後の累積純R(cum_net_r)も持つ。的中率が高くても
+    薄利でコスト負けしていないか=「儲かっているか」を同じ時間軸で見るため。net_r は
+    execution_cost_r が保存された判断でだけ算出されるので、cum_net_r は net_r を持つ
+    採点のみを累積し、net_r_points にその件数を持たせる(欠損時は前値を据え置き)。
     """
     scored = sorted(
         (o for o in outcomes if o.get("outcome") in {"hit", "miss"}),
@@ -488,14 +502,22 @@ def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     curve: list[dict[str, Any]] = []
     cumulative_hits = 0
+    cumulative_net_r = 0.0
+    net_r_points = 0
     for index, outcome in enumerate(scored, start=1):
         cumulative_hits += int(outcome.get("outcome") == "hit")
+        net_r = outcome.get("net_r")
+        if isinstance(net_r, (int, float)):
+            cumulative_net_r += float(net_r)
+            net_r_points += 1
         curve.append(
             {
                 "ts": outcome.get("ts"),
                 "scored": index,
                 "hits": cumulative_hits,
                 "hit_rate": round(cumulative_hits / index, 4),
+                "cum_net_r": round(cumulative_net_r, 4),
+                "net_r_points": net_r_points,
             }
         )
     return curve

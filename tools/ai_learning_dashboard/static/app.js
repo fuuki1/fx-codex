@@ -222,7 +222,12 @@ function renderCurve(data) {
 
   const last = curve[curve.length - 1];
   if (summaryEl) {
-    summaryEl.textContent = `採点 ${last.scored}件 / 累積的中率 ${pct(last.hit_rate)}`;
+    let summary = `採点 ${last.scored}件 / 累積的中率 ${pct(last.hit_rate)}`;
+    if ((last.net_r_points || 0) > 0) {
+      const netR = Number(last.cum_net_r);
+      summary += ` / 純R ${(netR >= 0 ? "+" : "") + netR.toFixed(2)}R(${last.net_r_points}件)`;
+    }
+    summaryEl.textContent = summary;
   }
   drawCurve(canvas, curve);
 }
@@ -251,6 +256,7 @@ function drawCurve(canvas, curve) {
   const muted = cssVar("--muted", "#aaa79c");
   const cyan = cssVar("--cyan", "#66b7c9");
   const green = cssVar("--green", "#5dc98c");
+  const amber = cssVar("--amber", "#d6a64b");
   const text = cssVar("--text", "#f3f1e9");
 
   const n = curve.length;
@@ -316,6 +322,42 @@ function drawCurve(canvas, curve) {
     ctx.fill();
   });
 
+  // 累積純R(コスト控除後)の折れ線(琥珀)。net_rを持つ採点があれば重畳する。
+  // 0を中心にした対称スケールで、儲かっているか(正/負)を同じ時間軸で見る。
+  const hasNetR = curve.some((p) => (p.net_r_points || 0) > 0);
+  if (hasNetR) {
+    const netVals = curve.map((p) => Number(p.cum_net_r) || 0);
+    const maxAbs = Math.max(0.5, ...netVals.map((v) => Math.abs(v)));
+    const yNet = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2); // -maxAbs..+maxAbs
+    // 0Rの基準線(琥珀の点線)
+    ctx.strokeStyle = amber;
+    ctx.globalAlpha = 0.35;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(padL, yNet(0));
+    ctx.lineTo(padL + plotW, yNet(0));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    // 累積純Rの線
+    ctx.strokeStyle = amber;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    curve.forEach((p, i) => {
+      const y = yNet(Number(p.cum_net_r) || 0);
+      if (i === 0) ctx.moveTo(xFor(i), y);
+      else ctx.lineTo(xFor(i), y);
+    });
+    ctx.stroke();
+    // 純R軸のレンジラベル(琥珀)。左軸(%)と重ならないよう plot 内側の左上/左下へ置く
+    ctx.fillStyle = amber;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(`純R +${maxAbs.toFixed(1)}`, padL + 4, padT + 2);
+    ctx.textBaseline = "bottom";
+    ctx.fillText(`-${maxAbs.toFixed(1)}`, padL + 4, padT + plotH - 2);
+  }
+
   // 最新値のラベル
   const lp = curve[curve.length - 1];
   ctx.fillStyle = text;
@@ -323,6 +365,17 @@ function drawCurve(canvas, curve) {
   ctx.textBaseline = "bottom";
   ctx.font = "600 12px system-ui, sans-serif";
   ctx.fillText(pct(lp.hit_rate), padL + plotW, yRate(lp.hit_rate) - 6);
+  if (hasNetR) {
+    const netVals = curve.map((p) => Number(p.cum_net_r) || 0);
+    const maxAbs = Math.max(0.5, ...netVals.map((v) => Math.abs(v)));
+    const yNet = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2);
+    ctx.fillStyle = amber;
+    ctx.fillText(
+      `${(lp.cum_net_r >= 0 ? "+" : "") + Number(lp.cum_net_r).toFixed(2)}R`,
+      padL + plotW,
+      yNet(Number(lp.cum_net_r) || 0) - 6,
+    );
+  }
 }
 
 function renderMetrics(data) {
