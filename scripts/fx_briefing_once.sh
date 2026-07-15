@@ -1,5 +1,5 @@
 #!/bin/zsh
-# FXシグナルボードを1回だけ生成し、Discordへ単一通知を送る。
+# FX統合ブリーフィングを1回だけ生成し、Discordへ通知する。
 # launchd(com.fx-codex.briefing)から5分ごとにrun_exclusive.pyのロック下で呼ばれる。
 # 価格系列はcom.fx-codex.snapshotが管理するため、ここでは価格を書き込まない。
 # stdinは/dev/nullに固定し、対話待ちによる常駐停止を防ぐ。
@@ -15,8 +15,8 @@ if [ ! -x "$PYTHON" ]; then
 fi
 
 exec "$PYTHON" fx_briefing.py \
-  --signal-board \
+  --per-timeframe \
   --no-price-write \
   --require-freshness \
-  --symbols GBPUSD EURUSD USDJPY \
-  </dev/null >> logs/fx_signal_board.log 2>&1
+  --symbols USDJPY EURUSD \
+  </dev/null >> logs/fx_integrated_briefing.log 2>&1
