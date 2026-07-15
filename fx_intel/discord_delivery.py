@@ -27,6 +27,8 @@ def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
         values.append(payload.get("retry_after"))
     values.append(response.headers.get("Retry-After"))
     for value in values:
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            continue
         try:
             delay = float(value)
         except (TypeError, ValueError):
