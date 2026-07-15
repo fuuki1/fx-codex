@@ -6,7 +6,7 @@
 #
 # インストールされるLaunchAgent(gui/$UID):
 #   com.fx-codex.snapshot  5分毎の価格スナップショット
-#   com.fx-codex.briefing  5分毎の単一FXシグナルボードDiscord通知
+#   com.fx-codex.briefing  5分毎のFX統合ブリーフィングDiscord通知
 #   com.fx-codex.health    5分毎のデータ鮮度監視+異常時Discord通知
 #
 # 設計メモ:
