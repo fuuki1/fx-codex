@@ -1123,3 +1123,56 @@ def test_check_trade_outcome_health_cli_returns_failure_for_negative_expectancy(
     _write_jsonl(journal_path, rows)
 
     assert check_trade_outcome_health_cli(journal_path) == 1
+
+
+def test_realized_net_r_subtracts_execution_cost() -> None:
+    """収益ラベル: 判断時の execution_cost_r をグロスRから引いて realized_net_r を作る。"""
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            direction="long",
+            action="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+            conviction=60,
+            horizon_hours=24.0,
+            execution_cost_r=0.15,
+            net_expected_r=0.30,
+        ),
+        _entry(NOW + DAY, "USDJPY", 102.0),  # 24h後に+2R到達(tp2先着)
+    ]
+    scored = [o for o in to.evaluate_trade_outcomes(rows) if o.realized_r is not None]
+    assert len(scored) == 1
+    outcome = scored[0]
+    assert outcome.realized_r == 2.0  # グロスは従来通り
+    assert outcome.execution_cost_r == 0.15
+    assert outcome.realized_net_r == 1.85  # 2.0 - 0.15
+    assert outcome.net_expected_r == 0.30  # 判断時の予測は比較対象として保持
+
+
+def test_realized_net_r_is_none_without_cost() -> None:
+    """execution_cost_r が無い行は realized_net_r=None、realized_r は従来通り(既存挙動不変)。"""
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            direction="long",
+            action="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+            conviction=60,
+            horizon_hours=24.0,
+        ),
+        _entry(NOW + DAY, "USDJPY", 102.0),
+    ]
+    scored = [o for o in to.evaluate_trade_outcomes(rows) if o.realized_r is not None]
+    assert len(scored) == 1
+    outcome = scored[0]
+    assert outcome.realized_r == 2.0
+    assert outcome.realized_net_r is None
+    assert outcome.execution_cost_r is None

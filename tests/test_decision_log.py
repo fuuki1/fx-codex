@@ -579,3 +579,65 @@ def test_fusion_decision_preserves_plan_horizon_for_scoring() -> None:
     scoring = decision_log.decision_event_to_scoring_entry(events[0])
     assert scoring is not None
     assert scoring["horizon_hours"] == 4.0
+
+
+def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
+    """判断時に確定した執行コスト(R換算)と期待R予測を判断ログへ保存し、
+
+    採点スキーマへ引き継ぐ。realized_net_r 生成の入力になる。"""
+    plan = TradePlan(
+        symbol="USDJPY",
+        direction="long",
+        action="long",
+        conviction=60,
+        composite=0.3,
+        tech_score=0.4,
+        news_score=0.2,
+        horizon_hours=24.0,
+    )
+    # build_checklist.to_dict() 相当のコスト系フィールドを持たせる
+    plan.checklist = {
+        "execution_cost_r": 0.13,
+        "net_expected_r": 0.42,
+        "expected_r": 0.55,
+        "expectancy_source": "test",
+        "probability_calibrated": True,
+    }
+    events = decision_log.build_fusion_decision_events(
+        [plan],
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+    )
+    execution = events[0]["decision"]["execution"]
+    assert execution["execution_cost_r"] == 0.13
+    assert execution["net_expected_r"] == 0.42
+    assert execution["expected_r"] == 0.55
+
+    scoring = decision_log.decision_event_to_scoring_entry(events[0])
+    assert scoring is not None
+    assert scoring["execution_cost_r"] == 0.13
+    assert scoring["net_expected_r"] == 0.42
+
+
+def test_fusion_decision_persists_null_execution_without_checklist() -> None:
+    """checklist が無い plan は execution を全て None で保存(採点側が欠損として扱える)。"""
+    plan = TradePlan(
+        symbol="USDJPY",
+        direction="long",
+        action="no_trade",
+        conviction=20,
+        composite=0.1,
+        tech_score=0.1,
+        news_score=0.1,
+        horizon_hours=24.0,
+    )
+    events = decision_log.build_fusion_decision_events(
+        [plan],
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+    )
+    execution = events[0]["decision"]["execution"]
+    assert execution["execution_cost_r"] is None
+    assert execution["net_expected_r"] is None
