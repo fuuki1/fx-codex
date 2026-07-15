@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "comment_ja": "時間足別統合ブリーフィングの運用ゲート専用設定。方向判断に直接必要な価格スナップショットと時間足別判断ジャーナルだけを監視する。旧fusion_journal、promotion_state、学習プロファイルは現行--per-timeframe定期経路の更新契約ではないため、このゲートへ混在させない。",
+  "cooldown_seconds": 21600,
+  "targets": [
+    {
+      "name": "tf_price_snapshot",
+      "path": "logs/briefing_tf_prices.jsonl",
+      "kind": "jsonl",
+      "expected_interval_seconds": 300,
+      "warn_after_seconds": 900,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "scripts/status_fx_services.sh で com.fx-codex.snapshot を確認し、TradingView取得と価格履歴の競合を調査"
+    },
+    {
+      "name": "tf_journal",
+      "path": "logs/briefing_tf_journal.jsonl",
+      "kind": "jsonl",
+      "expected_interval_seconds": 300,
+      "warn_after_seconds": 900,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を再起動"
+    }
+  ]
+}
