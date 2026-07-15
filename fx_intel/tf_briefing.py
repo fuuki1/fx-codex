@@ -172,7 +172,7 @@ def _timeframe_field(plan: TimeframePlan) -> dict:
     if warnings:
         lines.append(warnings[0])
     return {
-        "name": f"{label}｜主ホライズン {horizon}",
+        "name": f"{label}｜主ホライズン{horizon}",
         "value": _clip("\n".join(lines), MAX_FIELD),
         "inline": False,
     }
