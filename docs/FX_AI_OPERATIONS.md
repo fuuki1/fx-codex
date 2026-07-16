@@ -18,8 +18,10 @@ tail -n 5 logs/briefing_journal.jsonl
 
 正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・時間足別統合通知、同じ排他ロック内で最大1時間ごとの融合判断）、`com.fx-codex.health`（5分）です。融合判断は`--no-discord --no-price-write`で動き、ログは`logs/fx_fusion_capture.log`に残ります。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
 
-時間足別Discord通知はUSDJPY/EURUSD、融合判断はUSDJPY/EURUSD/GBPUSDです。
+時間足別Discord通知はUSDJPY/EURUSD、融合判断とGBDT候補収集はUSDJPY/EURUSD/GBPUSDです。
 GBPUSDを含む3ペア×4時間足の価格完全性は`com.fx-codex.snapshot`とfreshness monitorが監視します。
+GBDTは`source_cutoff`・`max_feature_available_time`・`prediction_time`の順序を検証できる
+PIT適格な融合行だけを学習・昇格に使います。旧形式行は監査用に保持しますが学習件数には含めません。
 
 時間足別処理の一般失敗では融合処理を開始しません。主要ジャーナル書込み失敗は終了コード4、
 Discord通知だけの失敗は終了コード5です。通知失敗時はlaunchdへ非ゼロを返しつつ、保存済みの判断とは

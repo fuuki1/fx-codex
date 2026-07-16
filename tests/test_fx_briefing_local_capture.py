@@ -105,11 +105,55 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     outcome_report = json.loads(decision_outcomes_path.read_text(encoding="utf-8"))
     feedback = json.loads(decision_feedback_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
+    assert rows[0]["pit_eligible"] is True
+    assert (
+        datetime.fromisoformat(rows[0]["source_cutoff"])
+        <= datetime.fromisoformat(rows[0]["max_feature_available_time"])
+        <= datetime.fromisoformat(rows[0]["prediction_time"])
+    )
+    assert rows[0]["ts"] == rows[0]["prediction_time"]
     assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
     assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
     assert "cells" in feedback
     assert "evaluated" in profile
     assert "Discord送信なし" in capsys.readouterr().out
+
+
+def test_fusion_journal_failure_stops_full_decision_writer(tmp_path, capsys) -> None:
+    journal_path = tmp_path / "briefing_journal.jsonl"
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
+        mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
+        mock.patch("fx_intel.calendar.fetch_calendar", return_value=([], [])),
+        mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
+        mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
+        mock.patch.object(
+            fx_briefing.journal,
+            "append_plans",
+            side_effect=OSError("read-only"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "append_decision_events",
+            side_effect=AssertionError("must not run"),
+        ),
+    ):
+        rc = fx_briefing.main(
+            [
+                "--no-discord",
+                "--no-macro",
+                "--no-ml",
+                "--no-learning",
+                "--no-trade-expectancy",
+                "--no-export-events",
+                "--no-event-archive",
+                "--symbols",
+                "USDJPY",
+            ]
+        )
+
+    assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
+    assert "ジャーナル書き込み失敗" in capsys.readouterr().err
 
 
 def _approved_overall_policy_registry(path, candidate_id: str) -> None:
@@ -135,10 +179,16 @@ def _approved_overall_policy_registry(path, candidate_id: str) -> None:
         "approval",
     )
     registry = to.update_improvement_registry(
-        None, [candidate], now=datetime(2026, 7, 1, tzinfo=UTC)
+        None,
+        [candidate],
+        now=datetime(2026, 7, 1, tzinfo=UTC),
+        data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
     )
     registry = to.update_improvement_registry(
-        registry, [candidate], now=datetime(2026, 7, 1, 1, tzinfo=UTC)
+        registry,
+        [candidate],
+        now=datetime(2026, 7, 1, 1, tzinfo=UTC),
+        data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,
@@ -161,10 +211,17 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
     lines = []
     for i in range(20):
         close = 100.0 - 1.5 * i
+        prediction_time = start + timedelta(hours=i * 3)
         lines.append(
             json.dumps(
                 {
-                    "ts": (start + timedelta(hours=i * 3)).isoformat(),
+                    "ts": prediction_time.isoformat(),
+                    "prediction_time": prediction_time.isoformat(),
+                    "source_cutoff": (prediction_time - timedelta(minutes=2)).isoformat(),
+                    "max_feature_available_time": (
+                        prediction_time - timedelta(seconds=1)
+                    ).isoformat(),
+                    "pit_eligible": True,
                     "symbol": "USDJPY",
                     "direction": "long",
                     "conviction": 20,
