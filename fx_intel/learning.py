@@ -69,6 +69,7 @@ from .journal import (
     DEFAULT_ATR_FRACTION,
     DEFAULT_HORIZON_HOURS,
     DEFAULT_TOLERANCE_HOURS,
+    is_pit_eligible_entry,
 )
 from .market import WEEKEND_CLOSURE, open_hours_between
 
@@ -399,6 +400,8 @@ HORIZONS: tuple[HorizonSpec, ...] = (
 def horizon_report_ja(
     entries: Iterable[dict],
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
+    *,
+    require_pit: bool = False,
 ) -> str:
     """ホライズン別(短期4h/主24h/スイング72h)の方向的中率1行。データ無しは空文字。"""
     materialized = list(entries)
@@ -409,6 +412,7 @@ def horizon_report_ja(
             materialized,
             horizon_hours=spec.hours,
             tolerance_hours=spec.tolerance_hours,
+            require_pit=require_pit,
         )
         if thin_gap_hours > 0:
             calls = thin_calls(calls, thin_gap_hours)
@@ -429,6 +433,8 @@ def evaluate_history(
     horizon_hours: float = DEFAULT_HORIZON_HOURS,
     tolerance_hours: float = DEFAULT_TOLERANCE_HOURS,
     atr_fraction: float = DEFAULT_ATR_FRACTION,
+    *,
+    require_pit: bool = False,
 ) -> list[EvaluatedCall]:
     """ジャーナル履歴内の全方向判断を、後続エントリの終値で採点する。
 
@@ -440,6 +446,8 @@ def evaluate_history(
     parsed: list[tuple[datetime, dict]] = []
     prices: dict[str, list[tuple[datetime, float]]] = {}
     for entry in entries:
+        if require_pit and not is_pit_eligible_entry(entry):
+            continue
         ts = _parse_ts(entry.get("ts"))
         if ts is None:
             continue
