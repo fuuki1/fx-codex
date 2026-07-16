@@ -38,6 +38,44 @@ from .timeframe import TimeframePlan
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
 DEFAULT_ATR_FRACTION = 0.1  # |値動き| がATRのこの割合未満なら判定しない
+FUSION_PIT_DATA_CONTRACT = "fusion-pit-v1"
+
+
+class PointInTimeError(ValueError):
+    """Raised when a journal row cannot prove feature availability before prediction."""
+
+
+def _aware_utc(value: datetime, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise PointInTimeError(f"{field_name} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _parse_aware_ts(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
+    """Return whether a fusion row proves all inputs were available before prediction."""
+    if entry.get("pit_eligible") is not True:
+        return False
+    recorded = _parse_aware_ts(entry.get("ts"))
+    prediction = _parse_aware_ts(entry.get("prediction_time"))
+    source_cutoff = _parse_aware_ts(entry.get("source_cutoff"))
+    feature_available = _parse_aware_ts(entry.get("max_feature_available_time"))
+    if None in (recorded, prediction, source_cutoff, feature_available):
+        return False
+    assert recorded is not None
+    assert prediction is not None
+    assert source_cutoff is not None
+    assert feature_available is not None
+    return recorded == prediction and source_cutoff <= feature_available <= prediction
 
 
 @dataclass(frozen=True)
@@ -55,9 +93,33 @@ class DirectionalStats:
         return self.hits / self.evaluated
 
 
-def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | None = None) -> None:
-    """今回の判断をJSONLへ追記する(1プラン1行)。"""
-    now = now or datetime.now(UTC)
+def append_plans(
+    path: str | Path,
+    plans: Sequence[TradePlan],
+    now: datetime | None = None,
+    *,
+    source_cutoff: datetime | None = None,
+    max_feature_available_time: datetime | None = None,
+) -> None:
+    """今回の判断をJSONLへ追記する(1プラン1行)。
+
+    source_cutoff と max_feature_available_time の両方がある行だけをGBDTの
+    PIT適格行として記録する。旧呼出しは互換のため記録できるが、学習対象外になる。
+    """
+    now = _aware_utc(now or datetime.now(UTC), "prediction_time")
+    pit_eligible = source_cutoff is not None and max_feature_available_time is not None
+    source_utc: datetime | None = None
+    feature_utc: datetime | None = None
+    if pit_eligible:
+        assert source_cutoff is not None
+        assert max_feature_available_time is not None
+        source_utc = _aware_utc(source_cutoff, "source_cutoff")
+        feature_utc = _aware_utc(max_feature_available_time, "max_feature_available_time")
+        if not source_utc <= feature_utc <= now:
+            raise PointInTimeError(
+                "PIT ordering must satisfy source_cutoff <= "
+                "max_feature_available_time <= prediction_time"
+            )
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
@@ -66,6 +128,12 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                 json.dumps(
                     {
                         "ts": now.isoformat(),
+                        "prediction_time": now.isoformat(),
+                        "source_cutoff": source_utc.isoformat() if source_utc else None,
+                        "max_feature_available_time": (
+                            feature_utc.isoformat() if feature_utc else None
+                        ),
+                        "pit_eligible": pit_eligible,
                         "symbol": plan.symbol,
                         "direction": plan.direction,
                         "conviction": plan.conviction,

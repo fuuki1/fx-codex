@@ -45,8 +45,10 @@ from .gbm import (
 )
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
+from .journal import FUSION_PIT_DATA_CONTRACT
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+TRAINING_CONTRACT = FUSION_PIT_DATA_CONTRACT
 
 # 方向依存(判断方向の符号を掛ける)特徴量と方向非依存の特徴量
 FEATURE_NAMES: tuple[str, ...] = (
@@ -766,6 +768,7 @@ def _binary_auc(labels: Sequence[int], probabilities: Sequence[float]) -> float:
 def save_artifact(artifact: MLArtifact, path: str | Path) -> None:
     payload = {
         "schema": SCHEMA_VERSION,
+        "training_contract": TRAINING_CONTRACT,
         "trained_at": artifact.trained_at,
         "n_train": artifact.n_train,
         "n_valid": artifact.n_valid,
@@ -824,6 +827,8 @@ def load_artifact(path: str | Path) -> MLArtifact:
         return MLArtifact()
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA_VERSION:
         return MLArtifact(reasons=["モデルファイルのスキーマ不一致"])
+    if payload.get("training_contract") != TRAINING_CONTRACT:
+        return MLArtifact(reasons=["モデルのPIT学習契約が現行と不一致(要再学習)"])
     if payload.get("feature_names") != list(FEATURE_NAMES):
         # 特徴量定義が変わった古いモデルを黙って使うと列がずれるため拒否
         return MLArtifact(reasons=["特徴量定義が現行と不一致(要再学習)"])

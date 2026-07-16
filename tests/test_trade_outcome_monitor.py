@@ -28,6 +28,10 @@ def monitor():
 def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict:
     row = {
         "ts": ts.isoformat(),
+        "prediction_time": ts.isoformat(),
+        "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+        "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+        "pit_eligible": True,
         "symbol": symbol,
         "direction": "neutral",
         "conviction": 0,
@@ -128,6 +132,37 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
     assert monitor_payload["variant_retest"]["candidate_count"] >= 1
     assert outcome_report["summary"]["overall"]["expectancy_r"] == -1.0
     assert variant_report["best"]["target1_r"] == 0.75
+    assert monitor_payload["runner"]["pit_ineligible_journal_rows"] == 0
+
+
+def test_monitor_runner_excludes_legacy_rows(monitor, tmp_path) -> None:
+    rows = _variant_rows(count=1)
+    for row in rows:
+        for field in (
+            "prediction_time",
+            "source_cutoff",
+            "max_feature_available_time",
+            "pit_eligible",
+        ):
+            row.pop(field, None)
+    journal_path = tmp_path / "legacy.jsonl"
+    _write_jsonl(journal_path, rows)
+
+    result = monitor.run_trade_outcome_monitor(
+        journal_path=journal_path,
+        registry_path=tmp_path / "registry.json",
+        monitor_json_path=tmp_path / "monitor.json",
+        outcome_json_path=None,
+        variant_json_path=None,
+        update_registry=False,
+        retest_variants=False,
+        now=NOW + timedelta(days=2),
+    )
+
+    runner = result["monitor"]["runner"]
+    assert runner["outcome_count"] == 0
+    assert runner["pit_eligible_journal_rows"] == 0
+    assert runner["pit_ineligible_journal_rows"] == len(rows)
 
 
 def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp_path) -> None:
@@ -152,8 +187,15 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
         "paper",
         "approval",
     )
-    registry = to.update_improvement_registry(None, [candidate], now=NOW)
-    registry = to.update_improvement_registry(registry, [candidate], now=NOW + timedelta(hours=1))
+    registry = to.update_improvement_registry(
+        None, [candidate], now=NOW, data_contract="fusion-pit-v1"
+    )
+    registry = to.update_improvement_registry(
+        registry,
+        [candidate],
+        now=NOW + timedelta(hours=1),
+        data_contract="fusion-pit-v1",
+    )
     registry, result = to.set_improvement_candidate_approval(
         registry,
         candidate.candidate_id,
