@@ -1,0 +1,33 @@
+{
+  "real_data": true,
+  "provider": "alfred",
+  "record_count": 16,
+  "series": [
+    "CPIAUCSL",
+    "GDPC1",
+    "UNRATE"
+  ],
+  "vintage_correct": true,
+  "vintage_evidence": {
+    "GDPC1_2023Q4_across_vintages": [
+      [
+        "2024-02-01",
+        22672.859
+      ],
+      [
+        "2024-04-05",
+        22679.255
+      ]
+    ],
+    "note": "second-estimate 22672.859 (vintage 2024-02-01) vs third-estimate 22679.255 (vintage 2024-04-05): stored as separate records"
+  },
+  "as_of_query_verified": true,
+  "as_of_evidence": "as_of(prediction < first capture) returned 0 rows; as_of(now) returns latest vintage (transcript)",
+  "revision_separation_verified": true,
+  "quality_flags_on_every_record": [
+    "provider_does_not_supply_release_time",
+    "provider_does_not_supply_scheduled_time",
+    "availability_normalized_to_capture_time",
+    "vintage_from_alfredgraph_keyless"
+  ]
+}

@@ -145,6 +145,10 @@ class TradePlan:
     interval_summary: str = ""
     ma_note: str = ""
     target_policy: dict[str, object] = field(default_factory=dict)
+    # 発注前9段チェックリスト(decision_pipeline.build_checklist の結果)。
+    # {"steps": [...], "net_expected_r": ..., "position_units": ...} の辞書。
+    # 空なら未算出。表示・ジャーナル記録に使う(判断そのものには影響しない)。
+    checklist: dict[str, object] = field(default_factory=dict)
 
     @property
     def direction_ja(self) -> str:
@@ -267,6 +271,8 @@ def build_trade_plan(
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
     tech_weight: float = TECH_WEIGHT,
     news_weight: float = NEWS_WEIGHT,
     conviction_factor: float = 1.0,
@@ -281,6 +287,9 @@ def build_trade_plan(
 
     calendar_ok=False は経済指標カレンダーが取得できず、イベントリスクを
     確認できていない状態。警戒窓判定が機能しないため確信度に上限を掛ける。
+
+    operational_data_ok=False は独立鮮度モニターの欠落・stale・warning・critical
+    を表し、方向スコアに関係なく新規リスクを neutral へ落とす。
 
     now がFX市場の休場中(週末クローズ)の場合、テクニカルの価格は最終取引
     時点のstale値なので、方向判断を出さず direction="closed" に固定する。
@@ -396,6 +405,11 @@ def build_trade_plan(
             f"確信度を{CALENDAR_UNKNOWN_CONVICTION_CAP}以下に制限"
         )
         conviction = min(conviction, CALENDAR_UNKNOWN_CONVICTION_CAP)
+    if not operational_data_ok:
+        warnings.append(
+            "⛔ 運用データ鮮度ゲート: "
+            + (operational_data_reason or "正常性を証明できないため新規判断を停止")
+        )
 
     conflict = (
         tech_score * news_score < 0 and min(abs(tech_score), abs(news_score)) >= CONFLICT_THRESHOLD
@@ -407,7 +421,10 @@ def build_trade_plan(
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if not is_market_open(now):
+    if not operational_data_ok:
+        direction = "neutral"
+        conviction = 0
+    elif not is_market_open(now):
         direction = "closed"
         conviction = 0
         warnings.append(
@@ -559,6 +576,45 @@ def _events_lines(events: Sequence[EconomicEvent], limit: int = 8) -> str:
     return "\n".join(lines)
 
 
+_CHECK_EMOJI = {"ok": "✅", "warn": "⚠️", "block": "⛔", "skip": "➖"}
+
+
+def _checklist_field(plan: TradePlan) -> dict | None:
+    """発注前9段チェックリストをDiscordの1フィールドに整形。
+
+    plan.checklist が空(未算出)なら None を返し、フィールドを足さない。
+    各ステップは「絵文字 番号. 項目 — 理由」の1行。純期待R/ポジションサイズは
+    末尾にまとめて添える。
+    """
+    checklist = plan.checklist or {}
+    raw_steps = checklist.get("steps")
+    if not isinstance(raw_steps, Sequence) or isinstance(raw_steps, str | bytes):
+        return None
+    steps = [step for step in raw_steps if isinstance(step, Mapping)]
+    if not steps:
+        return None
+    lines = []
+    for step in steps:
+        emoji = _CHECK_EMOJI.get(str(step.get("status")), "•")
+        head = f"{emoji} {step.get('order')}. {step.get('label_ja')}"
+        note = step.get("note")
+        lines.append(f"{head} — {note}" if note else head)
+    footer_bits = []
+    net_r = checklist.get("net_expected_r")
+    if isinstance(net_r, (int, float)):
+        footer_bits.append(f"執行コスト控除後の純期待 **{net_r:+.2f}R**")
+    units = checklist.get("position_units")
+    if isinstance(units, (int, float)):
+        footer_bits.append(f"想定サイズ {units:,.0f}通貨単位")
+    if footer_bits:
+        lines.append("— " + " / ".join(footer_bits))
+    return {
+        "name": "🧭 発注前チェックリスト(9段)",
+        "value": "\n".join(lines)[:1024],
+        "inline": False,
+    }
+
+
 def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
     color = {
         "long": COLOR_LONG,
@@ -627,6 +683,9 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
                 "inline": False,
             }
         )
+    checklist_field = _checklist_field(plan)
+    if checklist_field is not None:
+        fields.append(checklist_field)
     if plan.warnings:
         fields.append({"name": "⚠️ 注意点", "value": "\n".join(plan.warnings), "inline": False})
     if plan.headlines:
@@ -709,7 +768,7 @@ def build_discord_payload(
     if promotion_note:
         macro_fields.append(
             {
-                "name": "🎖️ 委員の運用段階(shadow→paper→live)",
+                "name": "🎖️ 委員の運用段階(shadow固定)",
                 "value": promotion_note[:1024],
                 "inline": False,
             }

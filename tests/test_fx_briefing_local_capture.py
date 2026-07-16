@@ -192,7 +192,11 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def test_auto_paused_policy_not_applied_to_same_run_plans(tmp_path, capsys) -> None:
+def test_auto_paused_policy_not_applied_to_same_run_plans(
+    tmp_path,
+    capsys,
+    isolated_fx_briefing_runtime,
+) -> None:
     """実行中に自動停止した承認済みTP/SLは、その実行のプランにも適用しない。
 
     修正前は実行冒頭のレジストリで注入器を作っていたため、悪化を検知して
@@ -237,6 +241,10 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(tmp_path, capsys) -> N
         )
 
     assert rc == 0
+    assert fx_briefing.DEFAULT_DECISION_LOG_PATH == (
+        isolated_fx_briefing_runtime / "logs" / "briefing_decisions.jsonl"
+    )
+    assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
     # 負け履歴の悪化検知で、承認済みポリシーはこの実行内で自動停止される
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert registry["candidates"][candidate_id]["stage"] == "auto_paused"

@@ -1,13 +1,7 @@
 #!/bin/zsh
-# ニュース×経済指標×テクニカル統合ブリーフィングを毎時10分に送信し続けるループ。
-# (tv_notify_loop.sh が毎時5分なので5分ずらしている)
-#
-# 毎時2通を連続送信する:
-#   1. 融合1判断モード(委員会・ML・昇格ゲートあり=本命パイプライン)
-#   2. 時間足別モード(--per-timeframe。15m/1h/4h/1d を独立採点・学習)
-# 両モードはジャーナル・学習ファイルを分けており互いに干渉しない。片方が
-# 失敗しても他方は実行する(|| true で連鎖停止を防ぐ)。時間足別の採点用に
-# fx_tf_snapshot_loop.sh(5分ごとの価格記録)も別途起動しておくこと。
+# FXシグナルボードを5分境界(00/05/10…分)ごとにDiscordへ1通だけ送る。
+# 従来の融合版・時間足別版の複数通知は送らず、上位3候補、システム状態、
+# データ品質を単一メッセージへ集約する。
 #
 # Desktop配下はmacOSのTCC制限でlaunchd/cronから読めないため、
 # ターミナルから直接起動すること。
@@ -15,10 +9,30 @@
 cd "$(dirname "$0")" || exit 1
 mkdir -p logs
 
+# 二重起動によるDiscord重複通知を防ぐ。異常終了で残ったロックはPIDが死んでいれば回収。
+lock_dir="logs/fx_signal_board_loop.lock"
+if [ -f "$lock_dir/pid" ]; then
+  old_pid=$(<"$lock_dir/pid")
+  if kill -0 "$old_pid" 2>/dev/null; then
+    print -u2 "FXシグナルボードは既に起動しています (PID $old_pid)"
+    exit 1
+  fi
+  rm -rf "$lock_dir"
+fi
+if ! mkdir "$lock_dir" 2>/dev/null; then
+  print -u2 "FXシグナルボードの起動ロックを取得できません: $lock_dir"
+  exit 1
+fi
+print $$ > "$lock_dir/pid"
+trap 'rm -rf "$lock_dir"' EXIT INT TERM
+
 while true; do
-  .venv/bin/python fx_briefing.py >> logs/fx_briefing.log 2>&1 || true
-  .venv/bin/python fx_briefing.py --per-timeframe >> logs/fx_briefing_tf.log 2>&1 || true
+  .venv/bin/python fx_briefing.py \
+    --signal-board \
+    --no-price-write \
+    --symbols GBPUSD EURUSD USDJPY \
+    >> logs/fx_signal_board.log 2>&1 || true
   now=$(date +%s)
-  next=$(( (now / 3600 + 1) * 3600 + 600 ))
+  next=$(( (now / 300 + 1) * 300 ))
   sleep $(( next - now ))
 done

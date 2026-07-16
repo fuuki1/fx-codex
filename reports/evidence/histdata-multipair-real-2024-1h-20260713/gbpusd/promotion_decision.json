@@ -1,0 +1,221 @@
+{
+  "evidence": {
+    "brier_improvement": 0.457890611308175,
+    "calibration_window_separate": true,
+    "cost_stress_2x_expectancy_r": -0.16523117516353006,
+    "data_quality_incidents": 0,
+    "dataset_hash": "390e9f648c87658a907681d058f4577f578d6c826ced1be9fa72940b61379bcd",
+    "dirty_worktree": true,
+    "dsr_probability": 2.5549359138343775e-05,
+    "expectancy_ci_lower_r": -0.2062112251718742,
+    "future_feature_violations": 0,
+    "git_commit": "09b0fda89bd08cfd26729a6217edb4378a0fdc80",
+    "live_like_execution_validated": null,
+    "lockbox_evaluated_once": false,
+    "lockbox_reused_for_selection": false,
+    "major_operational_incidents": null,
+    "max_drawdown_pct": null,
+    "net_expectancy_r": -0.0639102695980332,
+    "pair_count": 1,
+    "paper_days": null,
+    "pbo_probability": 0.3142857142857143,
+    "point_in_time_violations": 0,
+    "regime_count": 3,
+    "sample_count": 229,
+    "shadow_days": null,
+    "synthetic_data": false,
+    "test_window_separate": true,
+    "trial_count": 10
+  },
+  "failures": [
+    "clean_worktree",
+    "net_expectancy",
+    "expectancy_confidence_interval",
+    "deflated_sharpe",
+    "probability_of_backtest_overfitting",
+    "drawdown",
+    "untouched_lockbox",
+    "cost_stress_2x",
+    "pair_coverage",
+    "operational_incidents"
+  ],
+  "passed": false,
+  "policy_source": "governance defaults",
+  "report": {
+    "failures": [
+      "clean_worktree",
+      "net_expectancy",
+      "expectancy_confidence_interval",
+      "deflated_sharpe",
+      "probability_of_backtest_overfitting",
+      "drawdown",
+      "untouched_lockbox",
+      "cost_stress_2x",
+      "pair_coverage",
+      "operational_incidents"
+    ],
+    "gates": [
+      {
+        "critical": true,
+        "name": "dataset_hash",
+        "observed": "390e9f648c87658a907681d058f4577f578d6c826ced1be9fa72940b61379bcd",
+        "passed": true,
+        "requirement": "immutable dataset SHA-256 is recorded"
+      },
+      {
+        "critical": true,
+        "name": "git_commit",
+        "observed": "09b0fda89bd08cfd26729a6217edb4378a0fdc80",
+        "passed": true,
+        "requirement": "source commit is recorded"
+      },
+      {
+        "critical": true,
+        "name": "clean_worktree",
+        "observed": true,
+        "passed": false,
+        "requirement": "promotion artifact was built from a clean worktree"
+      },
+      {
+        "critical": true,
+        "name": "non_synthetic_data",
+        "observed": false,
+        "passed": true,
+        "requirement": "synthetic data cannot support promotion"
+      },
+      {
+        "critical": true,
+        "name": "point_in_time_integrity",
+        "observed": 0,
+        "passed": true,
+        "requirement": "zero point-in-time violations"
+      },
+      {
+        "critical": true,
+        "name": "future_feature_integrity",
+        "observed": 0,
+        "passed": true,
+        "requirement": "zero future-feature violations"
+      },
+      {
+        "critical": true,
+        "name": "all_trials_recorded",
+        "observed": 10,
+        "passed": true,
+        "requirement": "at least one trial and the complete trial ledger are recorded"
+      },
+      {
+        "critical": true,
+        "name": "sample_size",
+        "observed": 229,
+        "passed": true,
+        "requirement": "sample_count >= 200"
+      },
+      {
+        "critical": true,
+        "name": "net_expectancy",
+        "observed": -0.0639102695980332,
+        "passed": false,
+        "requirement": "net expectancy R > 0.000"
+      },
+      {
+        "critical": true,
+        "name": "expectancy_confidence_interval",
+        "observed": -0.2062112251718742,
+        "passed": false,
+        "requirement": "95% lower confidence bound > 0.000R"
+      },
+      {
+        "critical": true,
+        "name": "deflated_sharpe",
+        "observed": 2.5549359138343775e-05,
+        "passed": false,
+        "requirement": "DSR probability >= 0.95"
+      },
+      {
+        "critical": true,
+        "name": "probability_of_backtest_overfitting",
+        "observed": 0.3142857142857143,
+        "passed": false,
+        "requirement": "PBO <= 0.20"
+      },
+      {
+        "critical": true,
+        "name": "drawdown",
+        "observed": null,
+        "passed": false,
+        "requirement": "max drawdown <= 15.0%"
+      },
+      {
+        "critical": true,
+        "name": "calibration_improvement",
+        "observed": 0.457890611308175,
+        "passed": true,
+        "requirement": "Brier improvement > 0.0000"
+      },
+      {
+        "critical": true,
+        "name": "calibration_split",
+        "observed": true,
+        "passed": true,
+        "requirement": "calibration window is separate from tune/test/lockbox"
+      },
+      {
+        "critical": true,
+        "name": "test_split",
+        "observed": true,
+        "passed": true,
+        "requirement": "test window is not used for model or threshold selection"
+      },
+      {
+        "critical": true,
+        "name": "untouched_lockbox",
+        "observed": {
+          "evaluated_once": false,
+          "reused": false
+        },
+        "passed": false,
+        "requirement": "lockbox is evaluated once after selection and never fed back"
+      },
+      {
+        "critical": true,
+        "name": "cost_stress_2x",
+        "observed": -0.16523117516353006,
+        "passed": false,
+        "requirement": "2x cost expectancy >= 0.000R"
+      },
+      {
+        "critical": true,
+        "name": "regime_coverage",
+        "observed": 3,
+        "passed": true,
+        "requirement": "at least 3 regimes"
+      },
+      {
+        "critical": true,
+        "name": "pair_coverage",
+        "observed": 1,
+        "passed": false,
+        "requirement": "at least 3 currency pairs"
+      },
+      {
+        "critical": true,
+        "name": "operational_incidents",
+        "observed": null,
+        "passed": false,
+        "requirement": "zero unresolved major operational incidents"
+      },
+      {
+        "critical": true,
+        "name": "data_quality_incidents",
+        "observed": 0,
+        "passed": true,
+        "requirement": "zero unresolved data-quality incidents"
+      }
+    ],
+    "passed": false,
+    "policy_rationale": "Initial conservative research gates; re-estimate from sample size, mandate, execution venue, and loss tolerance before use.",
+    "target_stage": "validated"
+  },
+  "target_stage": "validated"
+}

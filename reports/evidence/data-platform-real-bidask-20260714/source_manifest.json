@@ -1,0 +1,62 @@
+{
+  "raw_storage": {
+    "location": "immutable content-addressed store (scratch during development; Mac mini ~/srv/fx-codex/collect/raw in production)",
+    "committed_to_git": false,
+    "blobs": [
+      {
+        "sha256": "24132877c3ca489d843895f390fdc0b1eaa94a650c2ba3396d3cca0804ba9ec1",
+        "bytes": 15304
+      },
+      {
+        "sha256": "2d6ef278114baee891d1c5750f7430be4b7e1464cad6146c02e0a85becf94ecc",
+        "bytes": 15419
+      },
+      {
+        "sha256": "61b7a005a0aa6b45abdd8d961fe4102d03e043f98afdccb62fb6ab1b62afbd7b",
+        "bytes": 20488
+      },
+      {
+        "sha256": "75eb52badd29b4bdb901d994d7b6a69d795ee63ffaf97f02b176be2ab358aadb",
+        "bytes": 27068
+      },
+      {
+        "sha256": "8c07203d6577bff81ebfa7d97c99944cc0ef882addf9ef346c8e26de38a07d5e",
+        "bytes": 23966
+      },
+      {
+        "sha256": "e883dd44177e919a9f56bdcc5474f6b10ecf1454c80e831b64f0dddb238a96ea",
+        "bytes": 40519
+      },
+      {
+        "sha256": "e957ad91cf7268dcd08cc273ce81df655ff4e32030b3d13baa3403c689c8982b",
+        "bytes": 43470
+      },
+      {
+        "sha256": "f5abe1a13b134b63958ccf3dd7fa72b233d4e48a2d7d45017b7d9c591b071283",
+        "bytes": 31193
+      },
+      {
+        "sha256": "fc24253f4d6172c832fa663eef8f741102cf6ff216df92f74e0d1a930855df16",
+        "bytes": 19956
+      }
+    ],
+    "total_bytes": 237383,
+    "quote_rows": 52732,
+    "refetch": "reproduce.sh (Dukascopy datafeed is publicly re-fetchable per pair-hour)",
+    "retention": "keep raw >= 400 days; delete only after decommission review with hash-signed manifest"
+  },
+  "macro_storage": {
+    "observations": 16,
+    "series": [
+      "CPIAUCSL",
+      "GDPC1",
+      "UNRATE"
+    ],
+    "vintages": [
+      "2024-02-01",
+      "2024-02-15",
+      "2024-04-05",
+      "2024-04-15"
+    ]
+  }
+}

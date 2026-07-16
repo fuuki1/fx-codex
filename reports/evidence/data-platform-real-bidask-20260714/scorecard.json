@@ -1,0 +1,190 @@
+{
+  "awards": [
+    {
+      "evidence": "",
+      "max_points": 15,
+      "points": 0.0,
+      "reason": "no live non-demo broker bid/ask stream collected",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 7,
+      "points": 7,
+      "reason": "real bid/ask quotes ingested: 52732 (modes: ['historical_download'])",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 4,
+      "points": 4,
+      "reason": "pair coverage: ['EURUSD', 'GBPUSD', 'USDJPY']",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "bid/ask sizes present or honestly flagged provider_does_not_supply_*",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "collection_summary.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "raw-first storage verified (raw sha256 recorded before normalization)",
+      "section": "trading_market_data"
+    },
+    {
+      "evidence": "divergence_report.json",
+      "max_points": 8,
+      "points": 8,
+      "reason": "independent providers compared: ['dukascopy', 'histdata']",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "divergence_report.json",
+      "max_points": 3,
+      "points": 3,
+      "reason": "compared pairs: ['EURUSD', 'GBPUSD', 'USDJPY']",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "",
+      "max_points": 2,
+      "points": 0.0,
+      "reason": "divergence metrics not all measured (need ['mid_diff_pips', 'receive_time_skew_ms', 'spread_diff_pips'])",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "",
+      "max_points": 2,
+      "points": 0.0,
+      "reason": "divergence breach policy never exercised",
+      "section": "dual_source_verification"
+    },
+    {
+      "evidence": "macro_pit_report.json",
+      "max_points": 8,
+      "points": 8,
+      "reason": "real macro records: 16 from alfred (vintage_correct=True)",
+      "section": "macro_event_pit"
+    },
+    {
+      "evidence": "macro_pit_report.json",
+      "max_points": 4,
+      "points": 4,
+      "reason": "as-of query verified on real data (pre-availability blocked)",
+      "section": "macro_event_pit"
+    },
+    {
+      "evidence": "macro_pit_report.json",
+      "max_points": 3,
+      "points": 3,
+      "reason": "initial vs revised values stored separately (vintage evidence)",
+      "section": "macro_event_pit"
+    },
+    {
+      "evidence": "",
+      "max_points": 20,
+      "points": 0.0,
+      "reason": "no qualifying trading days of continuous operation",
+      "section": "continuous_operation"
+    },
+    {
+      "evidence": "replay_report.json",
+      "max_points": 5,
+      "points": 5,
+      "reason": "deterministic replay on real data (hash cdca393e2e7a\u2026)",
+      "section": "reproducibility_audit"
+    },
+    {
+      "evidence": "independent_reproduction.json",
+      "max_points": 5,
+      "points": 5,
+      "reason": "independent-environment reproduction matched on real data",
+      "section": "reproducibility_audit"
+    },
+    {
+      "evidence": "fault_injection_report.json",
+      "max_points": 6,
+      "points": 6.0,
+      "reason": "fault injection: 23/23 scenarios fail-closed",
+      "section": "fault_tolerance_secrets"
+    },
+    {
+      "evidence": "secrets_scan.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "secrets scan clean (0 leaks)",
+      "section": "fault_tolerance_secrets"
+    },
+    {
+      "evidence": "secrets_scan.json",
+      "max_points": 2,
+      "points": 2,
+      "reason": "collector verified to import no order/executor path",
+      "section": "fault_tolerance_secrets"
+    }
+  ],
+  "daily_report_count": 0,
+  "evidence_bundle": "reports/evidence/data-platform-real-bidask-20260714",
+  "evidence_paths": [
+    "collection_summary.json",
+    "divergence_report.json",
+    "fault_injection_report.json",
+    "independent_reproduction.json",
+    "macro_pit_report.json",
+    "replay_report.json",
+    "secrets_scan.json"
+  ],
+  "fatal_reasons": [],
+  "hard_cap": 75,
+  "hard_cap_reasons": [
+    {
+      "limit": 75,
+      "reason": "no live market data (historical download and/or demo only)"
+    },
+    {
+      "limit": 85,
+      "reason": "fewer than 30 trading days (0)"
+    }
+  ],
+  "max_score": 100,
+  "raw_score": 61.0,
+  "score": 61.0,
+  "scorecard_version": "1.0.0",
+  "sections": {
+    "continuous_operation": {
+      "max_points": 20.0,
+      "points": 0.0
+    },
+    "dual_source_verification": {
+      "max_points": 15.0,
+      "points": 11.0
+    },
+    "fault_tolerance_secrets": {
+      "max_points": 10.0,
+      "points": 10.0
+    },
+    "macro_event_pit": {
+      "max_points": 15.0,
+      "points": 15.0
+    },
+    "reproducibility_audit": {
+      "max_points": 10.0,
+      "points": 10.0
+    },
+    "trading_market_data": {
+      "max_points": 30.0,
+      "points": 15.0
+    }
+  },
+  "status": "capped",
+  "unmet_conditions": [
+    "[trading_market_data] no live non-demo broker bid/ask stream collected",
+    "[dual_source_verification] divergence metrics not all measured (need ['mid_diff_pips', 'receive_time_skew_ms', 'spread_diff_pips'])",
+    "[dual_source_verification] divergence breach policy never exercised",
+    "[continuous_operation] no qualifying trading days of continuous operation"
+  ]
+}

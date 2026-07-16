@@ -1,0 +1,15 @@
+{
+  "collector_commit_sha": "dbaf82432f69b9f8b3d7e0801e75908af7dba641",
+  "slo_version_file": {
+    "path": "config/data_platform_slo_v1.json",
+    "sha256": "5964c47124028eb0463760052e703772e4ce9fbe7803351509ddf7e3b3f3df0b"
+  },
+  "dependency_lock": {
+    "path": "requirements.lock",
+    "sha256": "4d9bdfd3d67b3fbf983bfcb712d9670bab440c0a5e40461bcc45d992ef193a90"
+  },
+  "scorecard": {
+    "path": "tools/data_platform_scorecard.py",
+    "sha256": "619cf2f31053505c63909b922d457644c51e6d7f6e8f69dfb8b5b1bc078cf8a8"
+  }
+}

@@ -1,10 +1,22 @@
 #!/bin/zsh
-# ブリーフィング2モード(融合+時間足別)を1回ずつ実行するワンショットスクリプト。
-# launchd(com.fx-codex.briefing)から毎時:10に、run_exclusive.pyのロック下で呼ばれる。
-# 片方の失敗が他方を止めないよう `|| true` で分離する(旧fx_briefing_loop.shと同じ契約)。
-# stdinは/dev/nullに固定: 2026-07-05にstdin待ちでハングした事故の再発防止。
+# FX統合ブリーフィングを1回だけ生成し、Discordへ通知する。
+# launchd(com.fx-codex.briefing)から5分ごとにrun_exclusive.pyのロック下で呼ばれる。
+# 価格系列はcom.fx-codex.snapshotが管理するため、ここでは価格を書き込まない。
+# stdinは/dev/nullに固定し、対話待ちによる常駐停止を防ぐ。
+set -u
+
 cd "$(dirname "$0")/.." || exit 1
 mkdir -p logs
 
-.venv/bin/python fx_briefing.py </dev/null >> logs/fx_briefing.log 2>&1 || true
-.venv/bin/python fx_briefing.py --per-timeframe </dev/null >> logs/fx_briefing_tf.log 2>&1 || true
+PYTHON="$PWD/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  print -u2 "FX briefing Pythonが実行できません: $PYTHON"
+  exit 1
+fi
+
+exec "$PYTHON" fx_briefing.py \
+  --per-timeframe \
+  --no-price-write \
+  --require-freshness \
+  --symbols USDJPY EURUSD \
+  </dev/null >> logs/fx_integrated_briefing.log 2>&1

@@ -1,11 +1,11 @@
 """学習データ供給パイプラインの鮮度監視 + Discord通知(WARNING/CRITICAL/RECOVERY)。
 
-fx_tf_snapshot(5分毎)とfx_briefing(毎時:10)が書き続けるジャーナル・スナップショット・
+fx_tf_snapshotとfx_briefingが5分ごとに更新するジャーナル・スナップショット・
 学習ファイルの最終更新を監視し、停止を数分以内に検知してDiscordへ通知する。
 launchd(com.fx-codex.health)から5分間隔のワンショットで起動される前提。
 
 設計原則:
-- 監視対象と閾値はコードにハードコードせず ops/freshness_targets.json で設定する
+- 監視対象と閾値はコードにハードコードせず設定ファイルで指定する
 - 通知は「状態が変化した時」だけ送る(ok→warning→critical→ok=recovery)。
   同一状態の再通知はcooldown(既定6時間)経過後のみ。状態は
   logs/freshness_state.json に永続化し、プロセス再起動をまたいで重複抑止する
@@ -57,6 +57,8 @@ class TargetConfig:
     warn_after_seconds: float = 7200.0
     critical_after_seconds: float | None = 21600.0
     manual_action_ja: str = ""
+    required_symbols: tuple[str, ...] = ()
+    required_timeframes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -73,6 +75,9 @@ class TargetResult:
     warn_after_seconds: float = 0.0
     critical_after_seconds: float | None = None
     manual_action_ja: str = ""
+    expected_coverage: int | None = None
+    observed_coverage: int | None = None
+    missing_coverage: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -86,6 +91,9 @@ class TargetResult:
             "warn_after_seconds": self.warn_after_seconds,
             "critical_after_seconds": self.critical_after_seconds,
             "manual_action_ja": self.manual_action_ja,
+            "expected_coverage": self.expected_coverage,
+            "observed_coverage": self.observed_coverage,
+            "missing_coverage": list(self.missing_coverage),
         }
 
 
@@ -155,6 +163,10 @@ def load_config(path: str | Path) -> tuple[list[TargetConfig], float]:
                 warn_after_seconds=float(row.get("warn_after_seconds", 7200)),
                 critical_after_seconds=(float(critical_raw) if critical_raw is not None else None),
                 manual_action_ja=str(row.get("manual_action_ja", "")),
+                required_symbols=tuple(str(value) for value in row.get("required_symbols", [])),
+                required_timeframes=tuple(
+                    str(value) for value in row.get("required_timeframes", [])
+                ),
             )
         )
     return targets, cooldown
@@ -190,18 +202,21 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
 
     # JSONLの末尾行が壊れていたら書込み途中クラッシュや破損の兆候(鮮度より優先)
     if target.kind == "jsonl":
-        tail = _read_last_nonempty_line(file_path)
+        recent_lines = _read_recent_nonempty_lines(file_path)
+        tail = recent_lines[-1] if recent_lines else None
         if tail is not None:
             try:
                 json.loads(tail)
             except json.JSONDecodeError:
                 result.status = STATUS_CRITICAL
                 result.reason = "jsonl_corrupt_tail"
+        if target.required_symbols and target.required_timeframes:
+            _apply_capture_coverage(result, recent_lines, target)
     return result
 
 
-def _read_last_nonempty_line(path: Path, chunk: int = 65536) -> str | None:
-    """ファイル全体を読まずに末尾の非空行を返す(ジャーナルは数MBに育つため)。"""
+def _read_recent_nonempty_lines(path: Path, chunk: int = 65536) -> list[str]:
+    """ファイル全体を読まず、coverage判定に十分な末尾行を返す。"""
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -209,9 +224,51 @@ def _read_last_nonempty_line(path: Path, chunk: int = 65536) -> str | None:
             handle.seek(max(0, size - chunk))
             data = handle.read().decode("utf-8", errors="replace")
     except OSError:
-        return None
-    lines = [line for line in data.splitlines() if line.strip()]
-    return lines[-1] if lines else None
+        return []
+    return [line for line in data.splitlines() if line.strip()]
+
+
+def _apply_capture_coverage(
+    result: TargetResult,
+    lines: list[str],
+    target: TargetConfig,
+) -> None:
+    """最新capture slotが要求されたsymbol×timeframeを全て含むか検証する。"""
+
+    parsed: list[dict[str, object]] = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            parsed.append(row)
+    if not parsed:
+        result.status = STATUS_CRITICAL
+        result.reason = "coverage_unavailable"
+        return
+    latest_slot = parsed[-1].get("capture_slot")
+    if not isinstance(latest_slot, str) or not latest_slot:
+        result.status = STATUS_CRITICAL
+        result.reason = "coverage_metadata_missing"
+        return
+    observed = {
+        (str(row.get("symbol")), str(row.get("timeframe")))
+        for row in parsed
+        if row.get("capture_slot") == latest_slot
+    }
+    expected = {
+        (symbol, timeframe)
+        for symbol in target.required_symbols
+        for timeframe in target.required_timeframes
+    }
+    missing = sorted(expected - observed)
+    result.expected_coverage = len(expected)
+    result.observed_coverage = len(expected & observed)
+    result.missing_coverage = tuple(f"{symbol}:{timeframe}" for symbol, timeframe in missing)
+    if missing:
+        result.status = STATUS_CRITICAL
+        result.reason = "coverage_incomplete"
 
 
 def evaluate(
@@ -262,18 +319,14 @@ def evaluate(
             should_notify = True  # 悪化は即通知
         elif result.status == previous.status:
             last_at = _parse_ts(previous.last_notified_at)
-            if (
-                previous.last_notified_status == result.status
-                and last_at is not None
-                and (now - last_at).total_seconds() >= cooldown_seconds
-            ):
+            if previous.last_notified_status != result.status:
+                should_notify = True  # 前回の通知が未送信/失敗なら次周期に再試行
+            elif last_at is not None and (now - last_at).total_seconds() >= cooldown_seconds:
                 should_notify = True  # 同一状態の継続はcooldown後に再通知
         # 改善方向(crit→warn)は通知しない(recoveryまで待つ)
 
         if should_notify:
             notifications.append(_build_notification(severity, result, state, previous, host, now))
-            state.last_notified_status = severity if severity != "recovery" else STATUS_OK
-            state.last_notified_at = now.isoformat()
         new_states[result.name] = state
     return new_states, notifications
 
@@ -364,14 +417,14 @@ def load_webhook_url(root: Path) -> str | None:
 
 
 def send_discord(webhook_url: str, payload: dict) -> bool:
-    """Discordへ送信。失敗してもFalseを返すだけで例外は伝播させない。"""
-    import requests
+    """Discordへ再試行付きで送信し、秘密URLをログへ出さない。"""
+    from fx_intel import discord_delivery
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=15)
-        return 200 <= response.status_code < 300
-    except Exception as exc:  # noqa: BLE001 - 通知失敗が監視を殺してはいけない
-        print(f"[freshness] Discord送信失敗: {exc}", file=sys.stderr)
+        discord_delivery.send_webhook(webhook_url, payload)
+        return True
+    except discord_delivery.DiscordDeliveryError as error:
+        print(f"[freshness] {error}", file=sys.stderr)
         return False
 
 
@@ -448,6 +501,12 @@ def run_monitor(
             sent.append(
                 {"target": notification.target, "severity": notification.severity, "sent": ok}
             )
+            if ok:
+                state = new_states[notification.target]
+                state.last_notified_status = (
+                    notification.severity if notification.severity != "recovery" else STATUS_OK
+                )
+                state.last_notified_at = now.isoformat()
 
     report: dict[str, object] = {
         "monitor_timestamp": now.isoformat(),
@@ -460,10 +519,14 @@ def run_monitor(
             default=STATUS_OK,
         ),
     }
-    atomic_write_json(
-        state_path,
-        {"updated_at": now.isoformat(), "targets": {k: v.to_dict() for k, v in new_states.items()}},
-    )
+    if notify:
+        atomic_write_json(
+            state_path,
+            {
+                "updated_at": now.isoformat(),
+                "targets": {k: v.to_dict() for k, v in new_states.items()},
+            },
+        )
     atomic_write_json(report_path, report)
     return report
 
@@ -474,7 +537,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--state", default=DEFAULT_STATE_PATH)
     parser.add_argument("--report", default=DEFAULT_REPORT_PATH)
-    parser.add_argument("--no-notify", action="store_true", help="通知せず判定と記録のみ")
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="通知せず判定とレポートだけ更新する（通知状態は変更しない）",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()

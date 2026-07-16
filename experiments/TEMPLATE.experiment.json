@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "experiment_id": "REPLACE-lowercase-id",
+  "created_at": "REPLACE-2026-01-01T00:00:00+00:00",
+  "created_by": "REPLACE-name",
+  "research_question": "REPLACE: what decision does this experiment inform?",
+  "economic_hypothesis": "REPLACE: why should this edge exist and who pays for it?",
+  "invalidation_conditions": [
+    "REPLACE: observable condition under which the hypothesis is rejected"
+  ],
+  "strategy_card": {
+    "strategy_id": "REPLACE-strategy-id",
+    "economic_mechanism": "REPLACE: mechanism that generates the edge",
+    "why_should_edge_exist": "REPLACE: why the edge persists after costs",
+    "who_is_paying_the_edge": "REPLACE: hedgers / momentum chasers / liquidity takers ...",
+    "expected_horizon": "REPLACE: e.g. 12 hourly bars",
+    "known_failure_regimes": ["REPLACE: e.g. central-bank intervention days"],
+    "capacity_assumption": "REPLACE: notional at which the edge decays",
+    "cost_assumption": "REPLACE: declared static spread/slippage/commission/financing",
+    "exploratory": false
+  },
+  "git": {
+    "commit": "REPLACE-full-40-hex-commit",
+    "dirty_worktree_allowed": false
+  },
+  "environment": {
+    "python_version": "3.12",
+    "dependency_lock_sha256": null,
+    "platform_note": "REPLACE: e.g. macOS 15 / Mac mini"
+  },
+  "data": {
+    "sources": [
+      {
+        "source_id": "REPLACE-source-id",
+        "kind": "price_csv",
+        "path": "REPLACE/path/to/prices.csv",
+        "raw_sha256": "REPLACE-64-hex-sha256",
+        "license_note": "REPLACE: licence or 'synthetic test data'"
+      }
+    ],
+    "symbol": "USDJPY",
+    "start": "REPLACE-2024-01-01T00:00:00+00:00",
+    "end": "REPLACE-2024-06-01T00:00:00+00:00",
+    "timezone": "UTC",
+    "as_of_cutoff": "REPLACE-2024-06-01T02:00:00+00:00",
+    "bar_interval_minutes": 60,
+    "required_quality_level": "strict",
+    "synthetic": true
+  },
+  "features": {
+    "definitions": ["ret_1", "ret_4", "ma_ratio_24", "rsi_14", "vol_24"],
+    "availability_rule": "completed_bar_close",
+    "version": "features_v1"
+  },
+  "labels": {
+    "type": "triple_barrier",
+    "horizon_bars": 12,
+    "take_profit_vol_multiple": 2.0,
+    "stop_vol_multiple": 1.0,
+    "volatility_window_bars": 24,
+    "same_bar_policy": "stop_first",
+    "gap_policy": "adverse_open"
+  },
+  "splits": {
+    "method": "chronological_five_way",
+    "train_fraction": 0.5,
+    "tune_fraction": 0.15,
+    "calibration_fraction": 0.1,
+    "test_fraction": 0.15,
+    "lockbox_fraction": 0.1,
+    "purge_bars": 12,
+    "embargo_bars": 2,
+    "min_rows_per_partition": 10
+  },
+  "models": {
+    "candidates": [
+      {
+        "candidate_id": "noskill-flat",
+        "family": "constant_probability",
+        "hyperparameters": {
+          "probability": 0.5,
+          "long_threshold": 0.55,
+          "short_threshold": 0.45
+        }
+      },
+      {
+        "candidate_id": "logistic-r1",
+        "family": "logistic_ridge",
+        "hyperparameters": {
+          "ridge": 1.0,
+          "long_threshold": 0.55,
+          "short_threshold": 0.45
+        }
+      }
+    ],
+    "random_seed": 42,
+    "trial_budget": 8
+  },
+  "calibration": {"method": "platt"},
+  "costs": {
+    "cost_model_version": "declared_static_v1",
+    "spread_pips": 0.8,
+    "slippage_pips": 0.2,
+    "pip_size": 0.01,
+    "commission_r_per_trade": 0.001,
+    "financing_r_per_bar": 0.0001,
+    "stress_multipliers": [1.0, 1.25, 1.5, 2.0]
+  },
+  "selection": {
+    "primary_metric": "net_expectancy_r",
+    "minimum_trade_count": 30,
+    "minimum_effective_trades": 20,
+    "max_regime_concentration": 0.6,
+    "max_month_concentration": 0.5,
+    "multiple_testing_method": "holm",
+    "bootstrap_block_size": 5,
+    "pbo_blocks": 8
+  },
+  "lockbox": {"access_policy": "single_use", "access_count_limit": 1},
+  "promotion": {"target_stage": "validated", "policy_path": null}
+}

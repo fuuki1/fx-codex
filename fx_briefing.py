@@ -34,21 +34,21 @@
 8. 複数AI委員会(fx_intel/committee.py) — テクニカル/ニュース/マクロ/MLの
    4委員が意見を出し、複合スコアを重み付き平均で合成。リスクオフィサー
    (build_trade_planの決定論ゲート)が常に拒否権を持つ。
-9. マクロデータ層(fx_intel/macro.py) — COT・米金利・VIX・ドル指数を
-   TTLキャッシュ+staleness品質ゲート付きで取得。リスクレジームを実データ判定。
+9. マクロデータ層(fx_intel/macro.py / cot_pit.py) — 金利・VIX・ドル指数は
+   current-only TTL、COTは明示された監査済みresearch artifactだけをas-of読込。
+   legacy TTL COTへはfallbackしない。
 10. ML確率モデル(fx_intel/gbm.py + ml.py) — 依存ゼロのGBDTでジャーナルから
     P(hit|状態,方向)を学習。自己相関間引き・時系列split+エンバーゴ・較正・
     スキルゲート付き。--train-ml で強制再学習。モデルが無い/7日以上古い場合は
     自動再学習(サンプル不足ならゲートが弾くだけで安全)。
-11. 昇格ゲート(fx_intel/promotion.py) — 委員を実績で shadow→paper→live へ
-    段階昇格。live昇格のみ --promote-live の人間承認が必須。
+11. 昇格ゲート(fx_intel/promotion.py) — 委員を実績で shadow→paper まで段階昇格。
+    このCLIからのlive昇格は無効化されている。
 
 使い方:
     .venv/bin/python fx_briefing.py                  # Discordへ送信
     .venv/bin/python fx_briefing.py --dry-run        # 送信せず内容を表示
     .venv/bin/python fx_briefing.py --symbols USDJPY GBPJPY --no-llm
     .venv/bin/python fx_briefing.py --train-ml       # ML確率モデルを再学習して保存
-    .venv/bin/python fx_briefing.py --promote-live ml # 条件を満たせばML委員をliveへ承認
     .venv/bin/python fx_briefing.py --score-trade-outcomes # TP/SL込み期待値を監査
 
 副産物として以下を書き出す(いずれも fx_backtester の --events でそのまま使える形式):
@@ -70,15 +70,16 @@ import sys
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
-import requests
 
-import params_gate
 from fx_intel import (
     briefing,
     calendar,
     committee,
     decision_feedback,
     decision_log,
+    decision_pipeline,
+    discord_delivery,
+    freshness,
     journal,
     learning,
     macro,
@@ -87,6 +88,7 @@ from fx_intel import (
     news,
     price_history,
     promotion,
+    signal_board,
     sentiment,
     technicals,
     tf_briefing,
@@ -109,10 +111,11 @@ DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
 DEFAULT_TP_SL_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tp_sl_learning.json"
 DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
 # 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
-# 判断ジャーナルは毎時しか追記されず短い足の採点窓に入る点が得られないため、
+# 判断ジャーナルだけでは短い足の採点窓に十分な価格点が得られないため、
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
 # direction を持たない価格行なので採点対象は増やさず将来価格系列だけを密にする。
 DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
+DEFAULT_CALENDAR_CACHE = PROJECT_ROOT / "logs" / "calendar_cache.json"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
@@ -122,11 +125,59 @@ DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
+DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
 # ガードが早期returnするため、データが足りないうちは実質ノーコスト)
 ML_RETRAIN_DAYS = 7.0
+
+
+def _attach_cot_pit_dataset(
+    snapshot: macro.MacroSnapshot,
+    dataset_path: Path | None,
+    *,
+    prediction_time: datetime,
+) -> None:
+    """Attach only audited, release-attested COT rows available at prediction time."""
+
+    if prediction_time.tzinfo is None:
+        raise ValueError("COT prediction_time must be timezone-aware")
+    snapshot.cot = {}
+    if dataset_path is None:
+        snapshot.cot_evidence = {
+            "status": "disabled",
+            "prediction_time": prediction_time.astimezone(UTC).isoformat(),
+            "usable": False,
+        }
+        snapshot.warnings.append(
+            "COT PIT dataset未指定: legacy current-snapshot COTは判断入力から除外"
+        )
+        return
+    # Keep the normal notification runtime independent from fx_backtester.  The
+    # shared PIT artifact dependency is loaded only when this research-only input
+    # is explicitly selected.
+    from fx_intel import cot_pit
+
+    try:
+        result = cot_pit.load_cot_as_of(dataset_path, prediction_time)
+    except cot_pit.COTPITError as error:
+        snapshot.cot_evidence = {
+            "status": "invalid",
+            "prediction_time": prediction_time.astimezone(UTC).isoformat(),
+            "errors": [str(error)],
+            "usable": False,
+        }
+        snapshot.warnings.append(f"COT PIT dataset監査失敗のためCOTを除外: {error}")
+        return
+    snapshot.cot_evidence = result.to_dict()
+    if not result.usable:
+        detail = "; ".join((*result.errors, *result.warnings[:1]))
+        snapshot.warnings.append(
+            f"COT PIT status={result.status} のためCOTを除外" + (f": {detail}" if detail else "")
+        )
+        return
+    snapshot.cot = dict(result.reports)
 
 
 def ml_needs_retrain(
@@ -142,6 +193,35 @@ def ml_needs_retrain(
     if trained.tzinfo is None:
         trained = trained.replace(tzinfo=UTC)
     return (now - trained) >= timedelta(days=max_age_days)
+
+
+def _realized_expectancy_r(summary: dict | None, symbol: str, direction: str) -> float | None:
+    """Return promotion-grade net OOS expectancy evidence for one cell.
+
+    The current descriptive trade-outcome summary lacks independent-test, CI,
+    label-version, and full net-cost provenance, so its naked mean is not accepted.
+    A future producer must explicitly satisfy this typed evidence contract; absence
+    of any field returns None and the downstream checklist remains fail-closed.
+    """
+    if not summary or direction not in ("long", "short"):
+        return None
+    cell = (summary.get("by_symbol_direction") or {}).get(f"{symbol}:{direction}")
+    if not isinstance(cell, dict):
+        return None
+    if not (
+        cell.get("evidence_schema") == 2
+        and cell.get("sample_ok") is True
+        and cell.get("net_of_costs") is True
+        and cell.get("independent_test") is True
+        and isinstance(cell.get("label_version"), str)
+        and bool(cell.get("label_version"))
+    ):
+        return None
+    ci_lower = cell.get("expectancy_r_ci_lower")
+    if not isinstance(ci_lower, (int, float)) or isinstance(ci_lower, bool) or ci_lower <= 0:
+        return None
+    value = cell.get("expectancy_r")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def load_webhook_url() -> str | None:
@@ -160,37 +240,19 @@ def load_webhook_url() -> str | None:
 
 
 def load_strategy_params() -> tuple[int, int, float, str | None]:
-    """strategy_params.json から (fast, slow, atr_multiple, warning) を読む。
+    """テクニカル分析用の MA 窓と ATR 倍率を返す。
 
-    params_gate を通し、来歴の無い/過剰適合の疑いがあるパラメータは採用しない。
-    ライブ戦略（trader/app/strategy.py）と同じゲートを共有し、検証されていない
-    パラメータに基づくブリーフィングを出さないようにする。ゲートに落ちた場合は
-    保守的な既定値で継続し、warning を返して通知本文にも明示する。
+    このシステムは自動売買を行わず分析→Discord通知に専念するため、
+    発注戦略の最適化パラメータ（strategy_params.json）は持たない。
+    テクニカル委員が使う MA クロスの窓と SL/TP 距離の ATR 倍率は、
+    保守的な固定値（MA 20/100・ATR×2.5）で運用する。
+    戻り値は互換のため (fast, slow, atr_multiple, warning) の4要素を保つ。
     """
-    params_path = PROJECT_ROOT / "strategy_params.json"
-    fast, slow, atr_multiple = 20, 100, briefing.DEFAULT_ATR_MULTIPLE
-    if not params_path.exists():
-        return fast, slow, atr_multiple, None
-
-    params, errors = params_gate.load_validated_params(params_path)
-    if errors or params is None:
-        warning = (
-            "strategy_params.json が検証ゲートに不合格のため既定値"
-            f"(MA {fast}/{slow}, ATR×{atr_multiple})で継続: " + "; ".join(errors)
-        )
-        print(f"[warn] {warning}", file=sys.stderr)
-        return fast, slow, atr_multiple, warning
-
-    fast = int(params.get("fast_window", fast))
-    slow = int(params.get("slow_window", slow))
-    atr_multiple = float(params.get("atr_multiple", atr_multiple))
-    return fast, slow, atr_multiple, None
+    return 20, 100, briefing.DEFAULT_ATR_MULTIPLE, None
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
-    response = requests.post(webhook_url, json=payload, timeout=15)
-    if response.status_code >= 300:
-        raise RuntimeError(f"Discord通知に失敗: HTTP {response.status_code} {response.text[:200]}")
+    discord_delivery.send_webhook(webhook_url, payload)
 
 
 def score_trade_outcomes_cli(
@@ -550,10 +612,14 @@ def _run_per_timeframe(
     events_48h,
     ordered_currencies,
     calendar_ok,
+    news_warnings,
+    macro_snapshot,
     atr_multiple,
     fetch_warnings,
     items,
     now,
+    operational_data_ok,
+    operational_data_reason,
 ) -> int:
     """時間足別モードの本体(main から分岐)。
 
@@ -563,19 +629,27 @@ def _run_per_timeframe(
     """
     journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
 
-    # 採点用の将来価格系列を組む。判断ジャーナル(源A)は毎時しか追記されず、
-    # 短い足(15m:採点窓[9,21分])はそこに入る点が得られないため、
-    # fx_tf_snapshot.py が5分ごとに記録する価格専用系列と、今回の現在価格を
+    # 採点用の将来価格系列を組む。判断ジャーナル(源A)に加え、通知停止中も
+    # fx_tf_snapshot.py で継続できる価格専用系列と、今回の現在価格を
     # 結合する。direction を持たない価格行は採点対象を増やさず将来価格系列だけを
     # 密にするので、15m/1h/4h/1d の全時間足が採点可能になる。
     price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
     current_snapshot = price_history.snapshot_entries(
         {
-            symbol: {tf: tech_map[symbol].close(tf) for tf in timeframe.DEFAULT_TIMEFRAMES}
+            symbol: {tf: tech_map[symbol].price_snapshot(tf) for tf in timeframe.DEFAULT_TIMEFRAMES}
             for symbol in symbols
         },
-        now=now,
+        # The main analysis timestamp is captured before network I/O. Price
+        # availability must instead reflect acquisition completion.
+        now=datetime.now(UTC),
     )
+    # 5分ボード自身が方向を持たない価格系列も保存するため、別の価格取得ループを
+    # 併走せずに短期足の採点と鮮度監視を維持できる。
+    if args.signal_board and not args.no_price_write and not args.no_journal and not args.dry_run:
+        try:
+            price_history.append_snapshot_entries(DEFAULT_TF_PRICES_PATH, current_snapshot)
+        except (OSError, price_history.PriceHistoryWriteError) as error:
+            fetch_warnings.append(f"時間足別価格スナップショット書き込み失敗: {error}")
     scoring_entries = journal_entries + price_rows + current_snapshot
 
     # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
@@ -672,6 +746,8 @@ def _run_per_timeframe(
             now=now,
             atr_multiple=atr_multiple,
             calendar_ok=calendar_ok,
+            operational_data_ok=operational_data_ok,
+            operational_data_reason=operational_data_reason,
             profile_lookup=profile_lookup,
             expectancy_lookup=expectancy_lookup,
             target_r_adjuster=target_r_adjuster,
@@ -706,6 +782,7 @@ def _run_per_timeframe(
                 events_48h=events_48h,
                 fetch_warnings=fetch_warnings,
                 calendar_ok=calendar_ok,
+                macro_snapshot=macro_snapshot,
                 timeframe_learning=tf_learn if not args.no_learning else None,
                 tp_sl_learning=tp_sl_learn,
                 maximization_profile=max_profile,
@@ -734,20 +811,37 @@ def _run_per_timeframe(
         except OSError as error:
             fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
-    payload = tf_briefing.build_timeframe_discord_payload(
-        plans_by_symbol,
-        analysis,
-        events_48h,
-        ordered_currencies,
-        fetch_warnings=fetch_warnings,
-        learning_note=learning_note,
-        aux_reports_by_symbol={s: aux_reports_by_symbol.get("_shared", {}) for s in symbols},
-        now=now,
-    )
+    if args.signal_board:
+        data_quality = signal_board.assess_data_quality(
+            plans_by_symbol,
+            news_warnings=news_warnings,
+            calendar_ok=calendar_ok,
+            macro_snapshot=macro_snapshot,
+            now=now,
+        )
+        payload = signal_board.build_signal_board_payload(
+            plans_by_symbol,
+            analysis,
+            tech_map,
+            data_quality,
+            now=now,
+        )
+    else:
+        payload = tf_briefing.build_timeframe_discord_payload(
+            plans_by_symbol,
+            analysis,
+            events_48h,
+            ordered_currencies,
+            fetch_warnings=fetch_warnings,
+            learning_note=learning_note,
+            aux_reports_by_symbol={s: aux_reports_by_symbol.get("_shared", {}) for s in symbols},
+            now=now,
+        )
 
     if args.dry_run:
         print(payload["content"])
-        print(json.dumps(payload["embeds"], ensure_ascii=False, indent=2))
+        if payload.get("embeds"):
+            print(json.dumps(payload["embeds"], ensure_ascii=False, indent=2))
         return 0
 
     if args.no_discord:
@@ -832,6 +926,12 @@ def main(argv: list[str] | None = None) -> int:
         help="マクロデータ(COT・金利・VIX・ドル指数)の取得と委員を使わない",
     )
     parser.add_argument(
+        "--cot-pit-dataset",
+        type=Path,
+        default=None,
+        help="監査済みCFTC COT PIT artifactディレクトリ。未指定時はlegacy COTを使用しない",
+    )
+    parser.add_argument(
         "--no-ml",
         action="store_true",
         help="ML確率モデル委員を使わない(学習・予測をスキップ)",
@@ -846,13 +946,41 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         default=None,
         metavar="MEMBER",
-        help="指定した委員(macro/ml)を条件を満たせばliveへ昇格承認する(人間の明示承認)",
+        help="廃止済み。研究/分析CLIからのlive昇格は禁止",
+    )
+    parser.add_argument(
+        "--require-freshness",
+        action="store_true",
+        help="新規方向判断に最新の正常なfreshness reportを必須化する",
+    )
+    parser.add_argument(
+        "--freshness-report",
+        type=Path,
+        default=DEFAULT_FRESHNESS_REPORT_PATH,
+        help="運用データ鮮度レポートJSON",
+    )
+    parser.add_argument(
+        "--freshness-max-age-seconds",
+        type=float,
+        default=600.0,
+        help="freshness report自体の最大許容経過秒数",
+    )
+    parser.add_argument(
+        "--no-price-write",
+        action="store_true",
+        help="signal-boardから価格系列へ追記しない(snapshot writer併走時に使用)",
     )
     parser.add_argument(
         "--per-timeframe",
         action="store_true",
         help="時間足別モード: 15m/1h/4h/1d を独立に判断し、時間足ごとの主ホライズン"
         "(15m→15分後/1h→1h/4h→4h/1d→24h)で自己採点・学習する",
+    )
+    parser.add_argument(
+        "--signal-board",
+        action="store_true",
+        help="Discord通知を上位3候補・システム状態・データ品質をまとめた単一ボードにする"
+        "（時間足別モードを自動的に有効化）",
     )
     parser.add_argument(
         "--score-trade-outcomes",
@@ -958,6 +1086,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Discordには送信せず、判断ジャーナル・学習ファイルなどのローカル保存だけ行う",
     )
     args = parser.parse_args(argv)
+    if args.promote_live is not None:
+        parser.error("--promote-live is disabled; this build is research/shadow only")
+    if args.signal_board:
+        args.per_timeframe = True
 
     lifecycle_actions = [
         bool(args.approve_trade_candidate),
@@ -1043,11 +1175,22 @@ def main(argv: list[str] | None = None) -> int:
     fetch_warnings: list[str] = []
     if params_warning:
         fetch_warnings.append(params_warning)
+    freshness_gate = freshness.FreshnessGate(
+        allow_new_risk=True,
+        status="not_required",
+        reason="freshness gate not requested",
+    )
+    if args.require_freshness:
+        freshness_gate = freshness.evaluate_freshness_report(
+            args.freshness_report,
+            now=now,
+            max_report_age_seconds=args.freshness_max_age_seconds,
+        )
+        if not freshness_gate.allow_new_risk:
+            fetch_warnings.append(f"⛔ 運用データ鮮度ゲート: {freshness_gate.reason}")
 
     # 1. 経済指標カレンダー(レート制限対策にローカルキャッシュ併用)
-    events, calendar_warnings = calendar.fetch_calendar(
-        cache_path=PROJECT_ROOT / "logs" / "calendar_cache.json"
-    )
+    events, calendar_warnings = calendar.fetch_calendar(cache_path=DEFAULT_CALENDAR_CACHE)
     fetch_warnings.extend(calendar_warnings)
     # イベントが1件も取れていない=警戒窓判定が機能しない状態。判断側で安全側に倒す
     calendar_ok = bool(events)
@@ -1069,10 +1212,20 @@ def main(argv: list[str] | None = None) -> int:
     items, news_warnings = news.fetch_news_for_symbols(symbols, hours_back=args.hours_back)
     fetch_warnings.extend(news_warnings)
 
-    # 3. マクロデータ(COT・金利・VIX・ドル指数)。レジーム判定とマクロ委員に使う
+    # 3. マクロデータ。FRED系は現行snapshot、COTは明示された監査済みPIT artifact
+    # だけをprediction timeでas-of読込みする。legacy current snapshotは使わない。
     macro_snapshot = None
     if not args.no_macro:
-        macro_snapshot = macro.fetch_macro_snapshot(DEFAULT_MACRO_CACHE, now=now)
+        macro_snapshot = macro.fetch_macro_snapshot(
+            DEFAULT_MACRO_CACHE,
+            now=now,
+            include_cot=False,
+        )
+        _attach_cot_pit_dataset(
+            macro_snapshot,
+            args.cot_pit_dataset,
+            prediction_time=now,
+        )
         fetch_warnings.extend(macro_snapshot.warnings)
 
     # 4. センチメント分析(Claude API → 自前分析エンジン。レジームはマクロ実データ優先)
@@ -1098,10 +1251,14 @@ def main(argv: list[str] | None = None) -> int:
             events_48h=events_48h,
             ordered_currencies=ordered_currencies,
             calendar_ok=calendar_ok,
+            news_warnings=news_warnings,
+            macro_snapshot=macro_snapshot,
             atr_multiple=atr_multiple,
             fetch_warnings=fetch_warnings,
             items=items,
             now=now,
+            operational_data_ok=freshness_gate.allow_new_risk,
+            operational_data_reason=freshness_gate.reason,
         )
 
     # 6. 学習ループ: ジャーナル履歴を相互採点し、重み・確信度の調整を導出
@@ -1210,7 +1367,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # 8. 昇格ゲート: 委員(macro/ml)の実績をジャーナルから採点し段階を更新
     promotion_state = promotion.load_state(DEFAULT_PROMOTION_STATE)
-    require_live_ack = args.promote_live if args.promote_live is not None else []
+    # Live acknowledgement is deliberately unreachable from this research CLI.
+    require_live_ack: list[str] = []
     promotion_state, _member_perf = promotion.evaluate_and_update(
         journal_entries, promotion_state, now=now, require_live_ack=require_live_ack
     )
@@ -1231,27 +1389,44 @@ def main(argv: list[str] | None = None) -> int:
     for symbol in symbols:
         base, quote = calendar.symbol_currencies(symbol)
         windows = calendar.risk_windows(events, {base, quote})
-        plans.append(
-            committee.deliberate(
-                symbol,
-                tech_map[symbol],
-                analysis.currencies,
-                windows,
-                items,
-                now=now,
-                atr_multiple=atr_multiple,
-                calendar_ok=calendar_ok,
-                tech_weight=profile.tech_weight,
-                news_weight=profile.news_weight,
-                conviction_factor=profile.conviction_factor(symbol),
-                condition_adjuster=profile.condition_adjustment,
-                expectancy_adjuster=expectancy_adjuster,
-                target_r_adjuster=target_r_adjuster,
-                macro_snapshot=macro_snapshot,
-                ml_artifact=ml_artifact if not args.no_ml else None,
-                stages=stages,
-            )
+        plan = committee.deliberate(
+            symbol,
+            tech_map[symbol],
+            analysis.currencies,
+            windows,
+            items,
+            now=now,
+            atr_multiple=atr_multiple,
+            calendar_ok=calendar_ok,
+            operational_data_ok=freshness_gate.allow_new_risk,
+            operational_data_reason=freshness_gate.reason,
+            tech_weight=profile.tech_weight,
+            news_weight=profile.news_weight,
+            conviction_factor=profile.conviction_factor(symbol),
+            condition_adjuster=profile.condition_adjustment,
+            expectancy_adjuster=expectancy_adjuster,
+            target_r_adjuster=target_r_adjuster,
+            macro_snapshot=macro_snapshot,
+            ml_artifact=ml_artifact if not args.no_ml else None,
+            stages=stages,
         )
+        # 発注前9段チェックリスト: 完成した判断を順序付きゲートに写像し、
+        # スプレッド/執行コスト控除/ポジションサイズを付ける(表示・記録用)。
+        realized_r = _realized_expectancy_r(
+            trade_expectancy_summary if not args.no_trade_expectancy else None,
+            symbol,
+            plan.direction,
+        )
+        checklist = decision_pipeline.build_checklist(
+            plan,
+            tech_map[symbol],
+            now=now,
+            realized_expectancy_r=realized_r,
+            operational_data_ok=freshness_gate.allow_new_risk,
+            operational_data_reason=freshness_gate.reason,
+        )
+        plan.checklist = checklist.to_dict()
+        plans.append(plan)
 
     # 10. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
     journal_note = ""
@@ -1277,6 +1452,7 @@ def main(argv: list[str] | None = None) -> int:
                     events_48h=events_48h,
                     fetch_warnings=fetch_warnings,
                     calendar_ok=calendar_ok,
+                    macro_snapshot=macro_snapshot,
                     learning_profile=profile if not args.no_learning else None,
                     trade_expectancy_summary=(
                         trade_expectancy_summary if not args.no_trade_expectancy else None

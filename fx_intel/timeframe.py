@@ -238,6 +238,8 @@ def build_timeframe_plan(
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
     tech_weight: float = TECH_WEIGHT,
     news_weight: float = NEWS_WEIGHT,
     conviction_factor: float = 1.0,
@@ -323,6 +325,11 @@ def build_timeframe_plan(
             f"確信度を{CALENDAR_UNKNOWN_CONVICTION_CAP}以下に制限"
         )
         conviction = min(conviction, CALENDAR_UNKNOWN_CONVICTION_CAP)
+    if not operational_data_ok:
+        warnings.append(
+            "⛔ 運用データ鮮度ゲート: "
+            + (operational_data_reason or "正常性を証明できないため新規判断を停止")
+        )
 
     conflict = (
         tf_score * news_score < 0 and min(abs(tf_score), abs(news_score)) >= CONFLICT_THRESHOLD
@@ -334,7 +341,10 @@ def build_timeframe_plan(
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if not is_market_open(now):
+    if not operational_data_ok:
+        direction = "neutral"
+        conviction = 0
+    elif not is_market_open(now):
         direction = "closed"
         conviction = 0
         warnings.append(
@@ -455,6 +465,8 @@ def build_timeframe_plans(
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
     profile_lookup: Callable[[str, str], tuple[float, float, float, Callable | None]] | None = None,
     expectancy_lookup: ExpectancyLookup | None = None,
     target_r_adjuster: TargetRAdjuster | None = None,
@@ -497,6 +509,8 @@ def build_timeframe_plans(
                 atr_multiple=atr_multiple,
                 risk_pct=risk_pct,
                 calendar_ok=calendar_ok,
+                operational_data_ok=operational_data_ok,
+                operational_data_reason=operational_data_reason,
                 tech_weight=tech_weight,
                 news_weight=news_weight,
                 conviction_factor=conviction_factor,

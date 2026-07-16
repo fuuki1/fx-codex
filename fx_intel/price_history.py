@@ -27,14 +27,26 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, timedelta, UTC
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
 
 from .market import WEEKEND_CLOSURE, open_hours_between
 
 # 源B(外部履歴OHLC)の注入契約。
 # (symbol, timeframe, target_time, tolerance_hours) -> 将来終値 or None
 FuturePriceProvider = Callable[[str, str, datetime, float], float | None]
+SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_CADENCE_SECONDS = 300
+
+
+class PriceHistoryWriteError(RuntimeError):
+    """Raised when an append cannot preserve the single-writer journal contract."""
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -79,7 +91,7 @@ def future_close_from_series(
 
     horizon±tolerance(市場オープン時間換算)の範囲にある点のうち、
     ホライズンに最も近い1点の close を返す。該当が無ければ None。
-    二分探索で候補範囲を絞り、毎時追記で系列が長くなっても全走査しない。
+    二分探索で候補範囲を絞り、5分追記で系列が長くなっても全走査しない。
     """
     if not series:
         return None
@@ -131,6 +143,10 @@ def resolve_future_close(
 def snapshot_entries(
     closes_by_interval: Mapping[str, Mapping[str, float | Mapping[str, object] | None]],
     now: datetime | None = None,
+    *,
+    source: str = "tradingview_ta_scanner",
+    run_id: str | None = None,
+    writer_id: str | None = None,
 ) -> list[dict]:
     """現在スナップショットを、ジャーナル系列に足せる最新点の形に変換する。
 
@@ -142,14 +158,92 @@ def snapshot_entries(
     後続の運用監視で約定コストを見積もるために残す。
     """
     now = now or datetime.now(UTC)
+    if now.tzinfo is None:
+        raise ValueError("snapshot timestamp must be timezone-aware")
+    now = now.astimezone(UTC)
     stamp = now.isoformat()
+    capture_slot = _capture_slot(stamp)
+    resolved_writer = writer_id or f"{socket.gethostname()}:{os.getpid()}"
+    resolved_run = run_id or f"snapshot-{now.strftime('%Y%m%dT%H%M%S%fZ')}-{os.getpid()}"
     rows: list[dict] = []
     for symbol, intervals in closes_by_interval.items():
         for timeframe, snapshot in intervals.items():
-            row = _snapshot_row(stamp, str(symbol), str(timeframe), snapshot)
+            row = _snapshot_row(
+                stamp,
+                str(symbol),
+                str(timeframe),
+                snapshot,
+                source=source,
+                capture_slot=capture_slot,
+                run_id=resolved_run,
+                writer_id=resolved_writer,
+            )
             if row is not None:
                 rows.append(row)
     return rows
+
+
+def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object]]) -> int:
+    """Append unique snapshots under an OS advisory lock.
+
+    The natural key is ``(capture_slot, symbol, timeframe)``. Replaying the same
+    payload is idempotent. A different payload for an occupied key indicates a
+    competing writer or a non-deterministic retry and is rejected instead of
+    silently choosing a winner. ``flock`` is released by the kernel on process
+    death, so it cannot leave a stale PID lock behind.
+    """
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    appended = 0
+    with target.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            existing: dict[tuple[str, str, str], dict[str, object]] = {}
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise PriceHistoryWriteError(
+                        f"malformed JSONL at {target}:{line_number}"
+                    ) from error
+                if not isinstance(parsed, dict):
+                    raise PriceHistoryWriteError(f"non-object JSONL row at {target}:{line_number}")
+                key = _snapshot_key(parsed)
+                prior = existing.get(key)
+                if prior is not None and not _same_snapshot(prior, parsed):
+                    raise PriceHistoryWriteError(
+                        f"conflicting existing snapshots for natural key {key}"
+                    )
+                existing[key] = parsed
+
+            pending: list[dict[str, object]] = []
+            for raw in rows:
+                row = dict(raw)
+                key = _snapshot_key(row)
+                prior = existing.get(key)
+                if prior is not None:
+                    if not _same_snapshot(prior, row):
+                        raise PriceHistoryWriteError(
+                            f"conflicting snapshot from duplicate writer for natural key {key}"
+                        )
+                    continue
+                existing[key] = row
+                pending.append(row)
+
+            handle.seek(0, os.SEEK_END)
+            for row in pending:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            if pending:
+                handle.flush()
+                os.fsync(handle.fileno())
+            appended = len(pending)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return appended
 
 
 def _snapshot_row(
@@ -157,29 +251,63 @@ def _snapshot_row(
     symbol: str,
     timeframe: str,
     snapshot: float | Mapping[str, object] | None,
+    *,
+    source: str,
+    capture_slot: str,
+    run_id: str,
+    writer_id: str,
 ) -> dict | None:
+    core: dict[str, object]
     if isinstance(snapshot, (int, float)) and not isinstance(snapshot, bool):
-        return {
+        core = {
             "ts": stamp,
             "symbol": symbol,
             "timeframe": timeframe,
             "close": float(snapshot),
         }
-    if not isinstance(snapshot, Mapping):
-        return None
-    close = _number(snapshot.get("close"))
-    if close is None:
-        return None
-    row: dict[str, object] = {
-        "ts": stamp,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "close": close,
+    else:
+        if not isinstance(snapshot, Mapping):
+            return None
+        close = _number(snapshot.get("close"))
+        if close is None:
+            return None
+        core = {
+            "ts": stamp,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "close": close,
+        }
+        for key in ("open", "high", "low", "bid", "ask", "spread"):
+            value = _number(snapshot.get(key))
+            if value is not None:
+                core[key] = value
+
+    flags: list[str] = []
+    has_range = "high" in core or "low" in core or "open" in core
+    if has_range:
+        flags.append("forming_bar_ohlc_not_post_prediction_interval")
+    bid = _number(core.get("bid"))
+    ask = _number(core.get("ask"))
+    if bid is None or ask is None:
+        flags.append("bid_ask_unavailable")
+    elif bid > ask:
+        flags.append("crossed_quote")
+
+    row = {
+        **core,
+        "event_time": stamp,
+        "available_time": stamp,
+        "ingested_time": stamp,
+        "source": source,
+        "source_record_id": f"{symbol}:{timeframe}:{stamp}",
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "writer_id": writer_id,
+        "capture_slot": capture_slot,
+        "ohlc_scope": "forming_bar_snapshot" if has_range else "quote_snapshot",
+        "data_quality_flags": flags,
     }
-    for key in ("open", "high", "low", "bid", "ask", "spread"):
-        value = _number(snapshot.get(key))
-        if value is not None:
-            row[key] = value
+    row["content_hash"] = _content_hash(row)
     return row
 
 
@@ -189,3 +317,59 @@ def _number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _capture_slot(value: object) -> str:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError) as error:
+        raise PriceHistoryWriteError("snapshot key requires a valid timestamp") from error
+    if parsed.tzinfo is None:
+        raise PriceHistoryWriteError("snapshot key requires a timezone-aware timestamp")
+    utc = parsed.astimezone(UTC)
+    epoch = int(utc.timestamp())
+    slot_epoch = epoch - epoch % SNAPSHOT_CADENCE_SECONDS
+    return datetime.fromtimestamp(slot_epoch, tz=UTC).isoformat()
+
+
+def _snapshot_key(row: Mapping[str, object]) -> tuple[str, str, str]:
+    stamp = row.get("capture_slot") or row.get("event_time") or row.get("ts")
+    if not stamp:
+        raise PriceHistoryWriteError("snapshot row is missing ts/event_time/capture_slot")
+    symbol = str(row.get("symbol", "")).strip()
+    timeframe = str(row.get("timeframe", "")).strip()
+    if not symbol or not timeframe:
+        raise PriceHistoryWriteError("snapshot row is missing symbol or timeframe")
+    return _capture_slot(stamp), symbol, timeframe
+
+
+def _same_snapshot(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    left_writer = str(left.get("writer_id") or "").strip()
+    right_writer = str(right.get("writer_id") or "").strip()
+    if left_writer and right_writer and left_writer != right_writer:
+        return False
+    comparable = (
+        "open",
+        "high",
+        "low",
+        "close",
+        "bid",
+        "ask",
+        "spread",
+        "source",
+        "schema_version",
+        "ohlc_scope",
+    )
+    return all(left.get(key) == right.get(key) for key in comparable)
+
+
+def _content_hash(row: Mapping[str, object]) -> str:
+    payload = {key: value for key, value in row.items() if key != "content_hash"}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

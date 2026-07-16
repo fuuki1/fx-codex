@@ -311,6 +311,78 @@ def test_daily_loss_stop_prevents_more_entries() -> None:
     assert bool(result.equity_curve.iloc[-1]["daily_locked"]) is True
 
 
+def test_each_symbol_closes_on_its_own_last_available_bar() -> None:
+    index = pd.date_range("2024-01-01 00:00:00", periods=6, freq="h")
+
+    def frame(selected_index: pd.DatetimeIndex) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"open": 1.0, "high": 1.001, "low": 0.999, "close": 1.0},
+            index=selected_index,
+        )
+
+    result = BacktestEngine(
+        AlwaysLongStrategy(),
+        BacktestConfig(execution=_zero_cost_config()),
+    ).run({"EURUSD": frame(index[:3]), "GBPUSD": frame(index)})
+
+    exits = result.trades.set_index("symbol")["exit_time"]
+    assert exits["EURUSD"] == index[2]
+    assert exits["GBPUSD"] == index[-1]
+    reasons = result.trades.set_index("symbol")["exit_reason"]
+    assert reasons["EURUSD"] == "end_of_symbol_data"
+    assert reasons["GBPUSD"] == "end_of_backtest"
+    assert result.equity_curve.iloc[-1]["open_positions"] == 0
+
+
+def test_stale_pending_open_order_expires_before_distant_next_bar() -> None:
+    index = pd.DatetimeIndex(
+        [pd.Timestamp("2024-01-01 00:00:00"), pd.Timestamp("2024-01-03 00:00:00")]
+    )
+    data = {
+        "EURUSD": pd.DataFrame(
+            {"open": 1.0, "high": 1.001, "low": 0.999, "close": 1.0},
+            index=index,
+        )
+    }
+    config = BacktestConfig(
+        execution=_zero_cost_config(), pending_open_order_ttl=pd.Timedelta(hours=12)
+    )
+
+    result = BacktestEngine(AlwaysLongStrategy(), config).run(data)
+
+    assert result.trades.empty
+    assert result.equity_curve["open_positions"].eq(0).all()
+
+
+def test_mark_to_market_gross_leverage_breach_locks_and_closes_portfolio() -> None:
+    index = pd.date_range("2024-01-01 00:00:00", periods=5, freq="h")
+    data = {
+        "EURUSD": pd.DataFrame(
+            {
+                "open": [1.10, 1.10, 0.90, 0.90, 0.90],
+                "high": [1.11, 1.11, 0.91, 0.91, 0.91],
+                "low": [1.09, 1.09, 0.89, 0.89, 0.89],
+                "close": [1.10, 1.10, 0.90, 0.90, 0.90],
+            },
+            index=index,
+        )
+    }
+    config = BacktestConfig(
+        risk=RiskConfig(
+            risk_per_trade_pct=1.0,
+            risk_cap_pct=1.0,
+            max_daily_loss_pct=1.0,
+            max_leverage=2.0,
+        ),
+        execution=_zero_cost_config(),
+    )
+
+    result = BacktestEngine(SymbolOnlyLongStrategy("EURUSD", stop_distance=0.5), config).run(data)
+
+    assert "gross_leverage_breach" in result.trades["exit_reason"].tolist()
+    assert bool(result.equity_curve.iloc[-1]["risk_locked"])
+
+
 def test_no_trade_window_blocks_new_entries() -> None:
     index = pd.date_range("2024-01-01 00:00:00", periods=3, freq="h")
     data = {
@@ -1177,6 +1249,41 @@ def test_currency_exposure_cap_blocks_second_correlated_position() -> None:
     assert result.trades["symbol"].nunique() == 1
 
 
+def test_max_leverage_caps_portfolio_gross_notional_not_each_position() -> None:
+    index = pd.date_range("2024-01-01 00:00:00", periods=3, freq="h")
+    frame = pd.DataFrame(
+        {
+            "open": [1.0, 1.0, 1.0],
+            "high": [1.005, 1.005, 1.005],
+            "low": [0.995, 0.995, 0.995],
+            "close": [1.0, 1.0, 1.0],
+            "spread": [1.0, 1.0, 1.0],
+        },
+        index=index,
+    )
+    config = BacktestConfig(
+        initial_cash=100_000,
+        risk=RiskConfig(
+            risk_per_trade_pct=0.50,
+            risk_cap_pct=0.50,
+            max_leverage=1.0,
+            min_stop_pips=1.0,
+        ),
+        execution=ExecutionConfig(
+            spread_pips={"EURUSD": 1.0, "GBPUSD": 1.0},
+            slippage_pips={"EURUSD": 0.1, "GBPUSD": 0.1},
+            commission_per_million_usd=0.0,
+        ),
+    )
+
+    result = BacktestEngine(AlwaysLongStrategy(), config).run(
+        {"EURUSD": frame.copy(), "GBPUSD": frame.copy()}
+    )
+
+    opened_notional = float((result.trades["units"] * result.trades["entry_price"]).sum())
+    assert opened_notional <= config.initial_cash * config.risk.max_leverage + 1.0
+
+
 def test_analyze_run_writes_commercial_validation_pack(tmp_path) -> None:
     output_dir = tmp_path / "candidate"
 
@@ -1261,6 +1368,13 @@ def test_analyze_run_writes_commercial_validation_pack(tmp_path) -> None:
     assert round(reconstructed, 6) == round(pnl["total_net_pnl"], 6)
     diagnosis = json.loads((output_dir / "strategy_diagnosis.json").read_text(encoding="utf-8"))
     assert "primary_cause" in diagnosis
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["git"]["commit"]
+    assert isinstance(manifest["git"]["dirty_worktree"], bool)
+    assert manifest["inputs"]["data"][0]["sha256"]
+    assert manifest["output_fingerprints"]["trade_log"]["sha256"]
+    assert "lockbox" in manifest["windows"]
 
 
 def test_monthly_target_summary_flags_shortfall() -> None:

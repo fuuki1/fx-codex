@@ -1,0 +1,8 @@
+{
+  "status": "match",
+  "real_data": true,
+  "raw_blobs_verified": 9,
+  "rows_compared": 52732,
+  "result_sha256": "cdca393e2e7a484f09da97ff2ad792a7fa8a55705d8c56bf812c98e029a6f5ba",
+  "method": "re-parse all raw .bi5 blobs from the immutable store; compare sorted data-derived fields (instrument, event_time, bid, ask, sizes, raw_sha) against the accepted log"
+}

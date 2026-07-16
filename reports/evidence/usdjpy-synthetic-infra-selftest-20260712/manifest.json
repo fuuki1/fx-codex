@@ -1,0 +1,218 @@
+{
+  "calibration": {
+    "method": "platt"
+  },
+  "costs": {
+    "commission_r_per_trade": 0.001,
+    "cost_model_version": "declared_static_v1",
+    "financing_r_per_bar": 0.0001,
+    "pip_size": 0.01,
+    "slippage_pips": 0.2,
+    "spread_pips": 0.8,
+    "stress_multipliers": [
+      1.0,
+      1.25,
+      1.5,
+      2.0
+    ]
+  },
+  "created_at": "2026-07-12T00:00:00+00:00",
+  "created_by": "codex/institutional-research-pipeline session",
+  "data": {
+    "as_of_cutoff": "2024-02-07T13:00:00+00:00",
+    "bar_interval_minutes": 60,
+    "end": "2024-02-07T11:00:00+00:00",
+    "required_quality_level": "strict",
+    "sources": [
+      {
+        "kind": "price_csv",
+        "license_note": "synthetic data generated in-repo (examples/generate_sample_data.py, seed 42); no licence required; NOT admissible for any performance claim",
+        "path": "examples/sample_prices.csv",
+        "raw_sha256": "b93513ba74070117edc02f404d285670b13f53772ac4ce91a10c87b6c398e427",
+        "source_id": "examples_sample_prices"
+      }
+    ],
+    "start": "2024-01-01T00:00:00+00:00",
+    "symbol": "USDJPY",
+    "synthetic": true,
+    "timezone": "UTC"
+  },
+  "economic_hypothesis": "None; examples/sample_prices.csv is a seeded synthetic random walk with no economic edge.",
+  "environment": {
+    "dependency_lock_sha256": "4d9bdfd3d67b3fbf983bfcb712d9670bab440c0a5e40461bcc45d992ef193a90",
+    "platform_note": "macOS local worktree; see environment.json in the bundle",
+    "python_version": "3.12"
+  },
+  "experiment_id": "usdjpy-synthetic-infra-selftest-20260712",
+  "features": {
+    "availability_rule": "completed_bar_close",
+    "definitions": [
+      "ret_1",
+      "ret_4",
+      "ma_ratio_24",
+      "rsi_14",
+      "vol_24"
+    ],
+    "version": "features_v1"
+  },
+  "git": {
+    "commit": "94466e6427b31fd7e70d1ffc4e2a6bd47c1ffb33",
+    "dirty_worktree_allowed": false
+  },
+  "invalidation_conditions": [
+    "Any non-reproducible artifact hash across identical replays invalidates the run.",
+    "Any promotion gate passing on this synthetic dataset invalidates the governance wiring."
+  ],
+  "labels": {
+    "gap_policy": "adverse_open",
+    "horizon_bars": 12,
+    "same_bar_policy": "stop_first",
+    "stop_vol_multiple": 1.0,
+    "take_profit_vol_multiple": 2.0,
+    "type": "triple_barrier",
+    "volatility_window_bars": 24
+  },
+  "lockbox": {
+    "access_count_limit": 1,
+    "access_policy": "single_use"
+  },
+  "models": {
+    "candidates": [
+      {
+        "candidate_id": "noskill",
+        "family": "constant_probability",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "probability": 0.5,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "random",
+        "family": "random_uniform",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "always-long",
+        "family": "always_long",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "always-short",
+        "family": "always_short",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "prev-sign",
+        "family": "previous_return_sign",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48,
+          "strength": 0.1
+        }
+      },
+      {
+        "candidate_id": "ma-cross",
+        "family": "ma_crossover",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48,
+          "strength": 0.1
+        }
+      },
+      {
+        "candidate_id": "rsi-rev",
+        "family": "rsi_reversion",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "short_threshold": 0.48,
+          "strength": 0.1
+        }
+      },
+      {
+        "candidate_id": "logit-r1",
+        "family": "logistic_ridge",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "ridge": 1.0,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "ridge-reg",
+        "family": "ridge_regression",
+        "hyperparameters": {
+          "long_threshold": 0.52,
+          "ridge": 1.0,
+          "short_threshold": 0.48
+        }
+      },
+      {
+        "candidate_id": "gbdt-small",
+        "family": "gbdt",
+        "hyperparameters": {
+          "feature_fraction": 1.0,
+          "learning_rate": 0.1,
+          "long_threshold": 0.52,
+          "max_depth": 2,
+          "min_samples_leaf": 10,
+          "n_estimators": 20,
+          "reg_lambda": 1.0,
+          "short_threshold": 0.48,
+          "subsample": 1.0
+        }
+      }
+    ],
+    "random_seed": 42,
+    "trial_budget": 10
+  },
+  "promotion": {
+    "policy_path": null,
+    "target_stage": "validated"
+  },
+  "research_question": "Does the authoritative pipeline run end-to-end, deterministically, and deny promotion on synthetic data?",
+  "schema_version": 1,
+  "selection": {
+    "bootstrap_block_size": 5,
+    "max_month_concentration": 1.0,
+    "max_regime_concentration": 0.8,
+    "minimum_effective_trades": 3,
+    "minimum_trade_count": 5,
+    "multiple_testing_method": "holm",
+    "pbo_blocks": 8,
+    "primary_metric": "net_expectancy_r"
+  },
+  "splits": {
+    "calibration_fraction": 0.1,
+    "embargo_bars": 2,
+    "lockbox_fraction": 0.1,
+    "method": "chronological_five_way",
+    "min_rows_per_partition": 10,
+    "purge_bars": 12,
+    "test_fraction": 0.15,
+    "train_fraction": 0.5,
+    "tune_fraction": 0.15
+  },
+  "strategy_card": {
+    "capacity_assumption": "not applicable (synthetic)",
+    "cost_assumption": "declared static spread/slippage/commission/financing at 1x with 1.25/1.5/2x stress",
+    "economic_mechanism": "None claimed; infrastructure self-test only.",
+    "expected_horizon": "12 hourly bars",
+    "exploratory": true,
+    "known_failure_regimes": [
+      "all real-market regimes"
+    ],
+    "strategy_id": "infra-selftest-v1",
+    "who_is_paying_the_edge": "Nobody; there is no counterparty in synthetic data.",
+    "why_should_edge_exist": "It should not; the generator is a seeded random walk."
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "method": "scenario -> pytest node mapping; outcomes parsed from junitxml of an actual run (this session)",
+  "injection_medium": "fixtures / injectable transports / filesystem permissions \u2014 never against production",
+  "scenarios": [
+    {
+      "name": "network_disconnect_reconnect_gap",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestOandaStreamLoop.test_disconnect_reconnects_with_gap_and_counter"
+      ]
+    },
+    {
+      "name": "provider_timeout_retry_then_success",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestDukascopy.test_retry_on_503_then_success"
+      ]
+    },
+    {
+      "name": "provider_persistent_failure_fail_closed",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestDukascopy.test_persistent_503_fails_closed"
+      ]
+    },
+    {
+      "name": "token_expiry_stops_collector",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestOandaStreamLoop.test_token_expiry_stops_fail_closed"
+      ]
+    },
+    {
+      "name": "reconnect_budget_exhaustion",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestOandaStreamLoop.test_reconnect_budget_exhausts_and_stops"
+      ]
+    },
+    {
+      "name": "malformed_payload_quarantined_raw_kept",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestRawFirstOrder.test_parse_failure_keeps_raw_and_quarantines",
+        "tests.test_collect_sources.TestDukascopy.test_truncated_payload_rejected",
+        "tests.test_collect_sources.TestOandaParsing.test_malformed_price_line_raises"
+      ]
+    },
+    {
+      "name": "duplicate_quote_quarantined",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestDuplicateOrderingStale.test_duplicate_quarantined_not_dropped"
+      ]
+    },
+    {
+      "name": "out_of_order_flagged",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestDuplicateOrderingStale.test_out_of_order_flagged_degraded"
+      ]
+    },
+    {
+      "name": "future_provider_timestamp_rejected",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestContractRejections.test_future_event_time_rejected"
+      ]
+    },
+    {
+      "name": "clock_skew_tolerance_bounded",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestContractRejections.test_small_clock_skew_tolerated"
+      ]
+    },
+    {
+      "name": "crossed_book_bid_ge_ask_rejected",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestContractRejections.test_crossed_book_rejected",
+        "tests.test_collect_contract.TestContractRejections.test_zero_width_book_rejected"
+      ]
+    },
+    {
+      "name": "nan_negative_price_rejected",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestContractRejections.test_nan_rejected",
+        "tests.test_collect_contract.TestContractRejections.test_negative_price_rejected"
+      ]
+    },
+    {
+      "name": "spread_divergence_degrades_no_averaging",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_divergence_macro.TestDivergence.test_breach_degrades_never_averages"
+      ]
+    },
+    {
+      "name": "primary_secondary_extreme_divergence_quarantines",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_divergence_macro.TestDivergence.test_extreme_breach_quarantines"
+      ]
+    },
+    {
+      "name": "provider_one_leg_down_unavailable",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_divergence_macro.TestDivergence.test_no_alignment_is_unavailable"
+      ]
+    },
+    {
+      "name": "heartbeat_stop_opens_gap_no_backfill",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestReconnectPolicy.test_heartbeat_timeout_opens_gap_and_blocks_tradable"
+      ]
+    },
+    {
+      "name": "stale_quote_quarantined_never_tradable",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestDuplicateOrderingStale.test_stale_live_quote_quarantined_never_tradable"
+      ]
+    },
+    {
+      "name": "collector_multi_start_blocked",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_daemon.TestMultiWriter.test_second_writer_cannot_acquire_lock"
+      ]
+    },
+    {
+      "name": "restart_recovery_duplicates_still_detected",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestDuplicateOrderingStale.test_log_state_survives_restart",
+        "tests.test_collect_daemon.TestMultiWriter.test_lock_released_after_crash_is_reacquirable"
+      ]
+    },
+    {
+      "name": "disk_full_fails_closed_before_accept",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_daemon.TestDiskFull.test_unwritable_raw_store_fails_closed"
+      ]
+    },
+    {
+      "name": "raw_file_tamper_detected",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_contract.TestRawFirstOrder.test_raw_tamper_detected_on_read"
+      ]
+    },
+    {
+      "name": "daily_replay_mismatch_is_scorecard_fatal",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_data_platform_scorecard.test_replay_mismatch_is_fatal"
+      ]
+    },
+    {
+      "name": "token_never_logged",
+      "outcome": "pass",
+      "tests": [
+        "tests.test_collect_sources.TestOandaConfig.test_repr_masks_token",
+        "tests.test_collect_daemon.TestDaemonDryRun.test_dry_run_with_credentials_masks_token"
+      ]
+    }
+  ],
+  "pass_count": 23,
+  "total": 23
+}

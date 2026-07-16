@@ -151,19 +151,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     return int(result["exit_code"])
 
 
+def _mapping(value: object) -> dict[str, Any]:
+    """Return a plain dict when ``value`` is a mapping, else an empty dict.
+
+    Keeps the callers below fail-soft (a missing / malformed section reads as
+    empty rather than crashing) while giving mypy a single concrete type instead
+    of the ``Any | dict | None`` union that ternary narrowing leaves behind.
+    """
+
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
 def _print_summary(result: Mapping[str, Any]) -> None:
     monitor = result.get("monitor")
     if not isinstance(monitor, Mapping):
         print("decision expectancy monitor: no monitor payload")
         return
-    summary = monitor.get("summary") if isinstance(monitor.get("summary"), Mapping) else {}
-    overall = summary.get("overall") if isinstance(summary.get("overall"), Mapping) else {}
-    counts = (
-        summary.get("action_counts") if isinstance(summary.get("action_counts"), Mapping) else {}
-    )
-    price_health = (
-        summary.get("price_health") if isinstance(summary.get("price_health"), Mapping) else {}
-    )
+    summary = _mapping(monitor.get("summary"))
+    overall = _mapping(summary.get("overall"))
+    counts = _mapping(summary.get("action_counts"))
+    price_health = _mapping(summary.get("price_health"))
     print(
         "decision expectancy monitor: "
         f"status={monitor.get('status')} exit={monitor.get('exit_code')} "

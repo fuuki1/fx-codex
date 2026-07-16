@@ -1,0 +1,4 @@
+interface:
+  display_name: "FX Data Integrity Audit"
+  short_description: "Check point-in-time FX data integrity"
+  default_prompt: "Use $fx-data-integrity-audit to verify point-in-time data integrity and report failures."

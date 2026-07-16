@@ -1,0 +1,9 @@
+{
+  "status": "match",
+  "real_data": true,
+  "independent_environment": true,
+  "environment": "fresh detached git worktree at the same commit, separate working directory",
+  "commit": "dbaf82432f69b9f8b3d7e0801e75908af7dba641",
+  "rows_reproduced": 52732,
+  "result_sha256": "cdca393e2e7a484f09da97ff2ad792a7fa8a55705d8c56bf812c98e029a6f5ba"
+}

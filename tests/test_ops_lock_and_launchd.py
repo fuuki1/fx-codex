@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
 import importlib.util
+import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -182,6 +184,38 @@ def test_plist_template_renders_to_valid_xml(template, tmp_path):
     assert "WEBHOOK" not in rendered and "API_KEY" not in rendered
 
 
+def test_briefing_plist_runs_on_five_minute_boundaries():
+    raw = (_ROOT / "ops" / "launchd" / "com.fx-codex.briefing.plist.tmpl").read_text(
+        encoding="utf-8"
+    )
+    rendered = raw.replace("__FX_ROOT__", "/Users/example/srv/fx-codex").replace(
+        "__PYTHON__", "/Users/example/srv/fx-codex/.venv/bin/python"
+    )
+    root = ET.fromstring(rendered)
+    dictionary = root.find("dict")
+    assert dictionary is not None
+    children = list(dictionary)
+    schedule_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "StartCalendarInterval"
+    )
+    schedule = children[schedule_index + 1]
+    assert schedule.tag == "array"
+    minutes = []
+    for entry in schedule.findall("dict"):
+        fields = list(entry)
+        minute_index = next(
+            index
+            for index, node in enumerate(fields)
+            if node.tag == "key" and node.text == "Minute"
+        )
+        minutes.append(int(fields[minute_index + 1].text or "-1"))
+    assert minutes == list(range(0, 60, 5))
+    keys = [node.text for node in root.iter("key")]
+    assert "RunAtLoad" not in keys
+
+
 _ZSH = shutil.which("zsh")  # CI(ubuntu)にはzshが無いためスキップ。macOS実機で検証する
 
 
@@ -221,6 +255,288 @@ def test_shell_scripts_parse(tmp_path):
         assert result.returncode == 0, f"{script}: {result.stderr}"
 
 
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_restart_script_fails_if_any_service_is_not_loaded(tmp_path):
+    fake_launchctl = tmp_path / "launchctl"
+    fake_launchctl.write_text(
+        '#!/bin/sh\ncase "$*" in *com.fx-codex.briefing*) exit 1;; *) exit 0;; esac\n',
+        encoding="utf-8",
+    )
+    fake_launchctl.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "restart_fx_services.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "NOT LOADED: com.fx-codex.briefing" in result.stderr
+    assert "restarted:" not in result.stdout
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_briefing_wrapper_runs_one_integrated_briefing_and_propagates_failure(tmp_path):
+    # cc8fbe8で定期通知経路を--signal-boardから統合ブリーフィング(--per-timeframe)へ切替済み。
+    # 単一呼び出しであること・子の終了コードを透過することを検証する。
+    root = tmp_path / "repo"
+    scripts = root / "scripts"
+    python_dir = root / ".venv" / "bin"
+    scripts.mkdir(parents=True)
+    python_dir.mkdir(parents=True)
+    shutil.copy2(_ROOT / "scripts" / "fx_briefing_once.sh", scripts)
+    fake_python = python_dir / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)\n'
+        'printf "%s\\n" "$*" >> "$root/invocations.txt"\n'
+        "exit 7\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 7
+    invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
+    assert len(invocations) == 1
+    invocation = invocations[0]
+    assert "--per-timeframe" in invocation
+    assert "--no-price-write" in invocation
+    assert "--require-freshness" in invocation
+    assert "--signal-board" not in invocation
+    assert "USDJPY EURUSD" in invocation
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_status_script_treats_corrupt_freshness_report_as_critical(tmp_path):
+    root = tmp_path / "repo"
+    scripts = root / "scripts"
+    logs = root / "logs"
+    fake_bin = tmp_path / "bin"
+    scripts.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    fake_bin.mkdir()
+    shutil.copy2(_ROOT / "scripts" / "status_fx_services.sh", scripts)
+    (logs / "freshness_report.json").write_text("{broken", encoding="utf-8")
+    for name, body in {
+        "launchctl": "#!/bin/sh\nexit 0\n",
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "crontab": "#!/bin/sh\nexit 1\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body, encoding="utf-8")
+        command.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "status_fx_services.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "CRITICAL: freshness reportを読めない" in result.stdout
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_uninstall_keeps_plist_and_fails_when_bootout_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    agents = tmp_path / "Library" / "LaunchAgents"
+    fake_bin.mkdir()
+    agents.mkdir(parents=True)
+    plist = agents / "com.fx-codex.briefing.plist"
+    plist.write_text("placeholder", encoding="utf-8")
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $*" in\n'
+        "  *print*com.fx-codex.briefing*) exit 0;;\n"
+        "  *bootout*com.fx-codex.briefing*) exit 1;;\n"
+        "  *) exit 1;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "uninstall_launchd.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert plist.exists()
+    assert "bootout失敗" in result.stderr
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_install_keeps_existing_plist_when_bootout_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    agents = tmp_path / "Library" / "LaunchAgents"
+    fake_bin.mkdir()
+    agents.mkdir(parents=True)
+    plist = agents / "com.fx-codex.snapshot.plist"
+    plist.write_text("known-old-plist", encoding="utf-8")
+    for name, body in {
+        "launchctl": (
+            "#!/bin/sh\n"
+            'case "$1 $*" in\n'
+            "  *print*com.fx-codex.briefing.hourly*) exit 1;;\n"
+            "  *print*com.fx-codex.snapshot*) exit 0;;\n"
+            "  *bootout*com.fx-codex.snapshot*) exit 1;;\n"
+            "  *) exit 1;;\n"
+            "esac\n"
+        ),
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "crontab": "#!/bin/sh\nexit 1\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body, encoding="utf-8")
+        command.chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "install_launchd.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert plist.read_text(encoding="utf-8") == "known-old-plist"
+    assert "既存serviceのbootout失敗" in result.stderr
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_install_fails_closed_when_legacy_plist_cannot_be_disabled(tmp_path):
+    fake_bin = tmp_path / "bin"
+    agents = tmp_path / "Library" / "LaunchAgents"
+    fake_bin.mkdir()
+    agents.mkdir(parents=True)
+    legacy = agents / "com.fx-codex.briefing.hourly.plist"
+    legacy.write_text("legacy-writer", encoding="utf-8")
+    for name, body in {
+        "launchctl": "#!/bin/sh\nexit 1\n",
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "crontab": "#!/bin/sh\nexit 1\n",
+        "mv": "#!/bin/sh\nexit 1\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body, encoding="utf-8")
+        command.chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "install_launchd.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert legacy.read_text(encoding="utf-8") == "legacy-writer"
+    assert "legacy plistを退避できません" in result.stderr
+    assert "installed:" not in result.stdout
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_uninstall_keeps_legacy_plist_when_bootout_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    agents = tmp_path / "Library" / "LaunchAgents"
+    fake_bin.mkdir()
+    agents.mkdir(parents=True)
+    legacy = agents / "com.fx-codex.briefing.hourly.plist"
+    legacy.write_text("legacy-writer", encoding="utf-8")
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $*" in\n'
+        "  *print*com.fx-codex.briefing.hourly*) exit 0;;\n"
+        "  *bootout*com.fx-codex.briefing.hourly*) exit 1;;\n"
+        "  *) exit 1;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "uninstall_launchd.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert legacy.read_text(encoding="utf-8") == "legacy-writer"
+    assert "legacy bootout失敗" in result.stderr
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_status_script_treats_future_report_as_critical(tmp_path):
+    root = tmp_path / "repo"
+    scripts = root / "scripts"
+    logs = root / "logs"
+    fake_bin = tmp_path / "bin"
+    scripts.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    fake_bin.mkdir()
+    shutil.copy2(_ROOT / "scripts" / "status_fx_services.sh", scripts)
+    future = datetime.now(UTC) + timedelta(minutes=10)
+    (logs / "freshness_report.json").write_text(
+        json.dumps({"monitor_timestamp": future.isoformat(), "overall": "ok", "targets": []}),
+        encoding="utf-8",
+    )
+    for name, body in {
+        "launchctl": "#!/bin/sh\nexit 0\n",
+        "pgrep": "#!/bin/sh\nexit 1\n",
+        "crontab": "#!/bin/sh\nexit 1\n",
+    }.items():
+        command = fake_bin / name
+        command.write_text(body, encoding="utf-8")
+        command.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "status_fx_services.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "freshness reportが未来時刻" in result.stdout
+
+
 # ------------------------------------------------------- ジャーナル監査
 
 
@@ -246,6 +562,24 @@ def test_gap_audit_detects_duplicates(gap_audit):
     report = gap_audit.audit_journal(_journal_rows(base, hours=24, per_hour=3))
     assert report["duplicate_rows"] == 48  # 各時間で2行が重複(3-1)×24
     assert report["duplicate_row_pct"] > 60
+
+
+def test_gap_audit_accepts_normal_five_minute_schedule(gap_audit):
+    base = datetime(2026, 7, 6, 10, 0, tzinfo=UTC)
+    rows = [
+        {
+            "ts": (base + timedelta(minutes=5 * offset)).isoformat(),
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+        }
+        for offset in range(24)
+    ]
+
+    report = gap_audit.audit_journal(rows, expected_interval_hours=1 / 12)
+
+    assert report["duplicate_rows"] == 0
+    assert report["multi_writer_hours"] == 0
+    assert report["gaps"] == []
 
 
 def test_gap_audit_detects_gap_and_records_period(gap_audit):

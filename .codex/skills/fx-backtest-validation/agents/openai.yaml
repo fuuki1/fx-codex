@@ -1,0 +1,4 @@
+interface:
+  display_name: "FX Backtest Validation"
+  short_description: "Validate FX backtests without leakage"
+  default_prompt: "Use $fx-backtest-validation to run a leakage-resistant validation and benchmark report."

@@ -42,6 +42,7 @@ class RiskManager:
         self._monthly_locked = False
         self._monthly_profit_locked = False
         self._hard_locked = False
+        self._leverage_locked = False
 
     @property
     def daily_locked(self) -> bool:
@@ -71,6 +72,7 @@ class RiskManager:
             or self._monthly_locked
             or self._monthly_profit_locked
             or self._hard_locked
+            or self._leverage_locked
         )
 
     def reset(self) -> None:
@@ -87,6 +89,7 @@ class RiskManager:
         self._monthly_locked = False
         self._monthly_profit_locked = False
         self._hard_locked = False
+        self._leverage_locked = False
 
     def on_bar(self, timestamp: Any, equity: float) -> None:
         normalized = pd.Timestamp(timestamp)
@@ -171,6 +174,13 @@ class RiskManager:
             return False
         return equity > 0
 
+    def check_gross_leverage(self, gross_notional_usd: float, equity: float) -> bool:
+        """Latch the run when marked-to-market gross leverage exceeds its cap."""
+
+        if equity <= 0 or gross_notional_usd > equity * self.config.max_leverage:
+            self._leverage_locked = True
+        return self._leverage_locked
+
     def position_size(
         self,
         symbol: str,
@@ -179,6 +189,7 @@ class RiskManager:
         stop_distance: float,
         extra_risk_per_unit_usd: float = 0.0,
         extra_risk_usd: float = 0.0,
+        current_gross_notional_usd: float = 0.0,
         conversion_rates: dict[str, float] | None = None,
     ) -> tuple[float, float, float]:
         """Return units, adjusted stop distance, and initial risk in USD.
@@ -207,7 +218,11 @@ class RiskManager:
         units = (risk_budget - fixed_risk) / total_risk_per_unit
 
         notional_per_unit = notional_usd(symbol, 1.0, entry_price, conversion_rates)
-        max_units_by_leverage = equity * self.config.max_leverage / notional_per_unit
+        remaining_notional = max(
+            0.0,
+            equity * self.config.max_leverage - max(current_gross_notional_usd, 0.0),
+        )
+        max_units_by_leverage = remaining_notional / notional_per_unit
         units = min(units, max_units_by_leverage)
         if self.config.max_position_units is not None:
             units = min(units, self.config.max_position_units)

@@ -1,6 +1,0 @@
-# Dev / CI dependencies. Installed on top of app/requirements.txt.
--r app/requirements.txt
-pytest~=8.3
-pytest-asyncio~=0.25
-ruff~=0.9
-fakeredis~=2.26

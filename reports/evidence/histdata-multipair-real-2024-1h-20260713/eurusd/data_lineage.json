@@ -1,0 +1,48 @@
+{
+  "chain": [
+    {
+      "artifact": "manifest",
+      "sha256": "a5484848e0558d3199b85d8a3ecb994092d157d937c248bf38b0877a03e5ec0d"
+    },
+    {
+      "artifact": "raw:histdata_eurusd_2024_m1_resampled_1h",
+      "sha256": "799f3c9f1cbf86a6e56545d83f0220f6834c14727ad0a1a438eb583037eed668"
+    },
+    {
+      "artifact": "normalized_dataset",
+      "sha256": "50a885939c49c67b3f60b162b594570eedd78d209c3fc0f8e27bf496e59fa981"
+    },
+    {
+      "artifact": "feature_dataset",
+      "sha256": "0d9936707ee5b8cb8cef942cda22886c04b470082229348a32d9ea0caeb87981"
+    },
+    {
+      "artifact": "label_dataset",
+      "sha256": "9ba51543e0bc40ed1a393fc08dceb2a33d615b1701dfb987a7e076d584e9c118"
+    },
+    {
+      "artifact": "split",
+      "sha256": "e1e1db24c5823a9db5298e8cb975da7f594aee8244a5418a4727864d6ea794f8"
+    },
+    {
+      "artifact": "trained_model",
+      "sha256": "4c3d0555185d0f5d2bb13bb72786805cd4661ad7be214f42bdfe0f4b4cd5714e"
+    },
+    {
+      "artifact": "test_predictions",
+      "sha256": "7683010bc048aede1d451032ac79951ad96ce492d3506693714fceb8e5d75abf"
+    },
+    {
+      "artifact": "evaluation",
+      "sha256": "020ca60f3e674728b52db58b08a4475a5c24ba4920e1e0e3b978fee08613dee4"
+    },
+    {
+      "artifact": "cost_stress",
+      "sha256": "c79b6aab6c0c10b1d12303412123242b7bd4fc087fe0a54e82e6a7dd497a5e91"
+    },
+    {
+      "artifact": "promotion_decision",
+      "sha256": "df88b5b94d64f6e6d9572de8ed8a2f3a639abbfb02cd123ebabca231d251dbd6"
+    }
+  ]
+}

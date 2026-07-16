@@ -108,6 +108,14 @@ def test_train_artifact_learns_usable_model() -> None:
     assert art.usable, art.reasons
     assert art.val_brier is not None and art.baseline_brier is not None
     assert art.val_brier < art.baseline_brier
+    assert art.test_auc is not None and art.test_auc >= 0.55
+    assert art.n_tune >= 30
+    assert art.n_calibration >= 30
+    assert art.n_test >= 30
+    assert art.n_lockbox >= 30
+    assert not art.lockbox_evaluated
+    assert set(art.partition_windows) == {"train", "tune", "calibration", "test", "lockbox"}
+    assert art.partition_windows["calibration"]["end"] < art.partition_windows["test"]["start"]
 
 
 def test_train_artifact_rejects_noise() -> None:
@@ -115,6 +123,43 @@ def test_train_artifact_rejects_noise() -> None:
     calls = _make_calls(700, gap_hours=8.0, seed=9, informative=False)
     art = train_artifact(calls, now=NOW)
     assert not art.usable
+
+
+def test_constant_features_and_prevalence_shift_cannot_pass_skill_gate() -> None:
+    calls: list[EvaluatedCall] = []
+    for index in range(1_000):
+        # Train/tune are 50%; calibration/test are 70%. Predictors are constant,
+        # so Platt scaling can learn only the later prevalence/intercept.
+        later_window = 650 <= index < 900
+        hit = index % 10 < (7 if later_window else 5)
+        calls.append(
+            EvaluatedCall(
+                symbol="USDJPY",
+                direction="long",
+                conviction=50,
+                tech_score=0.0,
+                news_score=0.0,
+                outcome="hit" if hit else "miss",
+                ts=(START + timedelta(hours=8 * index)).isoformat(),
+                features={
+                    "rsi_1h": 50.0,
+                    "adx_1h": 20.0,
+                    "atr_pct": 0.1,
+                    "tf_agreement": 0.5,
+                    "news_count": 1.0,
+                    "ma_gap_atr": 0.0,
+                },
+                move_atr=0.1 if hit else -0.1,
+                data_quality=1.0,
+            )
+        )
+
+    artifact = train_artifact(calls, now=NOW)
+
+    assert not artifact.usable
+    assert artifact.test_auc == 0.5
+    assert artifact.importance_by_name == {}
+    assert any("特徴量識別 なし" in reason for reason in artifact.reasons)
 
 
 def test_train_artifact_insufficient_data() -> None:

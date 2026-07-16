@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from fx_intel import price_history as ph
 from fx_intel.journal import append_timeframe_plans, read_entries
@@ -200,20 +202,39 @@ def test_snapshot_entries_preserves_ohlc_bid_ask_spread() -> None:
         now=T0,
     )
 
-    assert rows == [
-        {
-            "ts": T0.isoformat(),
-            "symbol": "USDJPY",
-            "timeframe": "1h",
-            "close": 157.0,
-            "open": 156.8,
-            "high": 157.2,
-            "low": 156.7,
-            "bid": 156.99,
-            "ask": 157.01,
-            "spread": 0.02,
-        }
-    ]
+    assert len(rows) == 1
+    row = rows[0]
+    assert {
+        key: row[key]
+        for key in (
+            "ts",
+            "symbol",
+            "timeframe",
+            "close",
+            "open",
+            "high",
+            "low",
+            "bid",
+            "ask",
+            "spread",
+        )
+    } == {
+        "ts": T0.isoformat(),
+        "symbol": "USDJPY",
+        "timeframe": "1h",
+        "close": 157.0,
+        "open": 156.8,
+        "high": 157.2,
+        "low": 156.7,
+        "bid": 156.99,
+        "ask": 157.01,
+        "spread": 0.02,
+    }
+    assert row["event_time"] == row["available_time"] == row["ingested_time"]
+    assert row["ohlc_scope"] == "forming_bar_snapshot"
+    assert row["schema_version"] == ph.SNAPSHOT_SCHEMA_VERSION
+    assert len(row["content_hash"]) == 64
+    assert "forming_bar_ohlc_not_post_prediction_interval" in row["data_quality_flags"]
 
 
 def test_snapshot_entries_feed_into_series() -> None:
@@ -221,6 +242,55 @@ def test_snapshot_entries_feed_into_series() -> None:
     rows = ph.snapshot_entries({"USDJPY": {"1h": 157.0}}, now=T0)
     series = ph.build_close_series(rows)
     assert series[("USDJPY", "1h")] == [(T0, 157.0)]
+
+
+def test_snapshot_append_is_idempotent_under_advisory_lock(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    rows = ph.snapshot_entries(
+        {"USDJPY": {"1h": 157.0}}, now=T0, run_id="run-1", writer_id="writer-1"
+    )
+
+    assert ph.append_snapshot_entries(path, rows) == 1
+    assert ph.append_snapshot_entries(path, rows) == 0
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_snapshot_append_rejects_conflicting_writer_in_same_capture_slot(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    first = ph.snapshot_entries({"USDJPY": {"1h": 157.0}}, now=T0, writer_id="writer-a")
+    conflicting = ph.snapshot_entries(
+        {"USDJPY": {"1h": 157.1}},
+        now=T0 + timedelta(seconds=30),
+        writer_id="writer-b",
+    )
+    ph.append_snapshot_entries(path, first)
+
+    with pytest.raises(ph.PriceHistoryWriteError, match="duplicate writer"):
+        ph.append_snapshot_entries(path, conflicting)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_snapshot_append_rejects_second_writer_even_when_quote_matches(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    first = ph.snapshot_entries({"USDJPY": {"1h": 157.0}}, now=T0, writer_id="writer-a")
+    second_writer = ph.snapshot_entries(
+        {"USDJPY": {"1h": 157.0}},
+        now=T0 + timedelta(seconds=30),
+        writer_id="writer-b",
+    )
+    ph.append_snapshot_entries(path, first)
+
+    with pytest.raises(ph.PriceHistoryWriteError, match="duplicate writer"):
+        ph.append_snapshot_entries(path, second_writer)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_snapshot_entries_reject_naive_timestamp() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ph.snapshot_entries(
+            {"USDJPY": {"1h": 157.0}},
+            now=datetime(2026, 6, 22, 8, 0),
+        )
 
 
 # ------------------------------------------------- 5分密系列で15mが解決できる

@@ -10,13 +10,14 @@
                         (休場・イベント警戒窓・データ品質・確信度上限)。
                         委員の総意に対して常に拒否権を持つ
 
-新任委員(マクロ・ML)は promotion.py の昇格ゲートに従う:
+新任委員(マクロ・ML)は promotion.py のlegacy shadow診断に従う:
 
 - shadow: 意見は計算・記録・表示されるが、複合スコアには参加しない。
           ジャーナルの特徴量(macro_score / ml_edge)として蓄積され、
           後から成績を採点できる
-- paper:  複合スコアに参加する(Discord助言に影響する)
-- live:   実売買への接続を許可する段階(明示承認でのみ到達)
+
+このresearch buildではpaper/live/未知段階もshadowへ正規化する。PIT・label・validation・
+governanceがend-to-end接続されるまで、追加委員は複合スコアへ参加しない。
 
 このモジュールはネットワークアクセスを持たない純粋ロジックで、
 テストから直接検証できる。データ取得は呼び出し側(fx_briefing.py)が行い、
@@ -54,8 +55,8 @@ ML_WEIGHT = 0.20
 # MLの優位差(p_long − p_short)がこの値未満なら「意見なし」扱い
 ML_MIN_EDGE = 0.05
 
-STAGE_ACTIVE = ("paper", "live")  # 複合スコアに参加できる段階
-STAGE_LABEL_JA = {"shadow": "shadow検証中", "paper": "paper参加中", "live": "live"}
+STAGE_ACTIVE: tuple[str, ...] = ()
+STAGE_LABEL_JA = {"shadow": "shadow検証中"}
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,7 @@ class Opinion:
     label_ja: str
     score: float  # -1.0〜+1.0
     weight: float  # 合成時の生重み(activeな場合のみ使用)
-    stage: str  # shadow / paper / live
+    stage: str  # research buildでは常にshadow
     active: bool
     rationale_ja: list[str] = field(default_factory=list)
 
@@ -87,6 +88,7 @@ def macro_opinion(
     """マクロアナリストの意見(COT+レジーム)。データが無ければNone。"""
     if snapshot is None:
         return None
+    stage = stage if stage in STAGE_LABEL_JA else "shadow"
     base, quote = symbol_currencies(symbol)
     score, confidence, notes = macro_pair_view(base, quote, snapshot)
     if confidence <= 0:
@@ -118,6 +120,7 @@ def ml_opinion(
     """
     if artifact is None:
         return None
+    stage = stage if stage in STAGE_LABEL_JA else "shadow"
     edge = artifact.direction_edge(tech_score, news_score, chart_features, data_quality)
     if edge is None:
         return None
@@ -153,6 +156,8 @@ def deliberate(
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
     risk_pct: float = DEFAULT_RISK_PCT,
     calendar_ok: bool = True,
+    operational_data_ok: bool = True,
+    operational_data_reason: str = "",
     tech_weight: float = TECH_WEIGHT,
     news_weight: float = NEWS_WEIGHT,
     conviction_factor: float = 1.0,
@@ -165,7 +170,7 @@ def deliberate(
 ) -> TradePlan:
     """1ペアぶんの委員会審議。build_trade_planの上位互換ラッパー。
 
-    - 追加委員(マクロ・ML)の意見を集め、昇格段階に応じて合成に参加させる
+    - 追加委員(マクロ・ML)の意見を集めるが、research buildでは合成に参加させない
     - shadow委員の意見もextra_featuresとしてジャーナルに記録し、
       promotion.pyが後から成績を採点できるようにする
     - 最終的なゲート適用(休場・イベント窓・品質・学習調整)は
@@ -232,6 +237,8 @@ def deliberate(
         atr_multiple=atr_multiple,
         risk_pct=risk_pct,
         calendar_ok=calendar_ok,
+        operational_data_ok=operational_data_ok,
+        operational_data_reason=operational_data_reason,
         tech_weight=tech_weight,
         news_weight=news_weight,
         conviction_factor=conviction_factor,

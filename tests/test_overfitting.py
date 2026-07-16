@@ -126,11 +126,11 @@ def test_pbo_is_deterministic() -> None:
     assert first == second
 
 
-def test_pbo_handles_nan_as_flat_periods() -> None:
+def test_pbo_rejects_nan_instead_of_treating_unknown_as_flat_return() -> None:
     matrix = _noise_matrix(periods=128, trials=5)
-    matrix.iloc[:40, 0] = np.nan  # 一部試行だけ欠測(ポジション無し)でも計算できる
-    result = probability_of_backtest_overfitting(matrix, n_blocks=4)
-    assert 0.0 <= result["pbo"] <= 1.0
+    matrix.iloc[:40, 0] = np.nan
+    with pytest.raises(ValueError, match="欠測"):
+        probability_of_backtest_overfitting(matrix, n_blocks=4)
 
 
 def test_pbo_rejects_invalid_inputs() -> None:

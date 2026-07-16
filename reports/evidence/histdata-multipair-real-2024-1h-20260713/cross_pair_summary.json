@@ -1,0 +1,45 @@
+{
+  "generated": "2026-07-13",
+  "timeframe": "1h",
+  "year": 2024,
+  "source": "HistData (close-only)",
+  "pairs": [
+    {
+      "pair": "USDJPY",
+      "selected": "see-bundle",
+      "synthetic": false,
+      "net_expectancy_r": -0.06455713510287675,
+      "expectancy_ci_lower_r": -0.20277038587889595,
+      "dsr_probability": 0.16705009994993686,
+      "pbo_probability": 0.2,
+      "sample_count": 249,
+      "pit_violations": 0,
+      "promotion": "DENIED"
+    },
+    {
+      "pair": "EURUSD",
+      "selected": "see-bundle",
+      "synthetic": false,
+      "net_expectancy_r": -0.11822776236356511,
+      "expectancy_ci_lower_r": -0.2552583575504985,
+      "dsr_probability": 1.1102230246251565e-16,
+      "pbo_probability": 0.05714285714285714,
+      "sample_count": 229,
+      "pit_violations": 0,
+      "promotion": "DENIED"
+    },
+    {
+      "pair": "GBPUSD",
+      "selected": "see-bundle",
+      "synthetic": false,
+      "net_expectancy_r": -0.0639102695980332,
+      "expectancy_ci_lower_r": -0.2062112251718742,
+      "dsr_probability": 2.5549359138343775e-05,
+      "pbo_probability": 0.3142857142857143,
+      "sample_count": 229,
+      "pit_violations": 0,
+      "promotion": "DENIED"
+    }
+  ],
+  "finding": "All three major pairs show negative cost-net OOS expectancy with negative CI lower bounds; promotion denied for all. Robust across pairs."
+}

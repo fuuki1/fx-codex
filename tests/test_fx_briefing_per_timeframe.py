@@ -54,6 +54,22 @@ def _analysis():
     )
 
 
+@pytest.fixture(autouse=True)
+def _market_always_open():
+    """市場を常にオープン扱いに固定する(テストの実行曜日依存を排除)。
+
+    fx_briefing.main は datetime.now の実時刻で is_market_open を判定するため、
+    週末に実行すると全時間足が「休場」standbyへ倒れ、方向判断に依存する検証
+    (承認済みTP/SL・期待値ガード等)が実行日によって失敗する。ネットワークを
+    全モックした決定論テストなので、市場状態も固定する。
+    """
+    with (
+        mock.patch("fx_intel.timeframe.is_market_open", return_value=True),
+        mock.patch("fx_intel.briefing.is_market_open", return_value=True),
+    ):
+        yield
+
+
 def _approved_tp_registry(path) -> None:
     candidate = to.TradeImprovementCandidate(
         "approved-overall-tp",
@@ -122,9 +138,18 @@ def patched_paths(tmp_path):
 
 
 def _run(argv, capsys, calendar_result=None):
-    """全ネットワーク経路をモックして fx_briefing.main を実行、payload を返す。"""
+    """全ネットワーク経路をモックして fx_briefing.main を実行、payload を返す。
+
+    ``fx_briefing.main`` は ``datetime.now`` から実時刻を取るため、テスト実行日が
+    週末だと ``is_market_open`` が False になり全時間足が「休場」へ倒れて方向判断
+    (と期待値ガード等の方向依存出力)が出なくなる。ネットワークを全モックした
+    決定論テストが実行曜日で挙動を変えないよう、市場は常にオープン扱いにする。
+    """
     calendar_result = calendar_result if calendar_result is not None else ([], [])
     with (
+        mock.patch("fx_intel.timeframe.is_market_open", return_value=True),
+        mock.patch("fx_intel.briefing.is_market_open", return_value=True),
+        mock.patch("fx_intel.decision_pipeline.is_market_open", return_value=True),
         mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
         mock.patch("fx_intel.calendar.fetch_calendar", return_value=calendar_result),
         mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
@@ -132,6 +157,16 @@ def _run(argv, capsys, calendar_result=None):
     ):
         rc = fx_briefing.main(argv)
     return rc
+
+
+def test_promote_live_flag_is_rejected_before_any_network_call(capsys) -> None:
+    with pytest.raises(SystemExit) as error:
+        fx_briefing.main(["--promote-live", "ml", "--dry-run"])
+
+    assert error.value.code == 2
+    error = capsys.readouterr().err
+    assert "--promote-live is disabled" in error
+    assert "research/shadow only" in error
 
 
 def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
@@ -142,6 +177,36 @@ def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
     # embed JSON に4時間足のフィールドが出る
     assert "15分足" in out and "日足" in out
     assert "主ホライズン15分後" in out
+
+
+def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
+    rc = _run(
+        ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
+        capsys,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FXシグナルボード" in out
+    # 自動売買を行わないため発注経路の死活監視は表示しない
+    assert "システム状態" not in out
+    assert "データ品質" in out
+    assert "マクロ・センチメント概況" not in out
+
+
+def test_signal_board_records_its_own_five_minute_price_series(patched_paths, capsys) -> None:
+    rc = _run(
+        ["--signal-board", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
+        capsys,
+    )
+
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in fx_briefing.DEFAULT_TF_PRICES_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["timeframe"] for row in rows} == {"15m", "1h", "4h", "1d"}
+    assert all("direction" not in row for row in rows)
 
 
 def test_per_timeframe_dry_run_does_not_write_journal(patched_paths, capsys) -> None:

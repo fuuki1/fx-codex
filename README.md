@@ -2,6 +2,18 @@
 
 USD/JPY、EUR/USD、GBP/USD向けの中低頻度FXバックテスト基盤です。目的は勝率保証ではなく、検証可能性、取引コストの明示、リスク管理、運用停止条件の再現性を優先することです。
 
+## 文書索引
+
+| 領域 | 正本 |
+|---|---|
+| Target（到達目標・非目標） | [INSTITUTIONAL_FX_AI_TARGET](docs/INSTITUTIONAL_FX_AI_TARGET.md) |
+| Architecture（境界・データフロー） | [INSTITUTIONAL_ARCHITECTURE](docs/INSTITUTIONAL_ARCHITECTURE.md)、[SYSTEM_OVERVIEW](SYSTEM_OVERVIEW.md) |
+| Research protocol（検証・昇格手順） | [RESEARCH_PROTOCOL](docs/RESEARCH_PROTOCOL.md) |
+| Model governance（所有権・承認・停止） | [MODEL_GOVERNANCE](docs/MODEL_GOVERNANCE.md) |
+| Independent audit（設計と実装の差分） | [INSTITUTIONAL_READINESS_AUDIT](docs/audits/INSTITUTIONAL_READINESS_AUDIT.md) |
+| Operations（Mac mini移行・監視・rollback） | [OPERATIONS_RUNBOOK](docs/OPERATIONS_RUNBOOK.md) |
+| Benchmark（再現可能な比較結果） | [institutional_benchmark_20260711](reports/institutional_benchmark_20260711.md) |
+
 ## ディレクトリ構成
 
 ```text
@@ -11,7 +23,7 @@ fx_backtester/
   engine.py                 # イベント型バックテストエンジン
   execution.py              # スプレッド、手数料、スリッページ
   indicators.py             # SMA、ATR、RSI
-  metrics.py                # DD、勝率、期待値、PF、Sharpe、Calmar
+  metrics.py                # DD、期待値、tail risk、Sharpe/Sortino、コスト/回転率
   analysis.py               # OOS、月次、ペア別、DD期間、Monte Carlo、商用ゲート
   models.py                 # Instrument、Position、Trade
   risk.py                   # 1%リスク、1日2%損失停止、月次利益ターゲット
@@ -42,7 +54,7 @@ tests/
 ## ニュース×経済指標×テクニカル統合ブリーフィング (fx_briefing.py)
 
 機関投資家のモーニングブリーフィングを模したDiscord通知です。
-`tv_discord_notify.py` の上位互換で、テクニカルに加えて以下を統合します。
+テクニカルに加えて以下を統合する、正規のDiscord分析通知です。
 
 - **経済指標カレンダー** (ForexFactory公開フィード): 今後48時間の重要イベント表示、
   イベント前後(前120分/後180分、research-maxプリセット準拠)の「様子見」判定
@@ -50,7 +62,7 @@ tests/
 - **センチメント分析**: 語彙ベース(常時動作) + Claude API(`.env` に
   `ANTHROPIC_API_KEY` があれば自動で有効化、失敗時は語彙ベースへフォールバック)
 - **複合スコア**: テクニカル55% + ニュース45% → ペアごとに方向・確信度(0-100)・
-  ATRベースのSL/TP(strategy_params.jsonのatr_multiple使用)を提示
+  ATRベースのSL/TP(保守的な固定値 ATR×2.5 を使用)を提示
 - **自己学習ループ**: 毎回の判断を `logs/briefing_journal.jsonl` に記録し、
   実行のたびに履歴全体を約24時間後(市場オープン時間換算)の値動きで相互採点。
   テクニカル/ニュースそれぞれの的中率から複合重みを再推定(シュリンク付き、
@@ -68,21 +80,54 @@ tests/
   確信度を×0.7〜1.0に減衰して理由を明示。当たりやすい/苦手な状態は
   方向付きで学習メモに一覧表示されます
 
+### 運用モードと書込み責務（必読）
+
+以下は**設計上の正規構成**です。Mac mini (`/Users/fuuki/srv/fx-codex`) では
+launchd のワンショットジョブだけを常駐させます。
+
+| ジョブ | 周期 | 正規の責務 |
+|---|---:|---|
+| `com.fx-codex.snapshot` | 5分 | `logs/briefing_tf_prices.jsonl` の唯一の定期writer |
+| `com.fx-codex.briefing` | 5分境界 | 時間足別の判断ジャーナル・学習プロファイル・統合通知 |
+| `com.fx-codex.health` | 5分 | 鮮度監視と運用通知（収集ジョブから独立） |
+
+`--signal-board` と `fx_briefing_loop.sh` は**開発・一時確認専用**です。Mac miniの
+正規サービス、cron、旧plistのいずれかが動いている間は起動せず、正規の
+`logs/*.jsonl` へ同時に書き込ませてはいけません。表示確認は、ジャーナルを保存しない
+`--dry-run` を優先してください。排他ロックは同じロック名を使う呼出し同士にしか効かず、
+rawな手動コマンドとの共存を自動的に安全にはしません。
+
+2026-07-10の実機監査で観測した状態は、この正規構成と一致していませんでした。旧サービス・
+cron・過去の多重writer、価格系列の鮮度異常があり、リポジトリは観測時点で`origin/main`から
+18コミット遅れていました。この数値はスナップショットであり、移行前に必ず再取得します。
+証跡取得、安全な移行、通知経路、rollbackは
+[運用Runbook](docs/OPERATIONS_RUNBOOK.md)を参照してください。
+
+institutional governance方針が表現できる上限は **research → validated → shadow → paper** です。
+ただしend-to-end承認サービスとbroker paper stackは現在存在せず、legacyマクロ/ML委員は
+非影響のshadowへ固定されています。`--promote-live`とPython APIのpaper/live遷移は無効化されており、
+実売買への昇格・発注はこのリポジトリの運用範囲外です。
+
 ```bash
-.venv/bin/python fx_briefing.py --dry-run        # 送信せず内容確認
+.venv/bin/python fx_briefing.py --signal-board --dry-run --symbols GBPUSD EURUSD USDJPY
+                                                   # 5分ボードを送信せず内容確認
 .venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ・学習ファイルだけ更新
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
 python3 tools/learning_capture.py                # Discord送信なしで融合/時間足別/価格系列を1回収集
-./fx_briefing_loop.sh &                          # 毎時10分に自動送信(融合＋時間足別の2通)
 ```
 
-`--dry-run` は表示確認用でログを保存しません。学習を進めたいがDiscordへ送信したくない場合は
-`--no-discord`、または `tools/learning_capture.py` を使います。
+`--dry-run` は判断/価格ジャーナル、学習/model/promotion状態、Discord送信を更新しません。ただし
+calendar/macro等のsource cacheは取得処理により更新され、イベントexport/archiveも明示的に
+`--no-export-events --no-event-archive`を付けない限り更新され得ます。完全なzero-write確認は正規runtimeと
+分離した作業copyで行います。学習を進めたいがDiscordへ送信したくない場合は`--no-discord`、または
+`tools/learning_capture.py`を使いますが、どちらも状態を更新するためMac miniの正規サービス稼働中には
+手動実行しません。
 
-`fx_briefing_loop.sh` は毎時、**融合1判断モード（本命：委員会・ML・昇格ゲートあり）と
-時間足別モード（`--per-timeframe`）の2通**を連続送信します。時間足別の採点を回すには、
-別途 `fx_tf_snapshot_loop.sh`（5分ごとの価格記録）も起動してください（下記）。
+開発用の`fx_briefing_loop.sh`は5分境界（00/05/10…分）ごとに、**上位3候補・
+エントリー適性・4層のデータ品質を1通へまとめたFXシグナルボード**を送ります。
+発注経路は存在しません。障害通知はボードへ
+集約せず、正規運用では独立した`com.fx-codex.health`から運用Webhookへ送ります。
 
 ### 時間足別モード (`--per-timeframe`)
 
@@ -96,10 +141,8 @@ python3 tools/learning_capture.py                # Discord送信なしで融合/
   補助ホライズン(15m: 30分/1h、1h: 4h/8h 等)は Discord 表示・分析確認用の
   「観測」で、学習には主ホライズンのみを使います(多重検定の回避)。
 - **将来価格の調達(5分スナップショット)**: TradingView スキャナーは現在値しか
-  返さないため、記録から主ホライズン後の実勢価格を後続の終値から取ります。ただし
-  判断ジャーナル `logs/briefing_tf_journal.jsonl` は毎時しか追記されないため、
-  短い足(特に 15m: 採点窓 9〜21分)は後続点が得られず永久に採点されません。
-  そこで **`fx_tf_snapshot.py` が5分ごとに各時間足の現在終値だけを
+  返さないため、記録から主ホライズン後の実勢価格を後続の終値から取ります。正規運用では
+  **`com.fx-codex.snapshot`が`fx_tf_snapshot.py`を5分ごとに起動し、各時間足の現在終値だけを
   `logs/briefing_tf_prices.jsonl` へ記録**し、採点時にこの密な価格系列を判断
   ジャーナルと結合します。これで **15m / 1h / 4h / 1d のすべてが採点可能**に
   なります。外部の履歴OHLC(yfinance/OANDA 等)を差し込む注入口も用意しています
@@ -115,22 +158,20 @@ python3 tools/learning_capture.py                # Discord送信なしで融合/
 ```bash
 .venv/bin/python fx_briefing.py --per-timeframe --dry-run   # 時間足別の内容確認
 .venv/bin/python fx_briefing.py --per-timeframe             # Discordへ送信
-./fx_tf_snapshot_loop.sh &                                  # 5分ごとに価格を記録(採点用)
 ```
 
-時間足別モードで全時間足を学習させるには、判断と価格採点用の系列の**2本立て**が必要です。
-判断は `fx_briefing_loop.sh` が毎時 `--per-timeframe` を自動送信するので、追加で
-起動するのは価格スナップショットループ(`fx_tf_snapshot_loop.sh`、5分ごと)だけです。
-価格スナップショットは価格取得のみ(判断・学習・Discord通知はしない)なので API 負荷は
-軽く、Discord は毎時のままです(手動で単発確認したいときは上のコマンドを使います)。
+Mac miniの正規運用では`com.fx-codex.snapshot`だけが価格専用系列を供給します。
+`fx_briefing_loop.sh`と`fx_tf_snapshot_loop.sh`を同時に起動する旧方式、または
+launchdとraw loopの併走は禁止です。開発機で一時的にどちらかを使う場合も、正規ログと
+分離した作業ディレクトリで単独実行し、終了後にwriterが残っていないことを確認します。
 
 ### MFE/MAE/TP/SL期待値監視ランナー
 
 `tools/trade_outcome_monitor.py` は cron/CI/dashboard 向けの運用コマンドです。判断
 ジャーナルを MFE/MAE/TP/SL で採点し、期待値・サンプル数・経路品質をチェックしたうえで、
 改善候補レジストリ、TP/SL候補paper再採点、承認済みTP/SLの自動停止、ダッシュボード用
-監視JSONを1回で更新します。候補の live 反映に相当する承認は自動化せず、既存の人間承認
-CLIだけで行います。
+監視JSONを1回で更新します。候補の`paper`/approval表記はoffline研究内の比較状態であり、
+institutional model stageやbroker paper実行を意味せず、live反映も行いません。
 
 ```bash
 python3 tools/trade_outcome_monitor.py
@@ -145,7 +186,7 @@ python3 fx_briefing.py --approve-trade-candidate <candidate_id> --trade-approval
 
 副産物として `research_pack/upcoming_events.csv`(最新スナップショット、毎回上書き)と
 `research_pack/event_history.csv`(追記アーカイブ)を書き出します。いずれも
-`fx_backtester` の `--events` にそのまま渡せる形式で、ライブのイベント回避と
+`fx_backtester` の `--events` にそのまま渡せる形式で、分析時のイベント回避と
 バックテストのイベント回避が同じデータを共有します。event_history.csv は実行のたびに
 未観測のイベント・改定分だけを `recorded_at` 付きで蓄積する簡易 point-in-time 記録で、
 運用を続けるほど過去期間のイベント回避を実カレンダーで再生できるようになります
@@ -470,8 +511,16 @@ CLIはJSONで以下を出力します。
 - `profit_factor`: Profit Factor
 - `average_win` / `average_loss`: 平均利益、平均損失
 - `sharpe_ratio`: Equity CurveリターンのSharpe Ratio
+- `sortino_ratio`: downside deviationだけを分母に使うSortino Ratio
+- `downside_deviation`: Equity Curveリターンの下方偏差
 - `calmar_ratio`: 年率リターン ÷ 最大DD
 - `recovery_factor`: 純損益 ÷ 最大DD金額
+- `median_trade_usd` / `median_r`: 1トレード損益の中央値（USD / R倍数）
+- `expected_shortfall_r_05`: R倍数損益の下位5% Expected Shortfall（5% ES R）
+- `longest_loss_streak`: 最長連敗数
+- `average_holding_hours` / `median_holding_hours`: 平均/中央値の保有時間
+- `total_fees_usd`: 手数料合計（USD）
+- `round_trip_turnover_units`: entryとexitを含むround-trip取引数量
 - `exposure_pct`: ポジション保有バー比率
 
 ## 約定モデル
@@ -570,19 +619,21 @@ CLIはJSONで以下を出力します。
 - ウォークフォワードの組み合わせ数は `max_parameter_combinations` で制限し、CLIでは `--max-params` の既定値を20にしています。
 - 学習区間で選んだパラメータを、隣接する未使用のテスト区間だけに適用します。
 - 勝率だけを目的関数にせず、Sharpe、期待R、Profit Factor、DDを組み合わせた簡易スコアを使います。
-- 試行ログ (`fx_backtester/trial_log.py`): `auto_optimize.py` はグリッドサーチの全試行
-  (パラメータ・指標・リターン系列)を `runs/trial_logs/<run_id>/` に記録します
-  (trials.jsonl / returns_matrix.csv / run.json)。`WalkForwardValidator` にも
-  `trial_logger=` で同じロガーを渡せます。探索履歴の監査証跡であり、下記検定の入力です。
+- 試行ログ (`fx_backtester/trial_log.py`): `WalkForwardValidator` に `trial_logger=` を
+  渡すと、探索の全試行(パラメータ・指標・リターン系列)を `runs/trial_logs/<run_id>/` に
+  記録します(trials.jsonl / returns_matrix.csv / run.json)。探索履歴の監査証跡であり、
+  下記検定の入力です。
 - 過剰最適化の統計検定 (`fx_backtester/overfitting.py`、scipy非依存):
   - PBO (CSCV; Bailey et al. 2015) — 時系列をブロック分割した全組み合わせで
     「ISで最良の試行がOOSで中央値未満に沈む確率」を測ります。0.5でIS順位に予測力ゼロ。
   - Deflated Sharpe Ratio (Bailey & López de Prado 2014) — 探索回数Nのまぐれで
     達成しうる期待最大Sharpeを控除した上で、観測Sharpeが本物である確率を
     歪度・尖度込みで出します。
-  - `auto_optimize.py` は両方を自動計算して `provenance.overfitting` に埋め込み、
-    PBO >= 0.5 / DSR < 0.95 は警告になります(警告付き candidate は
-    `promote_params.py` が `--force` 無しで昇格を拒否)。
+  - PBO >= 0.5 / DSR < 0.95 は過剰最適化の警告として扱います。
+
+  ※ 発注戦略パラメータを自動最適化・承認していた `auto_optimize.py` /
+  `promote_params.py` は自動売買の取りやめに伴い削除済みです（→ [SYSTEM_OVERVIEW](SYSTEM_OVERVIEW.md)）。
+  上記の試行ログと過剰最適化検定は `fx_backtester` の walk-forward 検証内で引き続き利用できます。
 
 ## ネット上のFX履歴データを使う際の前提
 
@@ -599,14 +650,12 @@ python3 -m pytest
 
 テストではCSV読み込み、経済指標マスク、日次損失停止、ウォークフォワードの探索上限を確認しています。
 
-## 将来のMT5/OANDA接続
+## 永続的なanalysis-only境界
 
-現在の `SimulatedExecution` はバックテスト用です。ライブ接続時は `execution.py` と同じ責務で、以下のような実装に差し替えます。
-
-- `MT5Execution`: 注文送信、約定確認、ポジション同期
-- `OandaExecution`: REST/streaming API、注文ID管理、約定価格取得
-
-戦略は `target_position` と `stop_distance` を返すだけなので、ライブ接続でもStrategy層はそのまま使えます。RiskManager層は口座残高、既存ポジション、当日損益をブローカー側の実データで同期する必要があります。
+本リポジトリは**分析・履歴研究・offline simulation・shadow判断・Discord通知専用**です。
+ブローカー注文、ポジション変更、口座リスク変更、paper/live broker executionは恒久的に
+対象外であり、旧`trader/`、executor、order client、自動パラメータ→注文配線を復元しません。
+ブローカー執行を研究する場合は、別リポジトリで独立した権限・レビュー・運用境界を設けます。
 
 ## 改善すべき点
 

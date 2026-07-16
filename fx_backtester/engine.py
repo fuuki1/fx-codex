@@ -53,6 +53,7 @@ class BacktestConfig:
     close_positions_on_daily_stop: bool = True
     close_positions_on_portfolio_stop: bool = True
     force_close_on_end: bool = True
+    pending_open_order_ttl: pd.Timedelta | None = pd.Timedelta(hours=24)
 
 
 @dataclass
@@ -246,6 +247,30 @@ class BacktestEngine:
                     )
                 )
 
+            # Each instrument must be closed on its own last available bar. Using
+            # only the union's final timestamp leaves earlier-ending symbols open
+            # with stale marks and silently omits their trade from the result.
+            if self.config.force_close_on_end:
+                final_conversion_rates = self._conversion_rates(current_bars, last_prices, "close")
+                for symbol, row in list(current_bars.items()):
+                    if symbol not in positions or timestamp != prepared[symbol].index[-1]:
+                        continue
+                    cash = self._close_position(
+                        positions[symbol],
+                        timestamp,
+                        float(row["close"]),
+                        ("end_of_backtest" if timestamp == all_times[-1] else "end_of_symbol_data"),
+                        "market_on_close",
+                        row,
+                        final_conversion_rates,
+                        positions,
+                        trades,
+                        cash,
+                    )
+                    pending_orders[:] = [
+                        order for order in pending_orders if order.symbol != symbol
+                    ]
+
             equity_rows.append(
                 {
                     "timestamp": timestamp,
@@ -431,6 +456,11 @@ class BacktestEngine:
     ) -> None:
         equity = self._equity(cash, positions, last_prices)
         reasons = self.risk.check_portfolio_stops(timestamp, equity)
+        conversion_rates = self.config.conversion_rates.copy()
+        conversion_rates.update(last_prices)
+        gross_notional = self._gross_notional_usd(positions, last_prices, conversion_rates)
+        if self.risk.check_gross_leverage(gross_notional, equity):
+            reasons.append("gross_leverage_breach")
         if reasons and self.config.close_positions_on_portfolio_stop:
             self._schedule_close_all(
                 pending_orders,
@@ -453,6 +483,9 @@ class BacktestEngine:
     ) -> float:
         remaining: list[PendingOrder] = []
         for order in pending_orders:
+            ttl = self.config.pending_open_order_ttl
+            if order.action == "open" and ttl is not None and timestamp - order.order_time > ttl:
+                continue
             row = current_bars.get(order.symbol)
             if row is None:
                 remaining.append(order)
@@ -491,13 +524,22 @@ class BacktestEngine:
                 row,
                 conversion_rates,
             )
+            estimated_fill_price = self.execution.fill_price(
+                order.symbol,
+                expected_price,
+                order.side,
+                row,
+            )
             units, adjusted_stop_distance, initial_risk = self.risk.position_size(
                 order.symbol,
                 equity,
-                expected_price,
+                estimated_fill_price,
                 float(order.stop_distance or 0.0),
                 extra_risk_per_unit_usd=extra_risk,
                 extra_risk_usd=self.execution.round_trip_fixed_fee_floor_usd(),
+                current_gross_notional_usd=self._gross_notional_usd(
+                    positions, last_prices, conversion_rates
+                ),
                 conversion_rates=conversion_rates,
             )
             if units <= 0 or initial_risk <= 0:
@@ -506,7 +548,7 @@ class BacktestEngine:
                 order.symbol,
                 order.side,
                 units,
-                expected_price,
+                estimated_fill_price,
                 equity,
                 positions,
                 last_prices,
@@ -780,6 +822,22 @@ class BacktestEngine:
                 conversion_rates,
             )
         return exposures
+
+    def _gross_notional_usd(
+        self,
+        positions: dict[str, Position],
+        last_prices: dict[str, float],
+        conversion_rates: dict[str, float],
+    ) -> float:
+        return sum(
+            notional_usd(
+                symbol,
+                position.units,
+                last_prices.get(symbol, position.entry_price),
+                conversion_rates,
+            )
+            for symbol, position in positions.items()
+        )
 
     def _add_currency_exposure(
         self,

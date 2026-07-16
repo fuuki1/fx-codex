@@ -788,9 +788,30 @@ def test_evaluate_trade_outcomes_uses_high_low_path_for_touch_and_quality() -> N
             target1=101.0,
             target2=102.0,
         ),
-        _entry(NOW + timedelta(hours=8), "USDJPY", 100.2, high=101.2, low=100.1),
-        _entry(NOW + timedelta(hours=16), "USDJPY", 100.4, high=100.6, low=100.2),
-        _entry(NOW + DAY, "USDJPY", 100.5, high=100.7, low=100.3),
+        _entry(
+            NOW + timedelta(hours=8),
+            "USDJPY",
+            100.2,
+            high=101.2,
+            low=100.1,
+            ohlc_scope="post_prediction_interval",
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "USDJPY",
+            100.4,
+            high=100.6,
+            low=100.2,
+            ohlc_scope="post_prediction_interval",
+        ),
+        _entry(
+            NOW + DAY,
+            "USDJPY",
+            100.5,
+            high=100.7,
+            low=100.3,
+            ohlc_scope="post_prediction_interval",
+        ),
     ]
 
     outcome = to.evaluate_trade_outcomes(rows)[0]
@@ -815,9 +836,30 @@ def test_evaluate_trade_outcomes_flags_ambiguous_intrabar_touch() -> None:
             target1=101.0,
             target2=102.0,
         ),
-        _entry(NOW + timedelta(hours=8), "USDJPY", 100.0, high=101.2, low=98.8),
-        _entry(NOW + timedelta(hours=16), "USDJPY", 100.2, high=100.4, low=100.0),
-        _entry(NOW + DAY, "USDJPY", 100.3, high=100.5, low=100.1),
+        _entry(
+            NOW + timedelta(hours=8),
+            "USDJPY",
+            100.0,
+            high=101.2,
+            low=98.8,
+            ohlc_scope="closed_bar_after_prediction",
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "USDJPY",
+            100.2,
+            high=100.4,
+            low=100.0,
+            ohlc_scope="closed_bar_after_prediction",
+        ),
+        _entry(
+            NOW + DAY,
+            "USDJPY",
+            100.3,
+            high=100.5,
+            low=100.1,
+            ohlc_scope="closed_bar_after_prediction",
+        ),
     ]
 
     outcome = to.evaluate_trade_outcomes(rows)[0]
@@ -827,6 +869,75 @@ def test_evaluate_trade_outcomes_flags_ambiguous_intrabar_touch() -> None:
     assert outcome.tp1_hit is True
     assert outcome.sl_hit is True
     assert "ambiguous_intrabar_touch" in outcome.quality_flags
+
+
+def test_forming_bar_ohlc_is_ignored_for_post_prediction_touch_labels() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            direction="long",
+            conviction=65,
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "USDJPY",
+            100.2,
+            high=101.2,
+            low=100.1,
+            ohlc_scope="forming_bar_snapshot",
+        ),
+        _entry(NOW + timedelta(hours=16), "USDJPY", 100.4),
+        _entry(NOW + DAY, "USDJPY", 100.5),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.first_touch == "none"
+    assert outcome.path_source == "close"
+    assert "untrusted_forming_ohlc_ignored" in outcome.quality_flags
+
+
+def test_mfe_and_mae_stop_at_the_first_exit_touch() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            direction="long",
+            conviction=65,
+            stop=99.0,
+            target1=101.0,
+            target2=None,
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "USDJPY",
+            101.0,
+            high=101.1,
+            low=99.8,
+            ohlc_scope="closed_bar_after_prediction",
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "USDJPY",
+            105.0,
+            high=110.0,
+            low=98.0,
+            ohlc_scope="closed_bar_after_prediction",
+        ),
+        _entry(NOW + DAY, "USDJPY", 105.0),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.first_touch == "tp1"
+    assert outcome.mfe_r == 1.1
+    assert outcome.mae_r == 0.2
 
 
 def test_retest_trade_variants_cli_writes_paper_candidate(tmp_path) -> None:

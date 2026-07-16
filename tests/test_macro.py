@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, UTC
+from datetime import date, datetime, timedelta, UTC
 
 from fx_intel.macro import (
     CotReport,
@@ -23,6 +23,30 @@ from fx_intel.macro import (
 )
 
 NOW = datetime(2026, 7, 3, 12, 0, tzinfo=UTC)
+
+
+def _audited_cot(currency: str, net_position: int) -> CotReport:
+    return CotReport(
+        currency,
+        date(2026, 6, 30),
+        net_position=net_position,
+        open_interest=200000,
+        available_time=NOW - timedelta(hours=1),
+        source_record_id=f"source-{currency}",
+        content_hash="a" * 64,
+        dataset_id="b" * 64,
+        data_quality_flags=("publication_time_attested_locally",),
+    )
+
+
+def _enable_cot(snapshot: MacroSnapshot) -> None:
+    snapshot.cot_evidence = {
+        "status": "ok",
+        "usable": True,
+        "dataset_id": "b" * 64,
+        "prediction_time": snapshot.fetched_at.isoformat(),
+        "record_hashes": ["a" * 64, "c" * 64],
+    }
 
 
 def test_parse_fred_csv_skips_missing_values() -> None:
@@ -110,8 +134,9 @@ def test_regime_neutral_without_data() -> None:
 
 def test_cot_pair_score_direction() -> None:
     snap = MacroSnapshot(fetched_at=NOW)
-    snap.cot["USD"] = CotReport("USD", date(2026, 6, 30), net_position=60000, open_interest=200000)
-    snap.cot["JPY"] = CotReport("JPY", date(2026, 6, 30), net_position=-40000, open_interest=200000)
+    _enable_cot(snap)
+    snap.cot["USD"] = _audited_cot("USD", 60000)
+    snap.cot["JPY"] = _audited_cot("JPY", -40000)
     result = cot_pair_score("USD", "JPY", snap)
     assert result is not None
     score, _ = result
@@ -120,8 +145,54 @@ def test_cot_pair_score_direction() -> None:
 
 def test_cot_pair_score_none_when_missing() -> None:
     snap = MacroSnapshot(fetched_at=NOW)
-    snap.cot["USD"] = CotReport("USD", date(2026, 6, 30), net_position=60000, open_interest=200000)
+    _enable_cot(snap)
+    snap.cot["USD"] = _audited_cot("USD", 60000)
     assert cot_pair_score("USD", "JPY", snap) is None
+
+
+def test_legacy_cot_without_positive_pit_evidence_is_rejected() -> None:
+    snap = MacroSnapshot(fetched_at=NOW, cot_evidence={"status": "ok"})
+    snap.cot["USD"] = CotReport("USD", date(2026, 6, 30), net_position=60000, open_interest=200000)
+    assert snap.fresh_cot("USD") is None
+
+
+def test_cot_evidence_must_bind_dataset_and_record_hash() -> None:
+    report = _audited_cot("USD", 60000)
+    snap = MacroSnapshot(
+        fetched_at=NOW,
+        cot={"USD": report},
+        cot_evidence={
+            "status": "ok",
+            "usable": True,
+            "dataset_id": "c" * 64,
+            "prediction_time": NOW.isoformat(),
+            "record_hashes": ["a" * 64, "d" * 64],
+        },
+    )
+    assert snap.fresh_cot("USD") is None
+
+    snap.cot_evidence = {
+        "status": "ok",
+        "usable": True,
+        "dataset_id": report.dataset_id,
+        "prediction_time": NOW.isoformat(),
+        "record_hashes": ["d" * 64, "e" * 64],
+    }
+    assert snap.fresh_cot("USD") is None
+
+    snap.fetched_at = NOW.replace(tzinfo=None)
+    _enable_cot(snap)
+    assert snap.fresh_cot("USD") is None
+
+    snap.fetched_at = NOW
+    snap.cot_evidence = {
+        "status": "ok",
+        "usable": True,
+        "dataset_id": report.dataset_id,
+        "prediction_time": NOW.isoformat(),
+        "record_hashes": [["not-a-hash"], report.content_hash],
+    }
+    assert snap.fresh_cot("USD") is None
 
 
 def test_regime_pair_score_risk_off_favors_safe_haven() -> None:
@@ -138,8 +209,9 @@ def test_regime_pair_score_none_in_neutral() -> None:
 
 def test_macro_pair_view_combines_cot_and_regime() -> None:
     snap = MacroSnapshot(fetched_at=NOW)
-    snap.cot["USD"] = CotReport("USD", date(2026, 6, 30), net_position=60000, open_interest=200000)
-    snap.cot["JPY"] = CotReport("JPY", date(2026, 6, 30), net_position=-40000, open_interest=200000)
+    _enable_cot(snap)
+    snap.cot["USD"] = _audited_cot("USD", 60000)
+    snap.cot["JPY"] = _audited_cot("JPY", -40000)
     score, confidence, notes = macro_pair_view("USD", "JPY", snap)
     assert confidence > 0
     assert notes

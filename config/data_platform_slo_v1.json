@@ -1,0 +1,57 @@
+{
+  "slo_version": "1.0.0",
+  "effective_from": "2026-07-14",
+  "applies_to": "read-only quote/macro collection (data_platform.collect)",
+  "change_policy": "Changing any target requires a new slo_version with a written reason; results already recorded under an older version are never rescored under a newer one.",
+  "targets": {
+    "availability_percent": {
+      "target": ">= 99.9",
+      "measurement": "per trading day: (seconds primary stream connected) / (seconds market open); from ConnectionState gaps in the daily report"
+    },
+    "quote_freshness_p99_seconds": {
+      "target": "< 2.0",
+      "measurement": "p99 of (received_at - provider_event_time) over accepted live-stream quotes; historical downloads are exempt (provenance, not freshness)"
+    },
+    "missing_interval_rate_percent": {
+      "target": "< 0.1",
+      "measurement": "sum of gap durations / market-open duration per day"
+    },
+    "duplicate_rate_percent": {
+      "target": "< 0.01",
+      "measurement": "quarantined duplicate_quote count / total quotes per day"
+    },
+    "out_of_order_rate_percent": {
+      "target": "< 0.01",
+      "measurement": "out_of_order_quote flag count / total quotes per day"
+    },
+    "raw_hash_verification_percent": {
+      "target": "= 100",
+      "measurement": "every ingest re-reads and re-hashes stored raw bytes; any mismatch is a fatal incident"
+    },
+    "daily_deterministic_replay_percent": {
+      "target": "= 100",
+      "measurement": "daily re-parse of the day's raw blobs must byte-reproduce the accepted quote log"
+    },
+    "stale_quote_treated_as_tradable_count": {
+      "target": "= 0",
+      "measurement": "quotes with stale_quote flag AND tradable=true in the accepted log; scorecard-fatal"
+    },
+    "future_timestamp_accepted_count": {
+      "target": "= 0",
+      "measurement": "contract rejects provider_event_time > received_at + 2.0s clock allowance; any acceptance is scorecard-fatal"
+    },
+    "multi_writer_incident_count": {
+      "target": "= 0",
+      "measurement": "ExclusiveLock contention events where a second writer acquired the same quote log"
+    },
+    "unacknowledged_critical_incident_count": {
+      "target": "= 0",
+      "measurement": "critical incidents in incident_report.json without a human acknowledgement entry"
+    }
+  },
+  "provider_limitations_declared": [
+    "Dukascopy datafeed (historical) has no freshness SLO: files are fetched minutes-to-years after event time by design; measured lag is recorded as provenance (collection_mode=historical_download), not as an SLO breach.",
+    "Dukascopy endpoint shows intermittent 503/timeouts; availability SLO applies to the OANDA live stream, while Dukascopy fetch failures count as fetch incidents with retry evidence.",
+    "ALFRED supplies no intraday release timestamps; release-time freshness for macro is bounded by vintage_date only and is flagged provider_does_not_supply_release_time."
+  ]
+}

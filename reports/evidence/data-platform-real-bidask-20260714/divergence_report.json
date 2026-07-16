@@ -1,0 +1,57 @@
+{
+  "providers": [
+    "dukascopy",
+    "histdata"
+  ],
+  "providers_independent": true,
+  "all_inputs_real": true,
+  "instruments": [
+    "USDJPY",
+    "EURUSD",
+    "GBPUSD"
+  ],
+  "comparison_granularity": "1h_bar_mid (dukascopy last-tick mid vs histdata close)",
+  "bars_compared": 9,
+  "metrics": {
+    "mid_diff_pips": {
+      "count": 9,
+      "max": 2.8,
+      "mean": 1.211,
+      "p50": 0.75
+    },
+    "spread_diff_pips": null,
+    "receive_time_skew_ms": null
+  },
+  "metric_limitations": [
+    "spread_diff_pips unavailable: HistData is close-only (no bid/ask)",
+    "receive_time_skew unavailable: both sources are historical downloads",
+    "quote-level dual-stream comparison requires the OANDA live stream (not yet credentialed)"
+  ],
+  "per_pair": {
+    "USDJPY": {
+      "bar_mid_diff_pips": [
+        2.8,
+        0.75,
+        0.4
+      ]
+    },
+    "EURUSD": {
+      "bar_mid_diff_pips": [
+        1.75,
+        0.4,
+        0.35
+      ]
+    },
+    "GBPUSD": {
+      "bar_mid_diff_pips": [
+        2.15,
+        0.15,
+        2.15
+      ]
+    }
+  },
+  "divergence_state": "usable",
+  "divergence_reason": [],
+  "breach_policy_exercised": false,
+  "breach_policy_note": "no real breach occurred in this window; degrade/quarantine transitions are exercised in tests/test_collect_divergence_macro.py on constructed inputs (not counted as real)"
+}

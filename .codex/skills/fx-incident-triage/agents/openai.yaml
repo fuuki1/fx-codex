@@ -1,0 +1,4 @@
+interface:
+  display_name: "FX Incident Triage"
+  short_description: "Triage FX data and process incidents"
+  default_prompt: "Use $fx-incident-triage to contain and diagnose this FX analysis or data-collection incident."
