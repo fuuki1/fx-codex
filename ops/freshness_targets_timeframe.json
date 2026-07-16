@@ -10,6 +10,8 @@
       "expected_interval_seconds": 300,
       "warn_after_seconds": 900,
       "critical_after_seconds": 2700,
+      "required_symbols": ["GBPUSD", "EURUSD", "USDJPY"],
+      "required_timeframes": ["15m", "1h", "4h", "1d"],
       "manual_action_ja": "scripts/status_fx_services.sh で com.fx-codex.snapshot を確認し、TradingView取得と価格履歴の競合を調査"
     },
     {

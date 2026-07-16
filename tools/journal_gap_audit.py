@@ -29,10 +29,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fx_intel.market import is_market_open  # noqa: E402
 
-# 同一(symbol, timeframe)の判断がこの分数以内に複数あれば「多重起動の重複」とみなす。
-# 正規の書込みは毎時:10の1回だけなので、30分以内の再出現は正常系では起こらない
-DUPLICATE_WINDOW_MINUTES = 30.0
-
 
 def read_journal(path: Path) -> list[dict]:
     rows: list[dict] = []
@@ -68,7 +64,7 @@ def _parse_ts(value: object) -> datetime | None:
 def audit_journal(
     rows: list[dict],
     expected_interval_hours: float = 1.0,
-    duplicate_window_minutes: float = DUPLICATE_WINDOW_MINUTES,
+    duplicate_window_minutes: float | None = None,
 ) -> dict:
     """重複・欠損・時刻逆転を集計する。"""
     parsed: list[tuple[datetime, str, str]] = []
@@ -92,7 +88,14 @@ def audit_journal(
     duplicate_rows = 0
     gaps: list[dict] = []
     gap_threshold = timedelta(hours=expected_interval_hours * 2)
-    window = timedelta(minutes=duplicate_window_minutes)
+    # 正規周期の半分以内に同一セルが再出現した場合だけ重複とする。
+    # 既定1時間なら30分、現行5分なら2.5分となり、正常な5分記録を汚染扱いしない。
+    resolved_duplicate_window = (
+        duplicate_window_minutes
+        if duplicate_window_minutes is not None
+        else expected_interval_hours * 30.0
+    )
+    window = timedelta(minutes=resolved_duplicate_window)
     for (symbol, timeframe), stamps in series.items():
         stamps.sort()
         cluster = 1
@@ -123,10 +126,9 @@ def audit_journal(
             duplicate_rows += cluster - 1
 
     per_hour = Counter(ts.strftime("%Y-%m-%dT%H") for ts, _, _ in parsed)
+    expected_per_hour = max(1, round(1.0 / expected_interval_hours))
     multi_writer_hours = sum(
-        1
-        for hour, count in per_hour.items()
-        if count > len(series)  # 1時間に(symbol×timeframe)数を超える行=多重書込み
+        1 for hour, count in per_hour.items() if count > len(series) * expected_per_hour
     )
 
     return {

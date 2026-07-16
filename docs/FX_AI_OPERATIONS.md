@@ -14,7 +14,7 @@ tail -n 80 logs/launchd/health.err.log
 tail -n 5 logs/briefing_tf_prices.jsonl
 ```
 
-正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（毎時）、`com.fx-codex.health`（5分）です。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
+正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・時間足別統合通知）、`com.fx-codex.health`（5分）です。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
 
 開発機 `/Users/takahashifuuki/Desktop/fx-codex` は検証用であり、Mac miniの収集責務を代替しません。
 

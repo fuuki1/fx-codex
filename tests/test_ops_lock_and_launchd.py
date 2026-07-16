@@ -280,7 +280,9 @@ def test_restart_script_fails_if_any_service_is_not_loaded(tmp_path):
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
-def test_briefing_wrapper_runs_one_signal_board_and_propagates_failure(tmp_path):
+def test_briefing_wrapper_runs_one_integrated_briefing_and_propagates_failure(tmp_path):
+    # cc8fbe8で定期通知経路を--signal-boardから統合ブリーフィング(--per-timeframe)へ切替済み。
+    # 単一呼び出しであること・子の終了コードを透過することを検証する。
     root = tmp_path / "repo"
     scripts = root / "scripts"
     python_dir = root / ".venv" / "bin"
@@ -308,11 +310,11 @@ def test_briefing_wrapper_runs_one_signal_board_and_propagates_failure(tmp_path)
     invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
     assert len(invocations) == 1
     invocation = invocations[0]
-    assert "--signal-board" in invocation
+    assert "--per-timeframe" in invocation
     assert "--no-price-write" in invocation
     assert "--require-freshness" in invocation
-    assert "--per-timeframe" not in invocation
-    assert "GBPUSD EURUSD USDJPY" in invocation
+    assert "--signal-board" not in invocation
+    assert "USDJPY EURUSD" in invocation
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
@@ -560,6 +562,24 @@ def test_gap_audit_detects_duplicates(gap_audit):
     report = gap_audit.audit_journal(_journal_rows(base, hours=24, per_hour=3))
     assert report["duplicate_rows"] == 48  # 各時間で2行が重複(3-1)×24
     assert report["duplicate_row_pct"] > 60
+
+
+def test_gap_audit_accepts_normal_five_minute_schedule(gap_audit):
+    base = datetime(2026, 7, 6, 10, 0, tzinfo=UTC)
+    rows = [
+        {
+            "ts": (base + timedelta(minutes=5 * offset)).isoformat(),
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+        }
+        for offset in range(24)
+    ]
+
+    report = gap_audit.audit_journal(rows, expected_interval_hours=1 / 12)
+
+    assert report["duplicate_rows"] == 0
+    assert report["multi_writer_hours"] == 0
+    assert report["gaps"] == []
 
 
 def test_gap_audit_detects_gap_and_records_period(gap_audit):

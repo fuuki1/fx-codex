@@ -31,6 +31,8 @@ import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import requests
 from tradingview_ta import Analysis
@@ -106,18 +108,24 @@ def _sleep(seconds: float) -> None:
         time.sleep(seconds)
 
 
-def _parse_retry_after(value: str | None) -> float | None:
-    """`Retry-After` ヘッダを秒に解釈する(デルタ秒のみ対応、負値/不正はNone)。
-
-    HTTP日付形式は運用簡素化のため未対応。数値で来なければバックオフに委ねる。
-    """
+def _parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
+    """`Retry-After`をdelta-secondsまたはHTTP-dateとしてUTC秒へ変換する。"""
 
     if not value:
         return None
     try:
         seconds = float(value.strip())
     except (TypeError, ValueError):
-        return None
+        try:
+            retry_at = parsedate_to_datetime(value.strip())
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        reference = now or datetime.now(UTC)
+        if reference.tzinfo is None:
+            raise ValueError("Retry-After reference time must be timezone-aware")
+        seconds = (retry_at.astimezone(UTC) - reference.astimezone(UTC)).total_seconds()
     if seconds < 0:
         return None
     return seconds

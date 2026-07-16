@@ -3,7 +3,7 @@
 核心の回帰: 旧実装は全取得失敗でも return 0 のため、launchd 上は成功に見え、
 429 が続いても監視が気づけなかった。ここでは:
 - 全時間足・全銘柄が一時障害 → 非zero(EXIT_TRANSIENT_FAILURE)
-- 部分成功(1点でも保存)→ 0
+- 部分成功は取得点を保存するが非zero(coverage incomplete)
 - technicals が ScannerError を「一時障害」として分類し空dataと区別する
 をネットワーク無しで検証する。
 """
@@ -96,8 +96,8 @@ def test_main_returns_transient_exit_code_on_total_failure() -> None:
     assert rc != 0
 
 
-def test_main_returns_zero_on_partial_success(tmp_path, monkeypatch) -> None:
-    """一部の足だけ取れても(部分成功)保存して 0 を返す。"""
+def test_main_returns_nonzero_on_partial_success(tmp_path, monkeypatch) -> None:
+    """一部の足だけ取れた場合は証拠を保存するが成功扱いにしない。"""
     exchange = technicals.DEFAULT_EXCHANGE
     out = tmp_path / "prices.jsonl"
     monkeypatch.setattr(fx_tf_snapshot, "DEFAULT_TF_PRICES_PATH", out)
@@ -110,9 +110,9 @@ def test_main_returns_zero_on_partial_success(tmp_path, monkeypatch) -> None:
     with mock.patch("fx_intel.technicals.get_multiple_analysis", side_effect=sometimes):
         rc = fx_tf_snapshot.main(["--symbols", "USDJPY"])
 
-    assert rc == 0
+    assert rc == fx_tf_snapshot.EXIT_TRANSIENT_FAILURE
     lines = out.read_text(encoding="utf-8").splitlines()
-    # 15m と 1h の2点が保存されている(部分成功維持)
+    # 15m と 1h の2点は欠損を隠さず保存する
     assert len(lines) == 2
 
 

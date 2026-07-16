@@ -54,7 +54,7 @@ tests/
 ## ニュース×経済指標×テクニカル統合ブリーフィング (fx_briefing.py)
 
 機関投資家のモーニングブリーフィングを模したDiscord通知です。
-`tv_discord_notify.py` の上位互換で、テクニカルに加えて以下を統合します。
+テクニカルに加えて以下を統合する、正規のDiscord分析通知です。
 
 - **経済指標カレンダー** (ForexFactory公開フィード): 今後48時間の重要イベント表示、
   イベント前後(前120分/後180分、research-maxプリセット準拠)の「様子見」判定
@@ -88,7 +88,7 @@ launchd のワンショットジョブだけを常駐させます。
 | ジョブ | 周期 | 正規の責務 |
 |---|---:|---|
 | `com.fx-codex.snapshot` | 5分 | `logs/briefing_tf_prices.jsonl` の唯一の定期writer |
-| `com.fx-codex.briefing` | 毎時:10 | 融合/時間足別の判断ジャーナル・学習プロファイル・定期通知 |
+| `com.fx-codex.briefing` | 5分境界 | 時間足別の判断ジャーナル・学習プロファイル・統合通知 |
 | `com.fx-codex.health` | 5分 | 鮮度監視と運用通知（収集ジョブから独立） |
 
 `--signal-board` と `fx_briefing_loop.sh` は**開発・一時確認専用**です。Mac miniの
@@ -126,7 +126,7 @@ calendar/macro等のsource cacheは取得処理により更新され、イベン
 
 開発用の`fx_briefing_loop.sh`は5分境界（00/05/10…分）ごとに、**上位3候補・
 エントリー適性・4層のデータ品質を1通へまとめたFXシグナルボード**を送ります。
-発注経路は存在しません。旧`tv_notify_loop.sh`は廃止済みです。障害通知はボードへ
+発注経路は存在しません。障害通知はボードへ
 集約せず、正規運用では独立した`com.fx-codex.health`から運用Webhookへ送ります。
 
 ### 時間足別モード (`--per-timeframe`)
@@ -650,21 +650,12 @@ python3 -m pytest
 
 テストではCSV読み込み、経済指標マスク、日次損失停止、ウォークフォワードの探索上限を確認しています。
 
-## 将来のライブ接続について（現在は未実装・保留）
+## 永続的なanalysis-only境界
 
-本システムは現在**分析→Discord通知に専念し、自動売買（発注）は行いません**。
-IBKRへ実発注していた `trader/` Docker スタックと、発注戦略の最適化・承認パイプライン
-（`auto_optimize.py` / `promote_params.py` / `params_gate.py` / `strategy_params.json`）は
-削除済みです。まだ発注は時期尚早と判断したためで、将来また組み込む場合はこの分析基盤の
-上に別コンポーネントとして構築します。
-
-参考までに、バックテスト用の `SimulatedExecution` をライブ接続へ拡張する場合は、
-`execution.py` と同じ責務で以下のような実装に差し替える設計になっています。
-
-- `MT5Execution`: 注文送信、約定確認、ポジション同期
-- `OandaExecution`: REST/streaming API、注文ID管理、約定価格取得
-
-戦略は `target_position` と `stop_distance` を返すだけなので、ライブ接続でもStrategy層はそのまま使えます。RiskManager層は口座残高、既存ポジション、当日損益をブローカー側の実データで同期する必要があります。実発注を組み込む際は、実注文前の多段リスクゲートと人間の明示承認を必須にします。
+本リポジトリは**分析・履歴研究・offline simulation・shadow判断・Discord通知専用**です。
+ブローカー注文、ポジション変更、口座リスク変更、paper/live broker executionは恒久的に
+対象外であり、旧`trader/`、executor、order client、自動パラメータ→注文配線を復元しません。
+ブローカー執行を研究する場合は、別リポジトリで独立した権限・レビュー・運用境界を設けます。
 
 ## 改善すべき点
 
