@@ -32,7 +32,7 @@
 22. tp_sl_learning — TP/SL先着正答率によるMVP確信度補正
 23. maximization — 期待R/PF/Brier/経路品質による最大化プロファイル
 
-通常の通知runtimeは tv_discord_notify.py と同じく fx_backtester 非依存で単体動作する。
+通常の通知runtimeは fx_backtester 非依存で単体動作する。
 例外は明示的に選択する研究用 cot_pit 境界で、共通PIT artifactを再利用するため
 fx_backtester.point_in_time / pit_dataset に依存する。gbm/ml/promotion は標準ライブラリ
 のみで動作し、ネイティブ拡張の重い依存を持ち込まない。

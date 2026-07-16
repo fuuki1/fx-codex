@@ -72,8 +72,8 @@ from .journal import (
 )
 from .market import WEEKEND_CLOSURE, open_hours_between
 
-# 学習サンプルの間引き幅。ブリーフィングの設計上の記録間隔(毎時)に合わせ、
-# それより高頻度の運用(Mac miniは5分間隔)でもガードの実効性を保つ
+# 学習サンプルの間引き幅。5分周期の高相関な判断を1時間単位へ間引き、
+# サンプル数の水増しを防ぐ。
 DERIVE_THIN_GAP_HOURS = 1.0
 
 # 重み再推定のガード

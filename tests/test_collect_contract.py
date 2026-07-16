@@ -183,7 +183,7 @@ class TestDuplicateOrderingStale:
         quarantined = (tmp_path / "log" / "quarantine.jsonl").read_text()
         assert FLAG_DUPLICATE in quarantined
 
-    def test_out_of_order_flagged_degraded(self, tmp_path: Path) -> None:
+    def test_out_of_order_quarantined_not_accepted(self, tmp_path: Path) -> None:
         store = ImmutableRawStore(tmp_path / "raw")
         log = QuoteLog(tmp_path / "log")
 
@@ -195,13 +195,18 @@ class TestDuplicateOrderingStale:
             ]
 
         result = ingest_payload(b"ooo-payload", parser=parser, store=store, log=log)
-        assert result.accepted_count == 2  # degraded is recorded, not hidden
+        assert result.accepted_count == 1
         rows = [
             json.loads(line)
             for line in (tmp_path / "log" / "quotes.jsonl").read_text().splitlines()
         ]
-        assert any(FLAG_OUT_OF_ORDER in row["quality_flags"] for row in rows)
-        assert any(row["quality_state"] == str(QualityState.DEGRADED) for row in rows)
+        assert all(FLAG_OUT_OF_ORDER not in row["quality_flags"] for row in rows)
+        quarantined = [
+            json.loads(line)
+            for line in (tmp_path / "log" / "quarantine.jsonl").read_text().splitlines()
+        ]
+        assert any(FLAG_OUT_OF_ORDER in row["quality_flags"] for row in quarantined)
+        assert any(row["quality_state"] == str(QualityState.QUARANTINED) for row in quarantined)
 
     def test_stale_live_quote_quarantined_never_tradable(self, tmp_path: Path) -> None:
         store = ImmutableRawStore(tmp_path / "raw")

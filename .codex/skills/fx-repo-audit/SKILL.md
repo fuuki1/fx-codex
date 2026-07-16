@@ -12,11 +12,11 @@ Establish the real repository and runtime state without changing it. Inputs are 
 ## Procedure
 
 1. Read `AGENTS.md`, `docs/OPERATIONS_RUNBOOK.md`, git status/branch/log, remotes, and open worktree changes. Treat every pre-existing change as user-owned.
-2. Inventory Python environments, CI, Docker/Compose, launchd, cron, `nohup`, loop scripts, PID/lock files, and process command lines.
+2. Inventory Python environments, CI, launchd, cron, `nohup`, loop scripts, PID/lock files, and process command lines. Treat any broker-execution container or process as a prohibited legacy finding, not an operating component.
 3. Map every writer to its output. Check duplicate schedules, advisory locks, stale-lock recovery, idempotency keys, and atomic writes.
 4. Measure journal rows, natural-key and slot duplicates, timestamp reversals, malformed rows, last update, OHLC/bid/ask coverage, and file permissions. Use `tools/journal_gap_audit.py` and `tools/data_freshness_monitor.py` when applicable.
-5. Confirm `.env` and `trader/.env` retain paper/live-off guards without printing secrets.
-6. Run read-only quality checks. Keep root and `trader/` results separate.
+5. Confirm secrets stay outside tracked files without printing them, and verify that no order endpoint, executor, position mutation, account-risk mutation, or automatic parameter-to-order wiring exists.
+6. Run read-only quality checks for the repository root.
 7. Record severity, evidence path/line/command result, current impact, safest remediation, and rollback. If a remote host is inspected, label MacBook and Mac mini evidence separately.
 
 ## Commands
@@ -36,7 +36,7 @@ crontab -l
 
 ## Pass and fail conditions
 
-Pass only when writer ownership is unique, locks and recovery are effective, required feeds are fresh, journals are monotonic/idempotent, quality checks pass, and paper/live-off state is proven. Missing access or evidence is `unknown`, not pass. Duplicate writers, stale critical data, unsafe permissions, process crash loops, live enablement, or untracked production code are failures.
+Pass only when writer ownership is unique, locks and recovery are effective, required feeds are fresh and complete, journals are monotonic/idempotent, quality checks pass, and prohibited broker-execution surfaces are absent. Missing access or evidence is `unknown`, not pass. Duplicate writers, stale or incomplete critical data, unsafe permissions, process crash loops, execution enablement, or untracked production code are failures.
 
 ## Output format
 

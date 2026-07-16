@@ -39,13 +39,13 @@ These values must be reviewed for horizon, serial dependence, capital mandate, t
 
 - Champion remains unchanged while challengers run research/shadow.
 - A challenger cannot consume champion outputs as labels or tune on champion failures without a registered new experiment.
-- Shadow predictions are logged but cannot influence orders. Paper influence requires governance promotion and a paper-safe config.
+- Shadow predictions are logged but cannot influence any broker action. Any `paper` stage name is evidence metadata only; broker paper execution is unavailable.
 - Compare both on aligned timestamps, costs and coverage; report disagreement and abstention.
 - Keep the prior champion artifact/config available for atomic rollback.
 
 ## Demotion and stop conditions
 
-Demote or abstain on negative rolling net R, calibration/log-loss breakdown, drawdown/tail breach, PSI/KS/prediction/concept drift, data-source or writer incident, spread/slippage error, broker disconnect, reconciliation mismatch, unexpected position, lockbox/provenance violation, regime concentration or operational instability.
+Demote or abstain on negative rolling net R, calibration/log-loss breakdown, drawdown/tail breach, PSI/KS/prediction/concept drift, data-source or writer incident, spread/slippage error, read-only source disconnect, coverage mismatch, lockbox/provenance violation, regime concentration or operational instability.
 
 Unmatured labels produce `human_review`, not a clean performance bill. Data drift can independently trigger warning, size reduction or abstention before labels mature. `drift.py` never enables automatic retraining/live promotion.
 

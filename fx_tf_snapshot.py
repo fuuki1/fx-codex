@@ -16,10 +16,9 @@ open/high/low/bid/ask/spread も保存する。fx_briefing の時間足別採点
 判断ロジック・学習・センチメント・カレンダーは一切動かさない(価格取得のみ)。
 
 終了コードの約束(launchd/監視が「見かけ上の成功」に騙されないため):
-    0  … 1点以上を保存できた(部分成功も成功扱い。1つでも取れれば前進)。
-    3  … 全時間足・全銘柄が一時障害(429/ネットワーク/HTTP/非JSON)で取れず、
-          1点も保存できなかった。launchdはこの非zeroで失敗を認識し、鮮度監視は
-          次に成功するまで critical を維持する。5分ループは次周期で再試行する。
+    0  … 要求した全銘柄・全時間足を保存できた。
+    3  … 1点でも欠けた。取得できた点は証拠として保存するが、launchdには非zeroで
+          不完全取得を伝え、鮮度監視は完全なcapture slotまで criticalを維持する。
     1  … 引数不正など(argparse)。
 一時障害でもプロセスはクラッシュせず 3 で戻るだけなので、ループは止まらない。
 
@@ -110,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     # snapshot. Timestamping before the network call would create false PIT history.
     now = datetime.now(UTC)
     rows = price_history.snapshot_entries(snapshots_by_interval, now=now)
+    expected_points = len(symbols) * len(technicals.DEFAULT_INTERVALS)
     if not rows:
         # 1点も取れなかった。一時障害(429/ネットワーク等)が原因なら非zeroで戻り、
         # launchd/監視に失敗を伝える(次周期で再試行、鮮度は成功まで critical)。
@@ -131,13 +131,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
-        return 0
+        return 0 if len(rows) == expected_points else EXIT_TRANSIENT_FAILURE
 
     append_snapshot(DEFAULT_TF_PRICES_PATH, rows)
     print(
         f"価格スナップショットを記録しました "
         f"({', '.join(symbols)} | {len(rows)}点 | {now.isoformat()})"
     )
+    if len(rows) != expected_points:
+        print(
+            f"[error] 価格スナップショットが不完全です "
+            f"({len(rows)}/{expected_points}点、exit {EXIT_TRANSIENT_FAILURE})",
+            file=sys.stderr,
+        )
+        return EXIT_TRANSIENT_FAILURE
     return 0
 
 
