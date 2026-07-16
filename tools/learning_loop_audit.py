@@ -243,16 +243,25 @@ def audit_data_collection(
         stamps.sort()
         buckets = {_bucket_5m(ts) for ts in stamps}
         coverage = min(1.0, len(buckets) / expected_slots) if expected_slots > 0 else 0.0
+        # 窓の途中で収集が始まったセル(新symbol追加・復旧直後)を全窓カバレッジで
+        # 責めないよう、初回行以降だけで測った実効カバレッジも持つ。
+        effective_hours = open_hours_between(stamps[0], now)
+        effective_slots = effective_hours * 60.0 / CAPTURE_INTERVAL_MINUTES
+        effective_coverage = (
+            min(1.0, len(buckets) / effective_slots) if effective_slots >= 1 else 1.0
+        )
         gap = 0.0
         for previous, current in zip(stamps, stamps[1:]):  # noqa: B905 (py3.9互換)
             gap = max(gap, open_hours_between(previous, current) * 60.0)
         worst_gap_minutes = max(worst_gap_minutes, gap)
-        min_coverage = min(min_coverage, coverage)
+        min_coverage = min(min_coverage, effective_coverage)
         last_ts_all = max(last_ts_all, stamps[-1]) if last_ts_all else stamps[-1]
         per_cell[f"{symbol}:{timeframe}"] = {
             "rows": len(stamps),
             "distinct_5m_slots": len(buckets),
-            "coverage_ratio": round(coverage, 4),
+            "window_coverage_ratio": round(coverage, 4),
+            "effective_coverage_ratio": round(effective_coverage, 4),
+            "first_ts": stamps[0].isoformat(),
             "max_open_market_gap_minutes": round(gap, 1),
             "last_ts": stamps[-1].isoformat(),
         }
@@ -280,7 +289,7 @@ def audit_data_collection(
             reasons.append(f"窓内に最大{worst_gap_minutes:.0f}分の収集ギャップ")
         if min_coverage < 0.5:
             status = _worst(status, FAIL if min_coverage < 0.25 else WARN)
-            reasons.append(f"5分スロットのカバレッジ最小{min_coverage:.0%}")
+            reasons.append(f"5分スロットの実効カバレッジ最小{min_coverage:.0%}")
         missing_symbols = symbols - {key.split(":", 1)[0] for key in per_cell}
         if missing_symbols:
             status = _worst(status, WARN)
@@ -294,7 +303,7 @@ def audit_data_collection(
             "window_open_hours": round(open_hours, 2),
             "expected_5m_slots_per_cell": round(expected_slots, 1),
             "cells": per_cell,
-            "min_coverage_ratio": round(min_coverage, 4),
+            "min_effective_coverage_ratio": round(min_coverage, 4),
             "worst_open_market_gap_minutes": round(worst_gap_minutes, 1),
             "last_price_age_open_minutes": (
                 round(last_age_minutes, 1) if last_age_minutes is not None else None
@@ -818,10 +827,17 @@ def audit_freshness(report: dict | None, now: datetime) -> dict:
     )
 
 
-def audit_scanner_429(err_log_hits: dict[str, int], tail_hits: dict[str, int]) -> dict:
+def audit_scanner_429(
+    err_log_hits: dict[str, int],
+    tail_hits: dict[str, int],
+    err_log_meta: dict[str, dict],
+    collection_currently_healthy: bool,
+) -> dict:
     """TradingViewスキャナーの429/JSONDecodeError/timeoutが制御下にあるか。
 
-    errログは行に時刻が無いため、全期間カウントと末尾200行カウントを分けて出す。
+    stderrログの行に時刻が無いため「末尾に痕跡がある」だけでは現在障害と断定
+    できない。現在の収集(価格鮮度)が健全なら、痕跡はデプロイ前の残存として
+    warnに落とし、収集も不健全なら再発中としてfailにする。
     """
     total_429 = err_log_hits.get("scanner_errors", 0)
     recent_429 = tail_hits.get("scanner_errors", 0)
@@ -829,11 +845,18 @@ def audit_scanner_429(err_log_hits: dict[str, int], tail_hits: dict[str, int]) -
     status = PASS
     reasons: list[str] = []
     if recent_429 > 5:
-        status = FAIL
-        reasons.append(f"末尾200行に429/decode失敗{recent_429}件(再発中)")
+        if collection_currently_healthy:
+            status = WARN
+            reasons.append(
+                f"末尾200行に429/decode痕跡{recent_429}件(時刻無し。現在の価格収集は"
+                "健全のため修正前の残存と推定。ログrotateで解消可)"
+            )
+        else:
+            status = FAIL
+            reasons.append(f"末尾200行に429/decode失敗{recent_429}件かつ収集が不健全(再発中)")
     elif recent_429 > 0:
         status = WARN
-        reasons.append(f"末尾200行に429/decode失敗{recent_429}件")
+        reasons.append(f"末尾200行に429/decode痕跡{recent_429}件")
     if recent_timeout > 5:
         status = _worst(status, WARN)
         reasons.append(f"末尾200行にtimeout {recent_timeout}件")
@@ -845,6 +868,8 @@ def audit_scanner_429(err_log_hits: dict[str, int], tail_hits: dict[str, int]) -
             "all_time_scanner_error_lines": total_429,
             "recent_scanner_error_lines_tail200": recent_429,
             "recent_timeout_lines_tail200": recent_timeout,
+            "collection_currently_healthy": collection_currently_healthy,
+            "per_file": err_log_meta,
         },
     )
 
@@ -988,25 +1013,50 @@ def collect_launchctl() -> dict[str, str]:
     return outputs
 
 
-def scan_error_logs(paths: list[Path]) -> tuple[dict[str, int], dict[str, int]]:
-    """errログ全体と末尾200行のパターン件数。(時刻情報が無いための近似)"""
+def scan_error_logs(paths: list[Path]) -> tuple[dict[str, int], dict[str, int], dict[str, dict]]:
+    """errログ全体と末尾200行のパターン件数、ファイル別の位置情報。
+
+    stderrログの行には時刻が無いため「末尾=最近」は近似でしかない。
+    last_match_line / total_lines を出し、最終一致がファイル末尾からどれだけ
+    離れているかで新旧を推定できるようにする。
+    """
     totals = {"scanner_errors": 0, "timeouts": 0, DUPLICATE_WRITER_PATTERN: 0}
     tails = {"scanner_errors": 0, "timeouts": 0, DUPLICATE_WRITER_PATTERN: 0}
+    per_file: dict[str, dict] = {}
     for path in paths:
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
-        for scope, subset in (("all", lines), ("tail", lines[-200:])):
-            bucket = totals if scope == "all" else tails
-            for line in subset:
-                if any(pattern in line for pattern in SCANNER_ERROR_PATTERNS):
-                    bucket["scanner_errors"] += 1
-                if any(pattern in line for pattern in TIMEOUT_PATTERNS):
-                    bucket["timeouts"] += 1
-                if DUPLICATE_WRITER_PATTERN in line:
-                    bucket[DUPLICATE_WRITER_PATTERN] += 1
-    return totals, tails
+        last_match_line: int | None = None
+        pattern_counts: Counter[str] = Counter()
+        for number, line in enumerate(lines, start=1):
+            matched = False
+            for pattern in SCANNER_ERROR_PATTERNS:
+                if pattern in line:
+                    pattern_counts[pattern] += 1
+                    matched = True
+            if matched:
+                totals["scanner_errors"] += 1
+                last_match_line = number
+            if any(pattern in line for pattern in TIMEOUT_PATTERNS):
+                totals["timeouts"] += 1
+            if DUPLICATE_WRITER_PATTERN in line:
+                totals[DUPLICATE_WRITER_PATTERN] += 1
+        for line in lines[-200:]:
+            if any(pattern in line for pattern in SCANNER_ERROR_PATTERNS):
+                tails["scanner_errors"] += 1
+            if any(pattern in line for pattern in TIMEOUT_PATTERNS):
+                tails["timeouts"] += 1
+            if DUPLICATE_WRITER_PATTERN in line:
+                tails[DUPLICATE_WRITER_PATTERN] += 1
+        if lines:
+            per_file[str(path)] = {
+                "total_lines": len(lines),
+                "scanner_pattern_counts": dict(pattern_counts),
+                "last_scanner_match_line": last_match_line,
+            }
+    return totals, tails, per_file
 
 
 def aggregate_overall(sections: dict[str, dict]) -> str:
@@ -1045,7 +1095,7 @@ def run_audit(
             log_dir / "fx_integrated_briefing.log",
             log_dir / "fx_fusion_capture.log",
         ]
-    err_totals, err_tails = scan_error_logs(err_log_paths)
+    err_totals, err_tails, err_meta = scan_error_logs(err_log_paths)
 
     symbols = {
         str(row.get("symbol", "")) for row in tf_journal.rows if isinstance(row.get("symbol"), str)
@@ -1071,9 +1121,19 @@ def run_audit(
         tf_journal, prices, err_totals, now, window_hours
     )
     sections["freshness"] = audit_freshness(read_json(log_dir / "freshness_report.json"), now)
+    collection_evidence = sections["data_collection"]["evidence"]
+    last_age = collection_evidence.get("last_price_age_open_minutes")
+    freshness_status = sections["freshness"]["status"]
+    collection_currently_healthy = (
+        isinstance(last_age, (int, float))
+        and last_age <= STALE_WARN_MINUTES
+        and freshness_status == PASS
+    )
     sections["scanner_429"] = audit_scanner_429(
         {"scanner_errors": err_totals["scanner_errors"]},
         {"scanner_errors": err_tails["scanner_errors"], "timeouts": err_tails["timeouts"]},
+        err_meta,
+        collection_currently_healthy,
     )
     sections["sample_sufficiency"] = audit_sample_sufficiency(maturation, fusion_journal, now)
     sections["blocking_reasons"] = audit_blocking_reasons(

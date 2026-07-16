@@ -171,8 +171,22 @@ def test_data_collection_pass_on_steady_capture(tmp_path) -> None:
     section = audit.audit_data_collection(prices, now, 6.0, {"USDJPY"})
     assert section["status"] == audit.PASS
     cell = section["evidence"]["cells"]["USDJPY:1h"]
-    assert cell["coverage_ratio"] > 0.95
+    assert cell["window_coverage_ratio"] > 0.95
+    assert cell["effective_coverage_ratio"] > 0.95
     assert cell["max_open_market_gap_minutes"] <= 5.1
+
+
+def test_data_collection_newly_started_cell_uses_effective_coverage(tmp_path) -> None:
+    """窓の途中で収集が始まった新セルを全窓カバレッジで failにしない。"""
+    now = TUESDAY_NOON
+    prices = audit.JsonlFile(path=tmp_path / "p.jsonl", exists=True)
+    # 72h窓のうち直近2hだけ収集(新symbol追加直後を模す)
+    prices.rows = _steady_prices(now - timedelta(hours=2), 2)
+    section = audit.audit_data_collection(prices, now, 72.0, {"USDJPY"})
+    assert section["status"] == audit.PASS, section["summary_ja"]
+    cell = section["evidence"]["cells"]["USDJPY:1h"]
+    assert cell["window_coverage_ratio"] < 0.1
+    assert cell["effective_coverage_ratio"] > 0.95
 
 
 def test_data_collection_fails_when_capture_stopped(tmp_path) -> None:
@@ -280,9 +294,17 @@ def test_decision_application_warns_when_learned_but_not_applied(tmp_path) -> No
 
 
 def test_scanner_429_thresholds() -> None:
-    assert audit.audit_scanner_429({}, {"scanner_errors": 0, "timeouts": 0})["status"] == audit.PASS
-    assert audit.audit_scanner_429({}, {"scanner_errors": 2, "timeouts": 0})["status"] == audit.WARN
-    assert audit.audit_scanner_429({}, {"scanner_errors": 9, "timeouts": 0})["status"] == audit.FAIL
+    clean = audit.audit_scanner_429({}, {"scanner_errors": 0, "timeouts": 0}, {}, True)
+    assert clean["status"] == audit.PASS
+    few = audit.audit_scanner_429({}, {"scanner_errors": 2, "timeouts": 0}, {}, True)
+    assert few["status"] == audit.WARN
+    # 痕跡が多くても現在の収集が健全なら残存扱いのwarn
+    stale_traces = audit.audit_scanner_429({}, {"scanner_errors": 151, "timeouts": 0}, {}, True)
+    assert stale_traces["status"] == audit.WARN
+    assert "残存" in stale_traces["summary_ja"]
+    # 収集も不健全なら再発中としてfail
+    recurring = audit.audit_scanner_429({}, {"scanner_errors": 151, "timeouts": 0}, {}, False)
+    assert recurring["status"] == audit.FAIL
 
 
 def test_freshness_mirror() -> None:
