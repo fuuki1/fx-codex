@@ -214,7 +214,7 @@ function renderReality(data) {
   const fusionLearningExists = Boolean(files[LEARNING_FILE]?.exists);
   const timeframeLearningExists = Boolean(files[TF_LEARNING_FILE]?.exists);
   const learningExists = fusionLearningExists || timeframeLearningExists;
-  const mlExists = Boolean(files[ML_FILE]?.exists);
+  const hasMlModel = Boolean(data.ml?.has_model);
   const journalTotal = Number(data.journal?.total || 0);
   const evaluated = Number(data.learning?.evaluated || 0);
   const pending = Number(data.evaluation?.pending || 0);
@@ -242,8 +242,32 @@ function renderReality(data) {
   if (!learningExists) {
     reasons.push("重み調整ファイルはまだ作られていません。");
   }
-  if (!mlExists) {
-    reasons.push("GBDTのMLモデルはまだ保存されていません。");
+  if (!hasMlModel) {
+    const training = data.ml?.training || {};
+    const modelReasons = Array.isArray(data.ml?.reasons) ? data.ml.reasons : [];
+    const eligible = Number(training.eligible_after_thinning || 0);
+    const minimumRequired = Number(training.minimum_required || 0);
+    const pendingMl = Number(training.pending || 0);
+    const pitIneligible = Number(training.pit_ineligible || 0);
+    if (modelReasons.length > 0) {
+      reasons.push(`GBDT学習未完了: ${modelReasons.join(" / ")}`);
+    } else if (minimumRequired > 0) {
+      reasons.push(
+        `GBDTの初期件数ゲートは、融合24時間判断を${training.thin_gap_hours || 4}時間` +
+          `間引きした採点済みデータが${eligible}/${minimumRequired}件です。`,
+      );
+      reasons.push(
+        "件数・クラス数・時系列分割を通過するとモデルを保存し、検証スコア不合格なら判断参加を無効のまま保持します。",
+      );
+      if (pitIneligible > 0) {
+        reasons.push(
+          `旧形式${pitIneligible}件は特徴量取得時刻を証明できないため、GBDT学習から除外しています。`,
+        );
+      }
+      if (pendingMl > 0) reasons.push(`融合判断の採点待ちは${pendingMl}件です。`);
+    } else {
+      reasons.push("GBDTのMLモデルはまだ保存されていません。");
+    }
   } else if (!data.ml.usable) {
     reasons.push("MLモデルはありますが、検証スコア不足などで判断参加は無効です。");
   }
@@ -347,7 +371,13 @@ function renderMetrics(data) {
   setText("hitRate", pct(data.learning.hit_rate));
   setText("hitCount", `${data.learning.hits || 0} / ${data.learning.evaluated || 0}`);
   setText("mlStatus", data.ml.has_model ? (data.ml.usable ? "有効" : "無効") : "未学習");
-  setText("mlRows", `学習${data.ml.n_train || 0} / 検証${data.ml.n_valid || 0}`);
+  const training = data.ml.training || {};
+  setText(
+    "mlRows",
+    data.ml.has_model
+      ? `学習${data.ml.n_train || 0} / 検証${data.ml.n_valid || 0}`
+      : `GBDT PIT適格 ${training.eligible_after_thinning || 0} / ${training.minimum_required || 150}`,
+  );
 }
 
 function renderWeights(data) {
@@ -505,11 +535,24 @@ function renderOps(data) {
   }
   processes.forEach((process) => {
     const running = Boolean(process.running);
+    const exitCode = process.last_exit_code;
+    let status = "未登録";
+    if (running && process.state === "running") {
+      status = `実行中${(process.pids || []).length ? ` pid=${process.pids.join(", ")}` : ""}`;
+    } else if (running && process.launchd_label) {
+      status = `登録済み・次周期待ち${exitCode === null || exitCode === undefined ? "" : ` / 前回終了 ${exitCode}`}`;
+    } else if (running) {
+      status = `稼働中${(process.pids || []).length ? ` pid=${process.pids.join(", ")}` : ""}`;
+    }
+    let tone = running ? "ok" : "fail";
+    if (running && exitCode !== null && exitCode !== undefined && exitCode !== 0) {
+      tone = process.key === "briefing_service" && exitCode === 5 ? "warn" : "fail";
+    }
     processList.appendChild(
       tradeItem(
         process.label_ja || process.key || "--",
-        running ? `稼働中 pid=${(process.pids || []).join(", ")}` : "停止中",
-        running ? "ok" : "warn",
+        status,
+        tone,
       ),
     );
   });
@@ -1387,7 +1430,15 @@ function renderMl(data) {
   const base = num(metrics.baseline_brier);
   setText("mlBrier", brier === null ? "--" : brier.toFixed(3));
   setText("mlBaseBrier", base === null ? "--" : base.toFixed(3));
-  setText("mlReasons", (data.ml.reasons || []).join(" / "));
+  const reasons = data.ml.reasons || [];
+  const training = data.ml.training || {};
+  const progress = data.ml.has_model
+    ? ""
+    : `融合24時間判断のPIT適格な初期件数ゲート: 4時間間引き後 ` +
+      `${training.eligible_after_thinning || 0} / ${training.minimum_required || 150}件` +
+      `（採点待ち ${training.pending || 0}件、旧形式除外 ${training.pit_ineligible || 0}件、` +
+      `通過後も追加検証あり）`;
+  setText("mlReasons", reasons.length ? reasons.join(" / ") : progress);
 
   const target = $("importanceBars");
   target.replaceChildren();

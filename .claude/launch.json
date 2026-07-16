@@ -4,8 +4,9 @@
     {
       "name": "ai-learning-dashboard",
       "runtimeExecutable": ".venv/bin/python",
-      "runtimeArgs": ["tools/ai_learning_dashboard/server.py", "--host", "127.0.0.1", "--port", "8788"],
-      "port": 8788
+      "runtimeArgs": ["tools/ai_learning_dashboard/server.py", "--host", "127.0.0.1", "--port", "8790"],
+      "port": 8790,
+      "autoPort": false
     }
   ]
 }
