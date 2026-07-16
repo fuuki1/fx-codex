@@ -29,8 +29,12 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Mac mini既定のpython3(3.9, Xcode CLT)でもSSH stream実行できるよう、
+# datetime.UTC(3.11+)ではなくtimezone.utcを使う。
+UTC = timezone.utc  # noqa: UP017
 
 SCHEMA_VERSION = 1
 
@@ -240,7 +244,7 @@ def audit_data_collection(
         buckets = {_bucket_5m(ts) for ts in stamps}
         coverage = min(1.0, len(buckets) / expected_slots) if expected_slots > 0 else 0.0
         gap = 0.0
-        for previous, current in zip(stamps, stamps[1:], strict=False):
+        for previous, current in zip(stamps, stamps[1:]):  # noqa: B905 (py3.9互換)
             gap = max(gap, open_hours_between(previous, current) * 60.0)
         worst_gap_minutes = max(worst_gap_minutes, gap)
         min_coverage = min(min_coverage, coverage)
@@ -333,7 +337,7 @@ def audit_prediction_capture(
     fusion_ts.sort()
     fusion_gaps = [
         (current - previous).total_seconds() / 60.0
-        for previous, current in zip(fusion_ts, fusion_ts[1:], strict=False)
+        for previous, current in zip(fusion_ts, fusion_ts[1:])  # noqa: B905 (py3.9互換)
         if (current - previous).total_seconds() > 60  # 同一実行の複数symbol行を除く
     ]
     median_fusion_gap = sorted(fusion_gaps)[len(fusion_gaps) // 2] if fusion_gaps else None
