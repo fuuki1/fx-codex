@@ -8,6 +8,8 @@
                    決定論的センチメント。Claude API非依存の既定経路)
 4.  sentiment   — センチメント統合(Claude API 任意 → analyst の序列)
 5.  technicals  — TradingViewマルチタイムフレームのテクニカル集約
+    tv_scanner  — 管理された TradingView スキャナーHTTPクライアント
+                  (ブラウザ互換UA・ステータス検証・429バックオフ・typed failure)
 6.  macro       — OHLC・米金利・DXY・VIX・CFTC COTの取得とリスクレジーム判定
 7.  cot_pit     — CFTC COTのraw保存・release/revision-aware PIT境界(研究専用)
 8.  gbm         — 依存ゼロの勾配ブースティング決定木(確率モデルの基盤)
@@ -60,4 +62,5 @@ __all__ = [
     "timeframe",
     "trade_outcome",
     "tp_sl_learning",
+    "tv_scanner",
 ]
