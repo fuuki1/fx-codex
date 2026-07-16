@@ -103,6 +103,93 @@ function legendItem(label, color) {
   return item;
 }
 
+// ===== 共有ツールチップ(全チャート共通のマウス追従オーバーレイ) =====
+// dataviz方針: 値を主、ラベルを従。系列キーは短い線。ラベルは textContent のみ。
+let _tooltipEl = null;
+
+function tooltipEl() {
+  if (_tooltipEl) return _tooltipEl;
+  const el = document.createElement("div");
+  el.className = "chart-tooltip";
+  el.setAttribute("role", "tooltip");
+  el.hidden = true;
+  document.body.appendChild(el);
+  _tooltipEl = el;
+  return el;
+}
+
+// rows: [{ label, value, color?, muted? }] / title は見出し
+function showTooltip(evt, title, rows) {
+  const el = tooltipEl();
+  el.replaceChildren();
+  if (title) {
+    const head = document.createElement("div");
+    head.className = "tt-title";
+    head.textContent = title;
+    el.appendChild(head);
+  }
+  for (const row of rows) {
+    const line = document.createElement("div");
+    line.className = `tt-row${row.muted ? " tt-muted" : ""}`;
+    if (row.color) {
+      const key = document.createElement("span");
+      key.className = "tt-key";
+      key.style.background = row.color;
+      line.appendChild(key);
+    }
+    if (row.label !== undefined && row.label !== "") {
+      const label = document.createElement("span");
+      label.className = "tt-label";
+      label.textContent = row.label;
+      line.appendChild(label);
+    }
+    const value = document.createElement("span");
+    value.className = "tt-value";
+    value.textContent = row.value;
+    line.appendChild(value);
+    el.appendChild(line);
+  }
+  el.hidden = false;
+  moveTooltip(evt);
+}
+
+function moveTooltip(evt) {
+  const el = _tooltipEl;
+  if (!el || el.hidden) return;
+  const pad = 14;
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  let x = evt.clientX + pad;
+  let y = evt.clientY + pad;
+  if (x + w + 8 > window.innerWidth) x = evt.clientX - w - pad;
+  if (y + h + 8 > window.innerHeight) y = evt.clientY - h - pad;
+  el.style.left = `${Math.max(4, x)}px`;
+  el.style.top = `${Math.max(4, y)}px`;
+}
+
+function hideTooltip() {
+  if (_tooltipEl) _tooltipEl.hidden = true;
+}
+
+// マーク(バー/セル/点)にホバー+フォーカスでツールチップを付ける。
+// getContent() は { title, rows } を返す。tabindex を付けてキーボードでも出す。
+function attachTooltip(node, getContent) {
+  const enter = (evt) => {
+    const { title, rows } = getContent();
+    showTooltip(evt, title, rows);
+  };
+  node.addEventListener("pointerenter", enter);
+  node.addEventListener("pointermove", moveTooltip);
+  node.addEventListener("pointerleave", hideTooltip);
+  node.addEventListener("focus", (evt) => {
+    const rect = node.getBoundingClientRect();
+    const fake = { clientX: rect.left + rect.width / 2, clientY: rect.top };
+    const { title, rows } = getContent();
+    showTooltip(fake, title, rows);
+  });
+  node.addEventListener("blur", hideTooltip);
+}
+
 function setReality({ badge, title, body, tone, reasons }) {
   const panel = $("realityPanel");
   panel.className = `reality-panel ${tone}`;
@@ -776,38 +863,49 @@ function renderLearnedMatrix(data) {
     }
     tr.appendChild(rh);
 
+    const tfLabel = TF_LABEL[row.tf] || row.tf;
     const bySym = new Map(row.symbols.map((s) => [s.symbol, s]));
     symbolOrder.forEach((sym) => {
       const s = bySym.get(sym);
-      tr.appendChild(matrixCell(s));
+      tr.appendChild(matrixCell(s, { tf: tfLabel, symbol: sym }));
     });
 
     // 時間足合計セル
     const rate = row.evaluated ? row.hits / row.evaluated : null;
-    tr.appendChild(matrixCell({ hit_rate: rate, hits: row.hits, evaluated: row.evaluated }, true));
+    tr.appendChild(
+      matrixCell(
+        { hit_rate: rate, hits: row.hits, evaluated: row.evaluated },
+        { tf: tfLabel, symbol: "全ペア", isTotal: true },
+      ),
+    );
 
     host.appendChild(tr);
   });
 }
 
-function matrixCell(stat, isTotal = false) {
+function matrixCell(stat, ctx = {}) {
   const cell = document.createElement("div");
   const evaluated = stat ? Number(stat.evaluated || 0) : 0;
   if (!stat || evaluated === 0) {
     cell.className = "matrix-cell empty";
+    cell.tabIndex = 0;
     const rate = document.createElement("span");
     rate.className = "cell-rate";
     rate.textContent = "—";
     cell.appendChild(rate);
+    attachTooltip(cell, () => ({
+      title: `${ctx.tf || ""} × ${ctx.symbol || ""}`,
+      rows: [{ label: "採点", value: "まだなし", muted: true }],
+    }));
     return cell;
   }
   const rate = evaluated ? Number(stat.hits || 0) / evaluated : null;
   const color = hitColor(rate);
   cell.className = `matrix-cell filled${evaluated < 3 ? " dim" : ""}`;
+  cell.tabIndex = 0;
   cell.style.background = color;
   cell.style.color = inkOn(color);
   cell.style.borderLeftColor = rate >= 0.5 ? "rgba(9,42,28,0.55)" : "rgba(60,12,12,0.55)";
-  cell.title = `${pct(rate)} 的中 (${stat.hits}/${evaluated})${isTotal ? "" : evaluated < 3 ? " · サンプル少" : ""}`;
   const rateEl = document.createElement("span");
   rateEl.className = "cell-rate";
   rateEl.textContent = pct(rate);
@@ -815,6 +913,16 @@ function matrixCell(stat, isTotal = false) {
   nEl.className = "cell-n";
   nEl.textContent = `${stat.hits}/${evaluated}`;
   cell.append(rateEl, nEl);
+  attachTooltip(cell, () => ({
+    title: `${ctx.tf || ""} × ${ctx.symbol || ""}`,
+    rows: [
+      { label: "的中率", value: pct(rate), color },
+      { label: "的中 / 採点", value: `${stat.hits} / ${evaluated}`, muted: true },
+      ...(!ctx.isTotal && evaluated < 3
+        ? [{ label: "サンプル少", value: "参考値", muted: true }]
+        : []),
+    ],
+  }));
   return cell;
 }
 
@@ -946,19 +1054,42 @@ function renderActivity(data) {
       if (v <= 0) return;
       const h = (v / yMax) * plotH;
       yTop -= h;
-      const rect = svg("rect", {
-        x,
-        y: yTop,
-        width: barW,
-        height: Math.max(0, h - 1.5), // 1.5px surface gap between stacked segments
-        fill: d.color,
-        rx: 1.5,
-      });
-      const title = svg("title");
-      title.textContent = `${shortDate(b.ts)} — ${d.label} ${v}件`;
-      rect.appendChild(title);
-      el.appendChild(rect);
+      el.appendChild(
+        svg("rect", {
+          x,
+          y: yTop,
+          width: barW,
+          height: Math.max(0, h - 1.5), // 1.5px surface gap between stacked segments
+          fill: d.color,
+          rx: 1.5,
+        }),
+      );
     });
+    // 列全体を覆う透明ヒット領域(バーの隙間もカバー)。ホバーで内訳ツールチップ。
+    if (total > 0) {
+      const hit = svg("rect", {
+        x: pad.left + slot * i,
+        y: pad.top,
+        width: slot,
+        height: plotH,
+        fill: "transparent",
+        tabindex: 0,
+        role: "img",
+        class: "activity-hit",
+      });
+      attachTooltip(hit, () => ({
+        title: shortDate(b.ts),
+        rows: [
+          ...DIRECTIONS.filter((d) => Number(b[d.key] || 0) > 0).map((d) => ({
+            label: d.label,
+            value: `${b[d.key]}件`,
+            color: d.color,
+          })),
+          { label: "合計", value: `${total}件`, muted: true },
+        ],
+      }));
+      el.appendChild(hit);
+    }
     // hour tick every 6h
     const hour = new Date(b.ts).getHours();
     if (Number.isFinite(hour) && hour % 6 === 0 && total >= 0 && (i === 0 || i === n - 1 || i % 6 === 0)) {
@@ -1075,11 +1206,37 @@ function renderCalibration(data) {
   pts.forEach((p) => {
     const r = 5 + 5 * Math.sqrt(p.b.evaluated / maxN);
     el.appendChild(svg("circle", { cx: p.x, cy: p.y, r: r + 2, fill: "var(--viz-surface)" })); // surface ring
-    const dot = svg("circle", { cx: p.x, cy: p.y, r, fill: hitColor(p.b.rate) });
-    const title = svg("title");
-    title.textContent = `確信度${p.b.low}-${p.b.high} → 的中${pct(p.b.rate)} (${p.b.hits}/${p.b.evaluated})`;
-    dot.appendChild(title);
+    const dot = svg("circle", { cx: p.x, cy: p.y, r, fill: hitColor(p.b.rate), class: "calib-dot" });
     el.appendChild(dot);
+    // ≥24px の透明ヒット領域(点は小さいので当てやすくする)+リッチツールチップ
+    const mid = (p.b.low + p.b.high) / 2;
+    const gap = p.b.rate - mid / 100; // 予測との差(較正誤差)
+    const hit = svg("circle", {
+      cx: p.x,
+      cy: p.y,
+      r: Math.max(14, r + 4),
+      fill: "transparent",
+      tabindex: 0,
+      role: "img",
+      class: "calib-hit",
+    });
+    hit.addEventListener("pointerenter", () => dot.classList.add("is-active"));
+    hit.addEventListener("pointerleave", () => dot.classList.remove("is-active"));
+    hit.addEventListener("focus", () => dot.classList.add("is-active"));
+    hit.addEventListener("blur", () => dot.classList.remove("is-active"));
+    attachTooltip(hit, () => ({
+      title: `確信度 ${p.b.low}–${p.b.high}`,
+      rows: [
+        { label: "実際の的中率", value: pct(p.b.rate), color: hitColor(p.b.rate) },
+        { label: "的中 / 採点", value: `${p.b.hits} / ${p.b.evaluated}`, muted: true },
+        {
+          label: gap >= 0 ? "予測より上振れ" : "予測より下振れ",
+          value: `${gap >= 0 ? "+" : ""}${Math.round(gap * 100)}pt`,
+          muted: true,
+        },
+      ],
+    }));
+    el.appendChild(hit);
   });
 
   // axis titles
@@ -1154,16 +1311,17 @@ function renderConditionChart(data) {
     title.textContent = COND_LABEL[group.feature] || group.feature;
     wrap.appendChild(title);
     group.rows.slice(0, 5).forEach((c) => {
-      wrap.appendChild(conditionRow(c));
+      wrap.appendChild(conditionRow(c, COND_LABEL[group.feature] || group.feature));
     });
     host.appendChild(wrap);
   });
 }
 
-function conditionRow(c) {
+function conditionRow(c, featureLabel) {
   const rate = Number(c.evaluated || 0) ? Number(c.hits || 0) / Number(c.evaluated || 0) : null;
   const row = document.createElement("div");
   row.className = "cond-row";
+  row.tabIndex = 0;
 
   const label = document.createElement("div");
   label.className = "cond-label";
@@ -1198,6 +1356,26 @@ function conditionRow(c) {
   out.textContent = `${pct(rate)} (${c.hits}/${c.evaluated})`;
 
   row.append(label, track, out);
+
+  // ホバー/フォーカスで詳細ツールチップ(50%基準からの優劣も明示)
+  const diff = rate === null ? null : rate - 0.5;
+  attachTooltip(row, () => ({
+    title: `${featureLabel || ""}: ${c.bucket}`,
+    rows: [
+      { label: "方向", value: dirLabel, muted: true },
+      { label: "的中率", value: pct(rate), color: rate === null ? undefined : hitColor(rate) },
+      { label: "的中 / 採点", value: `${c.hits} / ${c.evaluated}`, muted: true },
+      ...(diff === null
+        ? []
+        : [
+            {
+              label: diff >= 0 ? "五分以上に強い" : "五分より弱い",
+              value: `${diff >= 0 ? "+" : ""}${Math.round(diff * 100)}pt`,
+              muted: true,
+            },
+          ]),
+    ],
+  }));
   return row;
 }
 
