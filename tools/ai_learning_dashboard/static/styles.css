@@ -1034,3 +1034,69 @@ th {
     text-align: left;
   }
 }
+
+/* 直近の答え合わせ(予想の的中/外れ)一覧 */
+.outcome-list {
+  display: grid;
+  gap: 8px;
+}
+
+.outcome-row {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) 1fr minmax(60px, auto) minmax(90px, auto);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-left: 3px solid var(--muted);
+}
+
+.outcome-row.hit {
+  border-left-color: var(--green);
+}
+
+.outcome-row.miss {
+  border-left-color: var(--red);
+}
+
+.outcome-badge {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.outcome-row.hit .outcome-badge {
+  color: var(--green);
+}
+
+.outcome-row.miss .outcome-badge {
+  color: var(--red);
+}
+
+.outcome-main {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outcome-move {
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.outcome-ts {
+  text-align: right;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .outcome-row {
+    grid-template-columns: minmax(80px, auto) 1fr;
+  }
+  .outcome-move,
+  .outcome-ts {
+    display: none;
+  }
+}

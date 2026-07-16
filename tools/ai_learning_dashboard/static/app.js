@@ -523,6 +523,49 @@ function renderTimeframeBars(data) {
   });
 }
 
+const OUTCOME_STYLE = {
+  hit: { badge: "✅ 的中", className: "hit" },
+  miss: { badge: "❌ 外れ", className: "miss" },
+  flat: { badge: "⚪ 小動き", className: "flat" },
+};
+const DIRECTION_LABEL = { long: "上昇予想", short: "下落予想" };
+
+function renderRecentOutcomes(data) {
+  const target = $("recentOutcomes");
+  if (!target) return;
+  target.replaceChildren();
+  const outcomes = data.evaluation?.recent_outcomes || [];
+  if (!outcomes.length) {
+    target.appendChild(
+      empty("満期を迎えた方向判断がまだありません(主ホライズン経過後にここへ並びます)"),
+    );
+    return;
+  }
+  // サーバは古い順で最新20件を返すため、新しい順に並べ替えて表示する
+  [...outcomes].reverse().forEach((row) => {
+    const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
+    const item = document.createElement("div");
+    item.className = `outcome-row ${style.className}`;
+    const badge = document.createElement("span");
+    badge.className = "outcome-badge";
+    badge.textContent = style.badge;
+    const main = document.createElement("span");
+    main.className = "outcome-main";
+    const tfLabel = TIMEFRAME_LABEL[row.timeframe] || row.timeframe || "";
+    const horizon = TIMEFRAME_HORIZON[row.timeframe] || "";
+    main.textContent = `${row.symbol || "?"} ${tfLabel} ${DIRECTION_LABEL[row.direction] || row.direction || ""}${horizon ? `(${horizon}を採点)` : ""}`;
+    const move = document.createElement("span");
+    move.className = "outcome-move";
+    const moveValue = num(row.move);
+    move.textContent = moveValue === null ? "" : `${moveValue > 0 ? "+" : ""}${moveValue}`;
+    const ts = document.createElement("span");
+    ts.className = "outcome-ts subtle";
+    ts.textContent = shortDate(row.ts);
+    item.append(badge, main, move, ts);
+    target.appendChild(item);
+  });
+}
+
 function renderOps(data) {
   const ops = data.ops || {};
   setText("opsHealth", ops.status || "unknown");
@@ -1533,6 +1576,7 @@ function render(data) {
   renderStages(data);
   renderSymbolBars(data);
   renderTimeframeBars(data);
+  renderRecentOutcomes(data);
   renderActivity(data);
   renderConditionChart(data);
   renderOps(data);
