@@ -8,19 +8,18 @@ briefing の複合スコアの入力にする。
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from collections.abc import Sequence
 
-from tradingview_ta import get_multiple_analysis
+from fx_intel.tv_scanner import ScannerError, get_multiple_analysis
 
 DEFAULT_EXCHANGE = "OANDA"
 DEFAULT_SCREENER = "forex"
 DEFAULT_INTERVALS = ("15m", "1h", "4h", "1d")
 
-# スキャナーAPIは一時的に失敗することがあるため時間足ごとに再試行する
-FETCH_ATTEMPTS = 2
-FETCH_RETRY_WAIT_SECONDS = 1.0
+# 一時的な取得失敗(429/ネットワーク/サーバエラー)の再試行・バックオフは
+# 管理版スキャナークライアント(fx_intel.tv_scanner)が担当する。ここでは
+# ScannerError を「一時障害」として分類し、恒久的な空dataと区別するだけ。
 
 # tradingview_ta の既定91指標にATRは含まれないため、明示的に追加リクエストする。
 # ATRが無いとSL/TP計算・学習の小動き除外・ATR換算期待値がすべて機能しない
@@ -83,6 +82,9 @@ class PairTechnicals:
     views: dict[str, IntervalView] = field(default_factory=dict)
     fast_window: int = 20
     slow_window: int = 100
+    # 一時的な取得失敗(ネットワーク/429/HTTP/非JSON)が起きた時間足。
+    # 恒久的な「データなし」(空dataでの None)とは区別し、全滅時の終了コード判定に使う。
+    transient_failures: list[str] = field(default_factory=list)
 
     def alignment_score(self) -> float:
         """時間足の重み付きレーティング平均(-1.0〜+1.0)。"""
@@ -238,25 +240,19 @@ def fetch_pair_technicals(
     warnings: list[str] = []
 
     for interval in intervals:
-        analysis = None
-        last_error: Exception | None = None
-        for attempt in range(FETCH_ATTEMPTS):
-            try:
-                analysis = get_multiple_analysis(
-                    screener=screener,
-                    interval=interval,
-                    symbols=qualified,
-                    additional_indicators=list(ADDITIONAL_INDICATORS),
-                )
-                break
-            except Exception as error:  # noqa: BLE001 - 外部API起因
-                last_error = error
-                if attempt + 1 < FETCH_ATTEMPTS:
-                    time.sleep(FETCH_RETRY_WAIT_SECONDS)
-        if analysis is None:
-            warnings.append(
-                f"TradingView {interval} 取得失敗(再試行{FETCH_ATTEMPTS}回): {last_error}"
+        try:
+            analysis = get_multiple_analysis(
+                screener=screener,
+                interval=interval,
+                symbols=qualified,
+                additional_indicators=list(ADDITIONAL_INDICATORS),
             )
+        except ScannerError as error:
+            # 一時障害(429/ネットワーク/HTTP/非JSON)。クライアントが上限付きで
+            # 再試行し尽くしたうえでの失敗。全銘柄をこの足で「一時失敗」に記録する。
+            warnings.append(f"TradingView {interval} 取得失敗(一時障害): {error}")
+            for symbol in cleaned:
+                result[symbol].transient_failures.append(interval)
             continue
         for symbol in cleaned:
             entry = analysis.get(f"{exchange}:{symbol}")
