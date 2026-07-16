@@ -853,6 +853,7 @@ def update_improvement_registry(
     *,
     now: datetime | None = None,
     managed_action_types: set[str] | None = None,
+    data_contract: str | None = None,
 ) -> dict:
     generated_at = _utc(now or datetime.now(UTC)).isoformat()
     previous_records = _registry_records(previous)
@@ -878,6 +879,8 @@ def update_improvement_registry(
             "seen_count": seen_count,
             "ready_seen_threshold": READY_SEEN_BY_PRIORITY.get(candidate.priority, 3),
         }
+        if data_contract:
+            record["data_contract"] = data_contract
         for key in (
             "approved_at",
             "approved_by",
@@ -935,7 +938,10 @@ def update_improvement_registry(
             from_stage=str(prior.get("stage", "")),
             to_stage="resolved",
         )
-    return _registry_payload(records, generated_at, _bounded_registry_events(events))
+    payload = _registry_payload(records, generated_at, _bounded_registry_events(events))
+    if data_contract:
+        payload["data_contract"] = data_contract
+    return payload
 
 
 def load_improvement_registry(path: str | Path) -> dict:
@@ -2413,7 +2419,7 @@ def _registry_payload(
     generated_at: str,
     events: Sequence[Mapping[str, object]] | None = None,
 ) -> dict:
-    return {
+    payload = {
         "schema": IMPROVEMENT_REGISTRY_SCHEMA,
         "generated_at": generated_at,
         "active_count": sum(1 for record in records.values() if record.get("status") == "active"),
@@ -2435,6 +2441,14 @@ def _registry_payload(
         "events": [dict(event) for event in events] if events is not None else [],
         "candidates": {str(key): dict(value) for key, value in records.items()},
     }
+    contracts = {
+        str(record.get("data_contract"))
+        for record in records.values()
+        if record.get("data_contract")
+    }
+    if len(contracts) == 1:
+        payload["data_contract"] = contracts.pop()
+    return payload
 
 
 def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20) -> list[dict]:

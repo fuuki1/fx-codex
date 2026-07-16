@@ -6,14 +6,14 @@
 ## 起動
 
 ```bash
-cd ~/trader/fx-codex
-python3 tools/ai_learning_dashboard/server.py --host 127.0.0.1 --port 8765
+cd /Users/fuuki/srv/fx-codex
+.venv/bin/python tools/ai_learning_dashboard/server.py --host 127.0.0.1 --port 8765
 ```
 
 別のログディレクトリを見る場合:
 
 ```bash
-python3 tools/ai_learning_dashboard/server.py --log-dir /path/to/fx-codex/logs
+.venv/bin/python tools/ai_learning_dashboard/server.py --log-dir /path/to/fx-codex/logs
 ```
 
 ブラウザで開く:
@@ -30,20 +30,23 @@ python3 tools/trade_outcome_monitor.py
 python3 tools/decision_expectancy_monitor.py
 ```
 
-学習ログをDiscord送信なしで作り始める場合:
+正規launchdが動いていない隔離済み開発環境で、学習ログをDiscord送信なしで作り始める場合:
 
 ```bash
-python3 tools/learning_capture.py
+.venv/bin/python tools/learning_capture.py
 ```
+
+Mac miniの正規運用中は上記を手動実行しません。`com.fx-codex.briefing`とwriter競合するため、
+復旧は`docs/FX_AI_OPERATIONS.md`とOperations runbookに従います。
 
 `fx_briefing.py --dry-run` は表示確認用で、判断ログ・学習ファイルを保存しません。
 保存だけ行いDiscordに送らない場合は `fx_briefing.py --no-discord` を使います。
 
-上部の運用状態パネルは、`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh` の稼働有無、
-判断ログ、時間足別価格スナップショット、学習プロファイル、各実行ログの更新時刻を
-読み取り専用で確認します。Discord送信ループは自動起動しません。
+上部の運用状態パネルは、正規launchd 3サービス（snapshot / briefing / health）の登録状態と
+前回終了コード、判断ログ、時間足別価格スナップショット、学習プロファイル、各journalの更新時刻を
+読み取り専用で確認します。ワンショットサービスは周期の間に子プロセスがいなくても正常です。
 
-ループ確認と復旧手順は `docs/FX_AI_OPERATIONS.md` にまとめています。
+サービス確認と復旧手順は `docs/FX_AI_OPERATIONS.md` にまとめています。
 
 ## 読み取るファイル
 

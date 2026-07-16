@@ -125,6 +125,8 @@ DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
+JOURNAL_WRITE_FAILURE_EXIT_CODE = 4
+NOTIFICATION_FAILURE_EXIT_CODE = 5
 DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
@@ -263,7 +265,11 @@ def score_trade_outcomes_cli(
     monitor_json_path: Path | None = None,
 ) -> int:
     """判断ジャーナルをMFE/MAE/TP/SLで採点し、期待値監査レポートを出す。"""
-    entries = list(journal.read_entries(journal_path))
+    entries = [
+        entry
+        for entry in journal.read_entries(journal_path)
+        if journal.is_pit_eligible_entry(entry)
+    ]
     outcomes = trade_outcome.evaluate_trade_outcomes(entries)
     summary = trade_outcome.summarize_expectancy(outcomes)
     findings = trade_outcome.expectancy_findings(summary)
@@ -272,11 +278,12 @@ def score_trade_outcomes_cli(
     paused_policies: list[dict] = []
 
     if improvement_registry_path is not None:
-        previous = trade_outcome.load_improvement_registry(improvement_registry_path)
+        previous = load_pit_improvement_registry(improvement_registry_path)
         registry = trade_outcome.update_improvement_registry(
             previous,
             candidates,
             managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
+            data_contract=journal.FUSION_PIT_DATA_CONTRACT,
         )
         registry, paused_policies = trade_outcome.auto_pause_underperforming_approved_policies(
             registry,
@@ -342,7 +349,11 @@ def check_trade_outcome_health_cli(
     require_sample_ok: bool = False,
 ) -> int:
     """期待値監査のCI/cron向けヘルスチェック。"""
-    entries = list(journal.read_entries(journal_path))
+    entries = [
+        entry
+        for entry in journal.read_entries(journal_path)
+        if journal.is_pit_eligible_entry(entry)
+    ]
     outcomes = trade_outcome.evaluate_trade_outcomes(entries)
     summary = trade_outcome.summarize_expectancy(outcomes)
     report = trade_outcome.check_expectancy_health(
@@ -361,7 +372,7 @@ def approve_trade_candidate_cli(
     actor: str = "manual",
     note: str = "",
 ) -> int:
-    registry = trade_outcome.load_improvement_registry(registry_path)
+    registry = load_pit_improvement_registry(registry_path)
     updated, result = trade_outcome.set_improvement_candidate_approval(
         registry,
         candidate_id,
@@ -387,7 +398,11 @@ def retest_trade_variants_cli(
     target2_r_candidates: list[float] | None = None,
 ) -> int:
     """TP1/TP2候補を過去ジャーナルでpaper再採点する。"""
-    entries = list(journal.read_entries(journal_path))
+    entries = [
+        entry
+        for entry in journal.read_entries(journal_path)
+        if journal.is_pit_eligible_entry(entry)
+    ]
     report = trade_outcome.retest_tp_sl_variants(
         entries,
         target1_r_candidates=target1_r_candidates or trade_outcome.DEFAULT_TP1_R_CANDIDATES,
@@ -399,11 +414,12 @@ def retest_trade_variants_cli(
     overall = baseline.get("overall") if isinstance(baseline, dict) else None
     evaluated = int(overall.get("evaluated", 0)) if isinstance(overall, dict) else 0
     if improvement_registry_path is not None and evaluated > 0:
-        previous = trade_outcome.load_improvement_registry(improvement_registry_path)
+        previous = load_pit_improvement_registry(improvement_registry_path)
         registry = trade_outcome.update_improvement_registry(
             previous,
             candidates,
             managed_action_types=trade_outcome.VARIANT_CANDIDATE_ACTION_TYPES,
+            data_contract=journal.FUSION_PIT_DATA_CONTRACT,
         )
         trade_outcome.save_improvement_registry(registry, improvement_registry_path)
 
@@ -463,6 +479,8 @@ def compose_trade_expectancy_adjusters(
 def make_approved_tp_sl_adjuster(
     registry: Mapping[str, object],
 ) -> briefing.TargetRAdjuster | None:
+    if registry.get("data_contract") != journal.FUSION_PIT_DATA_CONTRACT:
+        return None
     if not trade_outcome.approved_target_policies(registry):
         return None
 
@@ -487,6 +505,14 @@ def make_approved_tp_sl_adjuster(
         return policy.target1_r, policy.target2_r, reason, policy.to_dict()
 
     return adjust
+
+
+def load_pit_improvement_registry(path: str | Path) -> dict:
+    """Load only a registry whose candidates were derived from PIT-eligible fusion rows."""
+    registry = trade_outcome.load_improvement_registry(path)
+    if registry.get("data_contract") != journal.FUSION_PIT_DATA_CONTRACT:
+        return {}
+    return registry
 
 
 def make_timeframe_trade_expectancy_lookup(
@@ -768,7 +794,8 @@ def _run_per_timeframe(
         try:
             journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
         except OSError as error:
-            fetch_warnings.append(f"時間足別ジャーナル書き込み失敗: {error}")
+            print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
+            return JOURNAL_WRITE_FAILURE_EXIT_CODE
         try:
             prior_decision_events = list(
                 decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
@@ -858,9 +885,13 @@ def _run_per_timeframe(
             "DISCORD_WEBHOOK_URL が未設定です。環境変数か .env に設定してください。",
             file=sys.stderr,
         )
-        return 1
+        return NOTIFICATION_FAILURE_EXIT_CODE
 
-    post_to_discord(webhook_url, payload)
+    try:
+        post_to_discord(webhook_url, payload)
+    except discord_delivery.DiscordDeliveryError as error:
+        print(str(error), file=sys.stderr)
+        return NOTIFICATION_FAILURE_EXIT_CODE
     print(
         f"時間足別ブリーフィングを送信しました ({', '.join(symbols)} | "
         f"ニュース{len(items)}件 | イベント{len(events_48h)}件 | {analysis.engine})"
@@ -1156,7 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
     fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
     now = datetime.now(UTC)
     trade_improvement_registry = (
-        trade_outcome.load_improvement_registry(args.trade_improvement_registry)
+        load_pit_improvement_registry(args.trade_improvement_registry)
         if not args.no_trade_expectancy
         else {}
     )
@@ -1266,12 +1297,15 @@ def main(argv: list[str] | None = None) -> int:
     learning_note = ""
     calls: list[learning.EvaluatedCall] = []
     journal_entries = list(journal.read_entries(DEFAULT_JOURNAL_PATH))
+    pit_journal_entries = [
+        entry for entry in journal_entries if journal.is_pit_eligible_entry(entry)
+    ]
     if not args.no_learning:
-        calls = learning.evaluate_history(journal_entries)
+        calls = learning.evaluate_history(journal_entries, require_pit=True)
         profile = learning.derive_profile(calls, now=now)
         learning_note = profile.summary_ja()
         # ホライズン別(4h/24h/72h)の的中率観測。学習は24hのみを使う
-        horizon_line = learning.horizon_report_ja(journal_entries)
+        horizon_line = learning.horizon_report_ja(journal_entries, require_pit=True)
         if horizon_line:
             learning_note = (learning_note + "\n" + horizon_line).strip()
         if not args.dry_run:
@@ -1302,7 +1336,7 @@ def main(argv: list[str] | None = None) -> int:
                 fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
 
     if not args.no_trade_expectancy:
-        trade_outcomes = trade_outcome.evaluate_trade_outcomes(journal_entries)
+        trade_outcomes = trade_outcome.evaluate_trade_outcomes(pit_journal_entries)
         trade_expectancy_summary = trade_outcome.summarize_expectancy(trade_outcomes)
         trade_expectancy_note = trade_outcome.format_expectancy_report_ja(
             trade_expectancy_summary, limit=3
@@ -1321,6 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
                     candidates,
                     now=now,
                     managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
+                    data_contract=journal.FUSION_PIT_DATA_CONTRACT,
                 )
                 registry, paused_policies = (
                     trade_outcome.auto_pause_underperforming_approved_policies(
@@ -1355,7 +1390,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.train_ml:
             ml_artifact = ml.load_artifact(DEFAULT_ML_MODEL_PATH)
         if args.train_ml or ml_needs_retrain(ml_artifact, now):
-            train_calls = calls or learning.evaluate_history(journal_entries)
+            train_calls = calls or learning.evaluate_history(journal_entries, require_pit=True)
             ml_artifact = ml.train_artifact(train_calls, now=now)
             # モデル本体ができたときだけ保存する(データ不足の空アーティファクトで
             # 毎回上書きしても意味がなく、--train-ml時は結果を必ず残す)
@@ -1370,7 +1405,7 @@ def main(argv: list[str] | None = None) -> int:
     # Live acknowledgement is deliberately unreachable from this research CLI.
     require_live_ack: list[str] = []
     promotion_state, _member_perf = promotion.evaluate_and_update(
-        journal_entries, promotion_state, now=now, require_live_ack=require_live_ack
+        pit_journal_entries, promotion_state, now=now, require_live_ack=require_live_ack
     )
     stages = promotion_state.as_stage_map()
     if args.no_macro:
@@ -1384,6 +1419,29 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as error:
             fetch_warnings.append(f"昇格状態の保存失敗: {error}")
 
+    # 外部取得・特徴量変換・学習済み状態の準備がすべて終わった時刻を記録する。
+    # prediction time は全プラン構築後に別途採るため、PIT契約は
+    # source cutoff <= max feature available time <= prediction time になる。
+    feature_available_time = datetime.now(UTC)
+    if args.require_freshness:
+        refreshed_gate = freshness.evaluate_freshness_report(
+            args.freshness_report,
+            now=feature_available_time,
+            max_report_age_seconds=args.freshness_max_age_seconds,
+        )
+        if not refreshed_gate.allow_new_risk and (
+            freshness_gate.allow_new_risk or refreshed_gate.reason != freshness_gate.reason
+        ):
+            fetch_warnings.append(f"⛔ 運用データ鮮度ゲート: {refreshed_gate.reason}")
+        freshness_gate = refreshed_gate
+    events_48h = calendar.upcoming_events(
+        events,
+        currencies,
+        feature_available_time,
+        hours_ahead=args.hours_ahead,
+        min_impact="high",
+    )
+
     # 9. ペアごとの委員会審議(tech/news/macro/ML、学習済み重み・段階ゲート反映)
     plans: list[briefing.TradePlan] = []
     for symbol in symbols:
@@ -1395,7 +1453,7 @@ def main(argv: list[str] | None = None) -> int:
             analysis.currencies,
             windows,
             items,
-            now=now,
+            now=feature_available_time,
             atr_multiple=atr_multiple,
             calendar_ok=calendar_ok,
             operational_data_ok=freshness_gate.allow_new_risk,
@@ -1420,7 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         checklist = decision_pipeline.build_checklist(
             plan,
             tech_map[symbol],
-            now=now,
+            now=feature_available_time,
             realized_expectancy_r=realized_r,
             operational_data_ok=freshness_gate.allow_new_risk,
             operational_data_reason=freshness_gate.reason,
@@ -1428,24 +1486,35 @@ def main(argv: list[str] | None = None) -> int:
         plan.checklist = checklist.to_dict()
         plans.append(plan)
 
+    prediction_time = datetime.now(UTC)
+
     # 10. 判断ジャーナル: 過去の判断を検証し、今回の判断を記録
     journal_note = ""
     if not args.no_journal:
         closes = {symbol: tech_map[symbol].close() for symbol in symbols}
-        stats = journal.evaluate_directional_accuracy(DEFAULT_JOURNAL_PATH, closes, now=now)
+        stats = journal.evaluate_directional_accuracy(
+            DEFAULT_JOURNAL_PATH, closes, now=prediction_time
+        )
         journal_note = journal.format_stats_ja(stats)
         if not args.dry_run:
             try:
-                journal.append_plans(DEFAULT_JOURNAL_PATH, plans, now=now)
-            except OSError as error:
-                fetch_warnings.append(f"判断ジャーナル書き込み失敗: {error}")
+                journal.append_plans(
+                    DEFAULT_JOURNAL_PATH,
+                    plans,
+                    now=prediction_time,
+                    source_cutoff=now,
+                    max_feature_available_time=feature_available_time,
+                )
+            except (OSError, journal.PointInTimeError) as error:
+                print(f"判断ジャーナル書き込み失敗: {error}", file=sys.stderr)
+                return JOURNAL_WRITE_FAILURE_EXIT_CODE
             try:
                 prior_decision_events = list(
                     decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
                 )
                 decision_events = decision_log.build_fusion_decision_events(
                     plans,
-                    now=now,
+                    now=prediction_time,
                     analysis=analysis,
                     tech_map=tech_map,
                     news_items=items,
@@ -1463,20 +1532,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 decision_outcome_report = decision_log.score_decision_events(
                     [*prior_decision_events, *decision_events],
-                    now=now,
+                    now=prediction_time,
                 )
                 decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
                 decision_log.save_latest_snapshot(
                     DEFAULT_DECISION_LATEST_PATH,
                     decision_events,
-                    now=now,
+                    now=prediction_time,
                 )
                 decision_log.save_outcome_report(
                     decision_outcome_report,
                     DEFAULT_DECISION_OUTCOMES_PATH,
                 )
                 decision_feedback.save_decision_feedback(
-                    decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
+                    decision_feedback.derive_decision_feedback(
+                        decision_outcome_report, now=prediction_time
+                    ),
                     DEFAULT_DECISION_FEEDBACK_PATH,
                 )
             except OSError as error:
@@ -1496,7 +1567,7 @@ def main(argv: list[str] | None = None) -> int:
         journal_note=journal_note,
         learning_note=learning_note,
         promotion_note=promotion_note,
-        now=now,
+        now=prediction_time,
     )
 
     if args.dry_run:
@@ -1518,9 +1589,13 @@ def main(argv: list[str] | None = None) -> int:
             "DISCORD_WEBHOOK_URL が未設定です。環境変数か .env に設定してください。",
             file=sys.stderr,
         )
-        return 1
+        return NOTIFICATION_FAILURE_EXIT_CODE
 
-    post_to_discord(webhook_url, payload)
+    try:
+        post_to_discord(webhook_url, payload)
+    except discord_delivery.DiscordDeliveryError as error:
+        print(str(error), file=sys.stderr)
+        return NOTIFICATION_FAILURE_EXIT_CODE
     print(
         f"ブリーフィングを送信しました ({', '.join(symbols)} | "
         f"ニュース{len(items)}件 | イベント{len(events_48h)}件 | {analysis.engine})"

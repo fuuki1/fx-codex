@@ -40,6 +40,17 @@ def _row(ts, timeframe, horizon, direction, close, atr=0.10):
     }
 
 
+def _pit(row: dict) -> dict:
+    prediction = datetime.fromisoformat(row["ts"])
+    return {
+        **row,
+        "prediction_time": prediction.isoformat(),
+        "source_cutoff": (prediction - timedelta(minutes=2)).isoformat(),
+        "max_feature_available_time": (prediction - timedelta(seconds=1)).isoformat(),
+        "pit_eligible": True,
+    }
+
+
 def test_scores_each_timeframe_at_its_horizon(server) -> None:
     entries = [
         # 1h long: 1時間後に上昇 → hit
@@ -286,6 +297,116 @@ def test_build_state_uses_timeframe_learning_when_fusion_learning_missing(
     assert state["tf_learning"]["timeframes"][0]["hit_rate"] == pytest.approx(16 / 29)
 
 
+def test_build_state_prefers_scored_timeframe_learning_over_empty_fusion_profile(
+    server,
+    tmp_path,
+) -> None:
+    (tmp_path / "briefing_learning.json").write_text(
+        json.dumps({"generated_at": START.isoformat(), "evaluated": 0, "hits": 0}),
+        encoding="utf-8",
+    )
+    (tmp_path / "briefing_tf_learning.json").write_text(
+        json.dumps(
+            {
+                "generated_at": START.isoformat(),
+                "per_timeframe": {
+                    "15m": {
+                        "generated_at": START.isoformat(),
+                        "evaluated": 3,
+                        "hits": 2,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+
+    assert state["learning_source"]["mode"] == "timeframe"
+    assert state["learning"]["evaluated"] == 3
+
+
+def test_build_state_reports_fusion_only_gbdt_training_progress(server, tmp_path) -> None:
+    fusion_rows = [
+        _pit(_row(START, "", 24.0, "long", 150.0)),
+        _pit(_row(START + timedelta(hours=24), "", 24.0, "long", 151.0)),
+    ]
+    timeframe_rows = [
+        _row(START, "15m", 0.25, "long", 150.0),
+        _row(START + timedelta(minutes=15), "15m", 0.25, "long", 151.0),
+    ]
+    (tmp_path / "briefing_journal.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in fusion_rows) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "briefing_tf_journal.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in timeframe_rows) + "\n",
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+    training = state["ml"]["training"]
+
+    assert state["evaluation"]["evaluated"] == 2
+    assert training["evaluated"] == 1
+    assert training["eligible_after_thinning"] == 1
+    assert training["minimum_required"] == 150
+    assert training["source"] == "briefing_journal.jsonl"
+    assert training["pit_ineligible"] == 0
+
+
+def test_build_state_excludes_legacy_fusion_rows_from_gbdt(server, tmp_path) -> None:
+    rows = [
+        _row(START, "", 24.0, "long", 150.0),
+        _row(START + timedelta(hours=24), "", 24.0, "long", 151.0),
+    ]
+    (tmp_path / "briefing_journal.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    training = server.build_state(tmp_path)["ml"]["training"]
+
+    assert training["evaluated"] == 0
+    assert training["eligible_after_thinning"] == 0
+    assert training["pit_ineligible"] == 2
+
+
+def test_ml_summary_rejects_pre_pit_artifact(server) -> None:
+    summary = server._ml_summary(
+        {
+            "schema": 3,
+            "trained_at": START.isoformat(),
+            "usable": True,
+            "model": {"trees": []},
+        }
+    )
+
+    assert summary["has_model"] is False
+    assert summary["usable"] is False
+    assert any("旧PIT契約" in reason for reason in summary["reasons"])
+
+
+def test_gbdt_progress_thins_flat_before_dropping_it(server) -> None:
+    outcomes = [
+        {
+            "ts": START.isoformat(),
+            "symbol": "USDJPY",
+            "outcome": "flat",
+            "pit_eligible": True,
+        },
+        {
+            "ts": (START + timedelta(hours=1)).isoformat(),
+            "symbol": "USDJPY",
+            "outcome": "hit",
+            "pit_eligible": True,
+        },
+    ]
+
+    assert server._thinned_outcome_count(outcomes) == 0
+
+
 def test_timeframe_summary_exposes_symbols_and_conditions(server, tmp_path) -> None:
     tf_learning = {
         "generated_at": START.isoformat(),
@@ -352,20 +473,29 @@ def test_journal_activity_buckets_by_direction(server, tmp_path) -> None:
 
 
 def test_build_state_reports_missing_learning_ops_inputs(server, tmp_path) -> None:
-    state = server.build_state(tmp_path, now=START, ps_output="")
+    state = server.build_state(
+        tmp_path,
+        now=START,
+        ps_output="",
+        launchctl_outputs={},
+    )
     ops = state["ops"]
 
-    assert ops["status"] == "warn"
+    assert ops["status"] == "fail"
     assert ops["signals"]["has_any_journal"] is False
     assert ops["signals"]["has_timeframe_prices"] is False
     assert ops["signals"]["has_any_learning"] is False
     assert ops["processes"][0]["running"] is False
     assert ops["processes"][1]["running"] is False
     assert any("判断ログ" in alert["message_ja"] for alert in ops["alerts"])
-    assert any("スナップショットループ" in alert["message_ja"] for alert in ops["alerts"])
+    assert any("launchd" in alert["message_ja"] for alert in ops["alerts"])
 
 
 def test_build_state_reports_running_learning_ops(server, tmp_path) -> None:
+    (tmp_path / "briefing_journal.jsonl").write_text(
+        json.dumps(_row(START, "", 24.0, "long", 150.0), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     (tmp_path / "briefing_tf_journal.jsonl").write_text(
         json.dumps(_row(START, "15m", 0.25, "long", 150.0), ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -391,20 +521,83 @@ def test_build_state_reports_running_learning_ops(server, tmp_path) -> None:
         ),
         encoding="utf-8",
     )
-    ps_output = "\n".join(
-        [
-            "100 /bin/zsh ./fx_briefing_loop.sh",
-            "101 /bin/zsh ./fx_tf_snapshot_loop.sh",
-            "102 python3 tools/ai_learning_dashboard/server.py --port 8767",
-        ]
-    )
+    ps_output = "102 python3 tools/ai_learning_dashboard/server.py --port 8767"
+    launchctl_outputs = {
+        label: "state = not running\nlast exit code = 0\n"
+        for _, _, label in server.LAUNCHD_SERVICES
+    }
 
-    state = server.build_state(tmp_path, now=START, ps_output=ps_output)
+    state = server.build_state(
+        tmp_path,
+        now=START,
+        ps_output=ps_output,
+        launchctl_outputs=launchctl_outputs,
+    )
     ops = state["ops"]
 
     assert ops["status"] == "ok"
     assert ops["signals"]["has_any_journal"] is True
     assert ops["signals"]["has_timeframe_prices"] is True
     assert ops["signals"]["has_any_learning"] is True
-    assert [process["running"] for process in ops["processes"]] == [True, True, True]
+    assert [process["running"] for process in ops["processes"]] == [True, True, True, True]
+    assert [row["name"] for row in ops["runtime_logs"]] == [
+        "briefing_journal.jsonl",
+        "briefing_tf_journal.jsonl",
+        "briefing_tf_prices.jsonl",
+    ]
     assert ops["alerts"] == []
+
+
+def test_build_state_reports_briefing_notification_failure(server, tmp_path) -> None:
+    launchctl_outputs = {
+        label: (
+            "state = not running\nlast exit code = 5\n"
+            if label == "com.fx-codex.briefing"
+            else "state = not running\nlast exit code = 0\n"
+        )
+        for _, _, label in server.LAUNCHD_SERVICES
+    }
+
+    state = server.build_state(
+        tmp_path,
+        now=START,
+        ps_output="",
+        launchctl_outputs=launchctl_outputs,
+    )
+
+    assert any("Discord通知" in row["message_ja"] for row in state["ops"]["alerts"])
+    briefing = next(row for row in state["ops"]["processes"] if row["key"] == "briefing_service")
+    assert briefing["running"] is True
+    assert briefing["last_exit_code"] == 5
+
+
+def test_build_state_fails_when_one_required_journal_is_missing(server, tmp_path) -> None:
+    (tmp_path / "briefing_journal.jsonl").write_text(
+        json.dumps(_row(START, "", 24.0, "long", 150.0)) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "briefing_tf_prices.jsonl").write_text(
+        json.dumps(_row(START, "15m", 0.25, "neutral", 150.0)) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "briefing_learning.json").write_text("{}", encoding="utf-8")
+    launchctl_outputs = {
+        label: "state = not running\nlast exit code = 0\n"
+        for _, _, label in server.LAUNCHD_SERVICES
+    }
+
+    state = server.build_state(
+        tmp_path,
+        now=START,
+        ps_output="",
+        launchctl_outputs=launchctl_outputs,
+    )
+
+    assert state["ops"]["status"] == "fail"
+    assert any("時間足別判断ログが未作成" in row["message_ja"] for row in state["ops"]["alerts"])
+
+
+def test_dashboard_tones_launchd_exit_codes() -> None:
+    script = (_SERVER_PATH.parent / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'exitCode === 5 ? "warn" : "fail"' in script
