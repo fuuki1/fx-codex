@@ -93,12 +93,16 @@ def _approved_tp_registry(path) -> None:
         "approval",
     )
     registry = to.update_improvement_registry(
-        None, [candidate], now=datetime(2026, 7, 1, tzinfo=UTC)
+        None,
+        [candidate],
+        now=datetime(2026, 7, 1, tzinfo=UTC),
+        data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
     )
     registry = to.update_improvement_registry(
         registry,
         [candidate],
         now=datetime(2026, 7, 1, 1, tzinfo=UTC),
+        data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,
