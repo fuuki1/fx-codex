@@ -492,6 +492,55 @@ def _journal_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_direction": by_direction,
         "latest_ts": latest_ts.isoformat() if latest_ts else None,
         "recent": recent,
+        "activity": _journal_activity(entries),
+    }
+
+
+# 活動タイムライン用の方向カテゴリ。standby/neutral(見送り)と実方向を分けて
+# 「いつ・どの方向を・何回記録したか」を積み上げで見せる。
+_ACTIVITY_DIRECTIONS = ("long", "short", "neutral", "standby")
+
+
+def _journal_activity(entries: list[dict[str, Any]], *, buckets: int = 48) -> dict[str, Any]:
+    """判断ログを1時間刻みで集計し、方向別の積み上げ用データを返す。
+
+    「どこで何を」学習しているかの前段として、記録がいつ・どの方向で・どの
+    ペアで発生したかを可視化するための素材。採点はしない(direction 無し行や
+    価格スナップショットは呼び出し側で除外して渡す)。
+    """
+    stamped: list[tuple[datetime, dict[str, Any]]] = []
+    for entry in entries:
+        ts = _parse_ts(entry.get("ts"))
+        if ts is not None:
+            stamped.append((ts, entry))
+    if not stamped:
+        return {"buckets": [], "by_direction": {}, "bucket_hours": 1}
+    stamped.sort(key=lambda row: row[0])
+    latest = stamped[-1][0].replace(minute=0, second=0, microsecond=0)
+    start = latest - timedelta(hours=buckets - 1)
+    slots: list[dict[str, Any]] = [
+        {
+            "ts": (start + timedelta(hours=offset)).isoformat(),
+            "total": 0,
+            **{direction: 0 for direction in _ACTIVITY_DIRECTIONS},
+        }
+        for offset in range(buckets)
+    ]
+    by_direction: dict[str, int] = {direction: 0 for direction in _ACTIVITY_DIRECTIONS}
+    for ts, entry in stamped:
+        index = int((ts - start).total_seconds() // 3600)
+        if index < 0 or index >= buckets:
+            continue
+        direction = str(entry.get("direction") or "standby")
+        if direction not in by_direction:
+            direction = "standby"
+        slots[index][direction] += 1
+        slots[index]["total"] += 1
+        by_direction[direction] += 1
+    return {
+        "buckets": slots,
+        "by_direction": by_direction,
+        "bucket_hours": 1,
     }
 
 
@@ -589,6 +638,10 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "notes_ja": (
                 raw_profile.get("notes_ja") if isinstance(raw_profile.get("notes_ja"), list) else []
             ),
+            # どのペア・どの市場条件で学習したか(採点実体)。融合1判断と同じ
+            # 抽出器を各時間足プロファイルに適用する。
+            "symbols": _symbol_rows(raw_profile, {}),
+            "conditions": _condition_rows(raw_profile),
         }
         rows.append(row)
     rows.sort(key=lambda row: (_TIMEFRAME_ORDER.get(str(row["timeframe"]), 99), row["timeframe"]))

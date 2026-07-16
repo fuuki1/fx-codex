@@ -286,6 +286,71 @@ def test_build_state_uses_timeframe_learning_when_fusion_learning_missing(
     assert state["tf_learning"]["timeframes"][0]["hit_rate"] == pytest.approx(16 / 29)
 
 
+def test_timeframe_summary_exposes_symbols_and_conditions(server, tmp_path) -> None:
+    tf_learning = {
+        "generated_at": START.isoformat(),
+        "per_timeframe": {
+            "15m": {
+                "generated_at": START.isoformat(),
+                "evaluated": 6,
+                "hits": 3,
+                "flat": 0,
+                "tech_weight": 0.55,
+                "news_weight": 0.45,
+                "symbol_stats": {
+                    "USDJPY": {"evaluated": 3, "hits": 1},
+                    "EURUSD": {"evaluated": 3, "hits": 2},
+                },
+                "symbol_factors": {"USDJPY": 0.9},
+                "condition_stats": {
+                    "rsi_1h": {"中立圏(35-65)": {"long": {"evaluated": 3, "hits": 1}}},
+                },
+                "condition_factors": {},
+                "notes_ja": ["過去の方向判断6件を15分後の値動きで採点 — 的中率 50%"],
+            }
+        },
+    }
+    (tmp_path / "briefing_tf_learning.json").write_text(
+        json.dumps(tf_learning, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+    row = state["tf_learning"]["timeframes"][0]
+
+    assert row["timeframe"] == "15m"
+    symbols = {s["symbol"]: s for s in row["symbols"]}
+    assert symbols["EURUSD"]["hit_rate"] == pytest.approx(2 / 3)
+    assert symbols["USDJPY"]["factor"] == pytest.approx(0.9)
+    assert any(
+        c["feature"] == "rsi_1h" and c["bucket"] == "中立圏(35-65)" for c in row["conditions"]
+    )
+    assert row["notes_ja"]
+
+
+def test_journal_activity_buckets_by_direction(server, tmp_path) -> None:
+    rows = [
+        _row(START, "15m", 0.25, "long", 150.0),
+        _row(START + timedelta(minutes=20), "15m", 0.25, "short", 150.0),
+        _row(START + timedelta(hours=2), "1h", 1.0, "neutral", 150.0),
+    ]
+    (tmp_path / "briefing_tf_journal.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path)
+    activity = state["journal"]["activity"]
+
+    assert activity["by_direction"]["long"] == 1
+    assert activity["by_direction"]["short"] == 1
+    assert activity["by_direction"]["neutral"] == 1
+    # 同じ1時間バケットに long+short の2件が入る
+    filled = [b for b in activity["buckets"] if b["total"] > 0]
+    assert any(b["long"] == 1 and b["short"] == 1 for b in filled)
+    assert sum(b["total"] for b in activity["buckets"]) == 3
+
+
 def test_build_state_reports_missing_learning_ops_inputs(server, tmp_path) -> None:
     state = server.build_state(tmp_path, now=START, ps_output="")
     ops = state["ops"]

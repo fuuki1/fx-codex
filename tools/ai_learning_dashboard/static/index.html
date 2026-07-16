@@ -28,6 +28,35 @@
         <ul id="realityReasons" class="reason-list"></ul>
       </section>
 
+      <section class="panel wide learned-panel" aria-label="学習の中身">
+        <div class="panel-head">
+          <h2>学習の中身 — どこで・何を学んだか</h2>
+          <span id="learnedSource" class="subtle">未生成</span>
+        </div>
+        <div class="learned-layout">
+          <div class="learned-gauge">
+            <div id="hitRateDonut" class="donut" aria-label="全体の方向的中率"></div>
+            <div class="learned-gauge-meta">
+              <span class="metric-label">全体の方向的中率</span>
+              <strong id="donutHitRate">--</strong>
+              <small id="donutHitCount">0 / 0 採点</small>
+              <small id="donutSampleNote" class="subtle"></small>
+            </div>
+          </div>
+          <div class="learned-matrix-wrap">
+            <div class="learned-matrix-head">
+              <h3>時間足 × 通貨ペア の的中率</h3>
+              <div class="legend" id="matrixLegend"></div>
+            </div>
+            <div id="learnedMatrix" class="matrix" role="table"></div>
+          </div>
+        </div>
+        <div class="learned-notes-wrap">
+          <h3>AIが書いた学習メモ</h3>
+          <div id="learnedNotes" class="learned-notes"></div>
+        </div>
+      </section>
+
       <section class="status-grid" aria-label="学習概要">
         <article class="metric">
           <span class="metric-label">判断ログ</span>
@@ -154,6 +183,24 @@
 
         <article class="panel wide">
           <div class="panel-head">
+            <h2>記録アクティビティ</h2>
+            <span class="subtle">直近48時間 / 方向別の記録件数</span>
+          </div>
+          <div class="legend" id="activityLegend"></div>
+          <div id="activityChart" class="chart-area"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>市場条件別の学習結果</h2>
+            <span id="conditionChartTf" class="subtle">時間足別</span>
+          </div>
+          <p class="chart-note">どんな相場つき(RSI・ボラティリティ・時間足一致など)で当たり／外れが多かったか。</p>
+          <div id="conditionChart" class="condition-chart"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
             <h2>期待値・改善候補監視</h2>
             <span id="tradeMonitorUpdated" class="subtle">未生成</span>
           </div>
@@ -205,12 +252,13 @@
           </div>
         </article>
 
-        <article class="panel wide">
+        <article class="panel">
           <div class="panel-head">
             <h2>確信度キャリブレーション</h2>
-            <span class="subtle">conviction bins</span>
+            <span id="calibrationSource" class="subtle">確信度帯 → 実際の的中率</span>
           </div>
-          <div id="binBars" class="bars compact"></div>
+          <p class="chart-note">確信度が高い帯ほど実際に当たっていれば対角線に乗ります。</p>
+          <div id="calibrationChart" class="chart-area"></div>
         </article>
 
         <article class="panel">
