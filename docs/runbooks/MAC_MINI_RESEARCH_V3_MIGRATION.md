@@ -59,36 +59,38 @@ remote URLs into the audit bundle.
 Stop if the working tree contains unreviewed local changes. Preserve them on a
 separate rescue branch or external archive before migration.
 
-## 4. Clean runtime construction
+## 4. Clean release construction
 
-After PR #41 is merged and the exact main SHA is approved:
-
-```bash
-cd /Users/fuuki/srv/fx-codex
-git fetch origin
-git checkout main
-git reset --hard <APPROVED_MAIN_SHA>
-git clean -fd
-
-python3 -m venv .venv.new
-.venv.new/bin/python -m pip install --upgrade pip
-.venv.new/bin/python -m pip install --require-hashes -r requirements.lock
-.venv.new/bin/python -m pip install --no-deps --no-build-isolation .
-.venv.new/bin/python -m pip check
-.venv.new/bin/python -m pytest -q
-```
-
-Do not use partial `rsync` or file-by-file checkout. The code, lock file,
-scripts, tests and launchd templates must come from the same approved SHA.
-
-Only after validation:
+After PR #41 is merged and the exact main SHA is approved, build a new release
+directory. Do not reset, clean or rewrite the existing runtime checkout.
 
 ```bash
-mv .venv .venv.previous
-mv .venv.new .venv
+RELEASES=/Users/fuuki/srv/fx-codex-releases
+RELEASE="$RELEASES/<APPROVED_MAIN_SHA>"
+mkdir -p "$RELEASES"
+test ! -e "$RELEASE"
+git clone https://github.com/fuuki1/fx-codex.git "$RELEASE"
+git -C "$RELEASE" checkout --detach <APPROVED_MAIN_SHA>
+test "$(git -C "$RELEASE" rev-parse HEAD)" = <APPROVED_MAIN_SHA>
+test -z "$(git -C "$RELEASE" status --porcelain)"
+
+python3 -m venv "$RELEASE/.venv"
+"$RELEASE/.venv/bin/python" -m pip install --upgrade pip
+"$RELEASE/.venv/bin/python" -m pip install --require-hashes -r "$RELEASE/requirements.lock"
+"$RELEASE/.venv/bin/python" -m pip install --no-deps --no-build-isolation "$RELEASE"
+"$RELEASE/.venv/bin/python" -m pip check
+(cd "$RELEASE" && .venv/bin/python -m pytest -q)
 ```
 
-Keep `.venv.previous` until post-migration validation is complete.
+Do not use partial `rsync` or file-by-file checkout. After validation and service
+shutdown, atomically point the stable runtime path at the approved release. If
+the current runtime is a real directory, preserve it under a timestamped backup
+name before creating the symlink; never delete or rewrite it in place.
+
+```bash
+ln -s "$RELEASE" /Users/fuuki/srv/fx-codex.next
+mv -h /Users/fuuki/srv/fx-codex.next /Users/fuuki/srv/fx-codex
+```
 
 ## 5. Existing analysis services
 
@@ -175,13 +177,12 @@ historical bundles do not count as prospective days.
 
 ## 9. Rollback
 
-Code rollback:
+Rollback only by switching the stable symlink to the preserved previous release:
 
 ```bash
-cd /Users/fuuki/srv/fx-codex
-git reset --hard <PREVIOUS_APPROVED_SHA>
-rm -rf .venv
-mv .venv.previous .venv
+ln -s /Users/fuuki/srv/fx-codex-releases/<PREVIOUS_APPROVED_SHA> \
+  /Users/fuuki/srv/fx-codex.rollback
+mv -h /Users/fuuki/srv/fx-codex.rollback /Users/fuuki/srv/fx-codex
 ```
 
 Service rollback:

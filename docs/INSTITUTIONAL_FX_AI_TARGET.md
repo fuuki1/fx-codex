@@ -2,7 +2,7 @@
 
 ## Status and definition
 
-This project targets an **institutional-grade research process (A)**: traceable point-in-time data, leakage-resistant validation, realistic execution assumptions, calibrated uncertainty, independent risk vetoes, reproducible artifacts, and governed paper operation.
+This project targets an **institutional-grade research process (A)**: traceable point-in-time data, leakage-resistant validation, realistic simulated-cost assumptions, calibrated uncertainty, independent risk vetoes, reproducible artifacts, and governed shadow evidence.
 
 It does **not** possess an **institutional information advantage (B)** such as bank customer flow, prime-broker positioning, consolidated ECN depth, dealer axes, option-flow intelligence, or guaranteed low-latency venue data. Public COT, candles, scanner snapshots, news and volume fields are public observations or proxies. They must never be described as proprietary order flow.
 

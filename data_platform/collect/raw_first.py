@@ -150,7 +150,10 @@ class QuoteLog:
         stamp = quote.provider_event_time or quote.received_at
         last = self._last_event.get(key)
         if last is not None and stamp < last:
-            return quote.with_quality(QualityState.DEGRADED, FLAG_OUT_OF_ORDER)
+            # Timestamp reversal is a hard PIT invariant violation.  Keeping it
+            # in the accepted log would make replay order depend on arrival
+            # order and contradict data_platform.quality.state.
+            return quote.with_quality(QualityState.QUARANTINED, FLAG_OUT_OF_ORDER)
         return quote
 
     def record(self, quote: CollectedQuote) -> None:

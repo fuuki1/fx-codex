@@ -18,6 +18,9 @@ def test_timeframe_freshness_config_contains_only_active_gating_targets() -> Non
     assert names == {"tf_price_snapshot", "tf_journal"}
     assert "fusion_journal" not in names
     assert "promotion_state" not in names
+    prices = next(row for row in payload["targets"] if row["name"] == "tf_price_snapshot")
+    assert prices["required_symbols"] == ["GBPUSD", "EURUSD", "USDJPY"]
+    assert prices["required_timeframes"] == ["15m", "1h", "4h", "1d"]
 
 
 def test_health_launchd_selects_timeframe_freshness_config() -> None:

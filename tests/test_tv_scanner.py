@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -165,6 +166,12 @@ def test_retry_after_non_numeric_is_ignored_and_backoff_used() -> None:
     # 数値でないRetry-Afterはバックオフに委ねる(retry_after は None)
     assert excinfo.value.retry_after is None
     assert len(session.calls) == 2
+
+
+def test_retry_after_http_date_is_parsed_in_utc() -> None:
+    now = datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
+    assert tv._parse_retry_after("Thu, 16 Jul 2026 00:00:12 GMT", now=now) == 12.0
+    assert tv._parse_retry_after("Wed, 15 Jul 2026 23:59:59 GMT", now=now) is None
 
 
 # --------------------------------------------------------------- 空本文 / 非JSON

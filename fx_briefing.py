@@ -111,7 +111,7 @@ DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
 DEFAULT_TP_SL_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tp_sl_learning.json"
 DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
 # 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
-# 判断ジャーナルは毎時しか追記されず短い足の採点窓に入る点が得られないため、
+# 判断ジャーナルだけでは短い足の採点窓に十分な価格点が得られないため、
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
 # direction を持たない価格行なので採点対象は増やさず将来価格系列だけを密にする。
 DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"

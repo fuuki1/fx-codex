@@ -69,6 +69,28 @@ def _touch_jsonl(
     return path
 
 
+def _write_coverage_config(root: Path) -> Path:
+    config = {
+        "schema": 1,
+        "cooldown_seconds": 21600,
+        "targets": [
+            {
+                "name": "prices",
+                "path": "logs/prices.jsonl",
+                "kind": "jsonl",
+                "expected_interval_seconds": 300,
+                "warn_after_seconds": 900,
+                "critical_after_seconds": 2700,
+                "required_symbols": ["USDJPY", "EURUSD"],
+                "required_timeframes": ["15m", "1h"],
+            }
+        ],
+    }
+    path = root / "coverage_config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
 def _run(monitor, root: Path, config: Path, sender=None, now: datetime = NOW):
     return monitor.run_monitor(
         root,
@@ -131,6 +153,51 @@ def test_corrupt_jsonl_tail_is_critical_even_if_fresh(monitor, tmp_path):
     report = _run(monitor, tmp_path, config, _Sender())
     assert report["targets"][0]["status"] == "critical"
     assert report["targets"][0]["reason"] == "jsonl_corrupt_tail"
+
+
+def test_latest_capture_slot_requires_complete_symbol_timeframe_coverage(monitor, tmp_path):
+    config = _write_coverage_config(tmp_path)
+    slot = "2026-07-10T03:00:00+00:00"
+    rows = [
+        {"capture_slot": slot, "symbol": symbol, "timeframe": timeframe, "close": 1.0}
+        for symbol in ("USDJPY", "EURUSD")
+        for timeframe in ("15m", "1h")
+    ]
+    _touch_jsonl(
+        tmp_path,
+        age_seconds=60,
+        content="\n".join(json.dumps(row) for row in rows),
+    )
+
+    report = _run(monitor, tmp_path, config, _Sender())
+    target = report["targets"][0]
+    assert target["status"] == "ok"
+    assert target["expected_coverage"] == 4
+    assert target["observed_coverage"] == 4
+    assert target["missing_coverage"] == []
+
+
+def test_incomplete_latest_capture_slot_is_critical(monitor, tmp_path):
+    config = _write_coverage_config(tmp_path)
+    slot = "2026-07-10T03:00:00+00:00"
+    rows = [
+        {"capture_slot": slot, "symbol": "USDJPY", "timeframe": "15m", "close": 1.0},
+        {"capture_slot": slot, "symbol": "USDJPY", "timeframe": "1h", "close": 1.0},
+        {"capture_slot": slot, "symbol": "EURUSD", "timeframe": "15m", "close": 1.0},
+    ]
+    _touch_jsonl(
+        tmp_path,
+        age_seconds=60,
+        content="\n".join(json.dumps(row) for row in rows),
+    )
+
+    report = _run(monitor, tmp_path, config, _Sender())
+    target = report["targets"][0]
+    assert report["overall"] == "critical"
+    assert target["reason"] == "coverage_incomplete"
+    assert target["expected_coverage"] == 4
+    assert target["observed_coverage"] == 3
+    assert target["missing_coverage"] == ["EURUSD:1h"]
 
 
 def test_warn_only_target_never_goes_critical(monitor, tmp_path):

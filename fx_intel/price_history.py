@@ -91,7 +91,7 @@ def future_close_from_series(
 
     horizon±tolerance(市場オープン時間換算)の範囲にある点のうち、
     ホライズンに最も近い1点の close を返す。該当が無ければ None。
-    二分探索で候補範囲を絞り、毎時追記で系列が長くなっても全走査しない。
+    二分探索で候補範囲を絞り、5分追記で系列が長くなっても全走査しない。
     """
     if not series:
         return None
