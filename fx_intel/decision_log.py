@@ -17,6 +17,13 @@ from pathlib import Path
 
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
+from .shadow_learning import (
+    SHADOW_LABEL_PROVENANCE,
+    assign_prediction_ids,
+    build_learning_observations,
+    summarize_shadow_outcomes,
+    summarize_outcome_dimensions,
+)
 
 SCHEMA_VERSION = 1
 EVENT_TYPE = "chart_decision"
@@ -24,6 +31,9 @@ SCORING_METHOD = "tp_sl_mfe_mae_first_touch"
 SCORING_METRICS = (
     "first_touch",
     "realized_r",
+    "gross_realized_r",
+    "execution_cost_r",
+    "realized_net_r",
     "mfe_r",
     "mae_r",
     "tp1_hit",
@@ -139,17 +149,22 @@ def build_timeframe_decision_events(
         for index, plan in enumerate(plans):
             timeframe = str(getattr(plan, "timeframe", ""))
             direction = str(getattr(plan, "direction", ""))
+            decision_id = _decision_id(
+                run_id,
+                "per_timeframe",
+                str(symbol),
+                timeframe,
+                direction,
+                index,
+            )
+            decision = _timeframe_plan_snapshot(plan)
+            decision["shadow_predictions"] = assign_prediction_ids(
+                decision.get("shadow_predictions", []), decision_id
+            )
             event = {
                 "schema": SCHEMA_VERSION,
                 "event_type": EVENT_TYPE,
-                "decision_id": _decision_id(
-                    run_id,
-                    "per_timeframe",
-                    str(symbol),
-                    timeframe,
-                    direction,
-                    index,
-                ),
+                "decision_id": decision_id,
                 "run_id": run_id,
                 "ts": now.isoformat(),
                 "source": source,
@@ -157,7 +172,7 @@ def build_timeframe_decision_events(
                 "symbol": str(symbol),
                 "timeframe": timeframe,
                 "horizon_hours": _number_or_none(getattr(plan, "horizon_hours", None)),
-                "decision": _timeframe_plan_snapshot(plan),
+                "decision": decision,
                 "market_context": market_context,
                 "technical_context": technical_context,
                 "learning_context": _timeframe_learning_context(
@@ -210,10 +225,15 @@ def build_fusion_decision_events(
     for index, plan in enumerate(plans):
         symbol = str(getattr(plan, "symbol", ""))
         direction = str(getattr(plan, "direction", ""))
+        decision_id = _decision_id(run_id, "fusion", symbol, "fusion", direction, index)
+        decision = _fusion_plan_snapshot(plan)
+        decision["shadow_predictions"] = assign_prediction_ids(
+            decision.get("shadow_predictions", []), decision_id
+        )
         event = {
             "schema": SCHEMA_VERSION,
             "event_type": EVENT_TYPE,
-            "decision_id": _decision_id(run_id, "fusion", symbol, "fusion", direction, index),
+            "decision_id": decision_id,
             "run_id": run_id,
             "ts": now.isoformat(),
             "source": source,
@@ -221,7 +241,7 @@ def build_fusion_decision_events(
             "symbol": symbol,
             "timeframe": "fusion",
             "horizon_hours": 24.0,
-            "decision": _fusion_plan_snapshot(plan),
+            "decision": decision,
             "market_context": market_context,
             "technical_context": _technical_context(tech_map.get(symbol)),
             "learning_context": {
@@ -340,11 +360,19 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "stop": decision.get("stop"),
         "target1": decision.get("target1"),
         "target2": decision.get("target2"),
+        "entry_bid": decision.get("entry_bid"),
+        "entry_ask": decision.get("entry_ask"),
+        "quote_observed_at": decision.get("quote_observed_at"),
+        "cost_model_id": decision.get("cost_model_id"),
+        "slippage_r": decision.get("slippage_r"),
+        "commission_r": decision.get("commission_r"),
+        "direction_threshold": decision.get("direction_threshold"),
         "target_policy": decision.get("target_policy", {}),
         "data_quality": decision.get("data_quality"),
         "features": decision.get("features", {}),
         "components": decision.get("components", []),
         "learning_context": event.get("learning_context", {}),
+        "learning_dimensions": decision.get("learning_dimensions", {}),
     }
     # 執行コスト(R換算)と判断時点の期待R予測を採点スキーマへ引き継ぐ。
     # 採点側は execution_cost_r から realized_net_r を作り、net_expected_r と対比する。
@@ -356,6 +384,72 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
     return _json_ready_dict(entry)
 
 
+def decision_event_to_shadow_entries(
+    event: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Flatten immutable shadow predictions into the canonical outcome input schema."""
+
+    decision = event.get("decision")
+    if not isinstance(decision, Mapping):
+        return []
+    predictions = decision.get("shadow_predictions")
+    if not isinstance(predictions, list):
+        return []
+    ts = str(event.get("ts", "")).strip()
+    symbol = str(event.get("symbol", decision.get("symbol", ""))).upper()
+    mode = str(event.get("mode", "fusion") or "fusion")
+    timeframe = str(event.get("timeframe", decision.get("timeframe", "fusion")) or "fusion")
+    output: list[dict[str, object]] = []
+    for raw in predictions:
+        if not isinstance(raw, Mapping) or raw.get("direction") not in ("long", "short"):
+            continue
+        prediction_id = str(raw.get("prediction_id", "")).strip()
+        if not prediction_id or not ts or not symbol:
+            continue
+        horizon = _number_or_none(raw.get("horizon_hours")) or _horizon_for_timeframe(timeframe)
+        output.append(
+            _json_ready_dict(
+                {
+                    "ts": ts,
+                    "symbol": symbol,
+                    "mode": mode,
+                    "timeframe": timeframe,
+                    "horizon_hours": horizon,
+                    # canonical evaluator carries this field into TradeOutcome.decision_id.
+                    "decision_id": prediction_id,
+                    "parent_decision_id": event.get("decision_id"),
+                    "run_id": event.get("run_id"),
+                    "prediction_id": prediction_id,
+                    "producer": raw.get("producer"),
+                    "producer_version": raw.get("producer_version"),
+                    "stage_at_prediction": raw.get("stage_at_prediction"),
+                    "direction": raw.get("direction"),
+                    "final_direction": decision.get("direction"),
+                    "score": raw.get("score"),
+                    "blocked_by": raw.get("blocked_by", []),
+                    "close": raw.get("close"),
+                    "atr": raw.get("atr"),
+                    "stop": raw.get("stop"),
+                    "target1": raw.get("target1"),
+                    "target2": raw.get("target2"),
+                    "entry_bid": raw.get("entry_bid"),
+                    "entry_ask": raw.get("entry_ask"),
+                    "quote_observed_at": raw.get("quote_observed_at"),
+                    "cost_model_id": raw.get("cost_model_id"),
+                    "slippage_r": raw.get("slippage_r"),
+                    "commission_r": raw.get("commission_r"),
+                    "target_policy": raw.get("target_policy", {}),
+                    "data_quality": decision.get("data_quality"),
+                    "features": decision.get("features", {}),
+                    "learning_dimensions": raw.get(
+                        "learning_dimensions", decision.get("learning_dimensions", {})
+                    ),
+                }
+            )
+        )
+    return output
+
+
 def score_decision_events(
     events: Iterable[Mapping[str, object]],
     *,
@@ -365,11 +459,19 @@ def score_decision_events(
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
+    materialized_events = list(events)
     event_entries = [
-        entry for event in events if (entry := decision_event_to_scoring_entry(event)) is not None
+        entry
+        for event in materialized_events
+        if (entry := decision_event_to_scoring_entry(event)) is not None
     ]
+    shadow_entries = [
+        entry for event in materialized_events for entry in decision_event_to_shadow_entries(event)
+    ]
+    shadow_predictions = _shadow_prediction_inventory(materialized_events)
     normalized_prices = [_normalize_price_entry(row) for row in price_entries]
-    all_entries = event_entries + normalized_prices
+    final_entries = event_entries + normalized_prices
+    all_entries = final_entries + shadow_entries
     contexts = sorted(
         {
             (
@@ -396,7 +498,7 @@ def score_decision_events(
     for mode, timeframe, horizon in contexts:
         group_entries = [
             entry
-            for entry in all_entries
+            for entry in final_entries
             if _entry_matches_context(entry, mode=mode, timeframe=timeframe)
         ]
         outcomes = evaluate_trade_outcomes(
@@ -422,6 +524,11 @@ def score_decision_events(
                     "score_method": SCORING_METHOD,
                     "score_label": _score_label(outcome),
                     "score_hit": outcome.realized_r is not None and outcome.realized_r > 0,
+                    "composite": meta.get("composite"),
+                    "tech_score": meta.get("tech_score"),
+                    "news_score": meta.get("news_score"),
+                    "features": meta.get("features", {}),
+                    "learning_dimensions": meta.get("learning_dimensions", {}),
                     "learning_context": meta.get("learning_context", {}),
                     "failure_reasons": failure_reasons,
                     "primary_failure_reason": (
@@ -431,6 +538,80 @@ def score_decision_events(
             )
             enriched_outcomes.append(outcome_dict)
 
+    shadow_outcomes: list[dict[str, object]] = []
+    shadow_meta = {
+        str(entry.get("prediction_id")): entry
+        for entry in shadow_entries
+        if entry.get("prediction_id")
+    }
+    shadow_contexts = sorted(
+        {
+            (
+                str(entry.get("mode", "fusion") or "fusion"),
+                str(entry.get("timeframe", "fusion") or "fusion"),
+                _entry_horizon(entry),
+            )
+            for entry in shadow_entries
+        },
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    for mode, timeframe, horizon in shadow_contexts:
+        group_entries = [
+            entry
+            for entry in all_entries
+            if _entry_matches_context(entry, mode=mode, timeframe=timeframe)
+        ]
+        for outcome in evaluate_trade_outcomes(
+            group_entries,
+            horizon_hours=horizon,
+            tolerance_hours=tolerance_for(horizon),
+        ):
+            shadow_row = shadow_meta.get(str(outcome.decision_id or ""))
+            if shadow_row is None:
+                continue
+            move_atr = outcome.terminal_r
+            direction_outcome = None
+            if move_atr is not None:
+                if move_atr > 0.1:
+                    direction_outcome = "hit"
+                elif move_atr < -0.1:
+                    direction_outcome = "miss"
+                else:
+                    direction_outcome = "flat"
+            row = outcome.to_dict()
+            row.update(
+                {
+                    "prediction_id": shadow_row.get("prediction_id"),
+                    "decision_id": shadow_row.get("parent_decision_id"),
+                    "run_id": shadow_row.get("run_id"),
+                    "prediction_kind": "shadow_hypothesis",
+                    "producer": shadow_row.get("producer"),
+                    "producer_version": shadow_row.get("producer_version"),
+                    "stage_at_prediction": shadow_row.get("stage_at_prediction"),
+                    "score": shadow_row.get("score"),
+                    "final_direction": shadow_row.get("final_direction"),
+                    "blocked_by": shadow_row.get("blocked_by", []),
+                    "mode": mode,
+                    "timeframe": timeframe,
+                    "direction_outcome": direction_outcome,
+                    "move_atr": move_atr,
+                    "label_provenance": SHADOW_LABEL_PROVENANCE,
+                    "features": shadow_row.get("features", {}),
+                    "learning_dimensions": shadow_row.get("learning_dimensions", {}),
+                    "training_role": "shadow_only",
+                }
+            )
+            shadow_outcomes.append(row)
+
+    shadow_summary = summarize_shadow_outcomes(
+        shadow_outcomes,
+        predictions=shadow_predictions,
+    )
+    learning_observations = build_learning_observations(
+        enriched_outcomes,
+        shadow_outcomes,
+    )
+
     return _json_ready_dict(
         {
             "schema": SCHEMA_VERSION,
@@ -439,15 +620,50 @@ def score_decision_events(
             "metrics": list(SCORING_METRICS),
             "decision_events": len(event_entries),
             "scored_outcomes": len(enriched_outcomes),
+            "shadow_predictions": len(shadow_predictions),
+            "shadow_scored_outcomes": len(shadow_outcomes),
             "summary": summarize_expectancy(all_outcomes),
+            "dimension_summary": summarize_outcome_dimensions(enriched_outcomes),
             "failure_reason_summary": _failure_reason_summary(enriched_outcomes),
             "by_timeframe": by_timeframe,
             "by_mode": {
                 mode: summarize_expectancy(outcomes) for mode, outcomes in sorted(by_mode.items())
             },
             "outcomes": enriched_outcomes,
+            "shadow_summary": shadow_summary,
+            "shadow_outcomes": shadow_outcomes,
+            "learning_observations": learning_observations,
         }
     )
+
+
+def _shadow_prediction_inventory(
+    events: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    output: list[dict[str, object]] = []
+    for event in events:
+        decision = event.get("decision")
+        if not isinstance(decision, Mapping):
+            continue
+        predictions = decision.get("shadow_predictions")
+        if not isinstance(predictions, list):
+            continue
+        for raw in predictions:
+            if not isinstance(raw, Mapping):
+                continue
+            row = dict(raw)
+            row.update(
+                {
+                    "decision_id": event.get("decision_id"),
+                    "run_id": event.get("run_id"),
+                    "ts": event.get("ts"),
+                    "symbol": event.get("symbol"),
+                    "mode": event.get("mode"),
+                    "timeframe": event.get("timeframe"),
+                }
+            )
+            output.append(row)
+    return output
 
 
 def save_outcome_report(report: Mapping[str, object], path: str | Path) -> None:
@@ -580,6 +796,13 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "stop": _number_or_none(getattr(plan, "stop", None)),
         "target1": _number_or_none(getattr(plan, "target1", None)),
         "target2": _number_or_none(getattr(plan, "target2", None)),
+        "entry_bid": _number_or_none(getattr(plan, "entry_bid", None)),
+        "entry_ask": _number_or_none(getattr(plan, "entry_ask", None)),
+        "quote_observed_at": getattr(plan, "quote_observed_at", None),
+        "cost_model_id": getattr(plan, "cost_model_id", ""),
+        "slippage_r": _number_or_none(getattr(plan, "slippage_r", None)),
+        "commission_r": _number_or_none(getattr(plan, "commission_r", None)),
+        "direction_threshold": _number_or_none(getattr(plan, "direction_threshold", None)),
         "risk_pct": _number_or_none(getattr(plan, "risk_pct", None)),
         "data_quality": _number_or_none(getattr(plan, "data_quality", None)),
         "tech_weight": _number_or_none(getattr(plan, "tech_weight", None)),
@@ -590,6 +813,13 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "warnings": list(getattr(plan, "warnings", []) or []),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
         "auxiliary_horizons": list(getattr(plan, "auxiliary_horizons", ()) or ()),
+        "learning_dimensions": dict(getattr(plan, "learning_dimensions", {}) or {}),
+        "input_context_id": str(getattr(plan, "input_context_id", "") or ""),
+        "input_features": dict(getattr(plan, "input_features", {}) or {}),
+        "input_feature_masks": dict(getattr(plan, "input_feature_masks", {}) or {}),
+        "input_context": dict(getattr(plan, "input_context", {}) or {}),
+        "gate_trace": list(getattr(plan, "gate_trace", []) or []),
+        "shadow_predictions": list(getattr(plan, "shadow_predictions", []) or []),
         "execution": _execution_snapshot(plan),
     }
 
@@ -632,6 +862,13 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "stop": _number_or_none(getattr(plan, "stop", None)),
         "target1": _number_or_none(getattr(plan, "target1", None)),
         "target2": _number_or_none(getattr(plan, "target2", None)),
+        "entry_bid": _number_or_none(getattr(plan, "entry_bid", None)),
+        "entry_ask": _number_or_none(getattr(plan, "entry_ask", None)),
+        "quote_observed_at": getattr(plan, "quote_observed_at", None),
+        "cost_model_id": getattr(plan, "cost_model_id", ""),
+        "slippage_r": _number_or_none(getattr(plan, "slippage_r", None)),
+        "commission_r": _number_or_none(getattr(plan, "commission_r", None)),
+        "direction_threshold": _number_or_none(getattr(plan, "direction_threshold", None)),
         "risk_pct": _number_or_none(getattr(plan, "risk_pct", None)),
         "data_quality": _number_or_none(getattr(plan, "data_quality", None)),
         "tech_weight": _number_or_none(getattr(plan, "tech_weight", None)),
@@ -644,6 +881,13 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "interval_summary": getattr(plan, "interval_summary", ""),
         "ma_note": getattr(plan, "ma_note", ""),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
+        "learning_dimensions": dict(getattr(plan, "learning_dimensions", {}) or {}),
+        "input_context_id": str(getattr(plan, "input_context_id", "") or ""),
+        "input_features": dict(getattr(plan, "input_features", {}) or {}),
+        "input_feature_masks": dict(getattr(plan, "input_feature_masks", {}) or {}),
+        "input_context": dict(getattr(plan, "input_context", {}) or {}),
+        "gate_trace": list(getattr(plan, "gate_trace", []) or []),
+        "shadow_predictions": list(getattr(plan, "shadow_predictions", []) or []),
         "execution": _execution_snapshot(plan),
     }
 
@@ -729,6 +973,7 @@ def _learned_profile_snapshot(
         "symbol_factor": symbol_factor,
         "condition_stats": dict(getattr(profile, "condition_stats", {}) or {}),
         "condition_factors": dict(getattr(profile, "condition_factors", {}) or {}),
+        "dimension_stats": dict(getattr(profile, "dimension_stats", {}) or {}),
         "notes_ja": list(getattr(profile, "notes_ja", []) or []),
     }
 
@@ -911,6 +1156,17 @@ def _ml_artifact_snapshot(artifact: object | None) -> dict[str, object] | None:
         "usable": getattr(artifact, "usable", False),
         "reasons": list(getattr(artifact, "reasons", []) or []),
         "importance_by_name": dict(getattr(artifact, "importance_by_name", {}) or {}),
+        "return_usable": getattr(artifact, "return_usable", False),
+        "return_n_train": getattr(artifact, "return_n_train", 0),
+        "return_n_valid": getattr(artifact, "return_n_valid", 0),
+        "return_val_rmse": getattr(artifact, "return_val_rmse", None),
+        "return_baseline_rmse": getattr(artifact, "return_baseline_rmse", None),
+        "return_oos_mean_net_r": getattr(artifact, "return_oos_mean_net_r", None),
+        "return_oos_r_tstat": getattr(artifact, "return_oos_r_tstat", None),
+        "return_dsr": getattr(artifact, "return_dsr", None),
+        "return_label_version": getattr(artifact, "return_label_version", ""),
+        "return_cost_model_id": getattr(artifact, "return_cost_model_id", ""),
+        "return_reasons": list(getattr(artifact, "return_reasons", []) or []),
         "summary_ja": artifact.summary_ja() if hasattr(artifact, "summary_ja") else "",
     }
 
