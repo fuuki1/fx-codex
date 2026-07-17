@@ -369,3 +369,45 @@ def test_return_head_pbo_dsr_survive_roundtrip(tmp_path) -> None:
     assert loaded.return_n_trials == art.return_n_trials
     assert loaded.return_pbo == art.return_pbo
     assert loaded.return_dsr == art.return_dsr
+
+
+def test_direction_features_one_hot_session_and_regime() -> None:
+    row = direction_features(
+        "long",
+        0.0,
+        0.0,
+        {},
+        dimensions={"session_bucket": "london_new_york_overlap", "regime": "risk_off"},
+    )
+    assert row["session_london_new_york_overlap"] == 1.0
+    assert row["session_london"] == 0.0
+    assert row["regime_risk_off"] == 1.0
+    assert row["regime_risk_on"] == 0.0
+
+
+def test_direction_features_include_macro_and_liquidity_context() -> None:
+    chart = {
+        "macro__macro_pair_score": -0.4,
+        "macro__vix_level": 26.0,
+        "macro__cot_pair_diff": 0.2,
+        "macro__vix_level__available": 1.0,
+        "macro__cot_pair_diff__available": 1.0,
+        "liquidity__spread_pips": 1.3,
+        "liquidity__spread_percentile": 0.95,
+        "liquidity__spread_atr": 0.08,
+        "liquidity__status_thin": 1.0,
+        "liquidity__spread_pips__available": 1.0,
+        "liquidity__spread_percentile__available": 1.0,
+    }
+
+    long = direction_features("long", 0.0, 0.0, chart)
+    short = direction_features("short", 0.0, 0.0, chart)
+
+    assert long["dir_macro"] == -0.4
+    assert short["dir_macro"] == 0.4
+    assert long["dir_cot_pair_diff"] == 0.2
+    assert short["dir_cot_pair_diff"] == -0.2
+    assert long["macro_vix_level"] == 26.0
+    assert long["liquidity_spread_percentile"] == 0.95
+    assert long["liquidity_status_thin"] == 1.0
+    assert long["liquidity_baseline_available"] == 1.0
