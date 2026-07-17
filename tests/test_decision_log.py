@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 
 from fx_intel import decision_log, learning, maximization, tf_learning, tp_sl_learning
+from fx_intel.briefing import TradePlan
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import TimeframePlan
@@ -280,12 +281,10 @@ def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
     plan = TradePlan(
         symbol="USDJPY",
         direction="long",
-        action="long",
         conviction=60,
         composite=0.3,
         tech_score=0.4,
         news_score=0.2,
-        horizon_hours=24.0,
     )
     # build_checklist.to_dict() 相当のコスト系フィールドを持たせる
     plan.checklist = {
@@ -317,12 +316,10 @@ def test_fusion_decision_persists_null_execution_without_checklist() -> None:
     plan = TradePlan(
         symbol="USDJPY",
         direction="long",
-        action="no_trade",
         conviction=20,
         composite=0.1,
         tech_score=0.1,
         news_score=0.1,
-        horizon_hours=24.0,
     )
     events = decision_log.build_fusion_decision_events(
         [plan],
