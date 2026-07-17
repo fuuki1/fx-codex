@@ -54,11 +54,18 @@ from .briefing import (
     _event_warnings,
     NEWS_FULL_COVERAGE_COUNT,
 )
-from .calendar import RiskWindow, symbol_currencies
+from .calendar import RiskWindow, active_and_next_window, symbol_currencies
 from .market import is_market_open
 from .news import NewsItem
 from .sentiment import CurrencySentiment, pair_bias
 from .technicals import PairTechnicals
+from .evaluation_labels import (
+    DEFAULT_COMMISSION_R,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_SLIPPAGE_R,
+)
+from .shadow_learning import build_shadow_predictions, prediction_draft
+from . import input_context as decision_inputs
 
 ExpectancyAdjuster = Callable[[str, str, int], tuple[float, str, bool]]
 ExpectancyLookup = Callable[[str, str], ExpectancyAdjuster | None]
@@ -103,6 +110,8 @@ DEFAULT_TOLERANCE_HOURS = 2.0
 # 上位足レーティングを順張り/逆張りとして時間足スコアに加味する重み。
 # その足自身のレーティングを主、上位足を従にする(合計で -1.0〜+1.0 にクランプ)。
 HIGHER_TF_BONUS = 0.2
+# 15分足の観測分析だけに使う低い閾値。本番売買のDIRECTION_THRESHOLDは変更しない。
+FIFTEEN_MINUTE_ANALYSIS_THRESHOLD = 0.05
 
 # どの時間足がどの上位足を「上位」とみなすか(順張り判定に使う)。
 HIGHER_TIMEFRAMES: dict[str, tuple[str, ...]] = {
@@ -135,6 +144,9 @@ class TimeframePlan:
     tf_score: float  # その時間足の方向スコア(-1.0〜+1.0)
     news_score: float
     composite: float
+    # 売買ゲート適用前の観測用分析。standby中も別系列で満期採点する。
+    analysis_direction: str = "neutral"
+    analysis_conviction: int = 0
     close: float | None = None
     atr: float | None = None
     rsi: float | None = None
@@ -142,6 +154,13 @@ class TimeframePlan:
     stop: float | None = None
     target1: float | None = None
     target2: float | None = None
+    entry_bid: float | None = None
+    entry_ask: float | None = None
+    quote_observed_at: str | None = None
+    cost_model_id: str = DEFAULT_COST_MODEL_ID
+    slippage_r: float = DEFAULT_SLIPPAGE_R
+    commission_r: float = DEFAULT_COMMISSION_R
+    direction_threshold: float = DIRECTION_THRESHOLD
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0
     tech_weight: float = TECH_WEIGHT
@@ -155,6 +174,13 @@ class TimeframePlan:
     target_policy: dict[str, object] = field(default_factory=dict)
     # 補助ホライズン(観測専用)。{ホライズン時間: ラベル} の順序付き情報
     auxiliary_horizons: tuple[float, ...] = ()
+    learning_dimensions: dict[str, object] = field(default_factory=dict)
+    gate_trace: list[dict[str, object]] = field(default_factory=list)
+    shadow_predictions: list[dict[str, object]] = field(default_factory=list)
+    input_context_id: str = ""
+    input_features: dict[str, float | None] = field(default_factory=dict)
+    input_feature_masks: dict[str, int] = field(default_factory=dict)
+    input_context: dict[str, object] = field(default_factory=dict)
 
     @property
     def direction_ja(self) -> str:
@@ -244,6 +270,9 @@ def build_timeframe_plan(
     condition_adjuster: Callable[[Mapping[str, float], str], tuple[float, str]] | None = None,
     expectancy_adjuster: ExpectancyAdjuster | None = None,
     target_r_adjuster: TargetRAdjuster | None = None,
+    direction_threshold: float = DIRECTION_THRESHOLD,
+    learning_dimensions: Mapping[str, object] | None = None,
+    input_context: Mapping[str, object] | None = None,
 ) -> TimeframePlan:
     """1ペア・1時間足ぶんの独立した方向判断を組み立てる。
 
@@ -253,6 +282,7 @@ def build_timeframe_plan(
     その時間足単体のスコアである」ことと、判断に主ホライズンが紐づくこと。
     """
     now = now or datetime.now(UTC)
+    direction_threshold = max(DIRECTION_THRESHOLD, min(1.0, float(direction_threshold)))
     base, quote = symbol_currencies(symbol)
     horizon_hours = PRIMARY_HORIZON_HOURS.get(timeframe, 24.0)
 
@@ -290,6 +320,14 @@ def build_timeframe_plan(
 
     relevant_items = [item for item in news_items if _relevance(item) > 0]
     features = _extract_tf_features(tech, timeframe, len(relevant_items))
+    serialized_context = dict(input_context or {})
+    view_for_context = tech.views.get(timeframe)
+    input_features, input_masks = decision_inputs.flat_features_from_mapping(
+        serialized_context,
+        atr=view_for_context.atr if view_for_context is not None else None,
+    )
+    features.update({key: value for key, value in input_features.items() if value is not None})
+    features.update({f"{key}__available": float(mask) for key, mask in input_masks.items()})
 
     # データ品質: その時間足が取れたか(0/1) を tech カバレッジとして扱う。
     # 融合版は全足の重み和だが、時間足別ではその足の有無が本質なので簡潔にする。
@@ -334,9 +372,30 @@ def build_timeframe_plan(
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if not is_market_open(now):
+    market_open = is_market_open(now)
+    analysis_threshold = (
+        min(direction_threshold, FIFTEEN_MINUTE_ANALYSIS_THRESHOLD)
+        if timeframe == "15m"
+        else direction_threshold
+    )
+    if tech_cov <= 0 or quality < MIN_QUALITY_FOR_DIRECTION:
+        analysis_direction = "neutral"
+    elif composite >= analysis_threshold:
+        analysis_direction = "long"
+    elif composite <= -analysis_threshold:
+        analysis_direction = "short"
+    else:
+        analysis_direction = "neutral"
+    analysis_conviction = conviction if analysis_direction in ("long", "short") else 0
+    if not market_open:
+        analysis_direction = ""
+        analysis_conviction = 0
+    active_window, _next_window = active_and_next_window(windows, now)
+    gate_reasons: list[str] = []
+    if not market_open:
         direction = "closed"
         conviction = 0
+        gate_reasons.append("market_closed")
         warnings.append(
             "💤 FX市場休場中(週末クローズ) — 表示価格は最終取引時点のもの。"
             "方向判断は市場再開後に実施"
@@ -344,16 +403,19 @@ def build_timeframe_plan(
     elif in_event_window:
         direction = "standby"
         conviction = min(conviction, STANDBY_CONVICTION_CAP)
+        gate_reasons.append("event_window")
     elif tech_cov <= 0 or quality < MIN_QUALITY_FOR_DIRECTION:
         direction = "neutral"
-        if abs(composite) >= DIRECTION_THRESHOLD:
+        gate_reasons.append("missing_technical" if tech_cov <= 0 else "low_data_quality")
+        if abs(composite) >= direction_threshold:
             warnings.append(f"データ品質不足(品質{quality:.0%})のため方向判断を見送り")
-    elif composite >= DIRECTION_THRESHOLD:
+    elif composite >= direction_threshold:
         direction = "long"
-    elif composite <= -DIRECTION_THRESHOLD:
+    elif composite <= -direction_threshold:
         direction = "short"
     else:
         direction = "neutral"
+        gate_reasons.append("below_production_threshold")
 
     if condition_adjuster is not None and direction in ("long", "short"):
         condition_factor, condition_reason = condition_adjuster(features, direction)
@@ -375,16 +437,26 @@ def build_timeframe_plan(
         if expectancy_block:
             direction = "neutral"
             conviction = 0
+            gate_reasons.append("expectancy_guard")
 
     view = tech.views.get(timeframe)
     close = view.close if view else None
     atr = view.atr if view else None
     rsi = view.rsi if view else None
     adx = view.adx if view else None
+    entry_bid = view.bid if view else None
+    entry_ask = view.ask if view else None
+    quote_observed_at = now.isoformat() if entry_bid is not None and entry_ask is not None else None
+    context_bid, context_ask, context_quote_at = decision_inputs.decision_quote_from_mapping(
+        serialized_context
+    )
+    if context_bid is not None and context_ask is not None:
+        entry_bid, entry_ask, quote_observed_at = context_bid, context_ask, context_quote_at
 
     stop = target1 = target2 = None
     target_policy: dict[str, object] = {}
     if direction in ("long", "short") and (atr is None or atr <= 0):
+        gate_reasons.append("missing_atr")
         warnings.append(
             f"⚠️ ATR({timeframe})取得失敗 — SL/TPを算出できず、"
             "学習の小動き判定・期待値計算も無効"
@@ -415,6 +487,52 @@ def build_timeframe_plan(
         target1 = close + sign * risk_distance * target1_r
         target2 = close + sign * risk_distance * target2_r
 
+    dimensions = dict(learning_dimensions or {})
+    shadow_drafts = [prediction_draft("timeframe_raw", composite)]
+    macro_score = decision_inputs.macro_score_from_mapping(serialized_context)
+    if macro_score is not None:
+        shadow_drafts.append(
+            prediction_draft(
+                "macro",
+                macro_score,
+                stage="shadow",
+                producer_version="macro-features-v1",
+            )
+        )
+    shadow_predictions = build_shadow_predictions(
+        shadow_drafts,
+        close=close,
+        atr=atr,
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        cost_model_id=DEFAULT_COST_MODEL_ID,
+        slippage_r=DEFAULT_SLIPPAGE_R,
+        commission_r=DEFAULT_COMMISSION_R,
+        atr_multiple=atr_multiple,
+        production_threshold=direction_threshold,
+        horizon_hours=horizon_hours,
+        blocked_by=gate_reasons,
+        market_open=market_open,
+        learning_dimensions=dimensions,
+    )
+    gate_trace: list[dict[str, object]] = []
+    for blocked_gate in gate_reasons:
+        trace: dict[str, object] = {"gate": blocked_gate, "status": "blocked"}
+        if blocked_gate == "event_window" and active_window is not None:
+            trace.update(
+                {
+                    "event_currency": active_window.event.currency,
+                    "event_title": active_window.event.title,
+                    "event_impact": active_window.event.impact,
+                    "event_time": active_window.event.when.isoformat(),
+                    "blocked_until": active_window.end.isoformat(),
+                }
+            )
+        gate_trace.append(trace)
+    liquidity_trace = decision_inputs.liquidity_gate_trace_from_mapping(serialized_context)
+    if liquidity_trace is not None:
+        gate_trace.append(liquidity_trace)
     return TimeframePlan(
         symbol=symbol,
         timeframe=timeframe,
@@ -424,6 +542,8 @@ def build_timeframe_plan(
         tf_score=round(tf_score, 3),
         news_score=news_score,
         composite=composite,
+        analysis_direction=analysis_direction,
+        analysis_conviction=analysis_conviction,
         close=close,
         atr=atr,
         rsi=rsi,
@@ -431,6 +551,10 @@ def build_timeframe_plan(
         stop=stop,
         target1=target1,
         target2=target2,
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        direction_threshold=direction_threshold,
         risk_pct=risk_pct,
         data_quality=quality,
         tech_weight=tech_weight,
@@ -441,6 +565,13 @@ def build_timeframe_plan(
         warnings=warnings,
         target_policy=target_policy,
         auxiliary_horizons=AUXILIARY_HORIZON_HOURS.get(timeframe, ()),
+        learning_dimensions=dimensions,
+        gate_trace=gate_trace,
+        shadow_predictions=shadow_predictions,
+        input_context_id=str(serialized_context.get("context_id") or ""),
+        input_features=input_features,
+        input_feature_masks=input_masks,
+        input_context=serialized_context,
     )
 
 
@@ -458,6 +589,9 @@ def build_timeframe_plans(
     profile_lookup: Callable[[str, str], tuple[float, float, float, Callable | None]] | None = None,
     expectancy_lookup: ExpectancyLookup | None = None,
     target_r_adjuster: TargetRAdjuster | None = None,
+    direction_threshold: float = DIRECTION_THRESHOLD,
+    learning_dimensions: Mapping[str, object] | None = None,
+    input_context: Mapping[str, object] | None = None,
 ) -> list[TimeframePlan]:
     """1ペアについて、各時間足の独立した判断をまとめて作る。
 
@@ -503,6 +637,9 @@ def build_timeframe_plans(
                 condition_adjuster=adjuster,
                 expectancy_adjuster=expectancy_adjuster,
                 target_r_adjuster=target_r_adjuster,
+                direction_threshold=direction_threshold,
+                learning_dimensions=learning_dimensions,
+                input_context=input_context,
             )
         )
     return plans

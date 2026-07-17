@@ -64,6 +64,7 @@ def call(
     features: dict | None = None,
     ts: datetime | None = None,
     data_quality: float | None = None,
+    dimensions: dict | None = None,
 ) -> learning.EvaluatedCall:
     return learning.EvaluatedCall(
         symbol=symbol,
@@ -75,7 +76,23 @@ def call(
         ts=(ts or (NOW + timedelta(hours=next(_CALL_SEQ)))).isoformat(),
         features=features or {},
         data_quality=data_quality,
+        dimensions=dimensions or {},
     )
+
+
+def test_dimension_stats_separate_session_and_regime_without_adjusting() -> None:
+    calls = [
+        call(
+            outcome="hit" if index < 7 else "miss",
+            dimensions={"session_bucket": "london", "regime": "risk_off"},
+        )
+        for index in range(10)
+    ]
+    profile = learning.derive_profile(calls, thin_gap_hours=0)
+    cell = profile.dimension_stats["session_bucket"]["london"]["long"]
+    assert cell["evaluated"] == 10
+    assert cell["hit_rate"] == 0.7
+    assert profile.condition_factors == {}  # dimension集計は初期版では観測専用
 
 
 # ---------------------------------------------------------- evaluate_history
@@ -584,6 +601,23 @@ def test_build_trade_plan_uses_learned_weights() -> None:
     assert plan.composite == round(0.70 * plan.tech_score + 0.30 * plan.news_score, 3)
 
 
+def test_build_trade_plan_applies_injected_stricter_direction_threshold() -> None:
+    baseline = briefing.build_trade_plan("USDJPY", bullish_tech(), CURRENCIES, [], [], now=NOW)
+    strict = briefing.build_trade_plan(
+        "USDJPY",
+        bullish_tech(),
+        CURRENCIES,
+        [],
+        [],
+        now=NOW,
+        direction_threshold=1.0,
+    )
+
+    assert baseline.direction == "long"
+    assert strict.direction == "neutral"
+    assert strict.direction_threshold == 1.0
+
+
 def test_build_trade_plan_conviction_factor_damps_and_warns() -> None:
     baseline = briefing.build_trade_plan("USDJPY", bullish_tech(), CURRENCIES, [], [], now=NOW)
     damped = briefing.build_trade_plan(
@@ -624,7 +658,16 @@ def test_agreement_ratio() -> None:
 
 
 def test_build_trade_plan_records_chart_features() -> None:
-    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), CURRENCIES, [], [], now=NOW)
+    dimensions = {"session_bucket": "london", "regime": "risk_on"}
+    plan = briefing.build_trade_plan(
+        "USDJPY",
+        bullish_tech(),
+        CURRENCIES,
+        [],
+        [],
+        now=NOW,
+        learning_dimensions=dimensions,
+    )
     # make_view: close150 / RSI55 / ATR0.5 / SMA20=150.5 / SMA100=149
     assert plan.features["rsi_1h"] == 55.0
     assert plan.features["ma_gap_atr"] == pytest.approx(3.0)  # (150.5-149)/0.5
@@ -635,6 +678,9 @@ def test_build_trade_plan_records_chart_features() -> None:
     assert plan.features["rating_4h"] == 1.0
     assert plan.features["rating_1d"] == 0.5
     assert "adx_1h" not in plan.features  # 取得できなかった指標は記録しない
+    assert plan.learning_dimensions == dimensions
+    assert plan.shadow_predictions[0]["producer"] == "fusion_raw"
+    assert plan.shadow_predictions[0]["learning_dimensions"] == dimensions
 
 
 def test_bucket_for_maps_htf_ratings() -> None:

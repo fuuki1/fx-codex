@@ -23,6 +23,7 @@ APIキー不要の公開ソースのみを使う:
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, UTC
@@ -153,6 +154,9 @@ class MacroSnapshot:
     series: dict[str, MacroSeries] = field(default_factory=dict)
     cot: dict[str, CotReport] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # key=vix/us10y/us2y/usd_index/cot.  Cache metadata is preserved so a
+    # decision can prove when the exact response body was first available.
+    provenance: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def fresh_series(self, key: str) -> MacroSeries | None:
         """stale でない系列だけを返す(staleは無いのと同じ扱い)。"""
@@ -389,6 +393,7 @@ def _cached_fetch(
     """TTLキャッシュ経由の取得。ネット失敗時は期限切れキャッシュへ劣化。"""
     entry = cache.get(key)
     if isinstance(entry, Mapping):
+        _ensure_cache_metadata(entry)
         age = _cache_age_hours(entry, now)
         if age is not None and age <= ttl_hours and isinstance(entry.get("body"), str):
             return entry["body"]
@@ -404,8 +409,59 @@ def _cached_fetch(
             return entry["body"]
         warnings.append(f"マクロ取得失敗({key}): {error}")
         return None
-    cache[key] = {"fetched_at": now.isoformat(), "body": body}
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prior = dict(entry) if isinstance(entry, Mapping) else None
+    first_seen = now.isoformat()
+    history: list[dict[str, object]] = []
+    if prior is not None:
+        _ensure_cache_metadata(prior)
+        if prior.get("content_hash") == content_hash:
+            first_seen = str(prior.get("first_seen_time") or prior.get("fetched_at") or first_seen)
+        else:
+            old_history = prior.get("history")
+            if isinstance(old_history, list):
+                history.extend(item for item in old_history if isinstance(item, dict))
+            history.append(
+                {
+                    "fetched_at": prior.get("fetched_at"),
+                    "first_seen_time": prior.get("first_seen_time"),
+                    "content_hash": prior.get("content_hash"),
+                    "body": prior.get("body"),
+                }
+            )
+            history = history[-5:]
+    cache[key] = {
+        "fetched_at": now.isoformat(),
+        "first_seen_time": first_seen,
+        "content_hash": content_hash,
+        "body": body,
+        "history": history,
+    }
     return body
+
+
+def _ensure_cache_metadata(entry: Mapping) -> None:
+    """Upgrade old cache entries in place without changing their first-seen meaning."""
+
+    if not isinstance(entry, dict):
+        return
+    body = entry.get("body")
+    if isinstance(body, str):
+        entry.setdefault("content_hash", hashlib.sha256(body.encode("utf-8")).hexdigest())
+    entry.setdefault("first_seen_time", entry.get("fetched_at"))
+    entry.setdefault("history", [])
+
+
+def _cache_provenance(cache: Mapping[str, object], key: str, source: str) -> dict[str, object]:
+    entry = cache.get(key)
+    if not isinstance(entry, Mapping):
+        return {}
+    return {
+        "source": source,
+        "fetched_at": entry.get("fetched_at"),
+        "first_seen_time": entry.get("first_seen_time") or entry.get("fetched_at"),
+        "content_hash": entry.get("content_hash"),
+    }
 
 
 def _cot_query_url(limit: int = 200) -> str:
@@ -456,6 +512,7 @@ def fetch_macro_snapshot(
         if series.is_stale(now) and last_point is not None:
             warnings.append(f"マクロ系列 {label_ja} が古い(最終観測 {last_point.when.isoformat()})")
         snapshot.series[key] = series
+        snapshot.provenance[key] = _cache_provenance(cache, f"fred_{series_id}", "fred")
 
     if include_cot:
         body = _cached_fetch(
@@ -481,6 +538,7 @@ def fetch_macro_snapshot(
                     stale = [ccy for ccy, report in snapshot.cot.items() if report.is_stale(now)]
                     if stale:
                         warnings.append(f"COTレポートが古い: {', '.join(sorted(stale))}")
+                snapshot.provenance["cot"] = _cache_provenance(cache, "cftc_cot", "cftc")
 
     snapshot.warnings = warnings
     _save_cache(cache_file, cache)

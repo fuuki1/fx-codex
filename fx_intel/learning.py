@@ -71,6 +71,7 @@ from .journal import (
     DEFAULT_TOLERANCE_HOURS,
 )
 from .market import WEEKEND_CLOSURE, open_hours_between
+from .market_session import dimensions_from_mapping
 
 # 学習サンプルの間引き幅。ブリーフィングの設計上の記録間隔(毎時)に合わせ、
 # それより高頻度の運用(Mac miniは5分間隔)でもガードの実効性を保つ
@@ -233,6 +234,7 @@ class EvaluatedCall:
     # ml.py(確率モデルの教師)と promotion.py(期待値計算)が使う
     move_atr: float | None = None
     data_quality: float | None = None  # 記録時のデータ品質(0.0〜1.0)
+    dimensions: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -279,6 +281,10 @@ class LearnedProfile:
     condition_stats: dict[str, dict[str, dict[str, dict[str, int]]]] = field(default_factory=dict)
     # 苦手な状態×方向の減衰係数: {特徴量キー: {バケット名: {"long"/"short": 係数}}}
     condition_factors: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    # session/regime のカテゴリ周辺集計。初期版は観測専用。
+    dimension_stats: dict[str, dict[str, dict[str, dict[str, object]]]] = field(
+        default_factory=dict
+    )
     notes_ja: list[str] = field(default_factory=list)
 
     @property
@@ -516,9 +522,68 @@ def evaluate_history(
                 features=features,
                 move_atr=move_atr,
                 data_quality=data_quality,
+                dimensions=dimensions_from_mapping(
+                    entry.get("learning_dimensions"), fallback_ts=ts
+                ),
             )
         )
     return calls
+
+
+def _derive_dimension_stats(
+    calls: Sequence[EvaluatedCall],
+) -> dict[str, dict[str, dict[str, dict[str, object]]]]:
+    """Aggregate session/regime cells without creating production factors."""
+
+    raw: dict[str, dict[str, dict[str, dict[str, float | int]]]] = {}
+    for call in calls:
+        if call.direction not in ("long", "short"):
+            continue
+        for dimension in ("session_bucket", "regime"):
+            bucket = str(call.dimensions.get(dimension, "unknown") or "unknown")
+            cell = (
+                raw.setdefault(dimension, {})
+                .setdefault(bucket, {})
+                .setdefault(
+                    call.direction,
+                    {
+                        "raw": 0,
+                        "evaluated": 0,
+                        "hits": 0,
+                        "flat": 0,
+                        "move_atr_n": 0,
+                        "move_atr_sum": 0.0,
+                    },
+                )
+            )
+            cell["raw"] += 1
+            if call.outcome in ("hit", "miss"):
+                cell["evaluated"] += 1
+                cell["hits"] += 1 if call.outcome == "hit" else 0
+            elif call.outcome == "flat":
+                cell["flat"] += 1
+            if call.move_atr is not None:
+                cell["move_atr_n"] += 1
+                cell["move_atr_sum"] += float(call.move_atr)
+
+    result: dict[str, dict[str, dict[str, dict[str, object]]]] = {}
+    for dimension, buckets in raw.items():
+        for bucket, directions in buckets.items():
+            for direction, cell in directions.items():
+                evaluated = int(cell["evaluated"])
+                move_n = int(cell["move_atr_n"])
+                result.setdefault(dimension, {}).setdefault(bucket, {})[direction] = {
+                    "raw": int(cell["raw"]),
+                    "evaluated": evaluated,
+                    "hits": int(cell["hits"]),
+                    "flat": int(cell["flat"]),
+                    "hit_rate": (round(int(cell["hits"]) / evaluated, 4) if evaluated else None),
+                    "move_atr_n": move_n,
+                    "avg_move_atr": (
+                        round(float(cell["move_atr_sum"]) / move_n, 4) if move_n else None
+                    ),
+                }
+    return result
 
 
 def calibration_bins(calls: Sequence[EvaluatedCall]) -> list[ConvictionBin]:
@@ -693,6 +758,7 @@ def derive_profile(
         symbol_factors=symbol_factors,
         condition_stats=condition_stats,
         condition_factors=condition_factors,
+        dimension_stats=_derive_dimension_stats(calls),
     )
     profile.notes_ja = _build_notes_ja(profile, weights_adjusted, tech_n, news_n, horizon_label)
     profile.notes_ja.extend(reflection_report_ja(scored))
@@ -988,6 +1054,7 @@ def save_profile(profile: LearnedProfile, path: str | Path) -> None:
         "symbol_factors": profile.symbol_factors,
         "condition_stats": profile.condition_stats,
         "condition_factors": profile.condition_factors,
+        "dimension_stats": profile.dimension_stats,
         "notes_ja": profile.notes_ja,
     }
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1072,6 +1139,11 @@ def load_profile(path: str | Path) -> LearnedProfile:
             symbol_factors=symbol_factors,
             condition_stats=condition_stats,
             condition_factors=condition_factors,
+            dimension_stats=(
+                dict(payload.get("dimension_stats", {}))
+                if isinstance(payload.get("dimension_stats"), dict)
+                else {}
+            ),
             notes_ja=[str(note) for note in payload.get("notes_ja", [])],
         )
     except (KeyError, TypeError, ValueError):

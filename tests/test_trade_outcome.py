@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, UTC
 import json
 
+import pytest
+
 from fx_briefing import (
     approve_trade_candidate_cli,
     check_trade_outcome_health_cli,
@@ -827,6 +829,428 @@ def test_evaluate_trade_outcomes_flags_ambiguous_intrabar_touch() -> None:
     assert outcome.tp1_hit is True
     assert outcome.sl_hit is True
     assert "ambiguous_intrabar_touch" in outcome.quality_flags
+
+
+def test_evaluate_trade_outcomes_uses_bid_for_long_exit_path() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            101.0,
+            high=101.1,
+            low=100.0,
+            bid_close=100.8,
+            bid_high=100.95,
+            bid_low=99.9,
+            ask_close=101.0,
+            ask_high=101.15,
+            ask_low=100.1,
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "EURUSD",
+            100.5,
+            high=100.7,
+            low=100.3,
+            bid_close=100.4,
+            bid_high=100.6,
+            bid_low=100.2,
+            ask_close=100.6,
+            ask_high=100.8,
+            ask_low=100.4,
+        ),
+        _entry(
+            NOW + DAY,
+            "EURUSD",
+            100.4,
+            high=100.6,
+            low=100.2,
+            bid_close=100.3,
+            bid_high=100.5,
+            bid_low=100.1,
+            ask_close=100.5,
+            ask_high=100.7,
+            ask_low=100.3,
+        ),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    # mid highはTP1へ触れているが、longで売れるbid highは未達なのでTP扱いしない。
+    assert outcome.first_touch == "none"
+    assert outcome.terminal_price == 100.3
+    assert outcome.terminal_r == pytest.approx(0.3)
+    assert outcome.path_source == "bid_ask_ohlc"
+
+
+def test_evaluate_trade_outcomes_uses_ask_for_short_exit_path() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="short",
+            stop=101.0,
+            target1=99.0,
+            target2=98.0,
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            99.0,
+            high=100.0,
+            low=98.9,
+            bid_close=98.9,
+            bid_high=99.9,
+            bid_low=98.8,
+            ask_close=99.1,
+            ask_high=100.1,
+            ask_low=99.05,
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "EURUSD",
+            99.5,
+            high=99.7,
+            low=99.3,
+            bid_close=99.4,
+            bid_high=99.6,
+            bid_low=99.2,
+            ask_close=99.6,
+            ask_high=99.8,
+            ask_low=99.4,
+        ),
+        _entry(
+            NOW + DAY,
+            "EURUSD",
+            99.4,
+            high=99.6,
+            low=99.2,
+            bid_close=99.3,
+            bid_high=99.5,
+            bid_low=99.1,
+            ask_close=99.5,
+            ask_high=99.7,
+            ask_low=99.3,
+        ),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    # mid lowはTP1へ触れているが、shortを買い戻すask lowは未達。
+    assert outcome.first_touch == "none"
+    assert outcome.terminal_price == 99.5
+    assert outcome.terminal_r == pytest.approx(0.5)
+
+
+def test_realized_net_r_uses_executable_quotes_without_double_counting_spread() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=102.0,
+            target2=103.0,
+            entry_bid=99.9,
+            entry_ask=100.1,
+            quote_observed_at=NOW.isoformat(),
+            cost_model_id="test-quotes-v1",
+            slippage_r=0.0,
+            commission_r=0.0,
+            decision_id="decision-net-r",
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            100.3,
+            high=100.5,
+            low=100.1,
+            bid_close=100.2,
+            bid_high=100.4,
+            bid_low=100.0,
+            ask_close=100.4,
+            ask_high=100.6,
+            ask_low=100.2,
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "EURUSD",
+            100.6,
+            high=100.8,
+            low=100.4,
+            bid_close=100.5,
+            bid_high=100.7,
+            bid_low=100.3,
+            ask_close=100.7,
+            ask_high=100.9,
+            ask_low=100.5,
+        ),
+        _entry(
+            NOW + DAY,
+            "EURUSD",
+            100.9,
+            high=101.1,
+            low=100.7,
+            bid_close=100.8,
+            bid_high=101.0,
+            bid_low=100.6,
+            ask_close=101.0,
+            ask_high=101.2,
+            ask_low=100.8,
+        ),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.decision_id == "decision-net-r"
+    assert outcome.gross_realized_r == pytest.approx(0.9)
+    assert outcome.quote_realized_r == pytest.approx(0.7)
+    assert outcome.execution_cost_r == pytest.approx(0.2)
+    assert outcome.realized_net_r == pytest.approx(0.7)
+    assert outcome.net_label_eligible is True
+    assert outcome.cost_status == "quote_measured_modelled_execution"
+
+
+def test_realized_net_r_is_missing_without_decision_time_quote() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=102.0,
+            target2=103.0,
+            cost_model_id="test-quotes-v1",
+            slippage_r=0.0,
+            commission_r=0.0,
+        )
+    ]
+    for hours, close in ((8, 100.2), (16, 100.4), (24, 100.6)):
+        rows.append(
+            _entry(
+                NOW + timedelta(hours=hours),
+                "EURUSD",
+                close,
+                high=close + 0.1,
+                low=close - 0.1,
+                bid_close=close - 0.05,
+                bid_high=close + 0.05,
+                bid_low=close - 0.15,
+                ask_close=close + 0.05,
+                ask_high=close + 0.15,
+                ask_low=close - 0.05,
+            )
+        )
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.realized_r is not None
+    assert outcome.realized_net_r is None
+    assert outcome.net_label_eligible is False
+    assert "missing_net_label_entry_quote" in outcome.quality_flags
+
+
+def test_realized_net_r_uses_adverse_open_for_stop_gap() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+            entry_bid=99.9,
+            entry_ask=100.1,
+            quote_observed_at=NOW.isoformat(),
+            cost_model_id="test-quotes-v1",
+            slippage_r=0.0,
+            commission_r=0.0,
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            99.0,
+            high=99.2,
+            low=98.7,
+            bid_open=98.8,
+            bid_close=98.9,
+            bid_high=99.1,
+            bid_low=98.6,
+            ask_open=99.0,
+            ask_close=99.1,
+            ask_high=99.3,
+            ask_low=98.8,
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "EURUSD",
+            99.1,
+            high=99.3,
+            low=98.9,
+            bid_close=99.0,
+            bid_high=99.2,
+            bid_low=98.8,
+            ask_close=99.2,
+            ask_high=99.4,
+            ask_low=99.0,
+        ),
+        _entry(
+            NOW + DAY,
+            "EURUSD",
+            99.2,
+            high=99.4,
+            low=99.0,
+            bid_close=99.1,
+            bid_high=99.3,
+            bid_low=98.9,
+            ask_close=99.3,
+            ask_high=99.5,
+            ask_low=99.1,
+        ),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.first_touch == "sl"
+    assert outcome.executable_exit == pytest.approx(98.8)
+    assert outcome.realized_net_r == pytest.approx(-1.3)
+
+
+def test_completed_bar_starting_before_decision_is_excluded() -> None:
+    decision_time = NOW + timedelta(minutes=2)
+    rows = [
+        _entry(
+            decision_time,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        # 終了は判断後だが開始は判断前。high=TP到達を採点へ使ってはいけない。
+        _entry(
+            NOW + timedelta(minutes=5),
+            "EURUSD",
+            101.1,
+            high=101.2,
+            low=99.8,
+            bar_start=NOW.isoformat(),
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            100.2,
+            high=100.4,
+            low=100.0,
+            bar_start=(NOW + timedelta(hours=7, minutes=55)).isoformat(),
+        ),
+        _entry(
+            NOW + timedelta(hours=16),
+            "EURUSD",
+            100.3,
+            high=100.5,
+            low=100.1,
+            bar_start=(NOW + timedelta(hours=15, minutes=55)).isoformat(),
+        ),
+        _entry(
+            NOW + DAY,
+            "EURUSD",
+            100.4,
+            high=100.6,
+            low=100.2,
+            bar_start=(NOW + timedelta(hours=23, minutes=55)).isoformat(),
+        ),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+    assert outcome.first_touch == "none"
+
+
+def test_direction_only_and_forming_bar_ranges_do_not_score_tp() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(
+            NOW + timedelta(hours=4),
+            "EURUSD",
+            101.2,
+            high=101.4,
+            low=100.0,
+            price_usage="direction_only",
+        ),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            100.2,
+            high=101.3,
+            low=99.8,
+            ohlc_scope="forming_bar_snapshot",
+        ),
+        _entry(NOW + timedelta(hours=16), "EURUSD", 100.3),
+        _entry(NOW + DAY, "EURUSD", 100.4),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.first_touch == "none"
+    assert outcome.path_points == 3
+    assert outcome.path_source == "close"
+
+
+def test_duplicate_timestamp_prefers_bid_ask_ohlc_without_path_inflation() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "EURUSD",
+            100.0,
+            direction="long",
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(NOW + timedelta(hours=8), "EURUSD", 100.2),
+        _entry(
+            NOW + timedelta(hours=8),
+            "EURUSD",
+            100.25,
+            high=100.4,
+            low=100.0,
+            bid_close=100.2,
+            bid_high=100.35,
+            bid_low=99.95,
+            ask_close=100.3,
+            ask_high=100.45,
+            ask_low=100.05,
+        ),
+        _entry(NOW + timedelta(hours=16), "EURUSD", 100.3),
+        _entry(NOW + DAY, "EURUSD", 100.4),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.path_points == 3
+    assert outcome.terminal_price == 100.4
 
 
 def test_retest_trade_variants_cli_writes_paper_candidate(tmp_path) -> None:

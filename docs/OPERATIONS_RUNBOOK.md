@@ -8,9 +8,10 @@ launchd常駐サービスとして運用するための手順書。
 
 | Label | 周期 | 実体 | 役割 |
 |---|---|---|---|
-| `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | 時間足別採点用の価格系列供給。**止まると15m/1h採点が永久に不能** |
+| `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | OANDA完了済みM5 bid/ask OHLCを供給。**止まると15m/1h採点が永久に不能** |
 | `com.fx-codex.briefing` | 毎時:10(StartCalendarInterval) | `scripts/fx_briefing_once.sh`(融合+時間足別) | 判断生成・ジャーナル追記・学習更新・Discord通知 |
 | `com.fx-codex.health` | 5分毎 | `tools/data_freshness_monitor.py` | データ鮮度監視。WARNING/CRITICAL/RECOVERYをDiscordへ |
+| `com.fx-codex.horizon` | 5分毎(StartInterval 300) | `scripts/fx_horizon_once.sh` | 3ペア×9本のshadow予測、満期採点、セル学習。Discord/既存判断への影響なし |
 
 全サービスは `tools/run_exclusive.py` の排他ロック(flock)経由で起動し、
 **二重起動を構造的に防ぐ**(手動起動・cron・launchdのどの組合せでも同時実行は1つ)。
@@ -22,6 +23,9 @@ launchd常駐サービスとして運用するための手順書。
 - 秘密情報(Discord webhook)はplistに書かず、実行時に `.env` から読む。
   鮮度監視は `DISCORD_OPS_WEBHOOK_URL`(運用専用)があれば優先し、
   無ければ既存の `DISCORD_WEBHOOK_URL` を使う。
+- 価格取得用の `.env` には `OANDA_API_TOKEN` と
+  `OANDA_ENVIRONMENT=practice`（または`live`）が必要。未設定時は品質を偽装する
+  close-onlyフォールバックを行わず、snapshotを失敗させる。
 
 ## 1. インストール / 確認 / 再起動 / 撤去
 
@@ -83,7 +87,7 @@ crontab -l | grep -v 'fx_briefing.py' | crontab -
 
 # 5) 新サービスをインストール(旧briefing.hourlyは自動bootout+plist退避)
 ./scripts/install_launchd.sh
-./scripts/status_fx_services.sh   # 3サービスLOADED+鮮度okを確認
+./scripts/status_fx_services.sh   # 4サービスLOADED+鮮度okを確認
 
 # 6) 5〜10分後に再確認: snapshotが5分毎に追記され、healthがレポートを生成していること
 ./scripts/status_fx_services.sh
@@ -96,6 +100,7 @@ crontab -l | grep -v 'fx_briefing.py' | crontab -
 | 対象 | 期待周期 | WARNING | CRITICAL | 根拠 |
 |---|---|---|---|---|
 | `briefing_tf_prices.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 15m採点窓(9〜21分)を守るには45分停止が実害ライン |
+| `briefing_horizon_forecasts.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 5m恒久shadowを含む全9本のcapture継続を監視 |
 | `briefing_tf_journal.jsonl` | 1時間 | 2時間 | 6時間 | 1周期スキップは許容(API一時失敗)。6時間=営業日の1/4欠損 |
 | `briefing_journal.jsonl` | 1時間 | 2時間 | 6時間 | 同上 |
 | `briefing_tf_learning.json` | 1時間 | 3時間 | なし(warnのみ) | ブリーフィング成功の副産物。停止検知はジャーナル側が担う |
@@ -131,18 +136,19 @@ crontab -l | grep -v 'fx_briefing.py' | crontab -
   当時のニュース・スプレッド・取得条件は再現できないため、バックフィル期間を
   **完全なpoint-in-time判断データとして扱わない**(価格採点の補助のみ)
 
-## 6. OHLCデータソース設計(close-only経路の改善、次段階)
+## 6. OHLCデータソース設計
 
-現状: TradingViewスキャナーの現在値のみ=close-only経路。TP/SL先着判定の
-経路品質上限0.70。改善は `fx_intel/price_history.py` の注入口に
-プロバイダを差し込む形で行う(分析ロジック変更なし)。
+現行の採点経路はOANDA v20の完了済みM5 bid/ask OHLC。longの手仕舞いはbid、
+shortはaskでTP/SL・MFE/MAEを採点し、足開始が判断前の完了足は経路から除外する。
+TradingViewスキャナーの形成中OHLCは判断前のhigh/lowを含み、bid/askも取れないため、
+診断用の明示オプションに限定している。
 
 | 候補 | bid/ask | OHLC | 粒度 | 履歴 | レート制限 | PIT性 | 評価 |
 |---|---|---|---|---|---|---|---|
-| Dukascopy | ✅(tick) | ✅ | tick〜 | 数年 | 緩い(無償) | 高(確定足) | **本命**。fx_backtester系のdukascopy_cftc_modelで実績あり |
-| OANDA v20 | ✅ | ✅ | 5s〜 | 数年 | 有(無償枠) | 高 | 口座必要。live/historical整合が良い |
+| Dukascopy | ✅(tick) | ✅ | tick〜 | 数年 | 緩い(無償) | 高(確定足) | 独立再検証・tick検証の候補 |
+| OANDA v20 | ✅ | ✅ | 5s〜 | 数年 | 有(無償枠) | 高 | **現行採用**。口座・API tokenが必要 |
 | IBKR | ✅ | ✅ | 1s〜 | 制限有 | pacing厳しい | 高 | 口座未開設のため現状不可 |
-| TradingView(現行) | ❌ | ❌(現在値のみ) | - | なし | 非公式 | 低 | 継続はlive現在値の補助のみ |
+| TradingView(診断用) | ❌ | 形成中OHLC | - | なし | 非公式 | 低 | 判断前rangeを含みうるため採点には不採用 |
 | yfinance | ❌ | ✅(日足中心) | 1m(7日制限) | 長期は日足 | 非公式・不安定 | 低 | **主要ソース不採用**。開発時の補助のみ |
 
 プロバイダ抽象(実装時のインターフェース):

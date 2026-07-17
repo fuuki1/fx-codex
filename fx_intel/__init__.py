@@ -28,6 +28,11 @@
 20. trade_outcome — MFE/MAE/TP/SL採点・期待値監査・改善候補レジストリ
 21. tp_sl_learning — TP/SL先着正答率によるMVP確信度補正
 22. maximization — 期待R/PF/Brier/経路品質による最大化プロファイル
+23. oanda_prices — 完了済みM5 bid/ask OHLCの取得と採点用行への変換
+24. ibkr_prices — IBKR paperの判断quote・完了済みBID/ASK足の取得
+25. direction_threshold — 純Rで検証する承認制の見送り閾値ポリシー
+26. input_context — 判断時点で固定するマクロ・流動性の共通入力契約
+27. liquidity — broker spread・セッションによる流動性proxy
 
 tv_discord_notify.py と同じく fx_backtester 非依存で単体動作する
 (必要な外部パッケージは requests と tradingview_ta のみ。gbm/ml/promotion は
@@ -41,13 +46,20 @@ __all__ = [
     "committee",
     "decision_feedback",
     "decision_log",
+    "direction_threshold",
     "gbm",
+    "ibkr_prices",
     "journal",
     "learning",
+    "input_context",
+    "liquidity",
+    "market_session",
+    "shadow_learning",
     "macro",
     "maximization",
     "ml",
     "news",
+    "oanda_prices",
     "price_history",
     "promotion",
     "sentiment",

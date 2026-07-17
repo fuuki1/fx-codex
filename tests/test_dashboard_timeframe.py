@@ -286,21 +286,185 @@ def test_build_state_uses_timeframe_learning_when_fusion_learning_missing(
     assert state["tf_learning"]["timeframes"][0]["hit_rate"] == pytest.approx(16 / 29)
 
 
-def test_build_state_reports_missing_learning_ops_inputs(server, tmp_path) -> None:
+def test_learning_payload_preserves_zero_fusion_counts(server) -> None:
+    result = server._learning_payload(
+        {"evaluated": 1, "hits": 0, "flat": 0},
+        {"evaluated": 1921, "hits": 930, "flat": 12},
+        {},
+        {"mode": "fusion", "label_ja": "融合1判断"},
+    )
+
+    assert result["evaluated"] == 1
+    assert result["hits"] == 0
+    assert result["flat"] == 0
+    assert result["hit_rate"] == 0.0
+
+
+def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> None:
+    result = server._net_r_summary(
+        {
+            "outcomes": [
+                {
+                    "ts": "2026-07-01T00:00:00+00:00",
+                    "decision_id": "d1",
+                    "realized_r": 1.0,
+                    "realized_net_r": 0.8,
+                    "tradable": True,
+                    "net_label_eligible": True,
+                    "label_version": "net-r-v1",
+                    "cost_model_id": "quotes-v1",
+                },
+                {
+                    "ts": "2026-07-02T00:00:00+00:00",
+                    "decision_id": "d2",
+                    "realized_r": -1.0,
+                    "realized_net_r": -1.2,
+                    "tradable": True,
+                    "net_label_eligible": True,
+                    "label_version": "net-r-v1",
+                    "cost_model_id": "quotes-v1",
+                },
+                {
+                    "ts": "2026-07-03T00:00:00+00:00",
+                    "realized_r": 0.2,
+                    "realized_net_r": None,
+                    "tradable": True,
+                    "quality_flags": ["missing_net_label_entry_quote"],
+                },
+            ]
+        }
+    )
+
+    assert result["labels"] == 2
+    assert result["scored"] == 3
+    assert result["coverage"] == pytest.approx(2 / 3)
+    assert result["expectancy_r"] == pytest.approx(-0.2)
+    assert result["cumulative_net_r"] == pytest.approx(-0.4)
+    assert result["curve"][-1]["cumulative_net_r"] == pytest.approx(-0.4)
+    assert result["missing_reasons"] == {"missing_net_label_entry_quote": 1}
+
+
+def test_input_context_summary_reports_coverage_and_status(server) -> None:
+    journal_rows = [
+        {
+            "timeframe": "15m",
+            "input_context_id": "ctx-1",
+            "input_feature_masks": {"macro__vix_level": 1},
+        },
+        {"timeframe": "1h", "input_context_id": "ctx-1", "input_feature_masks": {}},
+        {"timeframe": "4h"},
+    ]
+    events = [
+        {
+            "decision": {
+                "input_context_id": "ctx-1",
+                "input_context": {
+                    "context_id": "ctx-1",
+                    "macro": {"quality_status": "partial"},
+                    "liquidity": {
+                        "status": "thin",
+                        "features": {"spread_pips": 1.2},
+                        "quote": {"source": "oanda_v20_pricing"},
+                    },
+                },
+            }
+        }
+    ]
+
+    result = server._input_context_summary(journal_rows, events)
+
+    assert result["coverage"] == pytest.approx(2 / 3)
+    assert result["unique_contexts"] == 1
+    assert result["macro_status"] == {"partial": 1}
+    assert result["liquidity_status"] == {"thin": 1}
+    assert result["quote_sources"] == {"oanda_v20_pricing": 1}
+    assert result["feature_coverage"][0]["coverage"] == 1.0
+
+
+def test_learning_payload_exposes_session_and_regime_dimensions(server) -> None:
+    result = server._learning_payload(
+        {
+            "evaluated": 10,
+            "hits": 7,
+            "dimension_stats": {
+                "session_bucket": {
+                    "london": {
+                        "long": {
+                            "raw": 10,
+                            "evaluated": 10,
+                            "hits": 7,
+                            "flat": 0,
+                            "hit_rate": 0.7,
+                            "avg_move_atr": 0.2,
+                        }
+                    }
+                },
+                "regime": {
+                    "risk_off": {"long": {"raw": 10, "evaluated": 10, "hits": 7, "flat": 0}}
+                },
+            },
+        },
+        {"evaluated": 0, "hits": 0, "flat": 0},
+        {},
+        {"mode": "fusion", "label_ja": "融合1判断"},
+    )
+    assert {row["dimension"] for row in result["dimensions"]} == {
+        "session_bucket",
+        "regime",
+    }
+    london = next(row for row in result["dimensions"] if row["bucket"] == "london")
+    assert london["hit_rate"] == 0.7
+
+
+def test_build_state_exposes_shadow_summary(server, tmp_path) -> None:
+    shadow = {
+        "schema": 1,
+        "predictions": 4,
+        "outcomes": 3,
+        "by_producer": {"fusion_raw": {"effective": 3, "hits": 2, "hit_rate": 2 / 3}},
+    }
+    dimensions = {
+        "regime": {
+            "risk_off": {
+                "long": {
+                    "effective": 3,
+                    "net_labels": 2,
+                    "net_label_coverage": 2 / 3,
+                    "net_expectancy_r": 0.2,
+                    "cumulative_net_r": 0.4,
+                }
+            }
+        }
+    }
+    (tmp_path / "briefing_decision_outcomes.json").write_text(
+        json.dumps({"shadow_summary": shadow, "dimension_summary": dimensions}), encoding="utf-8"
+    )
     state = server.build_state(tmp_path, now=START, ps_output="")
+    assert state["shadow"] == shadow
+    assert state["dimension_outcomes"][0]["net_expectancy_r"] == 0.2
+
+
+def test_build_state_reports_missing_learning_ops_inputs(server, tmp_path) -> None:
+    state = server.build_state(
+        tmp_path,
+        now=START,
+        ps_output="",
+        launchctl_outputs={},
+    )
     ops = state["ops"]
 
-    assert ops["status"] == "warn"
+    assert ops["status"] == "fail"
     assert ops["signals"]["has_any_journal"] is False
     assert ops["signals"]["has_timeframe_prices"] is False
     assert ops["signals"]["has_any_learning"] is False
     assert ops["processes"][0]["running"] is False
     assert ops["processes"][1]["running"] is False
     assert any("判断ログ" in alert["message_ja"] for alert in ops["alerts"])
-    assert any("スナップショットループ" in alert["message_ja"] for alert in ops["alerts"])
+    assert any("価格スナップショット" in alert["message_ja"] for alert in ops["alerts"])
 
 
 def test_build_state_reports_running_learning_ops(server, tmp_path) -> None:
+    (tmp_path / "briefing_journal.jsonl").write_text("{}\n", encoding="utf-8")
     (tmp_path / "briefing_tf_journal.jsonl").write_text(
         json.dumps(_row(START, "15m", 0.25, "long", 150.0), ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -334,12 +498,89 @@ def test_build_state_reports_running_learning_ops(server, tmp_path) -> None:
         ]
     )
 
-    state = server.build_state(tmp_path, now=START, ps_output=ps_output)
+    launchctl_output = "state = waiting\nlast exit code = 0\n"
+    state = server.build_state(
+        tmp_path,
+        now=START,
+        ps_output=ps_output,
+        launchctl_outputs={
+            "com.fx-codex.snapshot": launchctl_output,
+            "com.fx-codex.briefing": launchctl_output,
+            "com.fx-codex.health": launchctl_output,
+            "com.fx-codex.horizon": launchctl_output,
+            "com.fx-codex.monitors": launchctl_output,
+        },
+    )
     ops = state["ops"]
 
     assert ops["status"] == "ok"
     assert ops["signals"]["has_any_journal"] is True
     assert ops["signals"]["has_timeframe_prices"] is True
     assert ops["signals"]["has_any_learning"] is True
-    assert [process["running"] for process in ops["processes"]] == [True, True, True]
+    assert [process["running"] for process in ops["processes"]] == [
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
+    assert state["journal"]["fusion_total"] == 1
+    assert state["journal"]["timeframe_total"] == 1
     assert ops["alerts"] == []
+
+
+def test_build_state_exposes_horizon_matrix_and_promotion_metrics(server, tmp_path) -> None:
+    horizon_row = {
+        "ts": START.isoformat(),
+        "symbol": "USDJPY",
+        "horizon": "5m",
+        "direction": "long",
+        "conviction": 42,
+        "p_up": 0.5,
+        "p_down": 0.25,
+        "p_flat": 0.25,
+        "calibrated": False,
+    }
+    (tmp_path / "briefing_horizon_forecasts.jsonl").write_text(
+        json.dumps(horizon_row) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "briefing_horizon_learning.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "contract": "horizon-pit-v1",
+                "generated_at": START.isoformat(),
+                "gbdt_review_gate": "approved_pre_a2",
+                "scored_total": 12,
+                "profiles": {
+                    "USDJPY|5m": {
+                        "symbol": "USDJPY",
+                        "horizon": "5m",
+                        "n_scored": 12,
+                        "hits": 7,
+                        "misses": 5,
+                        "hit_rate": 7 / 12,
+                        "mean_brier": 0.55,
+                        "mean_log_loss": 0.9,
+                        "band_coverage": 0.8,
+                        "mean_net_r": 0.1,
+                        "promotion": {
+                            "stage": "shadow",
+                            "permanent_shadow": True,
+                            "remaining_n": None,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = server.build_state(tmp_path, now=START, ps_output="")
+
+    assert state["horizon"]["contract"] == "horizon-pit-v1"
+    assert state["horizon"]["journal_rows"] == 1
+    assert state["horizon"]["latest"][0]["horizon"] == "5m"
+    assert state["horizon"]["profiles"][0]["permanent_shadow"] is True
+    assert state["ops"]["signals"]["has_horizon_track"] is True

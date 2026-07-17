@@ -2,7 +2,7 @@
 # fx-codex収集サービスの状態を1画面で確認する。
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health)
+LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
 
 echo "=== launchd サービス ==="
 for label in $LABELS; do
@@ -36,7 +36,7 @@ fi
 
 echo ""
 echo "=== 主要ログの最終更新 ==="
-for f in logs/briefing_tf_prices.jsonl logs/briefing_journal.jsonl logs/briefing_tf_journal.jsonl; do
+for f in logs/briefing_tf_prices.jsonl logs/briefing_journal.jsonl logs/briefing_tf_journal.jsonl logs/briefing_horizon_forecasts.jsonl logs/briefing_horizon_learning.json logs/trade_outcome_monitor.json logs/decision_expectancy_monitor.json; do
   if [ -f "$ROOT/$f" ]; then
     ls -laT "$ROOT/$f" | awk '{printf "  %s %s %s %s  %s\n", $6, $7, $8, $9, $NF}'
   fi

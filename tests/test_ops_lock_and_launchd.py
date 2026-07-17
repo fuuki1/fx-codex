@@ -159,6 +159,8 @@ PLIST_TEMPLATES = [
     "com.fx-codex.snapshot.plist.tmpl",
     "com.fx-codex.briefing.plist.tmpl",
     "com.fx-codex.health.plist.tmpl",
+    "com.fx-codex.horizon.plist.tmpl",
+    "com.fx-codex.monitors.plist.tmpl",
 ]
 
 
@@ -197,7 +199,13 @@ def test_install_script_dry_run_makes_no_changes(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "dry-run" in result.stdout
-    for label in ("com.fx-codex.snapshot", "com.fx-codex.briefing", "com.fx-codex.health"):
+    for label in (
+        "com.fx-codex.snapshot",
+        "com.fx-codex.briefing",
+        "com.fx-codex.health",
+        "com.fx-codex.horizon",
+        "com.fx-codex.monitors",
+    ):
         assert label in result.stdout
     # 展開済みパスが含まれ、プレースホルダは残らない
     assert "__FX_ROOT__" not in result.stdout
@@ -211,6 +219,8 @@ def test_shell_scripts_parse(tmp_path):
         "status_fx_services.sh",
         "restart_fx_services.sh",
         "fx_briefing_once.sh",
+        "fx_horizon_once.sh",
+        "fx_monitors_once.sh",
     ):
         result = subprocess.run(
             [_ZSH, "-n", str(_ROOT / "scripts" / script)],

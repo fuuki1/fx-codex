@@ -35,6 +35,13 @@ from .market import is_market_open
 from .news import NewsItem
 from .sentiment import CurrencySentiment, MarketAnalysis, pair_bias
 from .technicals import PairTechnicals
+from .evaluation_labels import (
+    DEFAULT_COMMISSION_R,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_SLIPPAGE_R,
+)
+from .shadow_learning import build_shadow_predictions, prediction_draft
+from . import input_context as decision_inputs
 
 JST = timezone(timedelta(hours=9))
 
@@ -124,11 +131,22 @@ class TradePlan:
     composite: float
     tech_score: float
     news_score: float
+    # 売買ゲート適用前の観測用分析。standby中も別系列で満期採点する。
+    analysis_direction: str = "neutral"
+    analysis_conviction: int = 0
     close: float | None = None
     atr: float | None = None
     stop: float | None = None
     target1: float | None = None
     target2: float | None = None
+    # 判断時点の約定可能quote。純Rラベルはlong=ask entry、short=bid entryを使う。
+    entry_bid: float | None = None
+    entry_ask: float | None = None
+    quote_observed_at: str | None = None
+    cost_model_id: str = DEFAULT_COST_MODEL_ID
+    slippage_r: float = DEFAULT_SLIPPAGE_R
+    commission_r: float = DEFAULT_COMMISSION_R
+    direction_threshold: float = DIRECTION_THRESHOLD
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0  # 0.0〜1.0。判断の根拠データがどれだけ揃っていたか
     tech_weight: float = TECH_WEIGHT  # 実際に使った複合重み(学習調整で変わりうる)
@@ -145,6 +163,14 @@ class TradePlan:
     interval_summary: str = ""
     ma_note: str = ""
     target_policy: dict[str, object] = field(default_factory=dict)
+    # 判断時点のカテゴリ学習軸(session/regime)。数値featuresとは分離する。
+    learning_dimensions: dict[str, object] = field(default_factory=dict)
+    gate_trace: list[dict[str, object]] = field(default_factory=list)
+    shadow_predictions: list[dict[str, object]] = field(default_factory=list)
+    input_context_id: str = ""
+    input_features: dict[str, float | None] = field(default_factory=dict)
+    input_feature_masks: dict[str, int] = field(default_factory=dict)
+    input_context: dict[str, object] = field(default_factory=dict)
 
     @property
     def direction_ja(self) -> str:
@@ -276,6 +302,10 @@ def build_trade_plan(
     extra_components: Sequence[ScoreComponent] = (),
     extra_features: Mapping[str, float] | None = None,
     committee_notes: Sequence[str] = (),
+    direction_threshold: float = DIRECTION_THRESHOLD,
+    learning_dimensions: Mapping[str, object] | None = None,
+    shadow_prediction_drafts: Sequence[Mapping[str, object]] = (),
+    input_context: Mapping[str, object] | None = None,
 ) -> TradePlan:
     """1ペア分のトレードプランを組み立てる。
 
@@ -308,6 +338,7 @@ def build_trade_plan(
     shadow段階の委員でも成績を後から採点できるようにする)。
     """
     now = now or datetime.now(UTC)
+    direction_threshold = max(DIRECTION_THRESHOLD, min(1.0, float(direction_threshold)))
     base, quote = symbol_currencies(symbol)
 
     tech_score, ma_note = _tech_score(tech)
@@ -356,6 +387,12 @@ def build_trade_plan(
     # 判断時点のチャート状態を記録(learning.pyの状態別学習の入力)。
     # 追加委員のスコア(macro_score等)もここに合流させてジャーナルに残す
     features = _extract_features(tech, len(relevant_items))
+    serialized_context = dict(input_context or {})
+    input_features, input_masks = decision_inputs.flat_features_from_mapping(
+        serialized_context, atr=tech.atr()
+    )
+    features.update({key: value for key, value in input_features.items() if value is not None})
+    features.update({f"{key}__available": float(mask) for key, mask in input_masks.items()})
     if extra_features:
         for key, value in extra_features.items():
             if isinstance(value, (int, float)):
@@ -407,9 +444,25 @@ def build_trade_plan(
         )
         conviction = round(conviction * CONFLICT_CONVICTION_FACTOR)
 
-    if not is_market_open(now):
+    market_open = is_market_open(now)
+    if tech_cov <= 0 or quality < MIN_QUALITY_FOR_DIRECTION:
+        analysis_direction = "neutral"
+    elif composite >= direction_threshold:
+        analysis_direction = "long"
+    elif composite <= -direction_threshold:
+        analysis_direction = "short"
+    else:
+        analysis_direction = "neutral"
+    analysis_conviction = conviction if analysis_direction in ("long", "short") else 0
+    if not market_open:
+        analysis_direction = ""
+        analysis_conviction = 0
+    active_window, _next_window = active_and_next_window(windows, now)
+    gate_reasons: list[str] = []
+    if not market_open:
         direction = "closed"
         conviction = 0
+        gate_reasons.append("market_closed")
         warnings.append(
             "💤 FX市場休場中(週末クローズ) — 表示価格は最終取引時点のもの。"
             "方向判断は市場再開後に実施"
@@ -417,16 +470,19 @@ def build_trade_plan(
     elif in_event_window:
         direction = "standby"
         conviction = min(conviction, STANDBY_CONVICTION_CAP)
+        gate_reasons.append("event_window")
     elif tech_cov <= 0 or quality < MIN_QUALITY_FOR_DIRECTION:
         direction = "neutral"
-        if abs(composite) >= DIRECTION_THRESHOLD:
+        gate_reasons.append("missing_technical" if tech_cov <= 0 else "low_data_quality")
+        if abs(composite) >= direction_threshold:
             warnings.append(f"データ品質不足(品質{quality:.0%})のため方向判断を見送り")
-    elif composite >= DIRECTION_THRESHOLD:
+    elif composite >= direction_threshold:
         direction = "long"
-    elif composite <= -DIRECTION_THRESHOLD:
+    elif composite <= -direction_threshold:
         direction = "short"
     else:
         direction = "neutral"
+        gate_reasons.append("below_production_threshold")
 
     # 学習調整: いまのチャート状態×方向が過去に外しやすかった状態なら確信度を減衰
     if condition_adjuster is not None and direction in ("long", "short"):
@@ -449,12 +505,23 @@ def build_trade_plan(
         if expectancy_block:
             direction = "neutral"
             conviction = 0
+            gate_reasons.append("expectancy_guard")
 
     close = tech.close()
     atr = tech.atr()
+    quote_view = tech.views.get("1h")
+    entry_bid = quote_view.bid if quote_view is not None else None
+    entry_ask = quote_view.ask if quote_view is not None else None
+    quote_observed_at = now.isoformat() if entry_bid is not None and entry_ask is not None else None
+    context_bid, context_ask, context_quote_at = decision_inputs.decision_quote_from_mapping(
+        serialized_context
+    )
+    if context_bid is not None and context_ask is not None:
+        entry_bid, entry_ask, quote_observed_at = context_bid, context_ask, context_quote_at
     stop = target1 = target2 = None
     target_policy: dict[str, object] = {}
     if direction in ("long", "short") and (atr is None or atr <= 0):
+        gate_reasons.append("missing_atr")
         # ATRが無い方向判断は、SL/TPを提示できないだけでなく学習側の
         # 小動き除外・ATR換算期待値も無効になる(ジャーナルに残る欠陥データ)
         warnings.append(
@@ -486,6 +553,41 @@ def build_trade_plan(
         target1 = close + sign * risk_distance * target1_r
         target2 = close + sign * risk_distance * target2_r
 
+    dimensions = dict(learning_dimensions or {})
+    shadow_predictions = build_shadow_predictions(
+        [prediction_draft("fusion_raw", composite), *shadow_prediction_drafts],
+        close=close,
+        atr=atr,
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        cost_model_id=DEFAULT_COST_MODEL_ID,
+        slippage_r=DEFAULT_SLIPPAGE_R,
+        commission_r=DEFAULT_COMMISSION_R,
+        atr_multiple=atr_multiple,
+        production_threshold=direction_threshold,
+        horizon_hours=24.0,
+        blocked_by=gate_reasons,
+        market_open=market_open,
+        learning_dimensions=dimensions,
+    )
+    gate_trace: list[dict[str, object]] = []
+    for blocked_gate in gate_reasons:
+        trace: dict[str, object] = {"gate": blocked_gate, "status": "blocked"}
+        if blocked_gate == "event_window" and active_window is not None:
+            trace.update(
+                {
+                    "event_currency": active_window.event.currency,
+                    "event_title": active_window.event.title,
+                    "event_impact": active_window.event.impact,
+                    "event_time": active_window.event.when.isoformat(),
+                    "blocked_until": active_window.end.isoformat(),
+                }
+            )
+        gate_trace.append(trace)
+    liquidity_trace = decision_inputs.liquidity_gate_trace_from_mapping(serialized_context)
+    if liquidity_trace is not None:
+        gate_trace.append(liquidity_trace)
     return TradePlan(
         symbol=symbol,
         direction=direction,
@@ -493,11 +595,17 @@ def build_trade_plan(
         composite=composite,
         tech_score=round(tech_score, 3),
         news_score=news_score,
+        analysis_direction=analysis_direction,
+        analysis_conviction=analysis_conviction,
         close=close,
         atr=atr,
         stop=stop,
         target1=target1,
         target2=target2,
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        direction_threshold=direction_threshold,
         risk_pct=risk_pct,
         data_quality=quality,
         tech_weight=tech_weight,
@@ -510,6 +618,13 @@ def build_trade_plan(
         interval_summary=_interval_summary(tech),
         ma_note=ma_note,
         target_policy=target_policy,
+        learning_dimensions=dimensions,
+        gate_trace=gate_trace,
+        shadow_predictions=shadow_predictions,
+        input_context_id=str(serialized_context.get("context_id") or ""),
+        input_features=input_features,
+        input_feature_masks=input_masks,
+        input_context=serialized_context,
     )
 
 

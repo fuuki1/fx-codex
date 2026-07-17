@@ -20,6 +20,12 @@ from pathlib import Path
 
 from .journal import DEFAULT_HORIZON_HOURS, DEFAULT_TOLERANCE_HOURS
 from .market import WEEKEND_CLOSURE, open_hours_between
+from .evaluation_labels import (
+    DEFAULT_COST_STATUS,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+    has_executable_entry,
+)
 
 MIN_PATH_POINTS = 3
 MIN_PATH_COVERAGE = 0.50
@@ -29,6 +35,7 @@ MIN_GROUP_EXPECTANCY_SAMPLES = 12
 CLOSE_ONLY_QUALITY_CAP = 0.70
 PARTIAL_OHLC_QUALITY_CAP = 0.85
 OHLC_QUALITY_CAP = 0.95
+BID_ASK_OHLC_QUALITY_CAP = 1.0
 POINTS_FOR_FULL_DENSITY = 12
 WEAK_PROFIT_FACTOR = 1.05
 QUALITY_WARN_THRESHOLD = 0.55
@@ -60,10 +67,72 @@ class PricePathPoint:
     close: float
     high: float | None = None
     low: float | None = None
+    bid_close: float | None = None
+    bid_open: float | None = None
+    bid_high: float | None = None
+    bid_low: float | None = None
+    ask_close: float | None = None
+    ask_open: float | None = None
+    ask_high: float | None = None
+    ask_low: float | None = None
+    bar_start: datetime | None = None
 
     @property
     def has_range(self) -> bool:
         return self.high is not None and self.low is not None
+
+    @property
+    def has_bid_ask_range(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.bid_close,
+                self.bid_high,
+                self.bid_low,
+                self.ask_close,
+                self.ask_high,
+                self.ask_low,
+            )
+        )
+
+    def executable_close(self, direction: str) -> float:
+        if direction == "long" and self.bid_close is not None:
+            return self.bid_close
+        if direction == "short" and self.ask_close is not None:
+            return self.ask_close
+        return self.close
+
+    def executable_open(self, direction: str) -> float | None:
+        if direction == "long":
+            return self.bid_open
+        if direction == "short":
+            return self.ask_open
+        return None
+
+    def executable_half_spread(self) -> float | None:
+        if self.bid_close is None or self.ask_close is None or self.ask_close < self.bid_close:
+            return None
+        return (self.ask_close - self.bid_close) / 2.0
+
+    def executable_range(self, direction: str) -> tuple[float, float]:
+        if direction == "long" and self.bid_high is not None and self.bid_low is not None:
+            return self.bid_high, self.bid_low
+        if direction == "short" and self.ask_high is not None and self.ask_low is not None:
+            return self.ask_high, self.ask_low
+        high = self.high if self.high is not None else self.close
+        low = self.low if self.low is not None else self.close
+        return high, low
+
+
+@dataclass(frozen=True)
+class _NetLabel:
+    executable_entry: float | None = None
+    executable_exit: float | None = None
+    gross_realized_r: float | None = None
+    quote_realized_r: float | None = None
+    execution_cost_r: float | None = None
+    realized_net_r: float | None = None
+    cost_status: str = "missing"
 
 
 @dataclass(frozen=True)
@@ -76,7 +145,11 @@ class TradeOutcome:
     horizon_hours: float
     conviction: int
     data_quality: float | None
+    decision_id: str | None = None
     entry: float | None = None
+    entry_bid: float | None = None
+    entry_ask: float | None = None
+    executable_entry: float | None = None
     stop: float | None = None
     target1: float | None = None
     target2: float | None = None
@@ -86,6 +159,7 @@ class TradeOutcome:
     atr: float | None = None
     risk_distance: float | None = None
     terminal_price: float | None = None
+    executable_exit: float | None = None
     terminal_r: float | None = None
     mfe: float | None = None
     mae: float | None = None
@@ -97,6 +171,18 @@ class TradeOutcome:
     first_touch: str = "none"
     first_touch_ts: str | None = None
     realized_r: float | None = None
+    # Canonical paper-trade net label. realized_r remains the legacy planned
+    # payoff diagnostic and is intentionally not reused as the net label.
+    gross_realized_r: float | None = None
+    quote_realized_r: float | None = None
+    slippage_r: float | None = None
+    commission_r: float | None = None
+    execution_cost_r: float | None = None
+    realized_net_r: float | None = None
+    label_version: str = NET_LABEL_VERSION
+    label_provenance: str = NET_LABEL_PROVENANCE
+    cost_model_id: str | None = None
+    cost_status: str = "missing"
     path_points: int = 0
     path_start: str | None = None
     path_end: str | None = None
@@ -109,6 +195,10 @@ class TradeOutcome:
     def tradable(self) -> bool:
         return self.realized_r is not None and self.path_quality >= MIN_PATH_QUALITY
 
+    @property
+    def net_label_eligible(self) -> bool:
+        return self.tradable and self.realized_net_r is not None
+
     def to_dict(self) -> dict:
         return {
             "symbol": self.symbol,
@@ -117,7 +207,11 @@ class TradeOutcome:
             "horizon_hours": self.horizon_hours,
             "conviction": self.conviction,
             "data_quality": self.data_quality,
+            "decision_id": self.decision_id,
             "entry": self.entry,
+            "entry_bid": self.entry_bid,
+            "entry_ask": self.entry_ask,
+            "executable_entry": self.executable_entry,
             "stop": self.stop,
             "target1": self.target1,
             "target2": self.target2,
@@ -127,6 +221,7 @@ class TradeOutcome:
             "atr": self.atr,
             "risk_distance": self.risk_distance,
             "terminal_price": self.terminal_price,
+            "executable_exit": self.executable_exit,
             "terminal_r": self.terminal_r,
             "mfe": self.mfe,
             "mae": self.mae,
@@ -138,6 +233,16 @@ class TradeOutcome:
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
             "realized_r": self.realized_r,
+            "gross_realized_r": self.gross_realized_r,
+            "quote_realized_r": self.quote_realized_r,
+            "slippage_r": self.slippage_r,
+            "commission_r": self.commission_r,
+            "execution_cost_r": self.execution_cost_r,
+            "realized_net_r": self.realized_net_r,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "cost_model_id": self.cost_model_id,
+            "cost_status": self.cost_status,
             "path_points": self.path_points,
             "path_start": self.path_start,
             "path_end": self.path_end,
@@ -146,6 +251,7 @@ class TradeOutcome:
             "path_quality": self.path_quality,
             "quality_flags": list(self.quality_flags),
             "tradable": self.tradable,
+            "net_label_eligible": self.net_label_eligible,
         }
 
 
@@ -158,6 +264,11 @@ class ExpectancyStats:
     losses: int = 0
     win_rate: float | None = None
     expectancy_r: float | None = None
+    net_labels: int = 0
+    net_label_coverage: float = 0.0
+    net_expectancy_r: float | None = None
+    cumulative_net_r: float | None = None
+    net_profit_factor_r: float | None = None
     avg_win_r: float | None = None
     avg_loss_r: float | None = None
     profit_factor_r: float | None = None
@@ -179,6 +290,11 @@ class ExpectancyStats:
             "losses": self.losses,
             "win_rate": self.win_rate,
             "expectancy_r": self.expectancy_r,
+            "net_labels": self.net_labels,
+            "net_label_coverage": self.net_label_coverage,
+            "net_expectancy_r": self.net_expectancy_r,
+            "cumulative_net_r": self.cumulative_net_r,
+            "net_profit_factor_r": self.net_profit_factor_r,
             "avg_win_r": self.avg_win_r,
             "avg_loss_r": self.avg_loss_r,
             "profit_factor_r": self.profit_factor_r,
@@ -369,7 +485,9 @@ def evaluate_trade_outcomes(
     target2_r: float | None = None,
 ) -> list[TradeOutcome]:
     materialized = list(entries)
-    prices: dict[str, list[PricePathPoint]] = {}
+    # 同じ完了足を再取得した場合や、同時刻にclose-onlyとbid/ask OHLCが
+    # 共存した場合でも経路点を水増ししない。同時刻では品質の高い点を残す。
+    prices_by_time: dict[str, dict[datetime, PricePathPoint]] = {}
     parsed_entries: list[tuple[datetime, Mapping[str, object]]] = []
     for entry in materialized:
         ts = _parse_ts(entry.get("ts"))
@@ -378,9 +496,14 @@ def evaluate_trade_outcomes(
         parsed_entries.append((ts, entry))
         point = _price_path_point(ts, entry)
         if point is not None:
-            prices.setdefault(str(entry.get("symbol", "")).upper(), []).append(point)
-    for series in prices.values():
-        series.sort(key=lambda point: point.ts)
+            symbol = str(entry.get("symbol", "")).upper()
+            existing = prices_by_time.setdefault(symbol, {}).get(ts)
+            if existing is None or _price_point_rank(point) > _price_point_rank(existing):
+                prices_by_time[symbol][ts] = point
+    prices = {
+        symbol: sorted(points.values(), key=lambda point: point.ts)
+        for symbol, points in prices_by_time.items()
+    }
     price_times = {symbol: [point.ts for point in series] for symbol, series in prices.items()}
 
     outcomes: list[TradeOutcome] = []
@@ -389,7 +512,15 @@ def evaluate_trade_outcomes(
         if direction not in ("long", "short"):
             continue
         symbol = str(entry.get("symbol", "")).upper()
+        raw_decision_id = str(entry.get("decision_id", "")).strip()
+        decision_id = raw_decision_id or None
         entry_price = _float(entry.get("close"))
+        entry_bid = _float(entry.get("entry_bid"))
+        entry_ask = _float(entry.get("entry_ask"))
+        quote_observed_at = str(entry.get("quote_observed_at", "")).strip()
+        cost_model_id = str(entry.get("cost_model_id", "")).strip() or None
+        slippage_r = _float(entry.get("slippage_r"))
+        commission_r = _float(entry.get("commission_r"))
         stop = _float(entry.get("stop"))
         target1 = _float(entry.get("target1"))
         target2 = _float(entry.get("target2"))
@@ -430,7 +561,10 @@ def evaluate_trade_outcomes(
                     horizon_hours=horizon_hours,
                     conviction=conviction,
                     data_quality=data_quality,
+                    decision_id=decision_id,
                     entry=entry_price,
+                    entry_bid=entry_bid,
+                    entry_ask=entry_ask,
                     stop=stop,
                     target1=target1,
                     target2=target2,
@@ -441,6 +575,7 @@ def evaluate_trade_outcomes(
                     risk_distance=risk_distance,
                     first_touch="unscored",
                     quality_flags=tuple(dict.fromkeys(missing_flags)),
+                    cost_model_id=cost_model_id,
                 )
             )
             continue
@@ -453,12 +588,15 @@ def evaluate_trade_outcomes(
         tp1_r_value = _target_r(direction, entry_price, risk_distance, target1, default=1.0)
         tp2_r_value = _target_r(direction, entry_price, risk_distance, target2, default=2.0)
         terminal = future[-1]
-        terminal_ts, terminal_price = terminal.ts, terminal.close
+        terminal_ts = terminal.ts
+        # longの決済可能価格はbid、shortはask。bid/askが無い旧行だけmidへ戻す。
+        terminal_price = terminal.executable_close(direction)
         mfe = max(_favorable_move(direction, entry_price, point) for point in future)
         mae = max(0.0, max(_adverse_move(direction, entry_price, point) for point in future))
         terminal_r = _signed_move(direction, entry_price, terminal_price) / risk_distance
         first_touch = "none"
         first_touch_ts = None
+        first_touch_point: PricePathPoint | None = None
         tp1_hit = tp2_hit = sl_hit = False
         ambiguous_intrabar = False
         for point in future:
@@ -470,11 +608,32 @@ def evaluate_trade_outcomes(
             if first_touch == "none" and touch != "none":
                 first_touch = touch
                 first_touch_ts = point.ts.isoformat()
+                first_touch_point = point
 
         realized_r = _realized_r(first_touch, terminal_r, tp1_r_value, tp2_r_value)
         quality, flags, path_source = _path_quality(ts, future, horizon_hours, min_path_points)
         if ambiguous_intrabar:
             flags = tuple(dict.fromkeys((*flags, "ambiguous_intrabar_touch")))
+        net_values, net_flags = _paper_net_label(
+            direction=direction,
+            entry_mid=entry_price,
+            entry_bid=entry_bid,
+            entry_ask=entry_ask,
+            quote_observed_at=quote_observed_at,
+            risk_distance=risk_distance,
+            first_touch=first_touch,
+            first_touch_point=first_touch_point,
+            terminal=terminal,
+            stop=stop,
+            target1=target1,
+            target2=target2,
+            future=future,
+            path_quality=quality,
+            slippage_r=slippage_r,
+            commission_r=commission_r,
+            cost_model_id=cost_model_id,
+        )
+        flags = tuple(dict.fromkeys((*flags, *net_flags)))
         outcomes.append(
             TradeOutcome(
                 symbol=symbol,
@@ -483,7 +642,11 @@ def evaluate_trade_outcomes(
                 horizon_hours=horizon_hours,
                 conviction=conviction,
                 data_quality=data_quality,
+                decision_id=decision_id,
                 entry=entry_price,
+                entry_bid=entry_bid,
+                entry_ask=entry_ask,
+                executable_entry=net_values.executable_entry,
                 stop=stop,
                 target1=target1,
                 target2=target2,
@@ -493,6 +656,7 @@ def evaluate_trade_outcomes(
                 atr=atr,
                 risk_distance=round(risk_distance, 8),
                 terminal_price=terminal_price,
+                executable_exit=net_values.executable_exit,
                 terminal_r=round(terminal_r, 4),
                 mfe=round(mfe, 8),
                 mae=round(mae, 8),
@@ -504,6 +668,14 @@ def evaluate_trade_outcomes(
                 first_touch=first_touch,
                 first_touch_ts=first_touch_ts,
                 realized_r=round(realized_r, 4),
+                gross_realized_r=net_values.gross_realized_r,
+                quote_realized_r=net_values.quote_realized_r,
+                slippage_r=slippage_r,
+                commission_r=commission_r,
+                execution_cost_r=net_values.execution_cost_r,
+                realized_net_r=net_values.realized_net_r,
+                cost_model_id=cost_model_id,
+                cost_status=net_values.cost_status,
                 path_points=len(future),
                 path_start=future[0].ts.isoformat(),
                 path_end=terminal_ts.isoformat(),
@@ -555,10 +727,17 @@ def aggregate_expectancy(
     usable = [outcome for outcome in outcomes if outcome.realized_r is not None]
     tradable = [outcome for outcome in usable if outcome.tradable]
     r_values = [float(outcome.realized_r) for outcome in tradable if outcome.realized_r is not None]
+    net_values = [
+        float(outcome.realized_net_r)
+        for outcome in tradable
+        if outcome.net_label_eligible and outcome.realized_net_r is not None
+    ]
     wins = sum(1 for value in r_values if value > 0)
     losses = sum(1 for value in r_values if value < 0)
     gross_win = sum(value for value in r_values if value > 0)
     gross_loss = abs(sum(value for value in r_values if value < 0))
+    net_gross_win = sum(value for value in net_values if value > 0)
+    net_gross_loss = abs(sum(value for value in net_values if value < 0))
     mfe_values = [float(outcome.mfe_r) for outcome in tradable if outcome.mfe_r is not None]
     mae_values = [float(outcome.mae_r) for outcome in tradable if outcome.mae_r is not None]
     qualities = [outcome.path_quality for outcome in usable]
@@ -570,6 +749,15 @@ def aggregate_expectancy(
         losses=losses,
         win_rate=_round(wins / len(r_values)) if r_values else None,
         expectancy_r=_round(_mean(r_values)),
+        net_labels=len(net_values),
+        net_label_coverage=(_round(len(net_values) / len(tradable)) or 0.0) if tradable else 0.0,
+        net_expectancy_r=_round(_mean(net_values)),
+        cumulative_net_r=_round(sum(net_values)) if net_values else None,
+        net_profit_factor_r=(
+            _round(net_gross_win / net_gross_loss)
+            if net_gross_loss > 0
+            else (None if net_gross_win <= 0 else float("inf"))
+        ),
         avg_win_r=_round(_mean([value for value in r_values if value > 0])),
         avg_loss_r=_round(_mean([value for value in r_values if value < 0])),
         profit_factor_r=(
@@ -606,9 +794,12 @@ def quality_summary(outcomes: Sequence[TradeOutcome]) -> dict:
         for flag in outcome.quality_flags:
             flags[flag] = flags.get(flag, 0) + 1
     scored = [outcome for outcome in outcomes if outcome.realized_r is not None]
+    net_labeled = [outcome for outcome in outcomes if outcome.net_label_eligible]
     return {
         "evaluated": len(outcomes),
         "scored": len(scored),
+        "net_labeled": len(net_labeled),
+        "net_label_coverage": _round(len(net_labeled) / len(scored)) if scored else 0.0,
         "low_quality": sum(1 for outcome in outcomes if not outcome.tradable),
         "avg_path_quality": _round(_mean([outcome.path_quality for outcome in scored])),
         "flags": dict(sorted(flags.items())),
@@ -2105,16 +2296,73 @@ def _health_check_quality(quality: Mapping[str, object]) -> TradeOutcomeHealthCh
 
 
 def _price_path_point(ts: datetime, entry: Mapping[str, object]) -> PricePathPoint | None:
+    # 判断を作るための現在値は方向的中率には使えるが、約定経路ではない。
+    if entry.get("price_usage") == "direction_only":
+        return None
     close = _float(entry.get("close"))
     if close is None:
         return None
     high = _float(entry.get("high"))
     low = _float(entry.get("low"))
-    if high is None or low is None:
-        return PricePathPoint(ts, close)
-    normalized_high = max(high, low, close)
-    normalized_low = min(high, low, close)
-    return PricePathPoint(ts, close, normalized_high, normalized_low)
+
+    # 旧TradingView行は取得時点の形成中足で、判断前のhigh/lowを含みうる。
+    # closeは後続方向の観測として残すが、TP/SL・MFE/MAEのrangeには使わない。
+    raw_flags = entry.get("data_quality_flags")
+    quality_flags = (
+        {str(flag) for flag in raw_flags}
+        if isinstance(raw_flags, Sequence) and not isinstance(raw_flags, (str, bytes))
+        else set()
+    )
+    forming_bar = (
+        entry.get("ohlc_scope") == "forming_bar_snapshot"
+        or "forming_bar_ohlc_not_post_prediction_interval" in quality_flags
+    )
+    if forming_bar:
+        high = low = None
+    normalized_high = max(high, low, close) if high is not None and low is not None else None
+    normalized_low = min(high, low, close) if high is not None and low is not None else None
+
+    bid_close = _float(entry.get("bid_close"))
+    bid_open = _float(entry.get("bid_open"))
+    bid_high = _float(entry.get("bid_high"))
+    bid_low = _float(entry.get("bid_low"))
+    ask_close = _float(entry.get("ask_close"))
+    ask_open = _float(entry.get("ask_open"))
+    ask_high = _float(entry.get("ask_high"))
+    ask_low = _float(entry.get("ask_low"))
+    if forming_bar:
+        bid_close = bid_open = bid_high = bid_low = None
+        ask_close = ask_open = ask_high = ask_low = None
+    if bid_close is not None and bid_high is not None and bid_low is not None:
+        bid_high, bid_low = max(bid_high, bid_low, bid_close), min(bid_high, bid_low, bid_close)
+    else:
+        bid_close = bid_high = bid_low = None
+    if ask_close is not None and ask_high is not None and ask_low is not None:
+        ask_high, ask_low = max(ask_high, ask_low, ask_close), min(ask_high, ask_low, ask_close)
+    else:
+        ask_close = ask_high = ask_low = None
+    bar_start = _parse_ts(entry.get("bar_start"))
+    return PricePathPoint(
+        ts=ts,
+        close=close,
+        high=normalized_high,
+        low=normalized_low,
+        bid_close=bid_close,
+        bid_open=bid_open,
+        bid_high=bid_high,
+        bid_low=bid_low,
+        ask_close=ask_close,
+        ask_open=ask_open,
+        ask_high=ask_high,
+        ask_low=ask_low,
+        bar_start=bar_start,
+    )
+
+
+def _price_point_rank(point: PricePathPoint) -> tuple[int, int]:
+    """同時刻の候補ではbid/ask OHLC、次にmid OHLCを優先する。"""
+
+    return int(point.has_bid_ask_range), int(point.has_range)
 
 
 def _target_policy_meta(entry: Mapping[str, object]) -> tuple[str | None, str, str]:
@@ -2140,6 +2388,10 @@ def _future_path(
         point = series[index]
         if point.ts <= ts:
             continue
+        # 完了足のhigh/lowを使う場合、足開始が判断より前なら判断前の値動きが
+        # 混ざるため経路から除外する。旧スナップショット(bar_start無し)は後方互換。
+        if point.bar_start is not None and point.bar_start < ts:
+            continue
         if point.ts > upper:
             break
         age = open_hours_between(ts, point.ts)
@@ -2160,14 +2412,24 @@ def _path_quality(
     point_ratio = min(1.0, points / POINTS_FOR_FULL_DENSITY)
     range_points = sum(1 for point in future if point.has_range)
     range_ratio = range_points / points if points else 0.0
+    bid_ask_points = sum(1 for point in future if point.has_bid_ask_range)
+    bid_ask_ratio = bid_ask_points / points if points else 0.0
     if range_ratio <= 0:
         path_source = "close"
         flags.append("close_only_path")
         quality = min(CLOSE_ONLY_QUALITY_CAP, 0.65 * coverage + 0.35 * point_ratio)
+    elif bid_ask_ratio >= 0.8:
+        path_source = "bid_ask_ohlc"
+        quality = min(
+            BID_ASK_OHLC_QUALITY_CAP,
+            0.45 * coverage + 0.20 * point_ratio + 0.20 * range_ratio + 0.15 * bid_ask_ratio,
+        )
     else:
         path_source = "ohlc" if range_ratio >= 0.8 else "mixed"
         if path_source == "mixed":
             flags.append("partial_high_low_path")
+        if bid_ask_ratio > 0:
+            flags.append("partial_bid_ask_path")
         cap = OHLC_QUALITY_CAP if path_source == "ohlc" else PARTIAL_OHLC_QUALITY_CAP
         quality = min(cap, 0.50 * coverage + 0.25 * point_ratio + 0.25 * range_ratio)
     if points < min_path_points:
@@ -2194,8 +2456,9 @@ def _touch(
 ) -> str:
     if stop is None or target1 is None:
         return "none"
-    high = point.high if point.high is not None else point.close
-    low = point.low if point.low is not None else point.close
+    # longの手仕舞いはbid、shortの手仕舞いはaskで成立する。midのhigh/lowで
+    # TP到達を判定するとspread分だけ楽観的になるため、利用可能なら必ず側別経路を使う。
+    high, low = point.executable_range(direction)
     if direction == "long":
         stop_hit = low <= stop
         tp2_hit = target2 is not None and high >= target2
@@ -2223,6 +2486,128 @@ def _touch(
     return "none"
 
 
+def _paper_net_label(
+    *,
+    direction: str,
+    entry_mid: float,
+    entry_bid: float | None,
+    entry_ask: float | None,
+    quote_observed_at: str,
+    risk_distance: float,
+    first_touch: str,
+    first_touch_point: PricePathPoint | None,
+    terminal: PricePathPoint,
+    stop: float | None,
+    target1: float | None,
+    target2: float | None,
+    future: Sequence[PricePathPoint],
+    path_quality: float,
+    slippage_r: float | None,
+    commission_r: float | None,
+    cost_model_id: str | None,
+) -> tuple[_NetLabel, tuple[str, ...]]:
+    """Build the one canonical paper net-R label from executable quotes.
+
+    Spread is already present in ask-entry/bid-exit (or the reverse for a
+    short), so it is never subtracted a second time.  The legacy planned payoff
+    is intentionally not an input to this function.
+    """
+
+    flags: list[str] = []
+    if not has_executable_entry(entry_bid, entry_ask) or not quote_observed_at:
+        flags.append("missing_net_label_entry_quote")
+    if not cost_model_id:
+        flags.append("missing_cost_model_id")
+    if slippage_r is None or slippage_r < 0 or commission_r is None or commission_r < 0:
+        flags.append("invalid_execution_cost_model")
+    if path_quality < MIN_PATH_QUALITY:
+        flags.append("net_label_low_path_quality")
+    if not future or any(not point.has_bid_ask_range for point in future):
+        flags.append("net_label_requires_full_bid_ask_path")
+    if flags:
+        return _NetLabel(), tuple(flags)
+
+    assert entry_bid is not None and entry_ask is not None
+    assert slippage_r is not None and commission_r is not None
+    executable_entry = entry_ask if direction == "long" else entry_bid
+    exit_point = first_touch_point if first_touch != "none" else terminal
+    if exit_point is None:
+        return _NetLabel(executable_entry=executable_entry), ("missing_executable_exit",)
+
+    executable_exit = _paper_exit_price(
+        direction,
+        first_touch,
+        exit_point,
+        stop=stop,
+        target1=target1,
+        target2=target2,
+    )
+    half_spread = exit_point.executable_half_spread()
+    if executable_exit is None or half_spread is None:
+        return _NetLabel(executable_entry=executable_entry), ("missing_executable_exit",)
+
+    if first_touch == "none":
+        exit_mid = exit_point.close
+    else:
+        exit_mid = (
+            executable_exit + half_spread if direction == "long" else executable_exit - half_spread
+        )
+    gross_r = _signed_move(direction, entry_mid, exit_mid) / risk_distance
+    quote_r = _signed_move(direction, executable_entry, executable_exit) / risk_distance
+    net_r = quote_r - slippage_r - commission_r
+    execution_cost_r = gross_r - net_r
+    if execution_cost_r < -1e-8:
+        return (
+            _NetLabel(
+                executable_entry=executable_entry,
+                executable_exit=executable_exit,
+                gross_realized_r=round(gross_r, 4),
+                quote_realized_r=round(quote_r, 4),
+            ),
+            ("negative_execution_cost",),
+        )
+    return (
+        _NetLabel(
+            executable_entry=round(executable_entry, 10),
+            executable_exit=round(executable_exit, 10),
+            gross_realized_r=round(gross_r, 4),
+            quote_realized_r=round(quote_r, 4),
+            execution_cost_r=round(max(0.0, execution_cost_r), 4),
+            realized_net_r=round(net_r, 4),
+            cost_status=DEFAULT_COST_STATUS,
+        ),
+        (),
+    )
+
+
+def _paper_exit_price(
+    direction: str,
+    first_touch: str,
+    point: PricePathPoint,
+    *,
+    stop: float | None,
+    target1: float | None,
+    target2: float | None,
+) -> float | None:
+    if first_touch == "none":
+        return point.executable_close(direction)
+    if first_touch in ("sl", "ambiguous_sl_tp"):
+        if stop is None:
+            return None
+        opened = point.executable_open(direction)
+        if opened is not None:
+            if direction == "long" and opened < stop:
+                return opened
+            if direction == "short" and opened > stop:
+                return opened
+        return stop
+    if first_touch == "tp2":
+        return target2
+    if first_touch == "tp1":
+        return target1
+    return None
+
+
 def _target_price(direction: str, entry: float, risk_distance: float, target_r: float) -> float:
     sign = 1.0 if direction == "long" else -1.0
     return entry + sign * risk_distance * target_r
@@ -2242,15 +2627,17 @@ def _target_r(
 
 
 def _favorable_move(direction: str, entry: float, point: PricePathPoint) -> float:
+    high, low = point.executable_range(direction)
     if direction == "long":
-        return (point.high if point.high is not None else point.close) - entry
-    return entry - (point.low if point.low is not None else point.close)
+        return high - entry
+    return entry - low
 
 
 def _adverse_move(direction: str, entry: float, point: PricePathPoint) -> float:
+    high, low = point.executable_range(direction)
     if direction == "long":
-        return entry - (point.low if point.low is not None else point.close)
-    return (point.high if point.high is not None else point.close) - entry
+        return entry - low
+    return high - entry
 
 
 def _realized_r(

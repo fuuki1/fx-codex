@@ -4,7 +4,7 @@
 set -u
 
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health)
+LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
 
 for label in $LABELS; do
   launchctl bootout "gui/$(id -u)/$label" 2>/dev/null && echo "bootout: $label"

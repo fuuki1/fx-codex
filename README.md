@@ -73,6 +73,7 @@ tests/
 .venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ・学習ファイルだけ更新
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
+.venv/bin/python fx_briefing.py --horizon-only --dry-run  # 設計Aの9本を表示確認
 python3 tools/learning_capture.py                # Discord送信なしで融合/時間足別/価格系列を1回収集
 ./fx_briefing_loop.sh &                          # 毎時10分に自動送信(融合＋時間足別の2通)
 ```
@@ -95,15 +96,14 @@ python3 tools/learning_capture.py                # Discord送信なしで融合/
   未来の値動きで採点します(15m→15分後 / 1h→1時間後 / 4h→4時間後 / 1d→24時間後)。
   補助ホライズン(15m: 30分/1h、1h: 4h/8h 等)は Discord 表示・分析確認用の
   「観測」で、学習には主ホライズンのみを使います(多重検定の回避)。
-- **将来価格の調達(5分スナップショット)**: TradingView スキャナーは現在値しか
-  返さないため、記録から主ホライズン後の実勢価格を後続の終値から取ります。ただし
+- **将来価格の調達(5分スナップショット)**: 主ホライズン後の方向とTP/SL経路を
+  検証するため、OANDA v20の完了済みM5 bid/ask OHLCを記録します。ただし
   判断ジャーナル `logs/briefing_tf_journal.jsonl` は毎時しか追記されないため、
   短い足(特に 15m: 採点窓 9〜21分)は後続点が得られず永久に採点されません。
-  そこで **`fx_tf_snapshot.py` が5分ごとに各時間足の現在終値だけを
+  そこで **`fx_tf_snapshot.py` が5分ごとにbid/ask別のOHLC確定足を
   `logs/briefing_tf_prices.jsonl` へ記録**し、採点時にこの密な価格系列を判断
   ジャーナルと結合します。これで **15m / 1h / 4h / 1d のすべてが採点可能**に
-  なります。外部の履歴OHLC(yfinance/OANDA 等)を差し込む注入口も用意しています
-  (`fx_intel/price_history.py`)。
+  なります。longの手仕舞いはbid、shortはaskで判定します。
 - **symbol×timeframe セル別の学習**: 融合モードと同じ学習コア(複合重み再推定・
   確信度キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier)を、
   `(通貨ペア × 時間足)` のセル単位で適用します。「この通貨のこの時間足でのこの状態の
@@ -117,6 +117,25 @@ python3 tools/learning_capture.py                # Discord送信なしで融合/
 .venv/bin/python fx_briefing.py --per-timeframe             # Discordへ送信
 ./fx_tf_snapshot_loop.sh &                                  # 5分ごとに価格を記録(採点用)
 ```
+
+価格スナップショットは既定で **OANDA v20の完了済みM5 bid/ask OHLC** を使います。
+ルートの `.env` に次を設定してください。価格取得だけを行い、OANDAへ注文は出しません。
+
+```dotenv
+OANDA_API_TOKEN=your-v20-token
+OANDA_ENVIRONMENT=practice
+OANDA_PRICE_GRANULARITY=M5
+```
+
+トークンが無い場合はclose-onlyへ黙って戻らず、スナップショット実行を失敗させます。
+旧TradingView形成中足は診断時だけ
+`.venv/bin/python fx_tf_snapshot.py --provider tradingview --dry-run` で確認できます。
+
+### マルチホライズンshadow (`--horizon-only`)
+
+`5m`（恒久shadow）と `15m/30m/1h/3h/6h/12h/24h/3d` の9本を、
+`USDJPY/EURUSD/GBPUSD` について5分ごとに記録します。既存の融合・時間足別判断や
+Discord通知には参加しません。詳細は `docs/design/A_HORIZON_FORECASTS.md` を参照してください。
 
 時間足別モードで全時間足を学習させるには、判断と価格採点用の系列の**2本立て**が必要です。
 判断は `fx_briefing_loop.sh` が毎時 `--per-timeframe` を自動送信するので、追加で

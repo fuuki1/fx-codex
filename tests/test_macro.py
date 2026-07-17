@@ -167,6 +167,10 @@ def test_fetch_uses_fresh_cache_without_network(tmp_path) -> None:
     vix_last = snap.series["vix"].last()
     assert vix_last is not None
     assert vix_last.value == 19.0
+    upgraded = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert upgraded["fred_VIXCLS"]["first_seen_time"] == NOW.isoformat()
+    assert upgraded["fred_VIXCLS"]["content_hash"]
+    assert snap.provenance["vix"]["first_seen_time"] == NOW.isoformat()
 
 
 def test_coverage_reflects_fresh_data() -> None:
