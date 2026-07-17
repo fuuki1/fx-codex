@@ -543,9 +543,14 @@ def test_build_trade_plan_standby_in_event_window() -> None:
     }
     plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, windows, [], now=NOW)
     assert plan.direction == "standby"
+    assert plan.analysis_direction == "long"
+    assert plan.analysis_conviction > 0
     assert plan.conviction <= briefing.STANDBY_CONVICTION_CAP
     assert plan.stop is None
     assert any("イベント警戒中" in w for w in plan.warnings)
+    event_gate = next(trace for trace in plan.gate_trace if trace["gate"] == "event_window")
+    assert event_gate["event_title"] == "FOMC"
+    assert event_gate["blocked_until"] == windows[0].end.isoformat()
 
 
 def test_build_trade_plan_neutral_when_signals_conflict() -> None:

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 
 import pytest
 
+from fx_intel.calendar import EconomicEvent, risk_windows
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import (
     AUXILIARY_HORIZON_HOURS,
@@ -98,6 +99,22 @@ def test_timeframes_can_disagree() -> None:
     assert by_tf["1d"].direction == "long"
 
 
+def test_15m_shadow_analysis_records_weak_bias_below_trade_threshold() -> None:
+    tech = PairTechnicals(symbol="USDJPY")
+    tech.views = {
+        "15m": make_view("15m", "BUY", atr=0.08),
+        "1h": make_view("1h", "STRONG_SELL", atr=0.15),
+        "4h": make_view("4h", "STRONG_SELL", atr=0.30),
+    }
+
+    plan = build_timeframe_plan("USDJPY", "15m", tech, {}, [], [], now=OPEN_NOW)
+
+    assert 0.05 <= plan.composite < plan.direction_threshold
+    assert plan.direction == "neutral"
+    assert plan.analysis_direction == "long"
+    assert plan.analysis_conviction > 0
+
+
 def test_higher_timeframe_alignment_boosts_score() -> None:
     """同じ 1h BUY でも、上位足が順行だとスコア(=確信度)が上がる。"""
     aligned = PairTechnicals(symbol="USDJPY")
@@ -141,6 +158,19 @@ def test_operational_freshness_veto_forces_every_timeframe_neutral() -> None:
     assert all(plan.direction == "neutral" for plan in plans)
     assert all(plan.conviction == 0 for plan in plans)
     assert all(any("price writer stale" in warning for warning in plan.warnings) for plan in plans)
+
+
+def test_event_window_blocks_trading_but_keeps_analysis_running() -> None:
+    event = EconomicEvent("FOMC", "USD", OPEN_NOW + timedelta(minutes=30), "high")
+    windows = risk_windows([event], {"USD", "JPY"})
+    plan = build_timeframe_plan("USDJPY", "1h", _all_up_tech(), {}, windows, [], now=OPEN_NOW)
+
+    assert plan.direction == "standby"
+    assert plan.analysis_direction == "long"
+    assert plan.analysis_conviction > 0
+    event_gate = next(trace for trace in plan.gate_trace if trace["gate"] == "event_window")
+    assert event_gate["event_title"] == "FOMC"
+    assert event_gate["blocked_until"] == windows[0].end.isoformat()
 
 
 def test_missing_timeframe_is_neutral_not_crash() -> None:

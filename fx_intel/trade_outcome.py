@@ -83,6 +83,8 @@ class TradeOutcome:
     horizon_hours: float
     conviction: int
     data_quality: float | None
+    # 判断ログ行の識別子(shadow予測の満期照合キー)。無い行は None。
+    decision_id: str | None = None
     entry: float | None = None
     stop: float | None = None
     target1: float | None = None
@@ -151,6 +153,7 @@ class TradeOutcome:
             "first_touch_ts": self.first_touch_ts,
             "realized_r": self.realized_r,
             "realized_net_r": self.realized_net_r,
+            "decision_id": self.decision_id,
             "execution_cost_r": self.execution_cost_r,
             "net_expected_r": self.net_expected_r,
             "path_points": self.path_points,
@@ -497,6 +500,8 @@ def evaluate_trade_outcomes(
         # 判断時点の予測をそのまま持ち、実測 realized_net_r と対比できるようにする。
         execution_cost_r = _float(entry.get("execution_cost_r"))
         net_expected_r = _float(entry.get("net_expected_r"))
+        raw_decision_id = str(entry.get("decision_id", "")).strip()
+        decision_id = raw_decision_id or None
         realized_net_r = (
             round(realized_r - execution_cost_r, 4) if execution_cost_r is not None else None
         )
@@ -535,6 +540,7 @@ def evaluate_trade_outcomes(
                 realized_net_r=realized_net_r,
                 execution_cost_r=execution_cost_r,
                 net_expected_r=net_expected_r,
+                decision_id=decision_id,
                 path_points=len(future),
                 path_start=future[0].ts.isoformat(),
                 path_end=terminal_ts.isoformat(),

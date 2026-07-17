@@ -136,6 +136,8 @@ def append_plans(
                         "pit_eligible": pit_eligible,
                         "symbol": plan.symbol,
                         "direction": plan.direction,
+                        "analysis_direction": plan.analysis_direction,
+                        "analysis_conviction": plan.analysis_conviction,
                         "conviction": plan.conviction,
                         "composite": plan.composite,
                         "tech_score": plan.tech_score,
@@ -145,6 +147,13 @@ def append_plans(
                         "stop": plan.stop,
                         "target1": plan.target1,
                         "target2": plan.target2,
+                        "entry_bid": plan.entry_bid,
+                        "entry_ask": plan.entry_ask,
+                        "quote_observed_at": plan.quote_observed_at,
+                        "cost_model_id": plan.cost_model_id,
+                        "slippage_r": plan.slippage_r,
+                        "commission_r": plan.commission_r,
+                        "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
                         "data_quality": plan.data_quality,
                         # チャート状態の特徴量(learning.pyの状態別学習に使う)
@@ -154,6 +163,15 @@ def append_plans(
                         # 執行コスト(R換算)と期待R予測。採点(trade_outcome)が
                         # realized_net_r を作る入力で、MLの収益ラベルの源になる。
                         **_plan_execution(plan),
+                        "learning_dimensions": plan.learning_dimensions,
+                        "gate_trace": plan.gate_trace,
+                        "shadow_predictions": plan.shadow_predictions,
+                        "input_context_id": plan.input_context_id,
+                        "input_features": plan.input_features,
+                        "input_feature_masks": plan.input_feature_masks,
+                        "input_context_schema_version": plan.input_context.get(
+                            "context_schema_version"
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -189,6 +207,8 @@ def append_timeframe_plans(
                         "timeframe": plan.timeframe,
                         "horizon_hours": plan.horizon_hours,
                         "direction": plan.direction,
+                        "analysis_direction": plan.analysis_direction,
+                        "analysis_conviction": plan.analysis_conviction,
                         "conviction": plan.conviction,
                         "composite": plan.composite,
                         # 融合版の tech_score に相当(時間足単体の方向スコア)。
@@ -202,11 +222,27 @@ def append_timeframe_plans(
                         "stop": plan.stop,
                         "target1": plan.target1,
                         "target2": plan.target2,
+                        "entry_bid": plan.entry_bid,
+                        "entry_ask": plan.entry_ask,
+                        "quote_observed_at": plan.quote_observed_at,
+                        "cost_model_id": plan.cost_model_id,
+                        "slippage_r": plan.slippage_r,
+                        "commission_r": plan.commission_r,
+                        "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
                         "data_quality": plan.data_quality,
                         "features": plan.features,
                         "components": plan.components,
                         **_plan_execution(plan),
+                        "learning_dimensions": plan.learning_dimensions,
+                        "gate_trace": plan.gate_trace,
+                        "shadow_predictions": plan.shadow_predictions,
+                        "input_context_id": plan.input_context_id,
+                        "input_features": plan.input_features,
+                        "input_feature_masks": plan.input_feature_masks,
+                        "input_context_schema_version": plan.input_context.get(
+                            "context_schema_version"
+                        ),
                     },
                     ensure_ascii=False,
                 )

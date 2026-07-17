@@ -283,5 +283,6 @@ def _profile_to_dict(profile: LearnedProfile) -> dict:
         "symbol_factors": profile.symbol_factors,
         "condition_stats": profile.condition_stats,
         "condition_factors": profile.condition_factors,
+        "dimension_stats": profile.dimension_stats,
         "notes_ja": profile.notes_ja,
     }

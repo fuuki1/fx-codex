@@ -219,6 +219,38 @@ def test_per_timeframe_dry_run_does_not_write_journal(patched_paths, capsys) -> 
     assert not tf_journal.exists()  # dry-run は記録しない
 
 
+def test_horizon_only_defaults_to_three_pairs_and_writes_27_shadow_rows(tmp_path, capsys) -> None:
+    horizon_journal = tmp_path / "briefing_horizon_forecasts.jsonl"
+    horizon_learning = tmp_path / "briefing_horizon_learning.json"
+    tf_prices = tmp_path / "briefing_tf_prices.jsonl"
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_HORIZON_JOURNAL_PATH", horizon_journal),
+        mock.patch.object(fx_briefing, "DEFAULT_HORIZON_LEARNING_PATH", horizon_learning),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", tf_prices),
+    ):
+        rc = _run(["--horizon-only", "--no-macro"], capsys)
+
+    assert rc == 0
+    rows = [json.loads(line) for line in horizon_journal.read_text().splitlines()]
+    assert len(rows) == 27
+    assert {row["symbol"] for row in rows} == {"USDJPY", "EURUSD", "GBPUSD"}
+    assert {row["horizon"] for row in rows} == {
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "3h",
+        "6h",
+        "12h",
+        "24h",
+        "3d",
+    }
+    assert "9h" not in {row["horizon"] for row in rows}
+    assert all(row["track_stage"] == "shadow" for row in rows)
+    assert sum(row["shadow_only"] for row in rows) == 3
+    assert horizon_learning.exists()
+
+
 def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) -> None:
     tf_journal, tf_learning = patched_paths
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
@@ -229,6 +261,11 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
     rows = [json.loads(line) for line in tf_journal.read_text().splitlines() if line.strip()]
     timeframes = {row["timeframe"] for row in rows}
     assert timeframes == {"15m", "1h", "4h", "1d"}
+    context_ids = {row["input_context_id"] for row in rows}
+    assert len(context_ids) == 1
+    assert next(iter(context_ids))
+    assert all(row["input_context_schema_version"] == "decision-input-v1" for row in rows)
+    assert all("liquidity__is_rollover_window" in row["input_features"] for row in rows)
     # 各行に主ホライズンが紐づく
     horizons = {row["timeframe"]: row["horizon_hours"] for row in rows}
     assert horizons == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
