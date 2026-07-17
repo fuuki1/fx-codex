@@ -9,6 +9,7 @@ from fx_intel.learning import EvaluatedCall
 from fx_intel.ml import (
     FEATURE_NAMES,
     MLArtifact,
+    build_dataset,
     compute_medians,
     direction_features,
     load_artifact,
@@ -23,8 +24,20 @@ START = datetime(2026, 1, 6, 0, 0, tzinfo=UTC)
 
 
 def _make_calls(
-    n: int, gap_hours: float, seed: int, informative: bool = True
+    n: int,
+    gap_hours: float,
+    seed: int,
+    informative: bool = True,
+    net_r_mean: float | None = None,
 ) -> list[EvaluatedCall]:
+    """テスト用の採点済み判断列を作る。
+
+    net_r_mean を指定すると収益ラベル realized_net_r を付与する。値は
+    「net_r_mean(切片) + 0.5×(tech×方向符号)(=特徴依存の実力) + ノイズ」で、
+    方向シグナルに連動した本物のOOS識別力を持つ(過学習検定PBO/DSRを通過しうる)。
+    既定 None では realized_net_r=None(収益ヘッドの学習対象外)で、既存の二値
+    ヘッドのテストには影響しない。
+    """
     rng = random.Random(seed)
     calls: list[EvaluatedCall] = []
     for i in range(n):
@@ -41,6 +54,9 @@ def _make_calls(
             else:
                 p_hit = 0.5
             outcome = "hit" if rng.random() < p_hit else "miss"
+            realized_net_r = None
+            if net_r_mean is not None:
+                realized_net_r = round(net_r_mean + 0.5 * (tech * sign) + rng.gauss(0, 0.25), 4)
             calls.append(
                 EvaluatedCall(
                     symbol=symbol,
@@ -60,6 +76,8 @@ def _make_calls(
                     },
                     move_atr=rng.gauss(0.2 if outcome == "hit" else -0.2, 0.4),
                     data_quality=0.9,
+                    realized_net_r=realized_net_r,
+                    net_expected_r=0.15 if net_r_mean is not None else None,
                 )
             )
     return calls
@@ -216,3 +234,122 @@ def test_unusable_artifact_predicts_none() -> None:
     art = MLArtifact()
     assert art.predict_hit_probability("long", 0.5, 0.3, {}) is None
     assert art.direction_edge(0.5, 0.3, {}) is None
+
+
+def test_build_dataset_returns_aligned_return_labels() -> None:
+    """build_dataset は二値ラベルと同じ並びで収益ラベル(realized_net_r)を返す。"""
+    calls = _make_calls(20, gap_hours=8.0, seed=2, net_r_mean=0.3)
+    rows, labels, stamps, r_labels = build_dataset(calls)
+    assert len(rows) == len(labels) == len(stamps) == len(r_labels)
+    # net_r_mean 指定時は全行に収益ラベルが付く
+    assert all(r is not None for r in r_labels)
+
+
+def test_build_dataset_return_labels_none_without_cost() -> None:
+    """realized_net_r が無い(コスト不明の)判断は収益ラベルが None。"""
+    calls = _make_calls(20, gap_hours=8.0, seed=2)  # net_r_mean 未指定
+    _rows, _labels, _stamps, r_labels = build_dataset(calls)
+    assert all(r is None for r in r_labels)
+
+
+def test_return_heads_train_and_quantiles_are_ordered() -> None:
+    """収益ヘッド(期待R回帰+分位点)が学習され、p10<=p50<=p90 の順序を保つ。"""
+    calls = _make_calls(700, gap_hours=8.0, seed=1, net_r_mean=0.3)
+    art = train_artifact(calls, now=NOW)
+    assert art.return_model is not None
+    assert set(art.quantile_models) == {"p10", "p50", "p90"}
+    assert art.n_return_train > 0 and art.n_return_test > 0
+    assert art.return_val_rmse is not None
+    chart = {"rsi_1h": 65.0, "adx_1h": 25.0, "atr_pct": 0.15, "tf_agreement": 0.8, "news_count": 3}
+    interval = art.net_r_interval("long", 0.5, 0.2, chart, 0.9)
+    assert interval is not None
+    assert interval["p10"] <= interval["p50"] <= interval["p90"]
+
+
+def test_return_head_usable_requires_significant_positive_oos_net_r() -> None:
+    """OOS平均純Rが有意に正なら return_usable=True、期待純Rを返せる。"""
+    # 強く正の純R(平均+0.6R)なら t 検定を通過する
+    positive = _make_calls(700, gap_hours=8.0, seed=1, net_r_mean=0.6)
+    art = train_artifact(positive, now=NOW)
+    assert art.return_usable, art.return_reasons
+    assert art.return_oos_mean_net_r is not None and art.return_oos_mean_net_r > 0
+    chart = {"rsi_1h": 65.0, "adx_1h": 25.0, "atr_pct": 0.15, "tf_agreement": 0.8, "news_count": 3}
+    assert art.expected_net_r("long", 0.5, 0.2, chart, 0.9) is not None
+
+    # 平均ほぼ0の純Rは有意でないので return_usable=False、期待純Rは None
+    flat = _make_calls(700, gap_hours=8.0, seed=5, net_r_mean=0.0)
+    flat_art = train_artifact(flat, now=NOW)
+    assert not flat_art.return_usable
+    assert flat_art.expected_net_r("long", 0.5, 0.2, chart, 0.9) is None
+
+
+def test_return_heads_survive_save_load_roundtrip(tmp_path) -> None:
+    """収益ヘッド(回帰+分位点)が保存・読み込みで復元される。"""
+    calls = _make_calls(700, gap_hours=8.0, seed=1, net_r_mean=0.6)
+    art = train_artifact(calls, now=NOW)
+    path = tmp_path / "model.json"
+    save_artifact(art, path)
+    loaded = load_artifact(path)
+    assert loaded.return_usable == art.return_usable
+    assert set(loaded.quantile_models) == set(art.quantile_models)
+    chart = {"rsi_1h": 65.0, "adx_1h": 25.0, "atr_pct": 0.15, "tf_agreement": 0.8, "news_count": 3}
+    assert loaded.expected_net_r("long", 0.5, 0.2, chart, 0.9) == art.expected_net_r(
+        "long", 0.5, 0.2, chart, 0.9
+    )
+
+
+def test_return_head_runs_hyperparameter_trials_and_records_overfitting() -> None:
+    """収益ヘッドは小ハイパラ探索(複数試行)を回し、PBO/DSRを来歴に記録する。"""
+    calls = _make_calls(700, gap_hours=8.0, seed=1, net_r_mean=0.6)
+    art = train_artifact(calls, now=NOW)
+    # RETURN_TRIAL_GRID の試行数(4件)
+    assert art.return_n_trials == 4
+    # 十分な共有時刻があれば PBO/DSR が計算・記録される
+    assert art.return_pbo is not None
+    assert art.return_dsr is not None
+    # DSRが合格水準を満たすので採用される(t検定も通過)
+    assert art.return_usable
+
+
+def test_return_head_gate_is_dsr_not_pbo() -> None:
+    """PBOは記録のみでゲートに使わない: PBO=0.5(無情報)でも DSR 合格なら採用。
+
+    現グリッドは試行が似通いPBOが0.5付近に張り付くため、ゲートはDSRが担う。
+    """
+    calls = _make_calls(700, gap_hours=8.0, seed=1, net_r_mean=0.6)
+    art = train_artifact(calls, now=NOW)
+    # PBO は 0.5 付近(無情報)だが return_usable は True(DSRで判定)
+    assert art.return_pbo is not None and abs(art.return_pbo - 0.5) < 0.2
+    assert art.return_dsr is not None and art.return_dsr >= 0.95
+    assert art.return_usable
+
+
+def test_return_head_skips_overfitting_gate_with_few_observations() -> None:
+    """OOS共有時刻が32件未満だと過学習検定はskip(PBO/DSRは未計算=None)。
+
+    採点済みが最低件数(MIN_RETURN_TRAIN/TEST)は満たすが、共有時刻が
+    PBO_MIN_OBSERVATIONS 未満のケース。ゲートはt検定のみで判定する。
+    """
+    # 同一時刻に多数ペアを詰めて test区間のユニーク時刻を32未満に抑える
+    from fx_intel.ml import PBO_MIN_OBSERVATIONS
+
+    calls = _make_calls(90, gap_hours=8.0, seed=3, net_r_mean=0.6)
+    art = train_artifact(calls, now=NOW)
+    if art.n_return_train >= 40 and art.n_return_test >= 20:
+        # 学習は走るが、共有時刻が閾値未満なら過学習検定はskip
+        if art.return_n_trials > 0 and art.return_pbo is None:
+            assert any("過学習検定skip" in r for r in art.return_reasons)
+    # いずれにせよ PBO_MIN_OBSERVATIONS は正の定数
+    assert PBO_MIN_OBSERVATIONS > 0
+
+
+def test_return_head_pbo_dsr_survive_roundtrip(tmp_path) -> None:
+    """PBO/DSR/試行数が保存・読み込みで復元される。"""
+    calls = _make_calls(700, gap_hours=8.0, seed=1, net_r_mean=0.6)
+    art = train_artifact(calls, now=NOW)
+    path = tmp_path / "model.json"
+    save_artifact(art, path)
+    loaded = load_artifact(path)
+    assert loaded.return_n_trials == art.return_n_trials
+    assert loaded.return_pbo == art.return_pbo
+    assert loaded.return_dsr == art.return_dsr

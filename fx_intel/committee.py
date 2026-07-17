@@ -128,6 +128,19 @@ def ml_opinion(
     score = round(p_long - p_short, 3)
     if abs(score) < ML_MIN_EDGE:
         return None
+    rationale = [
+        f"的中確率 ロング{p_long:.0%} vs ショート{p_short:.0%}",
+        (
+            f"検証Brier {artifact.val_brier:.3f}(基準率 {artifact.baseline_brier:.3f})"
+            if artifact.val_brier is not None and artifact.baseline_brier is not None
+            else ""
+        ),
+    ]
+    # 収益ヘッド(期待R回帰+分位点)の見立てを shadow 表示。score(=二値の優位差)には
+    # 影響させない。return_usable でない時は accessor が None を返し、行は足さない。
+    rationale.extend(
+        _ml_return_head_notes(artifact, score, tech_score, news_score, chart_features, data_quality)
+    )
     return Opinion(
         role="ml",
         label_ja="ML委員(GBDT確率モデル)",
@@ -135,15 +148,36 @@ def ml_opinion(
         weight=ML_WEIGHT,
         stage=stage,
         active=stage in STAGE_ACTIVE,
-        rationale_ja=[
-            f"的中確率 ロング{p_long:.0%} vs ショート{p_short:.0%}",
-            (
-                f"検証Brier {artifact.val_brier:.3f}(基準率 {artifact.baseline_brier:.3f})"
-                if artifact.val_brier is not None and artifact.baseline_brier is not None
-                else ""
-            ),
-        ],
+        rationale_ja=rationale,
     )
+
+
+def _ml_return_head_notes(
+    artifact: MLArtifact,
+    score: float,
+    tech_score: float,
+    news_score: float,
+    chart_features: Mapping[str, float],
+    data_quality: float | None,
+) -> list[str]:
+    """収益ヘッドの期待純R・分位点帯を表示用の行にする(shadow=判断に不影響)。
+
+    二値の優位差 score の符号を「ML委員が張る方向」とみなし、その方向の期待純R
+    (コスト控除後)と p10/p90 帯を出す。return_usable でない・回帰モデル無しは空。
+    """
+    direction = "long" if score > 0 else "short"
+    expected = artifact.expected_net_r(
+        direction, tech_score, news_score, chart_features, data_quality
+    )
+    if expected is None:
+        return []
+    notes = [f"期待純R(コスト控除後) {expected:+.2f}R ※参考(判断には不使用)"]
+    interval = artifact.net_r_interval(
+        direction, tech_score, news_score, chart_features, data_quality
+    )
+    if interval is not None and "p10" in interval and "p90" in interval:
+        notes.append(f"純R帯 p10 {interval['p10']:+.2f}R 〜 p90 {interval['p90']:+.2f}R")
+    return notes
 
 
 def deliberate(
