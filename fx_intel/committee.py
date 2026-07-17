@@ -126,7 +126,9 @@ def ml_opinion(
     if artifact is None:
         return None
     stage = stage if stage in STAGE_LABEL_JA else "shadow"
-    edge = artifact.direction_edge(tech_score, news_score, chart_features, data_quality)
+    edge = artifact.direction_edge(
+        tech_score, news_score, chart_features, data_quality, learning_dimensions
+    )
     if edge is None:
         return None
     p_long, p_short = edge
@@ -144,7 +146,15 @@ def ml_opinion(
     # 収益ヘッド(期待R回帰+分位点)の見立てを shadow 表示。score(=二値の優位差)には
     # 影響させない。return_usable でない時は accessor が None を返し、行は足さない。
     rationale.extend(
-        _ml_return_head_notes(artifact, score, tech_score, news_score, chart_features, data_quality)
+        _ml_return_head_notes(
+            artifact,
+            score,
+            tech_score,
+            news_score,
+            chart_features,
+            data_quality,
+            learning_dimensions,
+        )
     )
     return Opinion(
         role="ml",
@@ -165,6 +175,7 @@ def _ml_return_head_notes(
     news_score: float,
     chart_features: Mapping[str, float],
     data_quality: float | None,
+    learning_dimensions: Mapping[str, object] | None = None,
 ) -> list[str]:
     """収益ヘッドの期待純R・分位点帯を表示用の行にする(shadow=判断に不影響)。
 
@@ -173,13 +184,13 @@ def _ml_return_head_notes(
     """
     direction = "long" if score > 0 else "short"
     expected = artifact.expected_net_r(
-        direction, tech_score, news_score, chart_features, data_quality
+        direction, tech_score, news_score, chart_features, data_quality, learning_dimensions
     )
     if expected is None:
         return []
     notes = [f"期待純R(コスト控除後) {expected:+.2f}R ※参考(判断には不使用)"]
     interval = artifact.net_r_interval(
-        direction, tech_score, news_score, chart_features, data_quality
+        direction, tech_score, news_score, chart_features, data_quality, learning_dimensions
     )
     if interval is not None and "p10" in interval and "p90" in interval:
         notes.append(f"純R帯 p10 {interval['p10']:+.2f}R 〜 p90 {interval['p90']:+.2f}R")
