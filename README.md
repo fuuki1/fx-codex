@@ -114,6 +114,7 @@ institutional governance方針が表現できる上限は **research → validat
 .venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ・学習ファイルだけ更新
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
+.venv/bin/python fx_briefing.py --horizon-only --dry-run  # 設計Aの9本を表示確認
 python3 tools/learning_capture.py                # Discord送信なしで融合/時間足別/価格系列を1回収集
 ```
 
@@ -145,8 +146,7 @@ calendar/macro等のsource cacheは取得処理により更新され、イベン
   **`com.fx-codex.snapshot`が`fx_tf_snapshot.py`を5分ごとに起動し、各時間足の現在終値だけを
   `logs/briefing_tf_prices.jsonl` へ記録**し、採点時にこの密な価格系列を判断
   ジャーナルと結合します。これで **15m / 1h / 4h / 1d のすべてが採点可能**に
-  なります。外部の履歴OHLC(yfinance/OANDA 等)を差し込む注入口も用意しています
-  (`fx_intel/price_history.py`)。
+  なります。longの手仕舞いはbid、shortはaskで判定します。
 - **symbol×timeframe セル別の学習**: 融合モードと同じ学習コア(複合重み再推定・
   確信度キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier)を、
   `(通貨ペア × 時間足)` のセル単位で適用します。「この通貨のこの時間足でのこの状態の
