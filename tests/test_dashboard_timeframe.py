@@ -116,6 +116,29 @@ def test_recent_outcomes_include_timeframe(server) -> None:
     assert result["recent_outcomes"][0]["timeframe"] == "4h"
 
 
+def test_recent_outcomes_grouped_per_timeframe_with_cap(server) -> None:
+    """時間足タブ用: 時間足ごとに直近12件ずつ返し、全体20件制限に潰されない。"""
+    entries = []
+    # 15mの判断を15件(12件制限を超えさせる)+ 1hの判断を2件
+    for index in range(15):
+        base = START + timedelta(minutes=20 * index)
+        entries.append(_row(base, "15m", 0.25, "long", 150.0 + index, atr=0.05))
+        entries.append(
+            _row(base + timedelta(minutes=15), "15m", 0.25, "long", 150.2 + index, atr=0.05)
+        )
+    entries.append(_row(START, "1h", 1.0, "long", 156.0))
+    entries.append(_row(START + timedelta(hours=1), "1h", 1.0, "short", 156.4))
+    result = server._evaluate_journal(entries)
+    grouped = result["recent_outcomes_by_timeframe"]
+    assert set(grouped) == {"15m", "1h"}
+    assert len(grouped["15m"]) == 12  # 直近12件に丸める
+    assert all(row["timeframe"] == "15m" for row in grouped["15m"])
+    # 旧UI互換のフラットな直近20件も残す
+    assert len(result["recent_outcomes"]) <= 20
+    # グループ内は時系列順(最後が最新)
+    assert grouped["15m"][-1]["ts"] > grouped["15m"][0]["ts"]
+
+
 def test_tolerance_scales_with_horizon(server) -> None:
     assert server._tolerance_for(0.25) < server._tolerance_for(24.0)
     assert server._tolerance_for(999.0) == 2.0

@@ -530,40 +530,139 @@ const OUTCOME_STYLE = {
 };
 const DIRECTION_LABEL = { long: "上昇予想", short: "下落予想" };
 
+// 選択中の時間足タブ("all" or "15m"/"1h"/"4h"/"1d")。5分ポーリングの
+// 再描画でも選択を維持する。
+let outcomeTabSelection = "all";
+
+function outcomeRowElement(row) {
+  const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
+  const item = document.createElement("div");
+  item.className = `outcome-row ${style.className}`;
+  const badge = document.createElement("span");
+  badge.className = "outcome-badge";
+  badge.textContent = style.badge;
+  const main = document.createElement("span");
+  main.className = "outcome-main";
+  const tfLabel = TIMEFRAME_LABEL[row.timeframe] || row.timeframe || "";
+  const horizon = TIMEFRAME_HORIZON[row.timeframe] || "";
+  main.textContent = `${row.symbol || "?"} ${tfLabel} ${DIRECTION_LABEL[row.direction] || row.direction || ""}${horizon ? `(${horizon}を採点)` : ""}`;
+  const move = document.createElement("span");
+  move.className = "outcome-move";
+  const moveValue = num(row.move);
+  move.textContent = moveValue === null ? "" : `${moveValue > 0 ? "+" : ""}${moveValue}`;
+  const ts = document.createElement("span");
+  ts.className = "outcome-ts subtle";
+  ts.textContent = shortDate(row.ts);
+  item.append(badge, main, move, ts);
+  return item;
+}
+
+function outcomeGroups(data) {
+  // 新サーバは時間足ごとに直近12件を返す。旧サーバ(直近20件のみ)でも
+  // 自前でグルーピングして同じUIを出す。
+  const grouped = data.evaluation?.recent_outcomes_by_timeframe;
+  if (grouped && typeof grouped === "object" && Object.keys(grouped).length) {
+    return grouped;
+  }
+  const fallback = {};
+  (data.evaluation?.recent_outcomes || []).forEach((row) => {
+    const tf = row.timeframe || "";
+    if (!tf) return;
+    (fallback[tf] = fallback[tf] || []).push(row);
+  });
+  return fallback;
+}
+
+function outcomeCounts(rows) {
+  const counts = { hit: 0, miss: 0, flat: 0 };
+  rows.forEach((row) => {
+    if (counts[row.outcome] !== undefined) counts[row.outcome] += 1;
+  });
+  return counts;
+}
+
+function outcomeSummaryChip(tf, rows, byTimeframe) {
+  const chip = document.createElement("div");
+  chip.className = "outcome-chip";
+  const counts = outcomeCounts(rows);
+  const label = document.createElement("strong");
+  label.textContent = `${TIMEFRAME_LABEL[tf] || tf}(${TIMEFRAME_HORIZON[tf] || "?"})`;
+  const recent = document.createElement("span");
+  recent.className = "outcome-chip-recent";
+  recent.textContent = `直近: ✅${counts.hit} ❌${counts.miss} ⚪${counts.flat}`;
+  chip.append(label, recent);
+  const total = byTimeframe?.[tf];
+  if (total && Number(total.evaluated)) {
+    const evaluated = Number(total.evaluated);
+    const hits = Number(total.hits || 0);
+    const rate = document.createElement("span");
+    rate.className = "subtle";
+    rate.textContent = `通算的中 ${pct(hits / evaluated)} (${hits}/${evaluated})`;
+    chip.append(rate);
+  }
+  return chip;
+}
+
 function renderRecentOutcomes(data) {
   const target = $("recentOutcomes");
   if (!target) return;
+  const tabs = $("outcomeTabs");
+  const summary = $("outcomeSummary");
   target.replaceChildren();
-  const outcomes = data.evaluation?.recent_outcomes || [];
-  if (!outcomes.length) {
+  if (tabs) tabs.replaceChildren();
+  if (summary) summary.replaceChildren();
+
+  const groups = outcomeGroups(data);
+  const availableTfs = TIMEFRAME_ORDER.filter((tf) => (groups[tf] || []).length);
+  if (!availableTfs.length) {
     target.appendChild(
       empty("満期を迎えた方向判断がまだありません(主ホライズン経過後にここへ並びます)"),
     );
     return;
   }
-  // サーバは古い順で最新20件を返すため、新しい順に並べ替えて表示する
-  [...outcomes].reverse().forEach((row) => {
-    const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
-    const item = document.createElement("div");
-    item.className = `outcome-row ${style.className}`;
-    const badge = document.createElement("span");
-    badge.className = "outcome-badge";
-    badge.textContent = style.badge;
-    const main = document.createElement("span");
-    main.className = "outcome-main";
-    const tfLabel = TIMEFRAME_LABEL[row.timeframe] || row.timeframe || "";
-    const horizon = TIMEFRAME_HORIZON[row.timeframe] || "";
-    main.textContent = `${row.symbol || "?"} ${tfLabel} ${DIRECTION_LABEL[row.direction] || row.direction || ""}${horizon ? `(${horizon}を採点)` : ""}`;
-    const move = document.createElement("span");
-    move.className = "outcome-move";
-    const moveValue = num(row.move);
-    move.textContent = moveValue === null ? "" : `${moveValue > 0 ? "+" : ""}${moveValue}`;
-    const ts = document.createElement("span");
-    ts.className = "outcome-ts subtle";
-    ts.textContent = shortDate(row.ts);
-    item.append(badge, main, move, ts);
-    target.appendChild(item);
-  });
+  if (outcomeTabSelection !== "all" && !availableTfs.includes(outcomeTabSelection)) {
+    outcomeTabSelection = "all";
+  }
+
+  // 時間足タブ(すべて / 15分足 / 1時間足 / 4時間足 / 日足)
+  if (tabs) {
+    const options = [["all", "すべて"], ...availableTfs.map((tf) => [tf, TIMEFRAME_LABEL[tf] || tf])];
+    options.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab${outcomeTabSelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeTabSelection === key ? "true" : "false");
+      const rows = key === "all" ? Object.values(groups).flat() : groups[key] || [];
+      const counts = outcomeCounts(rows);
+      button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}`;
+      button.addEventListener("click", () => {
+        outcomeTabSelection = key;
+        renderRecentOutcomes(data);
+      });
+      tabs.appendChild(button);
+    });
+  }
+
+  // 選択中タブの集計チップ(直近の✅❌⚪と通算的中率)
+  const byTimeframe = data.evaluation?.by_timeframe || {};
+  if (summary) {
+    const tfsToShow = outcomeTabSelection === "all" ? availableTfs : [outcomeTabSelection];
+    tfsToShow.forEach((tf) => {
+      summary.appendChild(outcomeSummaryChip(tf, groups[tf] || [], byTimeframe));
+    });
+  }
+
+  // 結果リスト(新しい順)。「すべて」は全時間足を時刻でマージして20件まで
+  const parseTs = (row) => {
+    const t = new Date(row.ts || 0).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  };
+  const rows =
+    outcomeTabSelection === "all"
+      ? Object.values(groups).flat().sort((a, b) => parseTs(b) - parseTs(a)).slice(0, 20)
+      : [...(groups[outcomeTabSelection] || [])].reverse();
+  rows.forEach((row) => target.appendChild(outcomeRowElement(row)));
 }
 
 function renderOps(data) {

@@ -1100,3 +1100,60 @@ th {
     display: none;
   }
 }
+
+/* 直近の答え合わせ: 時間足タブと集計チップ */
+.outcome-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.outcome-tab {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.outcome-tab:hover {
+  color: var(--text);
+}
+
+.outcome-tab.active {
+  color: var(--text);
+  border-color: var(--green);
+  background: rgba(93, 201, 140, 0.12);
+}
+
+.outcome-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.outcome-chip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.85rem;
+}
+
+.outcome-chip strong {
+  color: var(--text);
+}
+
+.outcome-chip-recent {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}

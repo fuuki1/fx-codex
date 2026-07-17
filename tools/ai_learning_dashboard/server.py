@@ -574,11 +574,28 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_symbol": by_symbol,
         "by_timeframe": by_timeframe,
         "recent_outcomes": outcomes[-20:],
+        # 時間足タブ表示用。全体の直近20件だけだと特定の時間足が数件しか
+        # 残らないため、時間足ごとに直近12件ずつ保持する(UIはこちらを優先し、
+        # 無ければrecent_outcomesを自前でグルーピングして後方互換)。
+        "recent_outcomes_by_timeframe": _recent_outcomes_by_timeframe(outcomes),
         "ml_eligible_after_thinning": _thinned_outcome_count(outcomes),
         "ml_pit_evaluated": ml_pit_evaluated,
         "ml_pit_pending": ml_pit_pending,
         "ml_pit_ineligible": ml_pit_ineligible,
     }
+
+
+def _recent_outcomes_by_timeframe(
+    outcomes: list[dict[str, Any]], per_timeframe: int = 12
+) -> dict[str, list[dict[str, Any]]]:
+    """満期採点済みの結果を時間足ごとに直近per_timeframe件ずつ返す。"""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in outcomes:
+        timeframe = str(row.get("timeframe") or "")
+        if not timeframe:
+            continue
+        grouped.setdefault(timeframe, []).append(row)
+    return {timeframe: rows[-per_timeframe:] for timeframe, rows in grouped.items()}
 
 
 def _thinned_outcome_count(
