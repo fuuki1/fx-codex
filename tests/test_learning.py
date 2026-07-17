@@ -54,6 +54,19 @@ def entry(
     }
 
 
+def pit_entry(ts: datetime, **kwargs) -> dict:
+    row = entry(ts, **kwargs)
+    row.update(
+        {
+            "prediction_time": ts.isoformat(),
+            "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+            "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+            "pit_eligible": True,
+        }
+    )
+    return row
+
+
 def call(
     symbol: str = "USDJPY",
     direction: str = "long",
@@ -106,6 +119,22 @@ def test_evaluate_history_picks_price_closest_to_horizon() -> None:
         entry(NOW + timedelta(hours=24.2), direction="neutral", close=101.0),
     ]
     calls = learning.evaluate_history(entries)
+    assert len(calls) == 1
+    assert calls[0].outcome == "hit"
+
+
+def test_evaluate_history_require_pit_excludes_legacy_rows() -> None:
+    legacy = [
+        entry(NOW, direction="long", close=100.0),
+        entry(NOW + DAY, direction="neutral", close=101.0),
+    ]
+    eligible = [
+        pit_entry(NOW, direction="long", close=100.0),
+        pit_entry(NOW + DAY, direction="neutral", close=101.0),
+    ]
+
+    assert learning.evaluate_history(legacy, require_pit=True) == []
+    calls = learning.evaluate_history(eligible, require_pit=True)
     assert len(calls) == 1
     assert calls[0].outcome == "hit"
 

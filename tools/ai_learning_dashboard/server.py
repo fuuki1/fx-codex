@@ -37,9 +37,6 @@ DECISION_LATEST_FILE = "briefing_decisions_latest.json"
 DECISION_OUTCOMES_FILE = "briefing_decision_outcomes.json"
 DECISION_FEEDBACK_FILE = "briefing_decision_feedback.json"
 DECISION_MONITOR_FILE = "decision_expectancy_monitor.json"
-BRIEFING_RUN_LOG_FILE = "fx_briefing.log"
-TF_BRIEFING_RUN_LOG_FILE = "fx_briefing_tf.log"
-TF_SNAPSHOT_RUN_LOG_FILE = "fx_tf_snapshot.log"
 # 時間足別モード(fx_briefing --per-timeframe)の記録
 TF_JOURNAL_FILE = "briefing_tf_journal.jsonl"
 TF_LEARNING_FILE = "briefing_tf_learning.json"
@@ -48,6 +45,19 @@ TF_LEARNING_FILE = "briefing_tf_learning.json"
 TF_PRICES_FILE = "briefing_tf_prices.jsonl"
 TF_PRICES_STALE_MINUTES = 15
 _TIMEFRAME_ORDER = {"15m": 0, "1h": 1, "4h": 2, "1d": 3}
+LAUNCHD_SERVICES = (
+    ("snapshot_service", "価格スナップショット定期サービス", "com.fx-codex.snapshot"),
+    ("briefing_service", "ブリーフィング定期サービス", "com.fx-codex.briefing"),
+    ("health_service", "鮮度監視定期サービス", "com.fx-codex.health"),
+)
+
+# Keep these dashboard-only mirrors aligned with fx_intel.ml.  The dashboard is
+# intentionally standalone, but it still needs to explain why a model has not
+# been created without importing the research pipeline.
+ML_MIN_TRAIN_ROWS = 150
+ML_THIN_MIN_GAP_HOURS = 4.0
+ML_ARTIFACT_SCHEMA = 4
+ML_TRAINING_CONTRACT = "fusion-pit-v1"
 
 # 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
 # ダッシュボードは fx_intel に依存しない方針なのでここに独立して持つ。
@@ -95,6 +105,35 @@ def _parse_ts(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _is_pit_eligible_fusion_row(entry: dict[str, Any]) -> bool:
+    """Mirror fx_intel.journal's fail-closed fusion learning provenance contract."""
+    if entry.get("pit_eligible") is not True:
+        return False
+
+    def aware(value: object) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(UTC)
+
+    recorded = aware(entry.get("ts"))
+    prediction = aware(entry.get("prediction_time"))
+    source_cutoff = aware(entry.get("source_cutoff"))
+    feature_available = aware(entry.get("max_feature_available_time"))
+    if any(value is None for value in (recorded, prediction, source_cutoff, feature_available)):
+        return False
+    assert recorded is not None
+    assert prediction is not None
+    assert source_cutoff is not None
+    assert feature_available is not None
+    return recorded == prediction and source_cutoff <= feature_available <= prediction
 
 
 def _number(value: object) -> float | None:
@@ -197,6 +236,51 @@ def _runtime_process_status(rows: list[dict[str, Any]], key: str, label: str, ne
     }
 
 
+def _launchctl_print(label: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _launchd_service_status(key: str, label_ja: str, label: str, output: str) -> dict:
+    loaded = bool(output.strip())
+    state: str | None = None
+    last_exit_code: int | None = None
+    pids: list[int] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("state ="):
+            state = line.partition("=")[2].strip()
+        elif line.startswith("last exit code ="):
+            try:
+                last_exit_code = int(line.partition("=")[2].strip())
+            except ValueError:
+                last_exit_code = None
+        elif line.startswith("pid ="):
+            try:
+                pids.append(int(line.partition("=")[2].strip()))
+            except ValueError:
+                continue
+    return {
+        "key": key,
+        "label_ja": label_ja,
+        "launchd_label": label,
+        # UI互換のrunningは、ワンショット子の瞬間的な実行状態ではなく
+        # 定期サービスがlaunchdへ登録済みかを示す。
+        "running": loaded,
+        "loaded": loaded,
+        "state": state,
+        "last_exit_code": last_exit_code,
+        "pids": pids,
+    }
+
+
 def _runtime_log_status(log_dir: Path, name: str, label: str, now: datetime) -> dict:
     status = _file_status_with_age(log_dir / name, now)
     status["name"] = name
@@ -210,56 +294,43 @@ def _ops_status(
     *,
     now: datetime | None = None,
     ps_output: str | None = None,
+    launchctl_outputs: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     rows = _process_table(ps_output)
-    processes = [
-        _runtime_process_status(
-            rows, "briefing_loop", "ブリーフィング送信ループ", "fx_briefing_loop.sh"
-        ),
-        _runtime_process_status(
-            rows, "tf_snapshot_loop", "時間足価格スナップショット", "fx_tf_snapshot_loop.sh"
-        ),
+    processes = []
+    for key, label_ja, launchd_label in LAUNCHD_SERVICES:
+        output = (
+            launchctl_outputs.get(launchd_label, "")
+            if launchctl_outputs is not None
+            else _launchctl_print(launchd_label)
+        )
+        processes.append(_launchd_service_status(key, label_ja, launchd_label, output))
+    processes.append(
         _runtime_process_status(
             rows, "dashboard", "ダッシュボード", "tools/ai_learning_dashboard/server.py"
-        ),
-    ]
+        )
+    )
     runtime_logs = [
-        _runtime_log_status(log_dir, BRIEFING_RUN_LOG_FILE, "融合1判断ログ", now),
-        _runtime_log_status(log_dir, TF_BRIEFING_RUN_LOG_FILE, "時間足別判断ログ", now),
-        _runtime_log_status(log_dir, TF_SNAPSHOT_RUN_LOG_FILE, "価格スナップショットログ", now),
+        _runtime_log_status(log_dir, JOURNAL_FILE, "融合1判断ログ", now),
+        _runtime_log_status(log_dir, TF_JOURNAL_FILE, "時間足別判断ログ", now),
+        _runtime_log_status(log_dir, TF_PRICES_FILE, "価格スナップショットログ", now),
     ]
     tf_prices_status = _file_status_with_age(log_dir / TF_PRICES_FILE, now)
     file_exists = {name: bool(info.get("exists")) for name, info in files.items()}
     alerts: list[dict[str, str]] = []
 
-    if not file_exists.get(JOURNAL_FILE) and not file_exists.get(TF_JOURNAL_FILE):
-        alerts.append(
-            {
-                "severity": "warn",
-                "message_ja": "融合/時間足別の判断ログが未作成です",
-                "action_ja": "まず python3 tools/learning_capture.py でDiscord送信なしの学習ログを1回収集できます",
-            }
-        )
-    if not file_exists.get(TF_PRICES_FILE):
-        alerts.append(
-            {
-                "severity": "warn",
-                "message_ja": "時間足別採点用の5分価格系列が未作成です",
-                "action_ja": "python3 tools/learning_capture.py が1回分の価格系列も同時に保存します",
-            }
-        )
-    else:
-        price_age = tf_prices_status.get("age_minutes")
-        if isinstance(price_age, (int, float)) and price_age > TF_PRICES_STALE_MINUTES:
+    for name, label_ja, service in (
+        (JOURNAL_FILE, "融合1判断ログ", "com.fx-codex.briefing"),
+        (TF_JOURNAL_FILE, "時間足別判断ログ", "com.fx-codex.briefing"),
+        (TF_PRICES_FILE, "時間足別採点用の5分価格系列", "com.fx-codex.snapshot"),
+    ):
+        if not file_exists.get(name):
             alerts.append(
                 {
                     "severity": "fail",
-                    "message_ja": "時間足別価格スナップショットがstaleです",
-                    "action_ja": (
-                        f"最終更新から約{int(price_age)}分経過。"
-                        "./fx_tf_snapshot_loop.sh を復旧してください"
-                    ),
+                    "message_ja": f"{label_ja}が未作成です",
+                    "action_ja": f"{service}の状態とOperations runbookの復旧手順を確認してください",
                 }
             )
     if file_exists.get(DECISION_LOG_FILE) and not file_exists.get(DECISION_MONITOR_FILE):
@@ -278,35 +349,52 @@ def _ops_status(
                 "action_ja": "判断ログが主ホライズン経過後に採点されると作成されます",
             }
         )
-    process_by_key = {process["key"]: process for process in processes}
-    if not process_by_key["briefing_loop"]["running"]:
-        alerts.append(
-            {
-                "severity": "warn",
-                "message_ja": "ブリーフィング送信ループが稼働していません",
-                "action_ja": "継続運用でDiscord送信も必要な場合だけ ./fx_briefing_loop.sh & を手動起動してください",
-            }
-        )
-    if not process_by_key["tf_snapshot_loop"]["running"]:
-        alerts.append(
-            {
-                "severity": "warn",
-                "message_ja": "5分価格スナップショットループが稼働していません",
-                "action_ja": "時間足別学習を継続するには ./fx_tf_snapshot_loop.sh & を起動してください",
-            }
-        )
+    for process in processes[: len(LAUNCHD_SERVICES)]:
+        if not process["loaded"]:
+            alerts.append(
+                {
+                    "severity": "fail",
+                    "message_ja": f"{process['label_ja']}がlaunchdに登録されていません",
+                    "action_ja": "scripts/status_fx_services.sh とOperations runbookの復旧手順を確認してください",
+                }
+            )
+            continue
+        exit_code = process.get("last_exit_code")
+        if exit_code in (None, 0):
+            continue
+        if process["key"] == "briefing_service" and exit_code == 5:
+            alerts.append(
+                {
+                    "severity": "warn",
+                    "message_ja": "判断保存後のDiscord通知に失敗しました",
+                    "action_ja": "logs/fx_integrated_briefing.log とDiscord側の応答を確認してください",
+                }
+            )
+        else:
+            alerts.append(
+                {
+                    "severity": "fail",
+                    "message_ja": f"{process['label_ja']}の前回終了コードは{exit_code}です",
+                    "action_ja": "launchd stderrと対象journalの整合性を確認してください",
+                }
+            )
 
     for runtime_log in runtime_logs:
         age = runtime_log.get("age_minutes")
         if age is None:
             continue
-        stale_after = 15 if runtime_log["name"] == TF_SNAPSHOT_RUN_LOG_FILE else 90
+        stale_after = 90 if runtime_log["name"] == JOURNAL_FILE else 15
         if age > stale_after:
+            service = (
+                "com.fx-codex.snapshot"
+                if runtime_log["name"] == TF_PRICES_FILE
+                else "com.fx-codex.briefing"
+            )
             alerts.append(
                 {
                     "severity": "warn",
                     "message_ja": f"{runtime_log['label_ja']}の更新が止まっています",
-                    "action_ja": f"最終更新から約{int(age)}分経過しています",
+                    "action_ja": f"最終更新から約{int(age)}分経過。{service}とlaunchdログを確認してください",
                 }
             )
 
@@ -391,6 +479,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
     # 価格系列は (symbol, timeframe) 別に持つ。timeframe を持たない旧スキーマ行は
     # timeframe="" のキー(融合1判断)に入り、従来どおり24h採点される。
     prices: dict[tuple[str, str], list[tuple[datetime, float]]] = {}
+    pit_prices: dict[tuple[str, str], list[tuple[datetime, float]]] = {}
     parsed: list[tuple[datetime, dict[str, Any]]] = []
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
@@ -402,10 +491,15 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         parsed.append((ts, entry))
         if close is not None and symbol:
             prices.setdefault((symbol, timeframe), []).append((ts, close))
+            if not timeframe and _is_pit_eligible_fusion_row(entry):
+                pit_prices.setdefault((symbol, timeframe), []).append((ts, close))
     for series in prices.values():
+        series.sort(key=lambda row: row[0])
+    for series in pit_prices.values():
         series.sort(key=lambda row: row[0])
 
     evaluated = hits = flat = pending = directional = 0
+    ml_pit_evaluated = ml_pit_pending = ml_pit_ineligible = 0
     by_symbol: dict[str, dict[str, int]] = {}
     by_timeframe: dict[str, dict[str, int]] = {}
     outcomes: list[dict[str, Any]] = []
@@ -416,21 +510,28 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         directional += 1
         symbol = str(entry.get("symbol") or "")
         timeframe = str(entry.get("timeframe") or "")
+        pit_eligible = _is_pit_eligible_fusion_row(entry) if not timeframe else False
+        if not timeframe and not pit_eligible:
+            ml_pit_ineligible += 1
         close = _number(entry.get("close"))
         atr = _number(entry.get("atr"))
         if close is None or not symbol:
             pending += 1
+            if pit_eligible:
+                ml_pit_pending += 1
             continue
         # その足の主ホライズンで採点(旧スキーマ行=24h)
         horizon = _number(entry.get("horizon_hours")) or 24.0
         future = _future_close(
-            prices.get((symbol, timeframe), []),
+            (pit_prices if pit_eligible else prices).get((symbol, timeframe), []),
             ts,
             horizon_hours=horizon,
             tolerance_hours=_tolerance_for(horizon),
         )
         if future is None:
             pending += 1
+            if pit_eligible:
+                ml_pit_pending += 1
             continue
         move = future - close
         signed = move if direction == "long" else -move
@@ -440,6 +541,8 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             outcome = "flat"
         else:
             evaluated += 1
+            if pit_eligible:
+                ml_pit_evaluated += 1
             hit = signed > 0
             hits += int(hit)
             stat = by_symbol.setdefault(symbol, {"evaluated": 0, "hits": 0, "flat": 0})
@@ -458,6 +561,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 "direction": direction,
                 "outcome": outcome,
                 "move": round(move, 6),
+                "pit_eligible": pit_eligible,
             }
         )
     return {
@@ -470,7 +574,59 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_symbol": by_symbol,
         "by_timeframe": by_timeframe,
         "recent_outcomes": outcomes[-20:],
+        # 時間足タブ表示用。全体の直近20件だけだと特定の時間足が数件しか
+        # 残らないため、時間足ごとに直近12件ずつ保持する(UIはこちらを優先し、
+        # 無ければrecent_outcomesを自前でグルーピングして後方互換)。
+        "recent_outcomes_by_timeframe": _recent_outcomes_by_timeframe(outcomes),
+        "ml_eligible_after_thinning": _thinned_outcome_count(outcomes),
+        "ml_pit_evaluated": ml_pit_evaluated,
+        "ml_pit_pending": ml_pit_pending,
+        "ml_pit_ineligible": ml_pit_ineligible,
     }
+
+
+def _recent_outcomes_by_timeframe(
+    outcomes: list[dict[str, Any]], per_timeframe: int = 12
+) -> dict[str, list[dict[str, Any]]]:
+    """満期採点済みの結果を時間足ごとに直近per_timeframe件ずつ返す。"""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in outcomes:
+        timeframe = str(row.get("timeframe") or "")
+        if not timeframe:
+            continue
+        grouped.setdefault(timeframe, []).append(row)
+    return {timeframe: rows[-per_timeframe:] for timeframe, rows in grouped.items()}
+
+
+def _thinned_outcome_count(
+    outcomes: list[dict[str, Any]],
+    *,
+    min_gap_hours: float = ML_THIN_MIN_GAP_HOURS,
+) -> int:
+    """Count GBDT rows using the same thin-then-drop-flat order as fx_intel.ml."""
+    stamped: list[tuple[datetime, str, str]] = []
+    for outcome in outcomes:
+        if outcome.get("pit_eligible") is not True:
+            continue
+        result = str(outcome.get("outcome") or "")
+        if result not in {"hit", "miss", "flat"}:
+            continue
+        ts = _parse_ts(outcome.get("ts"))
+        symbol = str(outcome.get("symbol") or "")
+        if ts is not None and symbol:
+            stamped.append((ts, symbol, result))
+    stamped.sort(key=lambda row: row[0])
+
+    last_kept: dict[str, datetime] = {}
+    kept = 0
+    for ts, symbol, result in stamped:
+        previous = last_kept.get(symbol)
+        if previous is not None and (ts - previous) < timedelta(hours=min_gap_hours):
+            continue
+        last_kept[symbol] = ts
+        if result in {"hit", "miss"}:
+            kept += 1
+    return kept
 
 
 def _journal_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -492,6 +648,55 @@ def _journal_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_direction": by_direction,
         "latest_ts": latest_ts.isoformat() if latest_ts else None,
         "recent": recent,
+        "activity": _journal_activity(entries),
+    }
+
+
+# 活動タイムライン用の方向カテゴリ。standby/neutral(見送り)と実方向を分けて
+# 「いつ・どの方向を・何回記録したか」を積み上げで見せる。
+_ACTIVITY_DIRECTIONS = ("long", "short", "neutral", "standby")
+
+
+def _journal_activity(entries: list[dict[str, Any]], *, buckets: int = 48) -> dict[str, Any]:
+    """判断ログを1時間刻みで集計し、方向別の積み上げ用データを返す。
+
+    「どこで何を」学習しているかの前段として、記録がいつ・どの方向で・どの
+    ペアで発生したかを可視化するための素材。採点はしない(direction 無し行や
+    価格スナップショットは呼び出し側で除外して渡す)。
+    """
+    stamped: list[tuple[datetime, dict[str, Any]]] = []
+    for entry in entries:
+        ts = _parse_ts(entry.get("ts"))
+        if ts is not None:
+            stamped.append((ts, entry))
+    if not stamped:
+        return {"buckets": [], "by_direction": {}, "bucket_hours": 1}
+    stamped.sort(key=lambda row: row[0])
+    latest = stamped[-1][0].replace(minute=0, second=0, microsecond=0)
+    start = latest - timedelta(hours=buckets - 1)
+    slots: list[dict[str, Any]] = [
+        {
+            "ts": (start + timedelta(hours=offset)).isoformat(),
+            "total": 0,
+            **{direction: 0 for direction in _ACTIVITY_DIRECTIONS},
+        }
+        for offset in range(buckets)
+    ]
+    by_direction: dict[str, int] = {direction: 0 for direction in _ACTIVITY_DIRECTIONS}
+    for ts, entry in stamped:
+        index = int((ts - start).total_seconds() // 3600)
+        if index < 0 or index >= buckets:
+            continue
+        direction = str(entry.get("direction") or "standby")
+        if direction not in by_direction:
+            direction = "standby"
+        slots[index][direction] += 1
+        slots[index]["total"] += 1
+        by_direction[direction] += 1
+    return {
+        "buckets": slots,
+        "by_direction": by_direction,
+        "bucket_hours": 1,
     }
 
 
@@ -589,6 +794,10 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "notes_ja": (
                 raw_profile.get("notes_ja") if isinstance(raw_profile.get("notes_ja"), list) else []
             ),
+            # どのペア・どの市場条件で学習したか(採点実体)。融合1判断と同じ
+            # 抽出器を各時間足プロファイルに適用する。
+            "symbols": _symbol_rows(raw_profile, {}),
+            "conditions": _condition_rows(raw_profile),
         }
         rows.append(row)
     rows.sort(key=lambda row: (_TIMEFRAME_ORDER.get(str(row["timeframe"]), 99), row["timeframe"]))
@@ -638,6 +847,12 @@ def _learning_source(
     tf_learning: dict[str, Any],
     evaluated: dict[str, Any],
 ) -> dict[str, Any]:
+    fusion_evaluated = int(learning.get("evaluated", 0) or 0)
+    timeframe_evaluated = int(tf_learning.get("evaluated", 0) or 0)
+    if learning and fusion_evaluated > 0:
+        return {"mode": "fusion", "label_ja": "融合1判断", "has_profile": True}
+    if tf_learning.get("timeframes") and timeframe_evaluated > 0:
+        return {"mode": "timeframe", "label_ja": "時間足別", "has_profile": True}
     if learning:
         return {"mode": "fusion", "label_ja": "融合1判断", "has_profile": True}
     if tf_learning.get("timeframes"):
@@ -701,6 +916,21 @@ def _learning_payload(
 
 
 def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload and (
+        payload.get("schema") != ML_ARTIFACT_SCHEMA
+        or payload.get("training_contract") != ML_TRAINING_CONTRACT
+    ):
+        return {
+            "trained_at": payload.get("trained_at"),
+            "usable": False,
+            "n_train": 0,
+            "n_valid": 0,
+            "base_rate": None,
+            "metrics": {},
+            "reasons": ["旧PIT契約のモデルを除外しました。再学習が必要です。"],
+            "importance": [],
+            "has_model": False,
+        }
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     importance = payload.get("importance_by_name")
     if not isinstance(importance, dict):
@@ -721,6 +951,20 @@ def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "reasons": payload.get("reasons") if isinstance(payload.get("reasons"), list) else [],
         "importance": importance_rows[:12],
         "has_model": payload.get("model") is not None,
+    }
+
+
+def _ml_training_progress(evaluated: dict[str, Any]) -> dict[str, Any]:
+    """Explain the current fusion-journal progress toward GBDT training."""
+    return {
+        "source": JOURNAL_FILE,
+        "horizon_hours": 24,
+        "evaluated": int(evaluated.get("ml_pit_evaluated", 0) or 0),
+        "eligible_after_thinning": int(evaluated.get("ml_eligible_after_thinning", 0) or 0),
+        "pending": int(evaluated.get("ml_pit_pending", 0) or 0),
+        "pit_ineligible": int(evaluated.get("ml_pit_ineligible", 0) or 0),
+        "minimum_required": ML_MIN_TRAIN_ROWS,
+        "thin_gap_hours": ML_THIN_MIN_GAP_HOURS,
     }
 
 
@@ -907,6 +1151,7 @@ def build_state(
     *,
     now: datetime | None = None,
     ps_output: str | None = None,
+    launchctl_outputs: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     journal_path = log_dir / JOURNAL_FILE
@@ -942,6 +1187,9 @@ def build_state(
     # 価格スナップショット行は将来価格系列にだけ寄与する(direction 無しなので
     # 採点対象=directional にはカウントされない)。
     evaluated = _evaluate_journal(entries + tf_entries + tf_price_rows)
+    # GBDT is trained only from the fusion journal.  Do not present timeframe
+    # outcomes as GBDT-ready samples; their horizons and schemas are different.
+    fusion_evaluated = _evaluate_journal(entries)
 
     source = _learning_source(learning, tf_learning, evaluated)
     learning_payload = _learning_payload(learning, evaluated, tf_learning, source)
@@ -968,13 +1216,22 @@ def build_state(
         "read_only": True,
         "log_dir": str(log_dir),
         "files": files,
-        "ops": _ops_status(log_dir, files, now=now, ps_output=ps_output),
+        "ops": _ops_status(
+            log_dir,
+            files,
+            now=now,
+            ps_output=ps_output,
+            launchctl_outputs=launchctl_outputs,
+        ),
         "journal": _journal_summary(entries + tf_entries),
         "evaluation": evaluated,
         "learning_source": source,
         "learning": learning_payload,
         "tf_learning": tf_learning,
-        "ml": _ml_summary(ml),
+        "ml": {
+            **_ml_summary(ml),
+            "training": _ml_training_progress(fusion_evaluated),
+        },
         "promotion": _promotion_summary(promotion),
         "trade_monitor": _trade_monitor_summary(trade_monitor, trade_registry),
         "decision_monitor": _decision_monitor_summary(decision_monitor, decision_feedback),

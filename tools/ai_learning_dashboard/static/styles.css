@@ -11,6 +11,24 @@
   --red: #de6e64;
   --cyan: #66b7c9;
   --ink: #181915;
+
+  /* dataviz palette (dark-surface steps, validated). Charts render on --panel
+     surfaces so contrast is judged against those, not pure black. */
+  --viz-surface: #22231f;
+  --viz-grid: #3c3f37;
+  --viz-axis: #4a4d43;
+  --viz-ink: #f3f1e9;
+  --viz-ink-2: #c3c2b7;
+  --viz-muted: #8f8d82;
+  /* categorical slots for direction series (long/short/neutral/standby) */
+  --viz-1: #3987e5; /* blue  — long   */
+  --viz-2: #d95926; /* orange— short  */
+  --viz-3: #c98500; /* yellow— neutral*/
+  --viz-4: #6f7268; /* gray  — standby (context) */
+  /* diverging hit-rate poles (below 50% red ← neutral → above 50% green) */
+  --viz-lo: #e34948;
+  --viz-mid: #4a4d43;
+  --viz-hi: #1baf7a;
 }
 
 * {
@@ -540,9 +558,441 @@ th {
   background: var(--panel-2);
 }
 
+/* ===== Learning contents (what/where learned) ===== */
+.learned-panel {
+  min-height: 0;
+}
+
+.learned-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.learned-gauge {
+  display: grid;
+  grid-template-columns: 132px 1fr;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.donut {
+  width: 132px;
+  height: 132px;
+}
+
+.learned-gauge-meta {
+  display: grid;
+  gap: 2px;
+  align-content: center;
+}
+
+.learned-gauge-meta strong {
+  font-size: 32px;
+  line-height: 1;
+}
+
+.learned-gauge-meta small {
+  font-size: 12px;
+}
+
+.learned-matrix-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.learned-matrix-head h3,
+.learned-notes-wrap h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.matrix {
+  display: grid;
+  gap: 4px;
+}
+
+.matrix-row {
+  display: grid;
+  gap: 4px;
+  align-items: stretch;
+}
+
+.matrix-corner,
+.matrix-colhead,
+.matrix-rowhead,
+.matrix-cell {
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.matrix-colhead,
+.matrix-rowhead {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  color: var(--muted);
+  background: #1b1c18;
+  font-weight: 700;
+}
+
+.matrix-rowhead small {
+  color: var(--viz-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.matrix-cell {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-height: 52px;
+  color: #10120e;
+  background: var(--panel-2);
+  transition: transform 120ms ease;
+}
+
+.matrix-cell.filled {
+  cursor: default;
+}
+
+.matrix-cell.filled:hover {
+  transform: translateY(-1px);
+}
+
+.matrix-cell .cell-rate {
+  font-size: 16px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.matrix-cell .cell-n {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.matrix-cell.empty {
+  color: var(--viz-muted);
+  background: #1b1c18;
+}
+
+.matrix-cell.empty .cell-rate {
+  font-weight: 600;
+}
+
+.matrix-cell.dim {
+  opacity: 0.62;
+}
+
+/* color-coded left rail carries identity for CVD (not color-alone) */
+.matrix-cell.filled {
+  border-left: 3px solid rgba(0, 0, 0, 0.28);
+}
+
+.learned-notes-wrap {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.learned-notes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.note-card {
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border-left: 3px solid var(--viz-1);
+}
+
+.note-card h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.note-card h4 .tf-pill {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--viz-1);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.note-card ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+}
+
+.note-card li {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ===== SVG chart surfaces ===== */
+.chart-area {
+  width: 100%;
+}
+
+.chart-area svg,
+.condition-chart svg,
+.donut svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.donut svg {
+  height: 132px;
+}
+
+.chart-note {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-bottom: 12px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex: none;
+}
+
+.legend-gradient {
+  width: 120px;
+  height: 12px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--viz-lo), var(--viz-mid), var(--viz-hi));
+}
+
+.condition-chart {
+  display: grid;
+  gap: 12px;
+}
+
+.cond-group-title {
+  margin: 2px 0 6px;
+  color: var(--viz-ink-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.cond-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 240px) 1fr minmax(88px, auto);
+  align-items: center;
+  gap: 10px;
+}
+
+.cond-row .cond-label {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cond-row .cond-label small {
+  color: var(--viz-muted);
+  font-size: 11px;
+}
+
+.cond-track {
+  position: relative;
+  height: 18px;
+  border-radius: 5px;
+  background: #1b1c18;
+  overflow: hidden;
+}
+
+.cond-track .cond-baseline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--viz-axis);
+}
+
+.cond-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 4px;
+}
+
+.cond-row output {
+  color: var(--viz-ink-2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.svg-grid {
+  stroke: var(--viz-grid);
+  stroke-width: 1;
+}
+
+.svg-axis {
+  stroke: var(--viz-axis);
+  stroke-width: 1;
+}
+
+.svg-tick {
+  fill: var(--viz-muted);
+  font-size: 11px;
+}
+
+.svg-label {
+  fill: var(--viz-ink-2);
+  font-size: 11px;
+}
+
+/* ===== 共有ツールチップ ===== */
+.chart-tooltip {
+  position: fixed;
+  z-index: 50;
+  min-width: 132px;
+  max-width: 280px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #171814;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.chart-tooltip .tt-title {
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chart-tooltip .tt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 0;
+}
+
+.chart-tooltip .tt-key {
+  width: 10px;
+  height: 3px;
+  border-radius: 999px;
+  flex: none;
+}
+
+.chart-tooltip .tt-label {
+  color: var(--muted);
+}
+
+.chart-tooltip .tt-value {
+  margin-left: auto;
+  color: var(--text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chart-tooltip .tt-muted .tt-value {
+  color: var(--viz-ink-2);
+  font-weight: 600;
+}
+
+/* ホバーで反応する marks */
+.activity-hit,
+.calib-hit,
+.matrix-cell,
+.cond-row {
+  cursor: default;
+}
+
+.calib-dot {
+  transition:
+    r 100ms ease,
+    stroke-width 100ms ease;
+}
+
+.calib-dot.is-active {
+  stroke: var(--viz-ink);
+  stroke-width: 2;
+}
+
+.cond-row {
+  border-radius: 6px;
+  transition: background 100ms ease;
+}
+
+.cond-row:hover,
+.cond-row:focus-visible {
+  background: rgba(255, 255, 255, 0.04);
+  outline: none;
+}
+
+.matrix-cell:focus-visible,
+.activity-hit:focus-visible,
+.calib-hit:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 1px;
+}
+
 @media (max-width: 980px) {
   .shell {
     padding: 16px;
+  }
+
+  .learned-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .cond-row {
+    grid-template-columns: 1fr;
+  }
+
+  .cond-row output {
+    text-align: left;
   }
 
   .topbar {
@@ -560,6 +1010,14 @@ th {
     grid-template-columns: 1fr;
   }
 
+  /* grid items must be allowed to shrink below their content's intrinsic
+     width, otherwise a wide child (data table, chart SVG) stretches the whole
+     column and forces horizontal page scroll on narrow screens. */
+  .main-grid > .panel,
+  .metric {
+    min-width: 0;
+  }
+
   .toolbar {
     min-width: 0;
   }
@@ -575,4 +1033,127 @@ th {
   .bar-row output {
     text-align: left;
   }
+}
+
+/* 直近の答え合わせ(予想の的中/外れ)一覧 */
+.outcome-list {
+  display: grid;
+  gap: 8px;
+}
+
+.outcome-row {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) 1fr minmax(60px, auto) minmax(90px, auto);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-left: 3px solid var(--muted);
+}
+
+.outcome-row.hit {
+  border-left-color: var(--green);
+}
+
+.outcome-row.miss {
+  border-left-color: var(--red);
+}
+
+.outcome-badge {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.outcome-row.hit .outcome-badge {
+  color: var(--green);
+}
+
+.outcome-row.miss .outcome-badge {
+  color: var(--red);
+}
+
+.outcome-main {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outcome-move {
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.outcome-ts {
+  text-align: right;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .outcome-row {
+    grid-template-columns: minmax(80px, auto) 1fr;
+  }
+  .outcome-move,
+  .outcome-ts {
+    display: none;
+  }
+}
+
+/* 直近の答え合わせ: 時間足タブと集計チップ */
+.outcome-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.outcome-tab {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.outcome-tab:hover {
+  color: var(--text);
+}
+
+.outcome-tab.active {
+  color: var(--text);
+  border-color: var(--green);
+  background: rgba(93, 201, 140, 0.12);
+}
+
+.outcome-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.outcome-chip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.85rem;
+}
+
+.outcome-chip strong {
+  color: var(--text);
+}
+
+.outcome-chip-recent {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
