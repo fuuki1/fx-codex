@@ -80,6 +80,8 @@ from fx_intel import (
     decision_pipeline,
     discord_delivery,
     freshness,
+    horizon_forecast,
+    horizon_journal,
     journal,
     learning,
     macro,
@@ -115,6 +117,10 @@ DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
 # direction を持たない価格行なので採点対象は増やさず将来価格系列だけを密にする。
 DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
+# マルチホライズン予測トラック(設計A)のshadowジャーナル。horizon-pit-v1契約。
+# 既存ジャーナル群とは完全に分離した新設ファイルで、--no-horizon-forecastsで
+# 追記を止めるだけでロールバックできる。
+DEFAULT_HORIZON_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_horizon_forecasts.jsonl"
 DEFAULT_CALENDAR_CACHE = PROJECT_ROOT / "logs" / "calendar_cache.json"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
@@ -249,6 +255,21 @@ def load_strategy_params() -> tuple[int, int, float, str | None]:
     戻り値は互換のため (fast, slow, atr_multiple, warning) の4要素を保つ。
     """
     return 20, 100, briefing.DEFAULT_ATR_MULTIPLE, None
+
+
+def _median_view_spread(tech: technicals.PairTechnicals) -> float | None:
+    """時間足ビューの実測スプレッドの中央値(横ばい閾値max(ATR×0.1, spread×2)用)。
+
+    どのビューにもspreadが無ければNone(閾値はATR項のみ=保守側に狭くなる)。
+    """
+    spreads = sorted(
+        view.spread
+        for view in tech.views.values()
+        if view is not None and view.spread is not None and view.spread > 0
+    )
+    if not spreads:
+        return None
+    return float(spreads[len(spreads) // 2])
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
@@ -769,6 +790,37 @@ def _run_per_timeframe(
             journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
         except OSError as error:
             fetch_warnings.append(f"時間足別ジャーナル書き込み失敗: {error}")
+        # マルチホライズン予測(設計A・shadow)。既存経路と独立の追記のみで、
+        # 失敗しても時間足別の判断・通知は止めない(warn-only)。
+        if not args.no_horizon_forecasts:
+            try:
+                feature_time = datetime.now(UTC)
+                horizon_rows: list[horizon_forecast.HorizonForecast] = []
+                for symbol in symbols:
+                    base, quote = calendar.symbol_currencies(symbol)
+                    horizon_rows.extend(
+                        horizon_forecast.build_horizon_forecasts(
+                            symbol,
+                            tech_map[symbol],
+                            analysis.currencies,
+                            calendar.risk_windows(events, {base, quote}),
+                            items,
+                            now=feature_time,
+                            calendar_ok=calendar_ok,
+                            operational_data_ok=operational_data_ok,
+                            operational_data_reason=operational_data_reason,
+                            spread=_median_view_spread(tech_map[symbol]),
+                        )
+                    )
+                horizon_journal.append_horizon_forecasts(
+                    DEFAULT_HORIZON_JOURNAL_PATH,
+                    horizon_rows,
+                    prediction_time=datetime.now(UTC),
+                    source_cutoff=now,
+                    max_feature_available_time=feature_time,
+                )
+            except (OSError, horizon_journal.HorizonPointInTimeError) as error:
+                fetch_warnings.append(f"ホライズン予測(shadow)の記録失敗: {error}")
         try:
             prior_decision_events = list(
                 decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
@@ -904,6 +956,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-journal",
         action="store_true",
         help="判断ジャーナル(logs/briefing_journal.jsonl)の記録・検証を行わない",
+    )
+    parser.add_argument(
+        "--no-horizon-forecasts",
+        action="store_true",
+        help="マルチホライズン予測(shadow)の記録を行わない(設計Aのロールバック用)",
     )
     parser.add_argument(
         "--no-learning",
