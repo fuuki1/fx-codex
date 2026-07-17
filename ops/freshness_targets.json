@@ -22,6 +22,33 @@
       "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を restart"
     },
     {
+      "name": "horizon_journal",
+      "path": "logs/briefing_horizon_forecasts.jsonl",
+      "kind": "jsonl",
+      "expected_interval_seconds": 300,
+      "warn_after_seconds": 900,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/horizon.err.log を確認し、com.fx-codex.horizon を restart"
+    },
+    {
+      "name": "trade_outcome_monitor",
+      "path": "logs/trade_outcome_monitor.json",
+      "kind": "json",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 5400,
+      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
+    },
+    {
+      "name": "decision_expectancy_monitor",
+      "path": "logs/decision_expectancy_monitor.json",
+      "kind": "json",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 5400,
+      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
+    },
+    {
       "name": "fusion_journal",
       "path": "logs/briefing_journal.jsonl",
       "kind": "jsonl",
