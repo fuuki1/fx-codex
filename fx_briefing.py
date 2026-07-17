@@ -794,14 +794,30 @@ def _run_per_timeframe(
         # 失敗しても時間足別の判断・通知は止めない(warn-only)。
         if not args.no_horizon_forecasts:
             try:
+                # Discord通知対象(symbols)を変えずにホライズン予測だけ追加ペアへ
+                # 広げるための追加取得。失敗はそのペアを飛ばすだけ(warn-only)。
+                horizon_tech: dict[str, technicals.PairTechnicals] = dict(tech_map)
+                extra_symbols = [
+                    symbol for symbol in (args.horizon_symbols or []) if symbol not in horizon_tech
+                ]
+                if extra_symbols:
+                    try:
+                        extra_map, extra_warnings = technicals.fetch_pair_technicals(extra_symbols)
+                        horizon_tech.update(extra_map)
+                        fetch_warnings.extend(extra_warnings)
+                    except Exception as error:  # noqa: BLE001 - shadow経路は主経路を止めない
+                        fetch_warnings.append(f"ホライズン用追加テクニカル取得失敗: {error}")
                 feature_time = datetime.now(UTC)
                 horizon_rows: list[horizon_forecast.HorizonForecast] = []
-                for symbol in symbols:
+                for symbol in [*symbols, *extra_symbols]:
+                    tech_for_symbol = horizon_tech.get(symbol)
+                    if tech_for_symbol is None:
+                        continue
                     base, quote = calendar.symbol_currencies(symbol)
                     horizon_rows.extend(
                         horizon_forecast.build_horizon_forecasts(
                             symbol,
-                            tech_map[symbol],
+                            tech_for_symbol,
                             analysis.currencies,
                             calendar.risk_windows(events, {base, quote}),
                             items,
@@ -809,7 +825,7 @@ def _run_per_timeframe(
                             calendar_ok=calendar_ok,
                             operational_data_ok=operational_data_ok,
                             operational_data_reason=operational_data_reason,
-                            spread=_median_view_spread(tech_map[symbol]),
+                            spread=_median_view_spread(tech_for_symbol),
                         )
                     )
                 horizon_journal.append_horizon_forecasts(
@@ -961,6 +977,17 @@ def main(argv: list[str] | None = None) -> int:
         "--no-horizon-forecasts",
         action="store_true",
         help="マルチホライズン予測(shadow)の記録を行わない(設計Aのロールバック用)",
+    )
+    parser.add_argument(
+        "--horizon-symbols",
+        nargs="*",
+        default=None,
+        metavar="SYMBOL",
+        help=(
+            "ホライズン予測だけに追加するペア(例: GBPUSD)。"
+            "Discord通知・時間足別ジャーナルの対象は変えずに、"
+            "テクニカルを追加取得してshadow予測を生成する"
+        ),
     )
     parser.add_argument(
         "--no-learning",

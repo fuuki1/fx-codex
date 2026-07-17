@@ -132,6 +132,74 @@ def test_flag_disables_horizon_journal(patched_paths) -> None:
     assert not horizon_path.exists()
 
 
+def test_horizon_symbols_adds_pair_without_touching_tf_journal(patched_paths) -> None:
+    """--horizon-symbols GBPUSD はホライズン予測だけ3ペア化し、Discord/時間足別対象を変えない。"""
+    horizon_path = patched_paths
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--no-discord",
+            "--no-macro",
+            "--symbols",
+            "USDJPY",
+            "--horizon-symbols",
+            "GBPUSD",
+        ]
+    )
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in horizon_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 18  # (USDJPY + GBPUSD) × 9ホライズン
+    assert {row["symbol"] for row in rows} == {"USDJPY", "GBPUSD"}
+    # 時間足別ジャーナルはUSDJPYのみ(通知対象を広げない)
+    tf_rows = [
+        json.loads(line)
+        for line in fx_briefing.DEFAULT_TF_JOURNAL_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["symbol"] for row in tf_rows} == {"USDJPY"}
+
+
+def test_horizon_extra_fetch_failure_skips_pair_only(patched_paths) -> None:
+    """追加ペアの取得失敗はそのペアを飛ばすだけで、主ペアのshadow予測は書かれる。"""
+    horizon_path = patched_paths
+    original = _tech_for
+
+    def failing_fetch(symbols, **kwargs):
+        if list(symbols) == ["GBPUSD"]:
+            raise RuntimeError("scanner down")
+        return original(symbols, **kwargs)
+
+    with (
+        mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=failing_fetch),
+        mock.patch("fx_intel.calendar.fetch_calendar", return_value=([], [])),
+        mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
+        mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
+    ):
+        rc = fx_briefing.main(
+            [
+                "--per-timeframe",
+                "--no-discord",
+                "--no-macro",
+                "--symbols",
+                "USDJPY",
+                "--horizon-symbols",
+                "GBPUSD",
+            ]
+        )
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in horizon_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["symbol"] for row in rows} == {"USDJPY"}
+    assert len(rows) == 9
+
+
 def test_horizon_write_failure_is_warn_only(patched_paths, capsys) -> None:
     """shadowジャーナルの失敗は既存経路(時間足別判断)を止めない。"""
     with mock.patch.object(
