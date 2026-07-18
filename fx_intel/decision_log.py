@@ -346,6 +346,13 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "components": decision.get("components", []),
         "learning_context": event.get("learning_context", {}),
     }
+    # 執行コスト(R換算)と判断時点の期待R予測を採点スキーマへ引き継ぐ。
+    # 採点側は execution_cost_r から realized_net_r を作り、net_expected_r と対比する。
+    execution = decision.get("execution")
+    if isinstance(execution, Mapping):
+        entry["execution_cost_r"] = execution.get("execution_cost_r")
+        entry["net_expected_r"] = execution.get("net_expected_r")
+        entry["expected_r"] = execution.get("expected_r")
     return _json_ready_dict(entry)
 
 
@@ -583,6 +590,31 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "warnings": list(getattr(plan, "warnings", []) or []),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
         "auxiliary_horizons": list(getattr(plan, "auxiliary_horizons", ()) or ()),
+        "execution": _execution_snapshot(plan),
+    }
+
+
+def _execution_snapshot(plan: object) -> dict[str, object]:
+    """発注前チェックリストが確定した執行コスト系の値を採点用に保存する。
+
+    trade_outcome の採点は「market が返した実現R」から realized_net_r を作るとき
+    このコスト(R換算)を差し引く。値は build_checklist が判断時点の実測 spread から
+    既に計算済み(decision_pipeline.execution_cost_in_r)なので、ここでは取り出して
+    載せるだけ(再計算しない)。net_expected_r は「判断時点の予測」として残し、
+    採点側で実測 realized_net_r と対比できるようにする。
+
+    checklist を持たない plan(時間足別=較正・コスト・サイズを通さない方向分析)は
+    全て None を保存する。採点側はコスト不明を欠損として扱う。
+    """
+    checklist = getattr(plan, "checklist", None)
+    if not isinstance(checklist, Mapping):
+        checklist = {}
+    return {
+        "execution_cost_r": _number_or_none(checklist.get("execution_cost_r")),
+        "expected_r": _number_or_none(checklist.get("expected_r")),
+        "net_expected_r": _number_or_none(checklist.get("net_expected_r")),
+        "expectancy_source": str(checklist.get("expectancy_source") or ""),
+        "probability_calibrated": bool(checklist.get("probability_calibrated", False)),
     }
 
 
@@ -612,6 +644,7 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "interval_summary": getattr(plan, "interval_summary", ""),
         "ma_note": getattr(plan, "ma_note", ""),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
+        "execution": _execution_snapshot(plan),
     }
 
 

@@ -83,6 +83,9 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                         "features": plan.features,
                         # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
                         "components": plan.components,
+                        # 執行コスト(R換算)と期待R予測。採点(trade_outcome)が
+                        # realized_net_r を作る入力で、MLの収益ラベルの源になる。
+                        **_plan_execution(plan),
                     },
                     ensure_ascii=False,
                 )
@@ -135,11 +138,30 @@ def append_timeframe_plans(
                         "data_quality": plan.data_quality,
                         "features": plan.features,
                         "components": plan.components,
+                        **_plan_execution(plan),
                     },
                     ensure_ascii=False,
                 )
                 + "\n"
             )
+
+
+def _plan_execution(plan: object) -> dict[str, object]:
+    """plan.checklist から執行コスト系の値を採点・学習用に取り出す。
+
+    値は build_checklist が判断時の実測 spread から既に計算済み。realized_net_r
+    (コスト控除後の実現R=収益ラベル)を trade_outcome が作るのに使う。checklist を
+    持たない plan(時間足別など)は None。欠損は採点側が欠損として扱う。
+    """
+    checklist = getattr(plan, "checklist", None)
+    if not isinstance(checklist, Mapping):
+        return {"execution_cost_r": None, "net_expected_r": None}
+    cost = checklist.get("execution_cost_r")
+    net = checklist.get("net_expected_r")
+    return {
+        "execution_cost_r": float(cost) if isinstance(cost, (int, float)) else None,
+        "net_expected_r": float(net) if isinstance(net, (int, float)) else None,
+    }
 
 
 def read_entries(path: str | Path):

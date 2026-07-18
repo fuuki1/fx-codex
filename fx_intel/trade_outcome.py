@@ -103,7 +103,12 @@ class TradeOutcome:
     sl_hit: bool = False
     first_touch: str = "none"
     first_touch_ts: str | None = None
-    realized_r: float | None = None
+    realized_r: float | None = None  # 執行コスト控除前(グロス)の実現R
+    # 執行コスト控除後の実現R。realized_r から execution_cost_r を引いた「市場が返した
+    # 正解ラベル」。コスト不明(spread未取得等)なら None。MLの収益ラベルはこれを使う。
+    realized_net_r: float | None = None
+    execution_cost_r: float | None = None  # 差し引いた執行コスト(R換算)。判断時の実測値
+    net_expected_r: float | None = None  # 判断時点の予測(比較対象)。実測 realized_net_r と対比
     path_points: int = 0
     path_start: str | None = None
     path_end: str | None = None
@@ -145,6 +150,9 @@ class TradeOutcome:
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
             "realized_r": self.realized_r,
+            "realized_net_r": self.realized_net_r,
+            "execution_cost_r": self.execution_cost_r,
+            "net_expected_r": self.net_expected_r,
             "path_points": self.path_points,
             "path_start": self.path_start,
             "path_end": self.path_end,
@@ -483,6 +491,15 @@ def evaluate_trade_outcomes(
         mae = max(0.0, max(_adverse_move(direction, entry_price, point) for point in active_path))
 
         realized_r = _realized_r(first_touch, terminal_r, tp1_r_value, tp2_r_value)
+        # 収益ラベル: 判断時に保存した執行コスト(R換算)をグロスRから差し引き、
+        # 「市場が返したコスト控除後の実現R」を作る。コスト不明(None)なら差し引かず
+        # realized_net_r も None(採点側=MLは欠損として扱う)。net_expected_r は
+        # 判断時点の予測をそのまま持ち、実測 realized_net_r と対比できるようにする。
+        execution_cost_r = _float(entry.get("execution_cost_r"))
+        net_expected_r = _float(entry.get("net_expected_r"))
+        realized_net_r = (
+            round(realized_r - execution_cost_r, 4) if execution_cost_r is not None else None
+        )
         quality, flags, path_source = _path_quality(ts, future, horizon_hours, min_path_points)
         if ambiguous_intrabar:
             flags = tuple(dict.fromkeys((*flags, "ambiguous_intrabar_touch")))
@@ -515,6 +532,9 @@ def evaluate_trade_outcomes(
                 first_touch=first_touch,
                 first_touch_ts=first_touch_ts,
                 realized_r=round(realized_r, 4),
+                realized_net_r=realized_net_r,
+                execution_cost_r=execution_cost_r,
+                net_expected_r=net_expected_r,
                 path_points=len(future),
                 path_start=future[0].ts.isoformat(),
                 path_end=terminal_ts.isoformat(),

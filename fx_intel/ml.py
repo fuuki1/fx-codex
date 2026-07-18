@@ -37,9 +37,11 @@ from collections.abc import Mapping, Sequence
 from .gbm import (
     CalibrationResult,
     GradientBoostingClassifier,
+    GradientBoostingRegressor,
     brier_score,
     log_loss,
     platt_calibrate,
+    rmse,
 )
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
@@ -76,6 +78,31 @@ MIN_PARTITION_ROWS = 30
 # ミッションクリティカル用途では「勝ったかもしれない」を「有効」と扱わない
 MIN_BRIER_IMPROVEMENT = 0.02  # 2%以上の改善を要求
 MIN_TEST_AUC = 0.55  # 基準率シフトだけでは得られない順位識別力を要求
+
+# 収益ヘッド(回帰/分位点)のゲート。realized_net_r が欠損(コスト不明)する行は
+# 学習・評価から除くため、二値ヘッドとは別に最低件数を課す。
+MIN_RETURN_TRAIN_ROWS = 40  # 回帰ヘッドの学習に必要な realized_net_r 付きサンプル
+MIN_RETURN_TEST_ROWS = 20  # OOS純Rの有意判定に必要なtest件数
+# 「test区間の平均純Rが有意に正」で return_usable にする。t = mean/(sd/√n) が
+# この値を超えることを要求(片側、ゆるめの2.0=およそ95%水準の目安)。
+MIN_RETURN_T_STAT = 2.0
+QUANTILE_LEVELS = {"p10": 0.10, "p50": 0.50, "p90": 0.90}
+
+# 収益ヘッドの小ハイパラ探索。PBO/DSRが「探索由来のまぐれ」を控除するには複数試行が
+# 必要。過剰な探索は過学習を招くので、代表的な (max_depth, learning_rate) を数点だけ。
+RETURN_TRIAL_GRID: tuple[tuple[int, float], ...] = (
+    (2, 0.03),
+    (2, 0.05),
+    (3, 0.03),
+    (3, 0.05),
+)
+# 過学習検定ゲート。DSRは「観測Sharpeが探索のまぐれ期待(N試行の最大)を超えて本物で
+# ある確率」で、昇格ゲートに使う(慣例の0.95合格水準)。PBOも計算するが来歴記録のみ:
+# 収益ヘッドの試行は depth/lr の小グリッドで似通っており、CSCVが要求する試行間OOS順位
+# 差がほぼ生じず、実力の有無に関わらず0.5付近(無情報)になるためゲートには使わない。
+MIN_RETURN_DSR = 0.95  # 慣例の合格水準
+# PBO(CSCV)は test区間を16ブロックに割るため最低 16×2=32 の共有時刻観測が要る。
+PBO_MIN_OBSERVATIONS = 32
 
 DEFAULT_MODEL_PATH = "logs/ml_model.json"
 
@@ -147,11 +174,18 @@ def thin_calls(
 
 def build_dataset(
     calls: Sequence[EvaluatedCall],
-) -> tuple[list[dict[str, float | None]], list[int], list[datetime]]:
-    """採点済み判断(hit/miss)を特徴量辞書・ラベル・時刻の3列に変換する。"""
+) -> tuple[list[dict[str, float | None]], list[int], list[datetime], list[float | None]]:
+    """採点済み判断を特徴量辞書・二値ラベル・時刻・収益ラベルの4列に変換する。
+
+    - 二値ラベル(既存): hit=1 / miss=0(方向的中)。分類ヘッドの教師。
+    - 収益ラベル r_labels(追加): realized_net_r(コスト控除後の実現R)。回帰・分位点
+      ヘッドの教師。コスト不明などで realized_net_r が無い行は None(回帰側で除外、
+      二値側は従来どおり hit/miss があれば使う)。行の並びは全ラベルで共通。
+    """
     rows: list[dict[str, float | None]] = []
     labels: list[int] = []
     stamps: list[datetime] = []
+    r_labels: list[float | None] = []
     for call in calls:
         if call.outcome not in ("hit", "miss") or call.direction not in ("long", "short"):
             continue
@@ -169,7 +203,8 @@ def build_dataset(
         )
         labels.append(1 if call.outcome == "hit" else 0)
         stamps.append(ts)
-    return rows, labels, stamps
+        r_labels.append(call.realized_net_r)
+    return rows, labels, stamps, r_labels
 
 
 def _median(values: Sequence[float]) -> float:
@@ -226,6 +261,61 @@ class MLArtifact:
     model: GradientBoostingClassifier | None = None
     calibration: CalibrationResult = field(default_factory=CalibrationResult)
     importance_by_name: dict[str, float] = field(default_factory=dict)
+    # 収益ヘッド(shadow=保存のみ、当面は委員会の判断に不参加)。期待R回帰と分位点。
+    # 教師は realized_net_r。二値ヘッド(model/usable)とは独立に評価・保存する。
+    return_model: GradientBoostingRegressor | None = None
+    quantile_models: dict[str, GradientBoostingRegressor] = field(default_factory=dict)
+    n_return_train: int = 0
+    n_return_test: int = 0
+    return_val_rmse: float | None = None  # 回帰ヘッドのtest RMSE
+    return_oos_mean_net_r: float | None = None  # test区間の平均実測純R(=収益の実体)
+    return_oos_r_tstat: float | None = None  # 平均純R>0 のt統計量(有意性の目安)
+    # 過学習検定(fx_backtester/overfitting.py の PBO/DSR を収益ヘッドの試行群に適用)。
+    # 小ハイパラ探索で作った複数試行から、探索由来のまぐれを控除して昇格可否を決める。
+    return_n_trials: int = 0  # ハイパラ探索の試行数(PBO/DSRの分母)
+    return_pbo: float | None = None  # PBO(過学習確率、低いほど良い。CSCV)
+    return_dsr: float | None = None  # Deflated Sharpe Ratio(高いほど良い、0.95以上で合格)
+    return_usable: bool = False  # 回帰ヘッドを判断に使ってよいか(OOS純R有意+過学習検定通過)
+    return_reasons: list[str] = field(default_factory=list)
+
+    def expected_net_r(
+        self,
+        direction: str,
+        tech_score: float,
+        news_score: float,
+        chart: Mapping[str, float],
+        data_quality: float | None = None,
+    ) -> float | None:
+        """期待純R(コスト控除後)。return_usableでない・回帰モデル無しはNone。"""
+        if (
+            not self.return_usable
+            or self.return_model is None
+            or direction not in ("long", "short")
+        ):
+            return None
+        row = direction_features(direction, tech_score, news_score, chart, data_quality)
+        return round(self.return_model.predict(vectorize(row, self.medians)), 4)
+
+    def net_r_interval(
+        self,
+        direction: str,
+        tech_score: float,
+        news_score: float,
+        chart: Mapping[str, float],
+        data_quality: float | None = None,
+    ) -> dict[str, float] | None:
+        """分位点予測(p10/p50/p90)の純R。ダウンサイド把握用。モデル無しはNone。"""
+        if (
+            self.return_model is None
+            or not self.quantile_models
+            or direction not in ("long", "short")
+        ):
+            return None
+        row = vectorize(
+            direction_features(direction, tech_score, news_score, chart, data_quality),
+            self.medians,
+        )
+        return {name: round(model.predict(row), 4) for name, model in self.quantile_models.items()}
 
     def predict_hit_probability(
         self,
@@ -286,7 +376,7 @@ def train_artifact(
     artifact = MLArtifact(trained_at=now.isoformat())
 
     thinned = thin_calls(calls)
-    rows, labels, stamps = build_dataset(thinned)
+    rows, labels, stamps, r_labels = build_dataset(thinned)
     if len(rows) < min_train_rows:
         artifact.reasons.append(f"学習サンプル不足(間引き後{len(rows)}件 < {min_train_rows}件)")
         return artifact
@@ -304,6 +394,7 @@ def train_artifact(
     rows = [rows[i] for i in order]
     labels = [labels[i] for i in order]
     stamps = [stamps[i] for i in order]
+    r_labels = [r_labels[i] for i in order]
     partitions = _temporal_partitions(stamps)
     for name in ("train", "tune", "calibration", "test", "lockbox"):
         if len(partitions[name]) < MIN_PARTITION_ROWS:
@@ -392,7 +483,229 @@ def train_artifact(
             f" / 特徴量識別 {'あり' if has_feature_signal else 'なし'}"
             f"(Brier {artifact.val_brier:.3f} vs {artifact.baseline_brier:.3f})"
         )
+
+    _train_return_heads(artifact, rows, r_labels, stamps, medians, train_idx, tune_idx, test_idx)
     return artifact
+
+
+def _train_return_heads(
+    artifact: MLArtifact,
+    rows: Sequence[Mapping[str, float | None]],
+    r_labels: Sequence[float | None],
+    stamps: Sequence[datetime],
+    medians: Mapping[str, float],
+    train_idx: Sequence[int],
+    tune_idx: Sequence[int],
+    test_idx: Sequence[int],
+) -> None:
+    """収益ヘッド(期待R回帰+分位点)を二値ヘッドと同じ分割で学習する。
+
+    教師は realized_net_r(コスト控除後の実測R)。欠損(コスト不明)する行は除く。
+    委員会の判断には当面参加させない(shadow=保存のみ)。
+
+    昇格(return_usable)は2条件すべて:
+      1. test区間の平均実測純Rが有意に正(片側t>=MIN_RETURN_T_STAT)
+      2. DSR >= MIN_RETURN_DSR(観測Sharpeが探索のまぐれ期待を超えて本物)
+
+    小ハイパラ探索(RETURN_TRIAL_GRID)で複数試行を作り、tune区間RMSEで採択する。
+    DSRはこの試行群でN試行の最大Sharpeをdeflateして探索まぐれを控除する。PBOも
+    計算して来歴に残すが、現グリッドでは試行が似通いCSCVが無情報になるためゲートには
+    使わない(_apply_overfitting_gate参照)。データ・観測不足は例外にせず理由付きで
+    return_usable=False。
+    """
+
+    def _labeled(
+        indices: Sequence[int],
+    ) -> tuple[list[list[float]], list[float], list[datetime]]:
+        """realized_net_r 付きの行を (特徴ベクトル, 純R, 時刻) に整える(欠損は除外)。"""
+        features: list[list[float]] = []
+        targets: list[float] = []
+        times: list[datetime] = []
+        for i in indices:
+            label = r_labels[i]
+            if label is None:
+                continue
+            features.append(vectorize(rows[i], medians))
+            targets.append(float(label))
+            times.append(stamps[i])
+        return features, targets, times
+
+    x_train_r, y_train_r, _ = _labeled(train_idx)
+    x_tune_r, y_tune_r, _ = _labeled(tune_idx)
+    x_test_r, y_test_r, t_test_r = _labeled(test_idx)
+    artifact.n_return_train = len(x_train_r)
+    artifact.n_return_test = len(x_test_r)
+    if len(x_train_r) < MIN_RETURN_TRAIN_ROWS:
+        artifact.return_reasons.append(
+            f"収益ヘッド学習サンプル不足(realized_net_r付き{len(x_train_r)}件"
+            f" < {MIN_RETURN_TRAIN_ROWS}件)"
+        )
+        return
+    if len(x_test_r) < MIN_RETURN_TEST_ROWS:
+        artifact.return_reasons.append(
+            f"収益ヘッドOOS評価サンプル不足({len(x_test_r)}件 < {MIN_RETURN_TEST_ROWS}件)"
+        )
+        return
+
+    # 小ハイパラ探索: 各試行を期待R回帰で学習し tune区間RMSE で採択する。
+    # 探索の副産物として、各試行の test区間「ゲート済みリターン」をPBO/DSRに回す。
+    trials: list[tuple[float, GradientBoostingRegressor, list[float]]] = []
+    for max_depth, learning_rate in RETURN_TRIAL_GRID:
+        model = GradientBoostingRegressor(
+            objective="squared",
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            seed=artifact_seed(artifact),
+        )
+        model.fit(x_train_r, y_train_r)
+        # tune RMSE(採択基準)。tuneが空なら学習RMSEで代用
+        tune_rmse = (
+            rmse(y_tune_r, model.predict_many(x_tune_r))
+            if x_tune_r
+            else rmse(y_train_r, model.predict_many(x_train_r))
+        )
+        # test区間のゲート済みリターン: モデルが正エッジと判断した点だけ純Rを取り、
+        # 見送り(予測<=0)は0(ノーポジション)。1試行=1ミニ戦略のリターン系列。
+        gated = [
+            realized if prediction > 0.0 else 0.0
+            for prediction, realized in zip(model.predict_many(x_test_r), y_test_r)
+        ]
+        trials.append((tune_rmse, model, gated))
+    artifact.return_n_trials = len(trials)
+
+    best_rmse, best_model, _ = min(trials, key=lambda item: item[0])
+    artifact.return_model = best_model
+    artifact.return_val_rmse = round(rmse(y_test_r, best_model.predict_many(x_test_r)), 6)
+
+    # 分位点(p10/p50/p90): 採択構成と同じ既定で学習(ダウンサイド〜アップサイド)
+    for name, q in QUANTILE_LEVELS.items():
+        head = GradientBoostingRegressor(
+            objective="quantile", quantile=q, seed=artifact_seed(artifact)
+        )
+        head.fit(x_train_r, y_train_r)
+        artifact.quantile_models[name] = head
+
+    # 条件1: OOSの実測純R平均が有意に正か
+    mean_net_r = sum(y_test_r) / len(y_test_r)
+    artifact.return_oos_mean_net_r = round(mean_net_r, 4)
+    t_stat = _one_sample_t(y_test_r)
+    artifact.return_oos_r_tstat = round(t_stat, 4) if t_stat is not None else None
+    significant = t_stat is not None and t_stat >= MIN_RETURN_T_STAT
+    if not significant:
+        artifact.return_reasons.append(
+            f"収益ヘッド未採用: OOS平均純R {mean_net_r:+.3f}R の有意性不足"
+            f"(t={t_stat if t_stat is not None else float('nan'):.2f}"
+            f" < {MIN_RETURN_T_STAT} 要, n={len(y_test_r)})"
+        )
+
+    # 条件2/3: 試行群にPBO、採択試行のOOSゲート済みリターンにDSRを適用
+    overfitting_ok = _apply_overfitting_gate(artifact, trials, best_model, t_test_r)
+
+    artifact.return_usable = bool(significant and overfitting_ok)
+
+
+def _apply_overfitting_gate(
+    artifact: MLArtifact,
+    trials: Sequence[tuple[float, GradientBoostingRegressor, list[float]]],
+    best_model: GradientBoostingRegressor,
+    test_times: Sequence[datetime],
+) -> bool:
+    """試行群に PBO、採択試行の OOS リターンに DSR を適用して過学習を検定する。
+
+    観測不足(共有時刻<PBO_MIN_OBSERVATIONS)や試行<2ではゲートを課さず True を返す
+    (=条件1のみで判定)。理由は必ず記録する。fx_backtester(numpy/pandas依存)は
+    ここで遅延importし、モジュール読み込みを軽く保つ。
+    """
+    if len(trials) < 2:
+        artifact.return_reasons.append("過学習検定skip: 試行が2件未満")
+        return True
+    # 同一時刻を共有する行だけを使う(PBOは全試行が同じ評価時刻を要求)。
+    # 同一時刻に複数ペアがある場合は最初の1つに揃える(決定論のため時刻順)。
+    unique_times: list[datetime] = []
+    seen: set[datetime] = set()
+    keep_positions: list[int] = []
+    for position, stamp in enumerate(test_times):
+        if stamp in seen:
+            continue
+        seen.add(stamp)
+        unique_times.append(stamp)
+        keep_positions.append(position)
+    if len(unique_times) < PBO_MIN_OBSERVATIONS:
+        artifact.return_reasons.append(
+            f"過学習検定skip: OOS共有時刻 {len(unique_times)} < {PBO_MIN_OBSERVATIONS} 件"
+        )
+        return True
+
+    try:
+        import numpy as np
+        import pandas as pd
+
+        from fx_backtester.overfitting import (
+            deflated_sharpe_ratio,
+            per_period_sharpe,
+            probability_of_backtest_overfitting,
+        )
+    except ImportError as error:  # numpy/pandas/fx_backtester 不在は検定skip
+        artifact.return_reasons.append(f"過学習検定skip: 依存不足({error})")
+        return True
+
+    index = pd.DatetimeIndex(unique_times)
+    columns = {
+        f"trial_{i}": [gated[position] for position in keep_positions]
+        for i, (_, _, gated) in enumerate(trials)
+    }
+    matrix = pd.DataFrame(columns, index=index).sort_index()
+
+    try:
+        pbo_result = probability_of_backtest_overfitting(matrix)
+        pbo = float(pbo_result["pbo"])
+    except ValueError as error:
+        artifact.return_reasons.append(f"過学習検定skip: PBO計算不能({error})")
+        return True
+    artifact.return_pbo = round(pbo, 4)
+
+    # DSR: 採択試行の OOS ゲート済みリターンを、全試行の per-period Sharpe で控除
+    best_position = next(i for i, (_, model, _) in enumerate(trials) if model is best_model)
+    selected_returns = np.asarray(columns[f"trial_{best_position}"], dtype=float)
+    trial_sharpes = [
+        per_period_sharpe(np.asarray(values, dtype=float)) for values in columns.values()
+    ]
+    # PBOはゲートに使わず来歴(return_pbo)に記録するのみ。現在の収益ヘッドの試行は
+    # (max_depth, learning_rate)の小グリッドで互いに似通っており、CSCVが要求する
+    # 「試行間のOOS順位の差」がほぼ生じない。このためPBOは実力の有無に関わらず0.5
+    # 付近(無情報)に張り付き、ゲートに使うと本物の実力まで一律に弾いてしまう。
+    # 探索まぐれの控除は、N試行の最大Sharpeを明示的にdeflateするDSRが担う。
+    try:
+        dsr_result = deflated_sharpe_ratio(selected_returns, trial_sharpes)
+        dsr = float(dsr_result["dsr"])
+    except ValueError as error:
+        artifact.return_reasons.append(f"過学習検定skip: DSR計算不能({error})")
+        return True
+    artifact.return_dsr = round(dsr, 4)
+
+    if dsr < MIN_RETURN_DSR:
+        artifact.return_reasons.append(
+            f"収益ヘッド未採用: DSR {dsr:.3f} < {MIN_RETURN_DSR}(探索まぐれを排除できない)"
+        )
+        return False
+    return True
+
+
+def artifact_seed(artifact: MLArtifact) -> int:
+    """収益ヘッドの乱数種。分類器と同じ既定(7)で決定論を保つ。"""
+    return 7
+
+
+def _one_sample_t(values: Sequence[float]) -> float | None:
+    """H0: 平均=0 に対する片側t統計量。分散0や1件以下は None。"""
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    if variance <= 0:
+        return None
+    return mean / math.sqrt(variance / n)
 
 
 def _temporal_partitions(stamps: Sequence[datetime]) -> dict[str, list[int]]:
@@ -481,6 +794,22 @@ def save_artifact(artifact: MLArtifact, path: str | Path) -> None:
         },
         "importance_by_name": artifact.importance_by_name,
         "model": artifact.model.to_dict() if artifact.model is not None else None,
+        "return_head": {
+            "n_train": artifact.n_return_train,
+            "n_test": artifact.n_return_test,
+            "val_rmse": artifact.return_val_rmse,
+            "oos_mean_net_r": artifact.return_oos_mean_net_r,
+            "oos_r_tstat": artifact.return_oos_r_tstat,
+            "n_trials": artifact.return_n_trials,
+            "pbo": artifact.return_pbo,
+            "dsr": artifact.return_dsr,
+            "usable": artifact.return_usable,
+            "reasons": artifact.return_reasons,
+            "model": artifact.return_model.to_dict() if artifact.return_model is not None else None,
+            "quantile_models": {
+                name: head.to_dict() for name, head in artifact.quantile_models.items()
+            },
+        },
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -537,6 +866,31 @@ def load_artifact(path: str | Path) -> MLArtifact:
             artifact.model = GradientBoostingClassifier.from_dict(model_raw)
         elif artifact.usable:
             return MLArtifact(reasons=["usableなのにモデル本体が無い(破損)"])
+
+        return_head = payload.get("return_head")
+        if isinstance(return_head, Mapping):
+            artifact.n_return_train = int(return_head.get("n_train", 0))
+            artifact.n_return_test = int(return_head.get("n_test", 0))
+            artifact.return_val_rmse = _maybe_float(return_head.get("val_rmse"))
+            artifact.return_oos_mean_net_r = _maybe_float(return_head.get("oos_mean_net_r"))
+            artifact.return_oos_r_tstat = _maybe_float(return_head.get("oos_r_tstat"))
+            artifact.return_n_trials = int(return_head.get("n_trials", 0))
+            artifact.return_pbo = _maybe_float(return_head.get("pbo"))
+            artifact.return_dsr = _maybe_float(return_head.get("dsr"))
+            artifact.return_usable = bool(return_head.get("usable", False))
+            artifact.return_reasons = [str(r) for r in return_head.get("reasons", [])]
+            return_model_raw = return_head.get("model")
+            if return_model_raw is not None:
+                artifact.return_model = GradientBoostingRegressor.from_dict(return_model_raw)
+            elif artifact.return_usable:
+                return MLArtifact(reasons=["return_usableなのに回帰モデルが無い(破損)"])
+            quantile_raw = return_head.get("quantile_models", {})
+            if isinstance(quantile_raw, Mapping):
+                artifact.quantile_models = {
+                    str(name): GradientBoostingRegressor.from_dict(head)
+                    for name, head in quantile_raw.items()
+                    if isinstance(head, Mapping)
+                }
         return artifact
     except (KeyError, TypeError, ValueError) as error:
         return MLArtifact(reasons=[f"モデルファイル破損: {error}"])

@@ -79,6 +79,26 @@
         </div>
       </section>
 
+      <section class="panel curve-panel" aria-label="学習の推移">
+        <div class="panel-head">
+          <h2>学習の推移</h2>
+          <span id="curveSummary" class="subtle">採点待ち</span>
+        </div>
+        <p class="note curve-note">
+          採点済み判断を古い順に累積した的中率(緑線)・採点数(シアンの棒)・
+          コスト控除後の純R(琥珀線、儲かっているか)。判断ログから再構築するため、
+          運用が続いて採点が溜まるほど線が伸びます。灰色の点線は基準50%、琥珀の点線は0R。
+          純Rは執行コストが保存された判断でのみ算出されます。
+        </p>
+        <div class="curve-wrap">
+          <canvas id="curveCanvas" role="img"
+            aria-label="累積的中率と累積採点数の推移グラフ"></canvas>
+        </div>
+        <div id="curveEmpty" class="curve-empty" hidden>
+          まだ採点済みの判断がありません。ブリーフィングが回り、判断の主ホライズンが経過すると点が増えます。
+        </div>
+      </section>
+
       <section class="panel ops-panel" aria-label="運用状態">
         <div class="panel-head">
           <h2>運用状態</h2>

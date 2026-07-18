@@ -197,3 +197,57 @@ def test_evaluation_rejects_naive_now_and_ignores_naive_or_future_rows() -> None
     assert contaminated == clean
     with pytest.raises(ValueError, match="timezone-aware"):
         evaluate_member("ml", entries, now=NOW.replace(tzinfo=None))
+
+
+def test_member_net_expectancy_r_is_computed_from_cost() -> None:
+    """execution_cost_r が保存された意見からコスト控除後の純R診断を算出する。"""
+    entries = _journal_with_signal(60, hit_prob=0.62, seed=3)
+    for entry in entries:
+        if entry.get("features", {}).get("ml_edge") is not None:
+            entry["execution_cost_r"] = 0.1
+    perf = evaluate_member("ml", entries, now=NOW)
+    assert perf.evaluated > 0
+    assert perf.net_r_samples > 0
+    assert perf.net_expectancy_r is not None
+    assert perf.expectancy_atr is not None
+    # 純R = ATR換算期待値 - コスト。コスト分だけ expectancy_atr より小さい
+    assert perf.net_expectancy_r < perf.expectancy_atr
+
+
+def test_member_net_expectancy_r_none_without_cost() -> None:
+    """執行コストが無ければ net_expectancy_r は None(診断は算出されない)。"""
+    entries = _journal_with_signal(60, hit_prob=0.62, seed=3)
+    perf = evaluate_member("ml", entries, now=NOW)
+    assert perf.evaluated > 0
+    assert perf.net_expectancy_r is None
+    assert perf.net_r_samples == 0
+
+
+def test_member_net_expectancy_r_roundtrips_and_is_not_a_gate() -> None:
+    """net_expectancy_r は to_dict/from_mapping で復元され、参考判定には影響しない。"""
+    perf = MemberPerformance(
+        member="ml",
+        evaluated=100,
+        hits=60,
+        expectancy_atr=0.3,
+        p_value=0.01,
+        net_expectancy_r=0.22,
+        net_r_samples=90,
+    )
+    restored = MemberPerformance.from_mapping("ml", perf.to_dict())
+    assert restored.net_expectancy_r == 0.22
+    assert restored.net_r_samples == 90
+    # net_expectancy_r は meets_reference_thresholds に含まれない: 純Rが負でも
+    # 参考判定の可否は変わらない(shadow診断のみで昇格権限を持たない)
+    ok_positive, _ = perf.meets_reference_thresholds()
+    negative = MemberPerformance(
+        member="ml",
+        evaluated=100,
+        hits=60,
+        expectancy_atr=0.3,
+        p_value=0.01,
+        net_expectancy_r=-5.0,
+        net_r_samples=90,
+    )
+    ok_negative, _ = negative.meets_reference_thresholds()
+    assert ok_positive == ok_negative

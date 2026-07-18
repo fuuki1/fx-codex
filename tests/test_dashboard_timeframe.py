@@ -343,3 +343,84 @@ def test_build_state_reports_running_learning_ops(server, tmp_path) -> None:
     assert ops["signals"]["has_any_learning"] is True
     assert [process["running"] for process in ops["processes"]] == [True, True, True]
     assert ops["alerts"] == []
+
+
+def test_learning_curve_is_cumulative_over_scored_judgments(server) -> None:
+    """学習の推移: 採点済み判断を古い順に累積した的中率と採点数を返す。
+
+    各判断行は close を持つため将来価格系列の1点も兼ねる。ここでは1h足を
+    08:00/09:00/10:00/11:00 に並べ、各行がその1時間後の行を将来価格として採点される
+    (08:00→hit / 09:00→miss / 10:00→miss、11:00は将来価格が無く pending)。
+    """
+    entries = [
+        _row(START, "1h", 1.0, "long", 156.0),  # →09:00で上昇 = hit
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 156.4),  # →10:00で下落 = miss
+        _row(START + timedelta(hours=2), "1h", 1.0, "long", 156.0),  # →11:00で下落 = miss
+        _row(START + timedelta(hours=3), "1h", 1.0, "long", 155.5),  # 将来価格なし = pending
+    ]
+    result = server._evaluate_journal(entries)
+    curve = result["curve"]
+    # 採点済み(hit/miss)は3件。累積で1点ずつ増える
+    assert [p["scored"] for p in curve] == [1, 2, 3]
+    # hit→miss→miss なので累積hitsは 1 のまま
+    assert [p["hits"] for p in curve] == [1, 1, 1]
+    # 的中率は 100% → 50% → 33.3% と収束していく
+    assert curve[0]["hit_rate"] == 1.0
+    assert curve[1]["hit_rate"] == 0.5
+    assert curve[2]["hit_rate"] == pytest.approx(0.3333, abs=1e-4)
+    # 時系列順(古い順)に並ぶ
+    assert [p["ts"] for p in curve] == sorted(p["ts"] for p in curve)
+
+
+def test_learning_curve_excludes_flat(server) -> None:
+    """小動き(flat)は的中率の分母に入らず、curve にも現れない。"""
+    entries = [
+        # 唯一の採点ペア。ATR10%(=0.05)以下の値動き → flat
+        _row(START, "1h", 1.0, "long", 150.0, atr=0.5),
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 150.01, atr=0.5),
+    ]
+    result = server._evaluate_journal(entries)
+    # flat=1, 採点済み(hit/miss)=0 → curve は空
+    assert result["flat"] == 1
+    assert result["evaluated"] == 0
+    assert result["curve"] == []
+
+
+def test_learning_curve_accumulates_net_r_from_execution_cost(server) -> None:
+    """execution_cost_r 付きの判断から、curve に累積純R(コスト控除後)が乗る。"""
+    # long判断 close=100 atr=1.0 cost=0.15、1h後 close=101(+1R方向)→ 純R +0.85R
+    entries = [
+        {
+            "ts": START.isoformat(),
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "horizon_hours": 1.0,
+            "direction": "long",
+            "action": "long",
+            "conviction": 55,
+            "close": 100.0,
+            "atr": 1.0,
+            "execution_cost_r": 0.15,
+        },
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 101.0, atr=1.0),
+    ]
+    result = server._evaluate_journal(entries)
+    curve = result["curve"]
+    assert curve, "採点済みが1件以上あるはず"
+    last = curve[-1]
+    # cum_net_r = move_atr(+1.0) - cost(0.15) = 0.85
+    assert last["net_r_points"] >= 1
+    assert last["cum_net_r"] == pytest.approx(0.85, abs=1e-4)
+
+
+def test_learning_curve_net_r_absent_without_cost(server) -> None:
+    """execution_cost_r が無い判断は純Rを算出しない(cum_net_r=0, net_r_points=0)。"""
+    entries = [
+        _row(START, "1h", 1.0, "long", 100.0, atr=1.0),
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 101.0, atr=1.0),
+    ]
+    result = server._evaluate_journal(entries)
+    curve = result["curve"]
+    assert curve
+    assert curve[-1]["net_r_points"] == 0
+    assert curve[-1]["cum_net_r"] == 0.0
