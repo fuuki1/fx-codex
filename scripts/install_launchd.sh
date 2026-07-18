@@ -8,6 +8,8 @@
 #   com.fx-codex.snapshot  5分毎の価格スナップショット
 #   com.fx-codex.briefing  5分毎のFX統合ブリーフィングDiscord通知
 #   com.fx-codex.health    5分毎のデータ鮮度監視+異常時Discord通知
+#   com.fx-codex.horizon   5分毎の9ホライズンshadow予測
+#   com.fx-codex.monitors  15分毎の期待値・改善候補監視
 #
 # 設計メモ:
 # - LaunchAgent(ユーザーセッション)を使う。LaunchDaemonにしないのは、.envや
@@ -23,7 +25,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON="$ROOT/.venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health)
+LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
 LEGACY_LABELS=(com.fx-codex.briefing.hourly)
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1

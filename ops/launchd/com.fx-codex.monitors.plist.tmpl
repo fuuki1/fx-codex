@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.monitors</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string><string>fx-monitors</string>
+    <string>--locks-dir</string><string>__FX_ROOT__/logs/locks</string>
+    <string>--</string>
+    <string>/bin/zsh</string>
+    <string>__FX_ROOT__/scripts/fx_monitors_once.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>2</integer></dict>
+    <dict><key>Minute</key><integer>17</integer></dict>
+    <dict><key>Minute</key><integer>32</integer></dict>
+    <dict><key>Minute</key><integer>47</integer></dict>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/monitors.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/monitors.err.log</string>
+</dict>
+</plist>
