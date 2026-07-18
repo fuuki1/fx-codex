@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 from datetime import datetime, timedelta, UTC
 
@@ -222,6 +223,21 @@ def test_artifact_serialization_roundtrip(tmp_path) -> None:
         "ma_gap_atr": 1.0,
     }
     assert loaded.direction_edge(0.5, 0.2, chart, 0.9) == art.direction_edge(0.5, 0.2, chart, 0.9)
+
+
+def test_load_artifact_rejects_pre_pit_training_contract(tmp_path) -> None:
+    art = train_artifact(_make_calls(700, gap_hours=8.0, seed=1), now=NOW)
+    path = tmp_path / "model.json"
+    save_artifact(art, path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop("training_contract")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_artifact(path)
+
+    assert loaded.model is None
+    assert not loaded.usable
+    assert any("PIT学習契約" in reason for reason in loaded.reasons)
 
 
 def test_load_missing_returns_unusable() -> None:

@@ -84,8 +84,21 @@ def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict
 
 
 def _write_jsonl(path, rows: list[dict]) -> None:
+    eligible_rows = []
+    for raw in rows:
+        row = dict(raw)
+        prediction = datetime.fromisoformat(str(row["ts"]))
+        row.update(
+            {
+                "prediction_time": prediction.isoformat(),
+                "source_cutoff": (prediction - timedelta(minutes=2)).isoformat(),
+                "max_feature_available_time": (prediction - timedelta(seconds=1)).isoformat(),
+                "pit_eligible": True,
+            }
+        )
+        eligible_rows.append(row)
     path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in eligible_rows) + "\n",
         encoding="utf-8",
     )
 
@@ -360,8 +373,15 @@ def test_tp_sl_candidate_approval_requires_expectancy_improvement_evidence() -> 
         "paper",
         "approval",
     )
-    registry = to.update_improvement_registry(None, [candidate], now=NOW)
-    registry = to.update_improvement_registry(registry, [candidate], now=NOW + timedelta(hours=1))
+    registry = to.update_improvement_registry(
+        None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
+    )
+    registry = to.update_improvement_registry(
+        registry,
+        [candidate],
+        now=NOW + timedelta(hours=1),
+        data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+    )
 
     unchanged, result = to.set_improvement_candidate_approval(
         registry,
@@ -473,8 +493,15 @@ def test_auto_pause_underperforming_approved_target_policy() -> None:
         "paper",
         "approval",
     )
-    registry = to.update_improvement_registry(None, [candidate], now=NOW)
-    registry = to.update_improvement_registry(registry, [candidate], now=NOW + timedelta(hours=1))
+    registry = to.update_improvement_registry(
+        None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
+    )
+    registry = to.update_improvement_registry(
+        registry,
+        [candidate],
+        now=NOW + timedelta(hours=1),
+        data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+    )
     registry, result = to.set_improvement_candidate_approval(
         registry,
         candidate.candidate_id,
@@ -605,8 +632,15 @@ def test_approve_trade_candidate_cli_updates_registry(tmp_path) -> None:
     outcomes = [_outcome(-1.0) for _ in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
     candidate = to.improvement_candidates(summary)[0]
-    registry = to.update_improvement_registry(None, [candidate], now=NOW)
-    registry = to.update_improvement_registry(registry, [candidate], now=NOW + timedelta(hours=1))
+    registry = to.update_improvement_registry(
+        None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
+    )
+    registry = to.update_improvement_registry(
+        registry,
+        [candidate],
+        now=NOW + timedelta(hours=1),
+        data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+    )
     registry_path = tmp_path / "registry.json"
     to.save_improvement_registry(registry, registry_path)
 
@@ -647,8 +681,15 @@ def test_resume_trade_candidate_cli_updates_auto_paused_registry(tmp_path) -> No
         "paper",
         "approval",
     )
-    registry = to.update_improvement_registry(None, [candidate], now=NOW)
-    registry = to.update_improvement_registry(registry, [candidate], now=NOW + timedelta(hours=1))
+    registry = to.update_improvement_registry(
+        None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
+    )
+    registry = to.update_improvement_registry(
+        registry,
+        [candidate],
+        now=NOW + timedelta(hours=1),
+        data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+    )
     registry, _ = to.set_improvement_candidate_approval(
         registry,
         candidate.candidate_id,
@@ -747,6 +788,19 @@ def test_score_trade_outcomes_cli_writes_json_report(tmp_path) -> None:
     assert monitor["schema"] == 1
     assert monitor["health"]["status"] in {to.STATUS_OK, to.STATUS_WARN, to.STATUS_FAIL}
     assert "alerts" in monitor
+
+
+def test_score_trade_outcomes_cli_excludes_legacy_rows(tmp_path) -> None:
+    journal_path = tmp_path / "legacy.jsonl"
+    report_path = tmp_path / "report.json"
+    rows = [
+        _entry(NOW, "USDJPY", 100.0, direction="long", stop=99.0, target1=101.0),
+        _entry(NOW + DAY, "USDJPY", 101.2),
+    ]
+    journal_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    assert score_trade_outcomes_cli(journal_path, json_report_path=report_path) == 0
+    assert json.loads(report_path.read_text(encoding="utf-8"))["outcomes"] == []
 
 
 def test_evaluate_trade_outcomes_can_override_tp_r_targets() -> None:
