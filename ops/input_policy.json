@@ -1,0 +1,14 @@
+{
+  "schema_version": "fx-liquidity-policy-v1",
+  "stage": "shadow",
+  "lookback_market_days": 20,
+  "min_baseline_samples": 100,
+  "thin_percentile": 0.9,
+  "stressed_percentile": 0.99,
+  "max_quote_age_seconds": 600,
+  "rollover_timezone": "America/New_York",
+  "rollover_hour": 17,
+  "rollover_minutes_before": 5,
+  "rollover_minutes_after": 15,
+  "absolute_spread_pips": {}
+}

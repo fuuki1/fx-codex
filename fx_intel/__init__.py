@@ -31,6 +31,11 @@
 21. trade_outcome — MFE/MAE/TP/SL採点・期待値監査・改善候補レジストリ
 22. tp_sl_learning — TP/SL先着正答率によるMVP確信度補正
 23. maximization — 期待R/PF/Brier/経路品質による最大化プロファイル
+24. oanda_prices — 完了済みM5 bid/ask OHLCの取得と採点用行への変換
+25. ibkr_prices — IBKR paperの判断quote・完了済みBID/ASK足の取得
+26. direction_threshold — 純Rで検証する承認制の見送り閾値ポリシー
+27. input_context — 判断時点で固定するマクロ・流動性の共通入力契約
+28. liquidity — broker spread・セッションによる流動性proxy
 
 通常の通知runtimeは fx_backtester 非依存で単体動作する。
 例外は明示的に選択する研究用 cot_pit 境界で、共通PIT artifactを再利用するため
@@ -46,13 +51,21 @@ __all__ = [
     "cot_pit",
     "decision_feedback",
     "decision_log",
+    "direction_threshold",
     "gbm",
+    "historical_chart",
+    "ibkr_prices",
     "journal",
     "learning",
+    "input_context",
+    "liquidity",
+    "market_session",
+    "shadow_learning",
     "macro",
     "maximization",
     "ml",
     "news",
+    "oanda_prices",
     "price_history",
     "promotion",
     "sentiment",
