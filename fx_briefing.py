@@ -125,6 +125,8 @@ DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
+JOURNAL_WRITE_FAILURE_EXIT_CODE = 4
+NOTIFICATION_FAILURE_EXIT_CODE = 5
 DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
@@ -768,7 +770,8 @@ def _run_per_timeframe(
         try:
             journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
         except OSError as error:
-            fetch_warnings.append(f"時間足別ジャーナル書き込み失敗: {error}")
+            print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
+            return JOURNAL_WRITE_FAILURE_EXIT_CODE
         try:
             prior_decision_events = list(
                 decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
@@ -858,9 +861,13 @@ def _run_per_timeframe(
             "DISCORD_WEBHOOK_URL が未設定です。環境変数か .env に設定してください。",
             file=sys.stderr,
         )
-        return 1
+        return NOTIFICATION_FAILURE_EXIT_CODE
 
-    post_to_discord(webhook_url, payload)
+    try:
+        post_to_discord(webhook_url, payload)
+    except discord_delivery.DiscordDeliveryError as error:
+        print(str(error), file=sys.stderr)
+        return NOTIFICATION_FAILURE_EXIT_CODE
     print(
         f"時間足別ブリーフィングを送信しました ({', '.join(symbols)} | "
         f"ニュース{len(items)}件 | イベント{len(events_48h)}件 | {analysis.engine})"

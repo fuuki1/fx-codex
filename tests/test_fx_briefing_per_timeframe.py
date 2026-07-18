@@ -218,8 +218,9 @@ def test_per_timeframe_dry_run_does_not_write_journal(patched_paths, capsys) -> 
 def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) -> None:
     tf_journal, tf_learning = patched_paths
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
-        # webhook 未設定なので送信段階で rc=1 になるが、ジャーナル追記はその前に済む
-        _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
+        # webhook 未設定は通知専用exit codeだが、ジャーナル追記はその前に済む
+        rc = _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
+    assert rc == fx_briefing.NOTIFICATION_FAILURE_EXIT_CODE
     assert tf_journal.exists()
     rows = [json.loads(line) for line in tf_journal.read_text().splitlines() if line.strip()]
     timeframes = {row["timeframe"] for row in rows}
@@ -227,6 +228,28 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
     # 各行に主ホライズンが紐づく
     horizons = {row["timeframe"]: row["horizon_hours"] for row in rows}
     assert horizons == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
+
+
+def test_per_timeframe_journal_failure_stops_later_writers(patched_paths, capsys) -> None:
+    with (
+        mock.patch.object(
+            fx_briefing.journal,
+            "append_timeframe_plans",
+            side_effect=OSError("read-only"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "append_decision_events",
+            side_effect=AssertionError("must not run"),
+        ),
+    ):
+        rc = _run(
+            ["--per-timeframe", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+        )
+
+    assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
+    assert "ジャーナル書き込み失敗" in capsys.readouterr().err
 
 
 def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, capsys) -> None:
