@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, UTC
 from fx_intel import input_context, liquidity
 from fx_intel.macro import CotReport, MacroSeries, MacroSnapshot, SeriesPoint
 from fx_intel.technicals import PairTechnicals, build_interval_view
+from fx_intel.timeframe import build_timeframe_plans
 
 OPEN_NOW = datetime(2026, 6, 29, 9, 0, tzinfo=UTC)
 
@@ -148,3 +149,39 @@ def test_future_macro_provenance_is_not_used() -> None:
     assert snapshot.quality_status == "invalid"
     assert all(value is None for value in snapshot.features.values())
     assert all(mask == 0 for mask in snapshot.feature_masks.values())
+
+
+def test_same_context_reaches_every_timeframe_without_changing_direction() -> None:
+    macro_features = input_context.build_macro_feature_snapshot(
+        _macro_snapshot(OPEN_NOW - timedelta(minutes=1)),
+        "USDJPY",
+        decision_time=OPEN_NOW,
+    )
+    context = input_context.build_decision_input_context(
+        "USDJPY",
+        decision_time=OPEN_NOW,
+        macro=macro_features,
+        liquidity=_unknown_liquidity(OPEN_NOW),
+        learning_dimensions={"session_bucket": "london", "regime": "neutral"},
+    ).to_dict()
+
+    baseline = build_timeframe_plans("USDJPY", _all_up_tech(), {}, [], [], now=OPEN_NOW)
+    connected = build_timeframe_plans(
+        "USDJPY", _all_up_tech(), {}, [], [], now=OPEN_NOW, input_context=context
+    )
+
+    assert [plan.direction for plan in connected] == [plan.direction for plan in baseline]
+    assert [plan.conviction for plan in connected] == [plan.conviction for plan in baseline]
+    assert {plan.input_context_id for plan in connected} == {context["context_id"]}
+    assert all("macro__vix_level" in plan.features for plan in connected)
+    assert all(
+        any(prediction["producer"] == "macro" for prediction in plan.shadow_predictions)
+        for plan in connected
+    )
+    assert all(
+        any(
+            trace.get("gate") == "liquidity" and not trace.get("applied")
+            for trace in plan.gate_trace
+        )
+        for plan in connected
+    )

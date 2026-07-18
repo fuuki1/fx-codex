@@ -66,6 +66,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping
 import json
+import os
 import sys
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
@@ -80,12 +81,22 @@ from fx_intel import (
     decision_pipeline,
     discord_delivery,
     freshness,
+    direction_threshold,
+    horizon_forecast,
+    horizon_journal,
+    horizon_learning,
+    horizons,
+    ibkr_prices,
     journal,
     learning,
+    input_context,
+    liquidity,
     macro,
     maximization,
+    market_session,
     ml,
     news,
+    oanda_prices,
     price_history,
     promotion,
     signal_board,
@@ -116,6 +127,8 @@ DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
 # direction を持たない価格行なので採点対象は増やさず将来価格系列だけを密にする。
 DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
 DEFAULT_CALENDAR_CACHE = PROJECT_ROOT / "logs" / "calendar_cache.json"
+DEFAULT_HORIZON_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_horizon_forecasts.jsonl"
+DEFAULT_HORIZON_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_horizon_learning.json"
 DEFAULT_MACRO_CACHE = PROJECT_ROOT / "logs" / "macro_cache.json"
 DEFAULT_ML_MODEL_PATH = PROJECT_ROOT / "logs" / "ml_model.json"
 DEFAULT_PROMOTION_STATE = PROJECT_ROOT / "logs" / "promotion_state.json"
@@ -126,6 +139,8 @@ DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_lates
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
 DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
+DEFAULT_DIRECTION_THRESHOLD_POLICY_PATH = PROJECT_ROOT / "logs" / "direction_threshold_policy.json"
+DEFAULT_INPUT_POLICY_PATH = PROJECT_ROOT / "ops" / "input_policy.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
@@ -237,6 +252,103 @@ def load_webhook_url() -> str | None:
             if line.startswith("DISCORD_WEBHOOK_URL="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     return None
+
+
+def load_env_value(name: str, default: str = "") -> str:
+    """環境変数を優先し、未設定ならproject .envから非秘密設定を読む。"""
+
+    value = os.environ.get(name)
+    if value is not None:
+        return value.strip()
+    env_path = PROJECT_ROOT / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return default
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, raw = stripped.split("=", 1)
+        if key.strip() == name:
+            return raw.strip().strip("\"'")
+    return default
+
+
+def build_decision_input_contexts(
+    symbols,
+    tech_map,
+    *,
+    macro_snapshot,
+    learning_dimensions,
+    price_rows,
+    now,
+    fetch_warnings,
+):
+    """Build one immutable context per symbol and share it across all decision paths."""
+
+    policy = liquidity.load_policy(DEFAULT_INPUT_POLICY_PATH)
+    broker_quotes: dict[str, dict[str, object]] = {}
+    provider = load_env_value("FX_DECISION_QUOTE_PROVIDER", "scanner").lower()
+    if provider == "oanda":
+        try:
+            config = oanda_prices.OandaPriceConfig.from_env(project_root=PROJECT_ROOT)
+            broker_quotes, quote_warnings = oanda_prices.fetch_decision_quotes(
+                symbols, config, captured_at=now
+            )
+            fetch_warnings.extend(quote_warnings)
+        except ValueError as error:
+            fetch_warnings.append(f"判断時quote設定不備: {error}")
+    elif provider == "ibkr":
+        try:
+            config = ibkr_prices.IbkrPriceConfig.from_env(project_root=PROJECT_ROOT)
+            broker_quotes, quote_warnings = ibkr_prices.fetch_decision_quotes(
+                symbols, config, captured_at=now
+            )
+            fetch_warnings.extend(quote_warnings)
+        except ValueError as error:
+            fetch_warnings.append(f"判断時quote設定不備: {error}")
+    elif provider != "scanner":
+        fetch_warnings.append(
+            f"FX_DECISION_QUOTE_PROVIDER={provider!r} は未対応のためscanner proxyを使用"
+        )
+
+    contexts: dict[str, dict[str, object]] = {}
+    session_bucket = str(learning_dimensions.get("session_bucket", "unknown"))
+    for symbol in symbols:
+        quote = liquidity.quote_from_mapping(broker_quotes.get(symbol))
+        if quote is None:
+            pair_tech = tech_map.get(symbol)
+            view = pair_tech.views.get("1h") if pair_tech is not None else None
+            quote = liquidity.scanner_quote(
+                symbol,
+                bid=view.bid if view is not None else None,
+                ask=view.ask if view is not None else None,
+                observed_at=now,
+            )
+        liquidity_snapshot = liquidity.build_liquidity_snapshot(
+            symbol,
+            decision_time=now,
+            quote=quote,
+            price_rows=price_rows,
+            session_bucket=session_bucket,
+            policy=policy,
+        )
+        macro_features = input_context.build_macro_feature_snapshot(
+            macro_snapshot,
+            symbol,
+            decision_time=now,
+        )
+        context = input_context.build_decision_input_context(
+            symbol,
+            decision_time=now,
+            macro=macro_features,
+            liquidity=liquidity_snapshot,
+            learning_dimensions=learning_dimensions,
+            run_id=f"{now.astimezone(UTC):%Y%m%dT%H%M%SZ}:briefing",
+        )
+        contexts[symbol] = context.to_dict()
+    return contexts
 
 
 def load_strategy_params() -> tuple[int, int, float, str | None]:
@@ -602,6 +714,89 @@ def append_note(base: str, addition: str) -> str:
     return (base + "\n" + addition).strip()
 
 
+def _run_horizon_track(
+    *,
+    args,
+    symbols,
+    tech_map,
+    analysis,
+    events,
+    calendar_ok,
+    fetch_warnings,
+    items,
+    now,
+    price_rows,
+    input_contexts,
+) -> int:
+    """Generate, score, and persist the isolated five-minute shadow track."""
+    entries = list(horizon_journal.read_horizon_entries(DEFAULT_HORIZON_JOURNAL_PATH))
+    learning_state = None
+    if not args.no_learning:
+        score_result = horizon_learning.score_horizon_history(entries, price_rows, now=now)
+        learning_state = horizon_learning.derive_horizon_learning(score_result, now=now)
+        if not args.dry_run:
+            try:
+                horizon_learning.save_horizon_learning(
+                    learning_state, DEFAULT_HORIZON_LEARNING_PATH
+                )
+            except OSError as error:
+                fetch_warnings.append(f"ホライズン学習状態の保存失敗: {error}")
+
+    profile_lookup = horizon_learning.make_profile_lookup(learning_state)
+    band_provider = horizon_learning.make_band_provider(learning_state)
+    calibration_provider = horizon_learning.make_calibration_provider(learning_state)
+    feature_time = datetime.now(UTC)
+    forecasts: list[horizon_forecast.HorizonForecast] = []
+    for symbol in symbols:
+        tech = tech_map.get(symbol)
+        if tech is None:
+            fetch_warnings.append(f"ホライズン予測のテクニカル欠損: {symbol}")
+            continue
+        base, quote = calendar.symbol_currencies(symbol)
+        forecasts.extend(
+            horizon_forecast.build_horizon_forecasts(
+                symbol,
+                tech,
+                analysis.currencies,
+                calendar.risk_windows(events, {base, quote}),
+                items,
+                input_contexts.get(symbol),
+                now=feature_time,
+                calendar_ok=calendar_ok,
+                profile_lookup=profile_lookup if not args.no_learning else None,
+                band_provider=band_provider if not args.no_learning else None,
+                calibration_provider=calibration_provider if not args.no_learning else None,
+            )
+        )
+
+    if args.dry_run:
+        summary = {
+            "contract": horizon_journal.HORIZON_PIT_CONTRACT,
+            "symbols": list(symbols),
+            "rows": len(forecasts),
+            "horizons": [spec.label for spec in horizons.HORIZON_SPECS],
+            "warnings": fetch_warnings,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    try:
+        written = horizon_journal.append_horizon_forecasts(
+            DEFAULT_HORIZON_JOURNAL_PATH,
+            forecasts,
+            prediction_time=datetime.now(UTC),
+            source_cutoff=now,
+            max_feature_available_time=feature_time,
+        )
+    except (OSError, horizon_journal.HorizonPointInTimeError) as error:
+        print(f"ホライズン予測(shadow)の記録失敗: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"ホライズン予測をshadow記録しました "
+        f"({', '.join(symbols)} | {written}行 | contract={horizon_journal.HORIZON_PIT_CONTRACT})"
+    )
+    return 0
+
+
 def _run_per_timeframe(
     *,
     args,
@@ -620,6 +815,10 @@ def _run_per_timeframe(
     now,
     operational_data_ok,
     operational_data_reason,
+    active_direction_threshold,
+    learning_dimensions,
+    price_rows,
+    input_contexts,
 ) -> int:
     """時間足別モードの本体(main から分岐)。
 
@@ -633,7 +832,6 @@ def _run_per_timeframe(
     # fx_tf_snapshot.py で継続できる価格専用系列と、今回の現在価格を
     # 結合する。direction を持たない価格行は採点対象を増やさず将来価格系列だけを
     # 密にするので、15m/1h/4h/1d の全時間足が採点可能になる。
-    price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
     current_snapshot = price_history.snapshot_entries(
         {
             symbol: {tf: tech_map[symbol].price_snapshot(tf) for tf in timeframe.DEFAULT_TIMEFRAMES}
@@ -643,6 +841,10 @@ def _run_per_timeframe(
         # availability must instead reflect acquisition completion.
         now=datetime.now(UTC),
     )
+    # 判断時点のTradingView現在値は方向採点には使うが、完了済み約定経路ではない。
+    # trade_outcome側がTP/SL・MFE/MAE経路から除外できるよう用途を明記する。
+    for row in current_snapshot:
+        row["price_usage"] = "direction_only"
     # 5分ボード自身が方向を持たない価格系列も保存するため、別の価格取得ループを
     # 併走せずに短期足の採点と鮮度監視を維持できる。
     if args.signal_board and not args.no_price_write and not args.no_journal and not args.dry_run:
@@ -751,6 +953,9 @@ def _run_per_timeframe(
             profile_lookup=profile_lookup,
             expectancy_lookup=expectancy_lookup,
             target_r_adjuster=target_r_adjuster,
+            direction_threshold=active_direction_threshold,
+            learning_dimensions=learning_dimensions,
+            input_context=input_contexts.get(symbol),
         )
 
     # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意。
@@ -904,6 +1109,23 @@ def main(argv: list[str] | None = None) -> int:
         "--no-journal",
         action="store_true",
         help="判断ジャーナル(logs/briefing_journal.jsonl)の記録・検証を行わない",
+    )
+    parser.add_argument(
+        "--horizon-only",
+        action="store_true",
+        help="設計Aの9ホライズンshadow生成・採点だけを実行する(Discord通知なし)",
+    )
+    parser.add_argument(
+        "--horizon-symbols",
+        nargs="+",
+        default=list(horizons.DEFAULT_HORIZON_SYMBOLS),
+        metavar="SYMBOL",
+        help="ホライズンtrack対象ペア(既定: USDJPY EURUSD GBPUSD)",
+    )
+    parser.add_argument(
+        "--no-horizon-forecasts",
+        action="store_true",
+        help="設計Aのshadow journal追記を停止するロールバックフラグ",
     )
     parser.add_argument(
         "--no-learning",
@@ -1153,6 +1375,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
+    horizon_symbols = list(dict.fromkeys(s.upper().replace("/", "") for s in args.horizon_symbols))
+    if args.horizon_only and args.no_horizon_forecasts:
+        print("--horizon-only と --no-horizon-forecasts は同時に指定できません")
+        return 2
+    data_symbols = horizon_symbols if args.horizon_only else symbols
     fast_window, slow_window, atr_multiple, params_warning = load_strategy_params()
     now = datetime.now(UTC)
     trade_improvement_registry = (
@@ -1167,7 +1394,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     currencies: set[str] = set()
-    for symbol in symbols:
+    for symbol in data_symbols:
         base, quote = calendar.symbol_currencies(symbol)
         currencies.update((base, quote))
     ordered_currencies = sorted(currencies)
@@ -1188,6 +1415,38 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not freshness_gate.allow_new_risk:
             fetch_warnings.append(f"⛔ 運用データ鮮度ゲート: {freshness_gate.reason}")
+    threshold_policy = (
+        None
+        if args.horizon_only
+        else direction_threshold.load_policy(DEFAULT_DIRECTION_THRESHOLD_POLICY_PATH)
+    )
+    threshold_report = (
+        {}
+        if args.horizon_only
+        else decision_feedback.load_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH)
+    )
+    raw_threshold_outcomes = threshold_report.get("outcomes")
+    threshold_outcomes = (
+        [row for row in raw_threshold_outcomes if isinstance(row, dict)]
+        if isinstance(raw_threshold_outcomes, list)
+        else []
+    )
+    if threshold_policy is not None:
+        updated_threshold_policy = direction_threshold.auto_pause_policy(
+            threshold_policy,
+            threshold_outcomes,
+        )
+        if updated_threshold_policy != threshold_policy:
+            threshold_policy = updated_threshold_policy
+            fetch_warnings.append(
+                "売買閾値ポリシーを自動停止: " f"{threshold_policy.auto_pause_reason or '純R劣化'}"
+            )
+            if not args.dry_run:
+                direction_threshold.save_policy(
+                    threshold_policy,
+                    DEFAULT_DIRECTION_THRESHOLD_POLICY_PATH,
+                )
+    active_direction_threshold = direction_threshold.effective_threshold(threshold_policy, now=now)
 
     # 1. 経済指標カレンダー(レート制限対策にローカルキャッシュ併用)
     events, calendar_warnings = calendar.fetch_calendar(cache_path=DEFAULT_CALENDAR_CACHE)
@@ -1197,19 +1456,19 @@ def main(argv: list[str] | None = None) -> int:
     events_48h = calendar.upcoming_events(
         events, currencies, now, hours_ahead=args.hours_ahead, min_impact="high"
     )
-    if not args.no_export_events and events:
+    if not args.horizon_only and not args.no_export_events and events:
         try:
             calendar.export_events_csv(events, DEFAULT_EVENTS_CSV)
         except OSError as error:
             fetch_warnings.append(f"イベントCSV書き出し失敗: {error}")
-    if not args.no_event_archive and events:
+    if not args.horizon_only and not args.no_event_archive and events:
         try:
             calendar.append_events_archive(events, DEFAULT_EVENTS_ARCHIVE, now=now)
         except OSError as error:
             fetch_warnings.append(f"イベント履歴アーカイブ追記失敗: {error}")
 
     # 2. ニュース収集
-    items, news_warnings = news.fetch_news_for_symbols(symbols, hours_back=args.hours_back)
+    items, news_warnings = news.fetch_news_for_symbols(data_symbols, hours_back=args.hours_back)
     fetch_warnings.extend(news_warnings)
 
     # 3. マクロデータ。FRED系は現行snapshot、COTは明示された監査済みPIT artifact
@@ -1232,12 +1491,47 @@ def main(argv: list[str] | None = None) -> int:
     analysis = sentiment.analyze_market(
         items, ordered_currencies, use_llm=not args.no_llm, macro=macro_snapshot, now=now
     )
+    learning_dimensions = market_session.build_learning_dimensions(
+        now,
+        regime=analysis.regime,
+        analysis_engine=analysis.engine,
+        macro_available=(macro_snapshot is not None and macro_snapshot.coverage() > 0),
+    ).to_dict()
 
     # 5. テクニカル取得
     tech_map, tech_warnings = technicals.fetch_pair_technicals(
-        symbols, fast_window=fast_window, slow_window=slow_window
+        data_symbols, fast_window=fast_window, slow_window=slow_window
     )
     fetch_warnings.extend(tech_warnings)
+
+    # C input context: completed M5 history is used only as an as-of spread
+    # baseline.  Each symbol gets one context shared by fusion and every
+    # timeframe; the context is record/shadow-only at this stage.
+    input_price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
+    input_contexts = build_decision_input_contexts(
+        data_symbols,
+        tech_map,
+        macro_snapshot=macro_snapshot,
+        learning_dimensions=learning_dimensions,
+        price_rows=input_price_rows,
+        now=now,
+        fetch_warnings=fetch_warnings,
+    )
+
+    if args.horizon_only:
+        return _run_horizon_track(
+            args=args,
+            symbols=horizon_symbols,
+            tech_map=tech_map,
+            analysis=analysis,
+            events=events,
+            calendar_ok=calendar_ok,
+            fetch_warnings=fetch_warnings,
+            items=items,
+            now=now,
+            price_rows=input_price_rows,
+            input_contexts=input_contexts,
+        )
 
     # 時間足別モード: ここで専用パスへ分岐して早期return(融合1判断の
     # 委員会・ML・昇格は使わず、時間足別の判断・採点・学習だけを回す)
@@ -1259,6 +1553,10 @@ def main(argv: list[str] | None = None) -> int:
             now=now,
             operational_data_ok=freshness_gate.allow_new_risk,
             operational_data_reason=freshness_gate.reason,
+            active_direction_threshold=active_direction_threshold,
+            learning_dimensions=learning_dimensions,
+            price_rows=input_price_rows,
+            input_contexts=input_contexts,
         )
 
     # 6. 学習ループ: ジャーナル履歴を相互採点し、重み・確信度の調整を導出
@@ -1283,10 +1581,13 @@ def main(argv: list[str] | None = None) -> int:
     expectancy_adjuster = None
     decision_feedback_adjuster = None
     decision_feedback_profile = decision_feedback.DecisionFeedbackProfile()
+    decision_outcome_history = decision_feedback.load_decision_outcome_report(
+        DEFAULT_DECISION_OUTCOMES_PATH
+    )
     trade_expectancy_summary: dict[str, object] = {}
     if not args.no_learning and not args.no_trade_expectancy:
         decision_feedback_profile = decision_feedback.derive_decision_feedback(
-            decision_feedback.load_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
+            decision_outcome_history,
             now=now,
         )
         learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
@@ -1356,6 +1657,8 @@ def main(argv: list[str] | None = None) -> int:
             ml_artifact = ml.load_artifact(DEFAULT_ML_MODEL_PATH)
         if args.train_ml or ml_needs_retrain(ml_artifact, now):
             train_calls = calls or learning.evaluate_history(journal_entries)
+            # 収益ラベル(trade_outcomeのrealized_net_r)のML接続はMLモデル拡張PRで
+            # train_artifact(return_outcomes=...) に配線される
             ml_artifact = ml.train_artifact(train_calls, now=now)
             # モデル本体ができたときだけ保存する(データ不足の空アーティファクトで
             # 毎回上書きしても意味がなく、--train-ml時は結果を必ず残す)
@@ -1369,8 +1672,18 @@ def main(argv: list[str] | None = None) -> int:
     promotion_state = promotion.load_state(DEFAULT_PROMOTION_STATE)
     # Live acknowledgement is deliberately unreachable from this research CLI.
     require_live_ack: list[str] = []
+    raw_shadow_outcomes = decision_outcome_history.get("shadow_outcomes", [])
+    shadow_outcomes = (
+        [row for row in raw_shadow_outcomes if isinstance(row, Mapping)]
+        if isinstance(raw_shadow_outcomes, list)
+        else []
+    )
     promotion_state, _member_perf = promotion.evaluate_and_update(
-        journal_entries, promotion_state, now=now, require_live_ack=require_live_ack
+        journal_entries,
+        promotion_state,
+        now=now,
+        require_live_ack=require_live_ack,
+        shadow_outcomes=shadow_outcomes,
     )
     stages = promotion_state.as_stage_map()
     if args.no_macro:
@@ -1409,6 +1722,9 @@ def main(argv: list[str] | None = None) -> int:
             macro_snapshot=macro_snapshot,
             ml_artifact=ml_artifact if not args.no_ml else None,
             stages=stages,
+            direction_threshold=active_direction_threshold,
+            learning_dimensions=learning_dimensions,
+            input_context=input_contexts.get(symbol),
         )
         # 発注前9段チェックリスト: 完成した判断を順序付きゲートに写像し、
         # スプレッド/執行コスト控除/ポジションサイズを付ける(表示・記録用)。

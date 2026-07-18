@@ -41,6 +41,7 @@ MEMBERS = ("macro", "ml")
 
 # 委員の意見スコアが記録される特徴量キー
 MEMBER_FEATURE_KEY = {"macro": "macro_score", "ml": "ml_edge"}
+MEMBER_SHADOW_PRODUCER = {"macro": "macro", "ml": "ml_direction"}
 
 # legacy診断の参考閾値（段階昇格には使用しない）
 PROMOTE_MIN_SAMPLES = 40  # 自己相関間引き後の実効採点数
@@ -65,9 +66,12 @@ class MemberPerformance:
     p_value: float | None = None  # 的中率が偶然50%超である確率(片側)
     # コスト控除後の実測純R(realized_net_r)の平均。shadow診断のみで昇格権限は持たない
     # (expectancy_atr がATR換算の値幅なのに対し、こちらは執行コストまで引いた「儲け」)。
-    # 執行コストが保存された採点でのみ算出され、無ければ None。
+    # 通常採点(evaluate_member)は保存済み execution_cost_r から、shadow採点
+    # (evaluate_shadow_member)は net_label_eligible な realized_net_r から算出する。
+    # 両経路は排他的に呼ばれるため同一フィールドを共有する。無ければ None。
     net_expectancy_r: float | None = None
     net_r_samples: int = 0  # net_expectancy_r の分母(realized_net_r が付いた採点数)
+    producer_version: str = ""
 
     @property
     def hit_rate(self) -> float | None:
@@ -84,9 +88,13 @@ class MemberPerformance:
         if rate is None or rate < PROMOTE_MIN_HIT_RATE:
             shown = f"{rate:.0%}" if rate is not None else "—"
             reasons.append(f"的中率不足({shown}<{PROMOTE_MIN_HIT_RATE:.0%})")
-        if self.expectancy_atr is None or self.expectancy_atr < PROMOTE_MIN_EXPECTANCY:
-            shown = f"{self.expectancy_atr:+.3f}" if self.expectancy_atr is not None else "—"
-            reasons.append(f"期待値不足(ATR換算{shown}<{PROMOTE_MIN_EXPECTANCY:+.3f})")
+        expectancy = (
+            self.net_expectancy_r if self.net_expectancy_r is not None else self.expectancy_atr
+        )
+        if expectancy is None or expectancy < PROMOTE_MIN_EXPECTANCY:
+            shown = f"{expectancy:+.3f}" if expectancy is not None else "—"
+            unit = "純R" if self.net_expectancy_r is not None else "ATR換算"
+            reasons.append(f"期待値不足({unit}{shown}<{PROMOTE_MIN_EXPECTANCY:+.3f})")
         if self.p_value is None or self.p_value > PROMOTE_MAX_PVALUE:
             shown = f"{self.p_value:.2f}" if self.p_value is not None else "—"
             reasons.append(f"有意性不足(p={shown}>{PROMOTE_MAX_PVALUE:.2f})")
@@ -102,6 +110,7 @@ class MemberPerformance:
             "p_value": self.p_value,
             "net_expectancy_r": self.net_expectancy_r,
             "net_r_samples": self.net_r_samples,
+            "producer_version": self.producer_version,
         }
 
     @classmethod
@@ -116,8 +125,14 @@ class MemberPerformance:
             hits=hits,
             expectancy_atr=_float(payload.get("expectancy_atr")),
             p_value=_float(payload.get("p_value")),
-            net_expectancy_r=_float(payload.get("net_expectancy_r")),
+            # 旧スキーマの expectancy_net_r キーも読む(net_expectancy_r へ統合済み)
+            net_expectancy_r=(
+                _float(payload.get("net_expectancy_r"))
+                if payload.get("net_expectancy_r") is not None
+                else _float(payload.get("expectancy_net_r"))
+            ),
             net_r_samples=_int(payload.get("net_r_samples")),
+            producer_version=str(payload.get("producer_version", "")),
         )
 
 
@@ -236,6 +251,59 @@ def evaluate_member(
         p_value=round(p_value, 4),
         net_expectancy_r=round(net_expectancy_r, 4) if net_expectancy_r is not None else None,
         net_r_samples=len(net_values),
+    )
+
+
+def evaluate_shadow_member(
+    member: str,
+    outcomes: Sequence[Mapping[str, object]],
+) -> MemberPerformance:
+    """Evaluate immutable shadow observations, using canonical Net R for expectancy."""
+
+    producer = MEMBER_SHADOW_PRODUCER.get(member)
+    if producer is None:
+        return MemberPerformance(member=member)
+    producer_rows = [row for row in outcomes if str(row.get("producer", "")) == producer]
+    if not producer_rows:
+        return MemberPerformance(member=member)
+    latest_row = max(producer_rows, key=lambda row: str(row.get("ts", "")))
+    active_version = str(latest_row.get("producer_version", "unknown") or "unknown")
+    parsed: list[tuple[datetime, Mapping[str, object]]] = []
+    for row in producer_rows:
+        if str(row.get("producer_version", "unknown") or "unknown") != active_version:
+            continue
+        if row.get("direction_outcome") not in ("hit", "miss"):
+            continue
+        ts = _parse_ts(row.get("ts"))
+        if ts is not None:
+            parsed.append((ts, row))
+    last: dict[str, datetime] = {}
+    effective: list[Mapping[str, object]] = []
+    for ts, row in sorted(parsed, key=lambda item: item[0]):
+        symbol = str(row.get("symbol", ""))
+        previous = last.get(symbol)
+        if previous is not None and ts - previous < timedelta(hours=THIN_MIN_GAP_HOURS):
+            continue
+        last[symbol] = ts
+        effective.append(row)
+    if not effective:
+        return MemberPerformance(member=member)
+    hits = sum(1 for row in effective if row.get("direction_outcome") == "hit")
+    net_values = [
+        value
+        for row in effective
+        if bool(row.get("net_label_eligible", False))
+        and (value := _float(row.get("realized_net_r"))) is not None
+    ]
+    net_expectancy_r = sum(net_values) / len(net_values) if net_values else None
+    return MemberPerformance(
+        member=member,
+        evaluated=len(effective),
+        hits=hits,
+        net_expectancy_r=(round(net_expectancy_r, 4) if net_expectancy_r is not None else None),
+        net_r_samples=len(net_values),
+        p_value=round(_one_sided_binomial_pvalue(hits, len(effective)), 4),
+        producer_version=active_version,
     )
 
 
@@ -449,9 +517,18 @@ def evaluate_and_update(
     state: PromotionState,
     now: datetime | None = None,
     require_live_ack: Sequence[str] = (),
+    shadow_outcomes: Sequence[Mapping[str, object]] = (),
 ) -> tuple[PromotionState, dict[str, MemberPerformance]]:
     """ジャーナルから全委員を採点し、段階を更新する(fx_briefingの入口)。"""
     now = now or datetime.now(UTC)
-    performances = {member: evaluate_member(member, entries, now=now) for member in MEMBERS}
+    performances: dict[str, MemberPerformance] = {}
+    for member in MEMBERS:
+        producer = MEMBER_SHADOW_PRODUCER[member]
+        has_shadow = any(str(row.get("producer", "")) == producer for row in shadow_outcomes)
+        performances[member] = (
+            evaluate_shadow_member(member, shadow_outcomes)
+            if has_shadow
+            else evaluate_member(member, entries, now=now)
+        )
     update_stages(state, performances, now=now, require_live_ack=require_live_ack)
     return state, performances

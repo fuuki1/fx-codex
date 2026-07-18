@@ -223,8 +223,13 @@ def test_member_net_expectancy_r_none_without_cost() -> None:
     assert perf.net_r_samples == 0
 
 
-def test_member_net_expectancy_r_roundtrips_and_is_not_a_gate() -> None:
-    """net_expectancy_r は to_dict/from_mapping で復元され、参考判定には影響しない。"""
+def test_member_net_expectancy_r_roundtrips_and_gates_expectancy() -> None:
+    """net_expectancy_r は to_dict/from_mapping で復元され、あれば期待値判定に使う。
+
+    コスト控除後の純Rが得られている委員は、ATR換算値幅ではなく純Rで期待値ゲートを
+    評価する(net_expectancy_r 優先)。これは参考判定であり段階昇格の権限は持たない
+    (research build は committee 側で常に shadow 固定)。
+    """
     perf = MemberPerformance(
         member="ml",
         evaluated=100,
@@ -237,9 +242,10 @@ def test_member_net_expectancy_r_roundtrips_and_is_not_a_gate() -> None:
     restored = MemberPerformance.from_mapping("ml", perf.to_dict())
     assert restored.net_expectancy_r == 0.22
     assert restored.net_r_samples == 90
-    # net_expectancy_r は meets_reference_thresholds に含まれない: 純Rが負でも
-    # 参考判定の可否は変わらない(shadow診断のみで昇格権限を持たない)
+    # 純Rが正(閾値超)なら参考判定を満たす
     ok_positive, _ = perf.meets_reference_thresholds()
+    assert ok_positive
+    # 純Rが負なら、ATR換算が正でも純R優先で期待値不足として弾く
     negative = MemberPerformance(
         member="ml",
         evaluated=100,
@@ -249,5 +255,6 @@ def test_member_net_expectancy_r_roundtrips_and_is_not_a_gate() -> None:
         net_expectancy_r=-5.0,
         net_r_samples=90,
     )
-    ok_negative, _ = negative.meets_reference_thresholds()
-    assert ok_positive == ok_negative
+    ok_negative, reasons = negative.meets_reference_thresholds()
+    assert not ok_negative
+    assert any("純R" in reason for reason in reasons)
