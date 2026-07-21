@@ -15,13 +15,9 @@ def _zip(name: str, text: str) -> bytes:
 
 def test_bid_and_ask_payloads_merge_to_completed_m5_rows() -> None:
     bid_lines = "".join(
-        f"20200102 000{i}00;1.100{i};1.101{i};1.099{i};1.100{i};0\n"
-        for i in range(5)
+        f"20200102 000{i}00;1.100{i};1.101{i};1.099{i};1.100{i};0\n" for i in range(5)
     )
-    ask_lines = "".join(
-        f"20200102 000{i}30;1.101{i};0\n"
-        for i in range(5)
-    )
+    ask_lines = "".join(f"20200102 000{i}30;1.101{i};0\n" for i in range(5))
     bid = fetch.bid_m1_to_ohlc(_zip("bid.csv", bid_lines))
     ask = fetch.price_to_ohlc(
         fetch.ask_tick_zip_to_frame(_zip("ask.csv", ask_lines)), price_column="price"
@@ -35,4 +31,3 @@ def test_bid_and_ask_payloads_merge_to_completed_m5_rows() -> None:
     assert merged.iloc[0]["bid_close"] == 1.1004
     assert merged.iloc[0]["ask_close"] == 1.1014
     assert merged.iloc[0]["promotion_admissible"] == False  # noqa: E712
-

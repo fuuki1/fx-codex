@@ -949,5 +949,3 @@ def test_timeframe_summary_exposes_symbols_and_conditions(server, tmp_path) -> N
         c["feature"] == "rsi_1h" and c["bucket"] == "中立圏(35-65)" for c in row["conditions"]
     )
     assert row["notes_ja"]
-
-

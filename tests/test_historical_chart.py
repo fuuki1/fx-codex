@@ -54,9 +54,7 @@ def test_fixed_window_training_stays_shadow_and_reports_quote_r() -> None:
 
 
 def test_partition_keeps_label_end_inside_fixed_window() -> None:
-    index = pd.to_datetime(
-        ["2023-12-31T23:45:00Z", "2023-12-31T23:55:00Z"], utc=True
-    )
+    index = pd.to_datetime(["2023-12-31T23:45:00Z", "2023-12-31T23:55:00Z"], utc=True)
     frame = pd.DataFrame(
         {
             "label_end_time": pd.to_datetime(

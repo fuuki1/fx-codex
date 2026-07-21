@@ -144,9 +144,7 @@ def merge_bid_ask(pair: str, bid: pd.DataFrame, ask: pd.DataFrame) -> tuple[pd.D
     joined["spread"] = joined["ask_close"] - joined["bid_close"]
     joined.insert(0, "symbol", pair)
     joined.insert(0, "timestamp", joined.index.strftime("%Y-%m-%dT%H:%M:%S%z"))
-    joined["timestamp"] = joined["timestamp"].str.replace(
-        r"(\d{2})(\d{2})$", r"\1:\2", regex=True
-    )
+    joined["timestamp"] = joined["timestamp"].str.replace(r"(\d{2})(\d{2})$", r"\1:\2", regex=True)
     joined["source"] = "histdata_bid_m1_ask_tick"
     joined["is_backfill"] = True
     joined["promotion_admissible"] = False
