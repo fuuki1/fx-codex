@@ -84,3 +84,20 @@ cd /Users/fuuki/srv/fx-codex
 - 監視: 反実仮想の量は `quality.flags.expectancy_guard_counterfactual`、学習側は
   `briefing_learning.json` の `counterfactual_evaluated` に出る。改善候補レジストリと
   期待値レポートは従来どおり実績のみを使う。
+
+## 7. USDファクター整合監査(観測専用)
+
+同一実行で提示された判断群のUSD観の内部矛盾(例: USDJPY long=USD強 ∧
+EURUSD/GBPUSD long=USD弱)を `fx_intel/usd_coherence.py` が監査する。
+2026-07-16に3ペア同時longがUSD全面高で相関全敗した実測が動機。
+
+- 各判断行の `gate_trace` に `gate: usd_factor_coherence / status: observed` が付く。
+  recommended(ゲート後の推奨)とanalysis(ゲート前の分析)の2トラックで、
+  スタンス(+1=USD強/-1=USD弱)・矛盾有無・確信度加重の少数派(`would_dampen`)を記録する。
+- **観測専用**: 方向・確信度は変更しない(`applied: false`)。ガードで推奨が全て
+  neutral化されている期間もanalysis側で観測が続く。
+- 矛盾検出時はDiscord警告「🧭 USD観の内部矛盾を検出」が出る。
+- 減衰(`DAMPEN_FACTOR_PROPOSAL`)の有効化は、蓄積した観測での期待値改善が
+  独立レビューで確認されてからの別PR。レトロ検証では7/16(推奨9実行)と
+  7/17・7/20(分析3+14実行、少数派=GBPUSD)を検出し、GBPUSDシャドー全敗5件は
+  すべて検出ウィンドウ内だった。
