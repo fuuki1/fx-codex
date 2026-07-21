@@ -6,15 +6,12 @@
 5分ごとに記録されるためこの補助スクリプトは不要だが、Discord通知を止めたまま
 学習用価格だけを継続収集したい場合に使う。
 
-このスクリプトは判断・Discord通知とは切り離し、TradingView から各時間足の
-現在価格スナップショットを5分ごとに取得して専用の価格系列
-logs/briefing_tf_prices.jsonl へ追記する。close に加え、取得できる場合は
-open/high/low/bid/ask/spread も保存する。fx_briefing の時間足別採点はこの密な
-価格系列を判断ジャーナルと結合して将来価格を解決するため、15m/1h/4h/1d の
-全時間足が採点可能になる。
+このスクリプトは判断・Discord通知とは切り離し、OANDA v20 または IBKR paper
+から最新の完了済みM5 bid/ask OHLCを専用価格系列へ追記する。
+形成中足を使わず、足開始・終了時刻を残すため、判断前のhigh/lowが将来経路へ
+混ざることを防げる。既存のTradingView方式は診断用に明示指定した場合だけ使える。
 
 判断ロジック・学習・センチメント・カレンダーは一切動かさない(価格取得のみ)。
-
 終了コードの約束(launchd/監視が「見かけ上の成功」に騙されないため):
     0  … 要求した全銘柄・全時間足を保存できた。
     3  … 1点でも欠けた。取得できた点は証拠として保存するが、launchdには非zeroで
@@ -23,24 +20,32 @@ open/high/low/bid/ask/spread も保存する。fx_briefing の時間足別採点
 一時障害でもプロセスはクラッシュせず 3 で戻るだけなので、ループは止まらない。
 
 使い方:
-    .venv/bin/python fx_tf_snapshot.py                       # 既定ペアを1回記録
+    .venv/bin/python fx_tf_snapshot.py                       # OANDAで既定ペアを1回記録
     .venv/bin/python fx_tf_snapshot.py --symbols USDJPY GBPJPY
     .venv/bin/python fx_tf_snapshot.py --dry-run             # 追記せず内容を表示
+    .venv/bin/python fx_tf_snapshot.py --provider ibkr       # IBKR paper(read-only)
+    .venv/bin/python fx_tf_snapshot.py --provider tradingview # 旧方式(診断用)
     ./fx_tf_snapshot_loop.sh &                               # 5分ごとに自動記録
+
+必要な.env:
+    OANDA_API_TOKEN=...
+    OANDA_ENVIRONMENT=practice   # または live。価格取得のみで注文は出さない
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, UTC
 from pathlib import Path
 
-from fx_intel import price_history, technicals
+from fx_intel import ibkr_prices, oanda_prices, price_history, technicals
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY"]
+DEFAULT_PROVIDER = "tradingview"
 # fx_briefing._run_per_timeframe が採点入力に結合する価格専用系列。
 # 判断ジャーナル(briefing_tf_journal.jsonl)とは別ファイルにして、
 # 価格行(direction 無し)が判断行と混ざらないようにする。
@@ -50,6 +55,23 @@ DEFAULT_TF_PRICES_PATH = PROJECT_ROOT / "logs" / "briefing_tf_prices.jsonl"
 # 0(成功)でも 1(引数不正)でもない値にして、launchd/監視が一時障害を
 # 「見かけ上の成功」と誤認しないようにする。
 EXIT_TRANSIENT_FAILURE = 3
+
+
+def configured_provider() -> str:
+    """launchdでも.envの価格provider設定を読めるようにする。"""
+
+    value = os.environ.get("FX_PRICE_PROVIDER")
+    if value:
+        return value.strip().lower()
+    try:
+        lines = (PROJECT_ROOT / ".env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return DEFAULT_PROVIDER
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("FX_PRICE_PROVIDER="):
+            return stripped.split("=", 1)[1].strip().strip("\"'").lower()
+    return DEFAULT_PROVIDER
 
 
 def collect_closes(
@@ -95,36 +117,76 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument(
+        "--provider",
+        choices=("oanda", "ibkr", "tradingview"),
+        default=configured_provider(),
+        help="価格取得元。oanda/ibkrは完了bid/ask足、tradingviewは診断用",
+    )
+    parser.add_argument(
+        "--oanda-environment",
+        choices=("practice", "live"),
+        default=None,
+        help="OANDA接続先。.envのOANDA_ENVIRONMENTを上書き",
+    )
+    parser.add_argument(
+        "--granularity",
+        default=None,
+        help="OANDA採点足の粒度(既定M5)。通常は変更しない",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="ファイルへ追記せず記録内容を表示する"
     )
     args = parser.parse_args(argv)
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
-    tech_map, warnings = technicals.fetch_pair_technicals(symbols)
+    now = datetime.now(UTC)
+    tech_map: dict[str, technicals.PairTechnicals] = {}
+    if args.provider == "oanda":
+        try:
+            config = oanda_prices.OandaPriceConfig.from_env(
+                project_root=PROJECT_ROOT,
+                environment=args.oanda_environment,
+                granularity=args.granularity,
+            )
+        except ValueError as error:
+            # close-onlyへ黙ってフォールバックすると品質改善したように見えてしまう。
+            print(f"[error] {error}", file=sys.stderr)
+            return 2
+        rows, warnings = oanda_prices.fetch_completed_bid_ask_rows(
+            symbols,
+            config,
+            target_timeframes=technicals.DEFAULT_INTERVALS,
+            now=now,
+        )
+    elif args.provider == "ibkr":
+        try:
+            config = ibkr_prices.IbkrPriceConfig.from_env(project_root=PROJECT_ROOT)
+        except ValueError as error:
+            print(f"[error] {error}", file=sys.stderr)
+            return 2
+        rows, warnings = ibkr_prices.fetch_completed_bid_ask_rows(
+            symbols,
+            config,
+            target_timeframes=technicals.DEFAULT_INTERVALS,
+            now=now,
+        )
+    else:
+        tech_map, warnings = technicals.fetch_pair_technicals(symbols)
+        snapshots_by_interval = collect_price_snapshots(tech_map)
+        # Acquisition completion is the earliest instant this process can use the
+        # snapshot. Timestamping before the network call would create false PIT history.
+        now = datetime.now(UTC)
+        rows = price_history.snapshot_entries(snapshots_by_interval, now=now)
+
     for warning in warnings:
         print(f"[warn] {warning}", file=sys.stderr)
-
-    snapshots_by_interval = collect_price_snapshots(tech_map)
-    # Acquisition completion is the earliest instant this process can use the
-    # snapshot. Timestamping before the network call would create false PIT history.
-    now = datetime.now(UTC)
-    rows = price_history.snapshot_entries(snapshots_by_interval, now=now)
     expected_points = len(symbols) * len(technicals.DEFAULT_INTERVALS)
     if not rows:
-        # 1点も取れなかった。一時障害(429/ネットワーク等)が原因なら非zeroで戻り、
-        # launchd/監視に失敗を伝える(次周期で再試行、鮮度は成功まで critical)。
-        # クラッシュはせず戻るだけなので5分ループは止まらない。部分成功はこの分岐に来ない。
-        if had_transient_failure(tech_map):
-            print(
-                "[error] 全時間足・全銘柄が一時障害で取得できませんでした"
-                f"(exit {EXIT_TRANSIENT_FAILURE}、次周期で再試行)",
-                file=sys.stderr,
-            )
-            return EXIT_TRANSIENT_FAILURE
-        # 一時障害の記録が無いのに1点も無いのは想定外(空data等)。同様に非zeroで扱う。
+        transient = args.provider in {"oanda", "ibkr"} or had_transient_failure(tech_map)
+        reason = "一時障害で" if transient else ""
         print(
-            "[error] 価格スナップショットを1点も取得できませんでした"
-            f"(exit {EXIT_TRANSIENT_FAILURE})",
+            f"[error] 全時間足・全銘柄が{reason}取得できませんでした"
+            f"(exit {EXIT_TRANSIENT_FAILURE}、次周期で再試行)",
             file=sys.stderr,
         )
         return EXIT_TRANSIENT_FAILURE
@@ -136,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     append_snapshot(DEFAULT_TF_PRICES_PATH, rows)
     print(
         f"価格スナップショットを記録しました "
-        f"({', '.join(symbols)} | {len(rows)}点 | {now.isoformat()})"
+        f"({args.provider} | {', '.join(symbols)} | {len(rows)}点 | {now.isoformat()})"
     )
     if len(rows) != expected_points:
         print(

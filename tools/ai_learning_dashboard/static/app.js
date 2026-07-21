@@ -6,6 +6,8 @@ const JOURNAL_FILE = "briefing_journal.jsonl";
 const LEARNING_FILE = "briefing_learning.json";
 const TF_JOURNAL_FILE = "briefing_tf_journal.jsonl";
 const TF_LEARNING_FILE = "briefing_tf_learning.json";
+const HORIZON_JOURNAL_FILE = "briefing_horizon_forecasts.jsonl";
+const HORIZON_LEARNING_FILE = "briefing_horizon_learning.json";
 const ML_FILE = "ml_model.json";
 const DECISION_MONITOR_FILE = "decision_expectancy_monitor.json";
 
@@ -47,6 +49,11 @@ function empty(text) {
   div.className = "empty";
   div.textContent = text;
   return div;
+}
+
+function markPanelEmpty(target, isEmpty) {
+  const panel = target.closest(".panel");
+  if (panel) panel.classList.toggle("is-empty-panel", Boolean(isEmpty));
 }
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -214,7 +221,7 @@ function renderReality(data) {
   const fusionLearningExists = Boolean(files[LEARNING_FILE]?.exists);
   const timeframeLearningExists = Boolean(files[TF_LEARNING_FILE]?.exists);
   const learningExists = fusionLearningExists || timeframeLearningExists;
-  const mlExists = Boolean(files[ML_FILE]?.exists);
+  const hasMlModel = Boolean(data.ml?.has_model);
   const journalTotal = Number(data.journal?.total || 0);
   const evaluated = Number(data.learning?.evaluated || 0);
   const pending = Number(data.evaluation?.pending || 0);
@@ -227,10 +234,17 @@ function renderReality(data) {
   } else if (!journalExists && learningExists) {
     reasons.push("判断ログ本体は見つかりませんが、保存済みの学習ファイルを読んでいます。");
   } else if (evaluated === 0) {
-    reasons.push(`判断ログは${journalTotal}件ありますが、約24時間後の比較がまだです。`);
+    reasons.push(`全系統の判断ログは${journalTotal}件ありますが、融合24h判断の比較がまだです。`);
     if (pending > 0) reasons.push(`${pending}件は採点待ちです。`);
   } else {
-    reasons.push(`${evaluated}件を採点済みです。的中率と重み調整に使えます。`);
+    reasons.push(`融合24h判断を${evaluated}件採点済みです。時間足別成績とは分けて表示しています。`);
+    const counterfactual = Number(data.learning?.counterfactual_evaluated || 0);
+    if (counterfactual > 0) {
+      reasons.push(
+        `うち${counterfactual}件は期待値ガード見送り中のシャドー分析(反実仮想)の採点です。` +
+          "運用推奨の答え合わせ(○×)とは分けて数えています。"
+      );
+    }
   }
 
   if (!fusionJournalExists && timeframeJournalExists) {
@@ -242,8 +256,32 @@ function renderReality(data) {
   if (!learningExists) {
     reasons.push("重み調整ファイルはまだ作られていません。");
   }
-  if (!mlExists) {
-    reasons.push("GBDTのMLモデルはまだ保存されていません。");
+  if (!hasMlModel) {
+    const training = data.ml?.training || {};
+    const modelReasons = Array.isArray(data.ml?.reasons) ? data.ml.reasons : [];
+    const eligible = Number(training.eligible_after_thinning || 0);
+    const minimumRequired = Number(training.minimum_required || 0);
+    const pendingMl = Number(training.pending || 0);
+    const pitIneligible = Number(training.pit_ineligible || 0);
+    if (modelReasons.length > 0) {
+      reasons.push(`GBDT学習未完了: ${modelReasons.join(" / ")}`);
+    } else if (minimumRequired > 0) {
+      reasons.push(
+        `GBDTの初期件数ゲートは、融合24時間判断を${training.thin_gap_hours || 4}時間` +
+          `間引きした採点済みデータが${eligible}/${minimumRequired}件です。`,
+      );
+      reasons.push(
+        "件数・クラス数・時系列分割を通過するとモデルを保存し、検証スコア不合格なら判断参加を無効のまま保持します。",
+      );
+      if (pitIneligible > 0) {
+        reasons.push(
+          `旧形式${pitIneligible}件は特徴量取得時刻を証明できないため、GBDT学習から除外しています。`,
+        );
+      }
+      if (pendingMl > 0) reasons.push(`融合判断の採点待ちは${pendingMl}件です。`);
+    } else {
+      reasons.push("GBDTのMLモデルはまだ保存されていません。");
+    }
   } else if (!data.ml.usable) {
     reasons.push("MLモデルはありますが、検証スコア不足などで判断参加は無効です。");
   }
@@ -338,7 +376,10 @@ function renderFlow(data) {
 
 function renderMetrics(data) {
   setText("journalTotal", String(data.journal.total));
-  setText("journalLatest", shortDate(data.journal.latest_ts));
+  setText(
+    "journalLatest",
+    `融合 ${data.journal.fusion_total || 0} / 時間足 ${data.journal.timeframe_total || 0}`,
+  );
   setText("evaluatedTotal", String(data.learning.evaluated || 0));
   setText(
     "pendingTotal",
@@ -347,7 +388,32 @@ function renderMetrics(data) {
   setText("hitRate", pct(data.learning.hit_rate));
   setText("hitCount", `${data.learning.hits || 0} / ${data.learning.evaluated || 0}`);
   setText("mlStatus", data.ml.has_model ? (data.ml.usable ? "有効" : "無効") : "未学習");
-  setText("mlRows", `学習${data.ml.n_train || 0} / 検証${data.ml.n_valid || 0}`);
+  const training = data.ml.training || {};
+  setText(
+    "mlRows",
+    data.ml.has_model
+      ? `学習${data.ml.n_train || 0} / 検証${data.ml.n_valid || 0}`
+      : `GBDT PIT適格 ${training.eligible_after_thinning || 0} / ${training.minimum_required || 150}`,
+  );
+  const tfEvaluated = Number(data.tf_learning?.evaluated || 0);
+  const tfHits = Number(data.tf_learning?.hits || 0);
+  const decisionOverall = data.decision_monitor?.overall || {};
+  setText(
+    "scopeFusion",
+    `融合24h方向: ${data.learning.hits || 0}/${data.learning.evaluated || 0} (${pct(data.learning.hit_rate)})`,
+  );
+  setText(
+    "scopeTimeframe",
+    `時間足別方向: ${tfHits}/${tfEvaluated} (${pct(tfEvaluated ? tfHits / tfEvaluated : null)})`,
+  );
+  setText(
+    "scopeExpectancy",
+    `売買期待R: n=${decisionOverall.evaluated || 0} / ${signedR(num(decisionOverall.expectancy_r))} / PF ${
+      num(decisionOverall.profit_factor_r) === null
+        ? "--"
+        : Number(decisionOverall.profit_factor_r).toFixed(2)
+    }`,
+  );
 }
 
 function renderWeights(data) {
@@ -493,6 +559,555 @@ function renderTimeframeBars(data) {
   });
 }
 
+const HORIZON_ORDER = ["5m", "15m", "30m", "1h", "3h", "6h", "12h", "24h", "3d"];
+
+function renderHorizons(data) {
+  const horizon = data.horizon || {};
+  setText(
+    "horizonUpdated",
+    `${shortDate(horizon.generated_at)} / ${horizon.contract || "horizon-pit-v1"}`,
+  );
+  const matrix = $("horizonMatrix");
+  matrix.replaceChildren();
+  const latest = horizon.latest || [];
+  const profiles = horizon.profiles || [];
+  markPanelEmpty(matrix, !latest.length && !profiles.length);
+  const symbols = [...new Set(latest.map((row) => row.symbol))].sort();
+  if (!symbols.length) {
+    matrix.appendChild(empty("ホライズン予測はまだ記録されていません"));
+  } else {
+    const corner = document.createElement("strong");
+    corner.textContent = "pair";
+    matrix.appendChild(corner);
+    HORIZON_ORDER.forEach((label) => {
+      const head = document.createElement("strong");
+      head.textContent = label === "5m" ? "5m shadow" : label;
+      matrix.appendChild(head);
+    });
+    symbols.forEach((symbol) => {
+      const label = document.createElement("strong");
+      label.textContent = symbol;
+      matrix.appendChild(label);
+      HORIZON_ORDER.forEach((name) => {
+        const row = latest.find((item) => item.symbol === symbol && item.horizon === name);
+        const cell = document.createElement("div");
+        cell.className = `horizon-cell ${row?.direction || "missing"}`;
+        cell.textContent = row
+          ? `${row.direction} ${row.conviction ?? 0}${row.calibrated ? " ✓" : " *"}`
+          : "--";
+        cell.title = row
+          ? `up ${pct(row.p_up)} / down ${pct(row.p_down)} / flat ${pct(row.p_flat)}`
+          : "未記録";
+        matrix.appendChild(cell);
+      });
+    });
+  }
+
+  const metrics = $("horizonMetrics");
+  metrics.replaceChildren();
+  if (!profiles.length) {
+    metrics.appendChild(empty(`満期採点待ち ${horizon.immature || 0} / 未解決 ${horizon.unresolved || 0}`));
+    return;
+  }
+  profiles.forEach((row) => {
+    const remaining = row.permanent_shadow
+      ? "恒久shadow"
+      : `昇格まで ${row.remaining_n ?? "--"}件`;
+    metrics.appendChild(
+      tradeItem(
+        `${row.symbol} ${row.horizon} / ${row.stage}`,
+        `方向 ${pct(row.hit_rate)} / Brier ${num(row.mean_brier)?.toFixed(3) || "--"} / ` +
+          `logloss ${num(row.mean_log_loss)?.toFixed(3) || "--"} / 帯 ${pct(row.band_coverage)} / ` +
+          `純R ${signedR(num(row.mean_net_r))} / n=${row.n_scored} / ${remaining}`,
+        row.stage === "adopted" ? "ok" : "",
+      ),
+    );
+  });
+}
+
+const OUTCOME_STYLE = {
+  hit: { badge: "✅ 的中", className: "hit" },
+  miss: { badge: "❌ 外れ", className: "miss" },
+  flat: { badge: "○ 小動き", className: "flat" },
+  pending: { badge: "⏳ 未採点", className: "pending" },
+  neutral: { badge: "○ 中立", className: "neutral" },
+  standby: { badge: "📊 分析稼働", className: "standby" },
+  closed: { badge: "💤 休場", className: "closed" },
+};
+const DIRECTION_LABEL = {
+  long: "上昇予想",
+  short: "下落予想",
+  neutral: "中立判断",
+  standby: "売買見送り",
+  closed: "市場休場",
+};
+const ANALYSIS_OUTCOME_LABEL = {
+  hit: "的中",
+  miss: "外れ",
+  flat: "小動き",
+  pending: "未採点",
+};
+
+// 選択中の時間足タブ("all" or "15m"/"1h"/"4h"/"1d")。5分ポーリングの
+// 再描画でも選択を維持する。
+let outcomeTabSelection = "all";
+let outcomeCategorySelection = "all";
+let outcomePeriodSelection = "recent";
+let outcomeHistoryPage = 1;
+let outcomeHistoryPayload = null;
+let outcomeHistoryRequestId = 0;
+let outcomeDashboardData = null;
+
+const OUTCOME_PERIOD_OPTIONS = [
+  ["recent", "直近"],
+  ["today", "今日"],
+  ["day_before_yesterday", "一昨日"],
+  ["last_week", "先週"],
+  ["all", "全期間"],
+];
+
+const OUTCOME_CATEGORY_OPTIONS = [
+  ["all", "すべて"],
+  ["pending", "採点中"],
+  ["scored", "採点結果"],
+  ["other", "対象外"],
+];
+const SCORED_OUTCOMES = new Set(["hit", "miss", "flat"]);
+
+function outcomeCategory(row) {
+  if (SCORED_OUTCOMES.has(row.outcome)) return "scored";
+  if (row.outcome === "pending") return "pending";
+  if (SCORED_OUTCOMES.has(row.analysis_outcome)) return "scored";
+  if (row.analysis_outcome === "pending") return "pending";
+  return "other";
+}
+
+function outcomeCategoryCounts(rows) {
+  const counts = { all: rows.length, pending: 0, scored: 0, other: 0 };
+  rows.forEach((row) => {
+    counts[outcomeCategory(row)] += 1;
+  });
+  return counts;
+}
+
+function formatOutcomePrice(symbol, value) {
+  const numeric = num(value);
+  if (numeric === null) return "--";
+  return numeric.toFixed(String(symbol || "").endsWith("JPY") ? 3 : 5);
+}
+
+function outcomeRowElement(row) {
+  const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
+  const item = document.createElement("div");
+  item.className = `outcome-row ${style.className}`;
+  const badge = document.createElement("span");
+  badge.className = "outcome-badge";
+  badge.textContent = style.badge;
+  const main = document.createElement("span");
+  main.className = "outcome-main";
+  const tfLabel = TIMEFRAME_LABEL[row.timeframe] || row.timeframe || "";
+  const horizon = TIMEFRAME_HORIZON[row.timeframe] || "";
+  const isDirectional = ["long", "short"].includes(row.direction);
+  const analysisStatus = ANALYSIS_OUTCOME_LABEL[row.analysis_outcome] || "";
+  const blockedGate = row.blocked_gate && typeof row.blocked_gate === "object"
+    ? row.blocked_gate
+    : null;
+  let gateReason = "";
+  if (blockedGate?.gate === "event_window") {
+    const eventName = [blockedGate.event_currency, blockedGate.event_title].filter(Boolean).join(" ");
+    const until = blockedGate.blocked_until ? shortDate(blockedGate.blocked_until) : "";
+    gateReason = `イベント警戒${eventName ? `: ${eventName}` : ""}${until ? ` / ${until}まで` : ""}`;
+  } else if (blockedGate?.gate) {
+    gateReason = blockedGate.gate;
+  }
+  const analysisDirection =
+    !isDirectional && ["long", "short", "neutral"].includes(row.analysis_direction)
+    ? ` / 分析は${DIRECTION_LABEL[row.analysis_direction]}${analysisStatus ? `（${analysisStatus}）` : ""}`
+    : "";
+  const scoring = isDirectional && horizon
+    ? `(${horizon}${row.outcome === "pending" ? "待ち" : "を採点"})`
+    : "";
+  if (row.direction === "standby") {
+    const analysisScore = num(row.analysis_score);
+    const analysisConviction = num(row.analysis_conviction);
+    const analysisDetail = [
+      analysisScore === null ? "" : `score ${analysisScore >= 0 ? "+" : ""}${analysisScore.toFixed(2)}`,
+      analysisConviction === null ? "" : `確信度 ${Math.round(analysisConviction)}`,
+    ].filter(Boolean).join(" / ");
+    const runningAnalysis = ["long", "short", "neutral"].includes(row.analysis_direction)
+      ? `${DIRECTION_LABEL[row.analysis_direction]}${analysisStatus ? `（${analysisStatus}）` : ""}${analysisDetail ? ` [${analysisDetail}]` : ""}`
+      : "方向データを収集中";
+    main.textContent = `${row.symbol || "?"} ${tfLabel} 分析稼働: ${runningAnalysis} / 売買見送り${gateReason ? `（${gateReason}）` : ""}`;
+  } else {
+    main.textContent = `${row.symbol || "?"} ${tfLabel} ${DIRECTION_LABEL[row.direction] || row.direction || ""}${analysisDirection}${scoring}`;
+  }
+  const move = document.createElement("span");
+  move.className = "outcome-move";
+  const moveValue = num(row.move ?? row.analysis_move);
+  const predictionValue = num(row.prediction_value);
+  const resultValue = num(row.result_value);
+  const resultText = resultValue === null
+    ? "待ち"
+    : formatOutcomePrice(row.symbol, resultValue);
+  const differenceText = moveValue === null
+    ? ""
+    : ` / 差 ${moveValue > 0 ? "+" : ""}${formatOutcomePrice(row.symbol, moveValue)}`;
+  move.textContent = predictionValue === null
+    ? (moveValue === null ? "--" : `差 ${moveValue > 0 ? "+" : ""}${formatOutcomePrice(row.symbol, moveValue)}`)
+    : `予想時値 ${formatOutcomePrice(row.symbol, predictionValue)} → 結果値 ${resultText}${differenceText}`;
+  const ts = document.createElement("span");
+  ts.className = "outcome-ts subtle";
+  ts.textContent = shortDate(row.ts);
+  item.append(badge, main, move, ts);
+  return item;
+}
+
+function outcomeGroups(data) {
+  const allDecisions = data.evaluation?.recent_decisions_by_timeframe;
+  if (allDecisions && typeof allDecisions === "object" && Object.keys(allDecisions).length) {
+    return allDecisions;
+  }
+  // 旧サーバでは満期済み方向判断だけを表示する。
+  const grouped = data.evaluation?.recent_outcomes_by_timeframe;
+  if (grouped && typeof grouped === "object" && Object.keys(grouped).length) {
+    return grouped;
+  }
+  const fallback = {};
+  (data.evaluation?.recent_outcomes || []).forEach((row) => {
+    const tf = row.timeframe || "";
+    if (!tf) return;
+    (fallback[tf] = fallback[tf] || []).push(row);
+  });
+  return fallback;
+}
+
+function outcomeCounts(rows) {
+  const counts = { hit: 0, miss: 0, flat: 0, pending: 0, neutral: 0, standby: 0, closed: 0 };
+  rows.forEach((row) => {
+    if (counts[row.outcome] !== undefined) counts[row.outcome] += 1;
+  });
+  return counts;
+}
+
+function nonScoredCount(counts) {
+  return counts.pending + counts.neutral + counts.standby + counts.closed;
+}
+
+function outcomeSummaryChip(tf, rows, byTimeframe, analysisByTimeframe) {
+  const chip = document.createElement("div");
+  chip.className = "outcome-chip";
+  const counts = outcomeCounts(rows);
+  const label = document.createElement("strong");
+  label.textContent = `${TIMEFRAME_LABEL[tf] || tf}(${TIMEFRAME_HORIZON[tf] || "?"})`;
+  const recent = document.createElement("span");
+  recent.className = "outcome-chip-recent";
+  recent.textContent = `直近: ✅${counts.hit} ❌${counts.miss} ○${counts.flat} ⏳${counts.pending} 中立${counts.neutral} 見送り${counts.standby} 休場${counts.closed}`;
+  chip.append(label, recent);
+  const total = byTimeframe?.[tf];
+  if (total && Number(total.evaluated)) {
+    const evaluated = Number(total.evaluated);
+    const hits = Number(total.hits || 0);
+    const rate = document.createElement("span");
+    rate.className = "subtle";
+    rate.textContent = `通算的中 ${pct(hits / evaluated)} (${hits}/${evaluated})`;
+    chip.append(rate);
+  }
+  const analysis = analysisByTimeframe?.[tf];
+  if (analysis && (Number(analysis.evaluated) || Number(analysis.pending))) {
+    const evaluated = Number(analysis.evaluated || 0);
+    const hits = Number(analysis.hits || 0);
+    const analysisRate = document.createElement("span");
+    analysisRate.className = "subtle";
+    analysisRate.textContent = `分析仮説 ${evaluated ? pct(hits / evaluated) : "--"} (${hits}/${evaluated}) / 未採点${Number(analysis.pending || 0)}`;
+    chip.append(analysisRate);
+  }
+  return chip;
+}
+
+function renderOutcomePeriodTabs(data) {
+  const target = $("outcomePeriodTabs");
+  if (!target) return;
+  target.replaceChildren();
+  OUTCOME_PERIOD_OPTIONS.forEach(([key, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `outcome-tab outcome-period-tab${outcomePeriodSelection === key ? " active" : ""}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", outcomePeriodSelection === key ? "true" : "false");
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      if (outcomePeriodSelection === key) return;
+      outcomePeriodSelection = key;
+      outcomeHistoryPage = 1;
+      outcomeHistoryPayload = null;
+      if (key === "recent") {
+        renderRecentOutcomes(data);
+      } else {
+        loadOutcomeHistory(data, 1);
+      }
+    });
+    target.appendChild(button);
+  });
+}
+
+function outcomeHistorySummaryChip(tf, summary, periodLabel) {
+  const chip = document.createElement("div");
+  chip.className = "outcome-chip";
+  const label = document.createElement("strong");
+  label.textContent = `${TIMEFRAME_LABEL[tf] || tf} / ${periodLabel}`;
+  const action = summary?.action || {};
+  const actionLine = document.createElement("span");
+  actionLine.className = "outcome-chip-recent";
+  actionLine.textContent = `判断: ✅${action.hit || 0} ❌${action.miss || 0} ○${action.flat || 0} ⏳${action.pending || 0}`;
+  const analysis = summary?.analysis || {};
+  const analysisLine = document.createElement("span");
+  analysisLine.className = "subtle";
+  analysisLine.textContent = `分析仮説 ${pct(summary?.analysis_hit_rate)} (${analysis.hit || 0}/${summary?.analysis_evaluated || 0}) / 小動き${analysis.flat || 0} / 未採点${analysis.pending || 0}`;
+  chip.append(label, actionLine, analysisLine);
+  return chip;
+}
+
+function outcomeHistoryMatches(payload) {
+  return payload
+    && payload.period === outcomePeriodSelection
+    && payload.timeframe === outcomeTabSelection
+    && payload.category === outcomeCategorySelection
+    && Number(payload.page) === outcomeHistoryPage;
+}
+
+async function loadOutcomeHistory(data, page = 1) {
+  outcomeDashboardData = data || outcomeDashboardData;
+  outcomeHistoryPage = Math.max(1, Number(page) || 1);
+  renderOutcomePeriodTabs(outcomeDashboardData);
+  const target = $("recentOutcomes");
+  const meta = $("outcomeHistoryMeta");
+  const pagination = $("outcomePagination");
+  $("outcomeTabs")?.replaceChildren();
+  $("outcomeCategoryTabs")?.replaceChildren();
+  $("outcomeSummary")?.replaceChildren();
+  if (target) {
+    target.replaceChildren(empty("履歴を集計中です…"));
+  }
+  if (meta) meta.textContent = "履歴を読み込み中";
+  if (pagination) pagination.hidden = true;
+
+  const params = new URLSearchParams({
+    period: outcomePeriodSelection,
+    timeframe: outcomeTabSelection,
+    category: outcomeCategorySelection,
+    page: String(outcomeHistoryPage),
+    pageSize: "50",
+  });
+  const logDir = outcomeDashboardData?.log_dir || state.logDir;
+  if (logDir) params.set("logDir", logDir);
+  const requestId = ++outcomeHistoryRequestId;
+  try {
+    const response = await fetch(`/api/outcome-history?${params.toString()}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    if (requestId !== outcomeHistoryRequestId || outcomePeriodSelection === "recent") return;
+    outcomeHistoryPayload = payload;
+    outcomeHistoryPage = Number(payload.page) || 1;
+    renderRecentOutcomes(outcomeDashboardData);
+  } catch (error) {
+    if (requestId !== outcomeHistoryRequestId) return;
+    console.error(error);
+    if (target) target.replaceChildren(empty(`履歴の読み込みに失敗しました: ${error.message}`));
+    if (meta) meta.textContent = "履歴を読み込めません";
+  }
+}
+
+function renderOutcomeHistory(data, payload) {
+  const target = $("recentOutcomes");
+  const tabs = $("outcomeTabs");
+  const categoryTabs = $("outcomeCategoryTabs");
+  const summary = $("outcomeSummary");
+  const meta = $("outcomeHistoryMeta");
+  const pagination = $("outcomePagination");
+  target.replaceChildren();
+  if (tabs) tabs.replaceChildren();
+  if (categoryTabs) categoryTabs.replaceChildren();
+  if (summary) summary.replaceChildren();
+
+  if (tabs) {
+    const options = [["all", "すべて"], ...TIMEFRAME_ORDER.map((tf) => [tf, TIMEFRAME_LABEL[tf] || tf])];
+    options.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab${outcomeTabSelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeTabSelection === key ? "true" : "false");
+      button.textContent = `${label} ${payload.timeframe_counts?.[key] || 0}`;
+      button.addEventListener("click", () => {
+        outcomeTabSelection = key;
+        outcomeHistoryPayload = null;
+        loadOutcomeHistory(data, 1);
+      });
+      tabs.appendChild(button);
+    });
+  }
+
+  if (categoryTabs) {
+    OUTCOME_CATEGORY_OPTIONS.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab outcome-category-tab${outcomeCategorySelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeCategorySelection === key ? "true" : "false");
+      button.textContent = `${label} ${payload.category_counts?.[key] || 0}`;
+      button.addEventListener("click", () => {
+        outcomeCategorySelection = key;
+        outcomeHistoryPayload = null;
+        loadOutcomeHistory(data, 1);
+      });
+      categoryTabs.appendChild(button);
+    });
+  }
+
+  if (summary) {
+    const tfsToShow = outcomeTabSelection === "all"
+      ? TIMEFRAME_ORDER.filter((tf) => Number(payload.timeframe_counts?.[tf] || 0) > 0)
+      : [outcomeTabSelection];
+    tfsToShow.forEach((tf) => {
+      summary.appendChild(
+        outcomeHistorySummaryChip(tf, payload.summaries?.[tf], payload.period_label || "履歴"),
+      );
+    });
+  }
+
+  const rows = payload.rows || [];
+  if (!rows.length) {
+    target.appendChild(empty("選択中の期間・分類に該当する判断はありません"));
+  } else {
+    rows.forEach((row) => target.appendChild(outcomeRowElement(row)));
+  }
+
+  if (meta) {
+    meta.textContent = `${payload.period_label || "履歴"} / ${payload.total_rows || 0}件 / ${payload.page || 1}/${payload.total_pages || 1}ページ（1ページ50件）`;
+  }
+  if (pagination) {
+    pagination.hidden = false;
+    const previous = $("outcomePrevPage");
+    const next = $("outcomeNextPage");
+    const pageLabel = $("outcomePageLabel");
+    previous.disabled = Number(payload.page) <= 1;
+    next.disabled = Number(payload.page) >= Number(payload.total_pages);
+    pageLabel.textContent = `${payload.page || 1} / ${payload.total_pages || 1}`;
+    previous.onclick = () => loadOutcomeHistory(data, Number(payload.page) - 1);
+    next.onclick = () => loadOutcomeHistory(data, Number(payload.page) + 1);
+  }
+}
+
+function renderRecentOutcomes(data) {
+  outcomeDashboardData = data;
+  renderOutcomePeriodTabs(data);
+  if (outcomePeriodSelection !== "recent") {
+    if (outcomeHistoryMatches(outcomeHistoryPayload)) {
+      renderOutcomeHistory(data, outcomeHistoryPayload);
+    } else {
+      loadOutcomeHistory(data, outcomeHistoryPage);
+    }
+    return;
+  }
+  outcomeHistoryRequestId += 1;
+  const target = $("recentOutcomes");
+  if (!target) return;
+  const tabs = $("outcomeTabs");
+  const categoryTabs = $("outcomeCategoryTabs");
+  const summary = $("outcomeSummary");
+  const meta = $("outcomeHistoryMeta");
+  const pagination = $("outcomePagination");
+  target.replaceChildren();
+  if (tabs) tabs.replaceChildren();
+  if (categoryTabs) categoryTabs.replaceChildren();
+  if (summary) summary.replaceChildren();
+  if (meta) meta.textContent = "各時間足の直近12件";
+  if (pagination) pagination.hidden = true;
+
+  const groups = outcomeGroups(data);
+  const availableTfs = TIMEFRAME_ORDER.filter((tf) => (groups[tf] || []).length);
+  if (!availableTfs.length) {
+    target.appendChild(empty("時間足別の判断ログはまだありません"));
+    return;
+  }
+  if (outcomeTabSelection !== "all" && !availableTfs.includes(outcomeTabSelection)) {
+    outcomeTabSelection = "all";
+  }
+
+  // 時間足タブ(すべて / 15分足 / 1時間足 / 4時間足 / 日足)
+  if (tabs) {
+    const options = [["all", "すべて"], ...availableTfs.map((tf) => [tf, TIMEFRAME_LABEL[tf] || tf])];
+    options.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab${outcomeTabSelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeTabSelection === key ? "true" : "false");
+      const rows = key === "all" ? Object.values(groups).flat() : groups[key] || [];
+      const counts = outcomeCounts(rows);
+      button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
+      button.addEventListener("click", () => {
+        outcomeTabSelection = key;
+        renderRecentOutcomes(data);
+      });
+      tabs.appendChild(button);
+    });
+  }
+
+  // 選択中タブの集計チップ(直近の✅❌⚪と通算的中率)
+  const byTimeframe = data.evaluation?.by_timeframe || {};
+  const analysisByTimeframe = data.evaluation?.analysis?.by_timeframe || {};
+  if (summary) {
+    const tfsToShow = outcomeTabSelection === "all" ? availableTfs : [outcomeTabSelection];
+    tfsToShow.forEach((tf) => {
+      summary.appendChild(
+        outcomeSummaryChip(tf, groups[tf] || [], byTimeframe, analysisByTimeframe),
+      );
+    });
+  }
+
+  // 結果リスト(新しい順)。「すべて」は全時間足を時刻でマージして20件まで
+  const selectedRows = outcomeTabSelection === "all"
+    ? Object.values(groups).flat()
+    : [...(groups[outcomeTabSelection] || [])];
+
+  // 時間足ごとに「採点中 / 採点結果 / 対象外」を分ける。
+  // 中立・見送りでも分析仮説が採点済みなら「採点結果」に含める。
+  if (categoryTabs) {
+    const counts = outcomeCategoryCounts(selectedRows);
+    OUTCOME_CATEGORY_OPTIONS.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab outcome-category-tab${outcomeCategorySelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeCategorySelection === key ? "true" : "false");
+      button.textContent = `${label} ${counts[key]}`;
+      button.addEventListener("click", () => {
+        outcomeCategorySelection = key;
+        renderRecentOutcomes(data);
+      });
+      categoryTabs.appendChild(button);
+    });
+  }
+
+  const parseTs = (row) => {
+    const t = new Date(row.ts || 0).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  };
+  const categoryRows = outcomeCategorySelection === "all"
+    ? selectedRows
+    : selectedRows.filter((row) => outcomeCategory(row) === outcomeCategorySelection);
+  const rows = outcomeTabSelection === "all"
+    ? categoryRows.sort((a, b) => parseTs(b) - parseTs(a)).slice(0, 20)
+    : categoryRows.reverse();
+  if (!rows.length) {
+    const selectedLabel = OUTCOME_CATEGORY_OPTIONS.find(([key]) => key === outcomeCategorySelection)?.[1];
+    target.appendChild(empty(`${selectedLabel || "選択中の分類"}に該当する判断はありません`));
+    return;
+  }
+  rows.forEach((row) => target.appendChild(outcomeRowElement(row)));
+}
+
 function renderOps(data) {
   const ops = data.ops || {};
   setText("opsHealth", ops.status || "unknown");
@@ -505,11 +1120,24 @@ function renderOps(data) {
   }
   processes.forEach((process) => {
     const running = Boolean(process.running);
+    const exitCode = process.last_exit_code;
+    let status = "未登録";
+    if (running && process.state === "running") {
+      status = `実行中${(process.pids || []).length ? ` pid=${process.pids.join(", ")}` : ""}`;
+    } else if (running && process.launchd_label) {
+      status = `登録済み・次周期待ち${exitCode === null || exitCode === undefined ? "" : ` / 前回終了 ${exitCode}`}`;
+    } else if (running) {
+      status = `稼働中${(process.pids || []).length ? ` pid=${process.pids.join(", ")}` : ""}`;
+    }
+    let tone = running ? "ok" : "fail";
+    if (running && exitCode !== null && exitCode !== undefined && exitCode !== 0) {
+      tone = process.key === "briefing_service" && exitCode === 5 ? "warn" : "fail";
+    }
     processList.appendChild(
       tradeItem(
         process.label_ja || process.key || "--",
-        running ? `稼働中 pid=${(process.pids || []).join(", ")}` : "停止中",
-        running ? "ok" : "warn",
+        status,
+        tone,
       ),
     );
   });
@@ -520,6 +1148,7 @@ function renderOps(data) {
   [
     ["判断ログ", signals.has_any_journal],
     ["5分価格系列", signals.has_timeframe_prices],
+    ["9ホライズンshadow", signals.has_horizon_track],
     ["学習プロファイル", signals.has_any_learning],
   ].forEach(([label, ok]) => {
     inputList.appendChild(
@@ -654,6 +1283,7 @@ function renderDecisionMonitor(data) {
   const netR = num(performance.net_R);
   const deltaExpected = num(modelDelta.delta_expected_R);
   const cellCount = Object.values(counts).reduce((total, value) => total + Number(value || 0), 0);
+  const canonicalNet = data.net_r || {};
 
   setText("decisionMonitorUpdated", shortDate(decision.generated_at));
   setText("decisionHealth", decision.status || "unknown");
@@ -666,6 +1296,14 @@ function renderDecisionMonitor(data) {
   setText(
     "decisionCounts",
     `events ${decision.decision_events || 0} / scored ${decision.scored_outcomes || 0} / cells ${cellCount}`,
+  );
+  setText(
+    "decisionNetR",
+    `純R期待 ${signedR(num(canonicalNet.expectancy_r))} / 累積 ${signedR(num(canonicalNet.cumulative_net_r))}`,
+  );
+  setText(
+    "decisionNetCoverage",
+    `label ${canonicalNet.labels || 0} / scored ${canonicalNet.scored || 0} (${pct(num(canonicalNet.coverage))})`,
   );
 
   const actions = $("decisionActionList");
@@ -985,6 +1623,53 @@ function renderLearnedNotes(data) {
     });
     el.appendChild(ul);
     host.appendChild(el);
+  });
+}
+
+// ===== 直近1時間足の分析(毎時の判断結果を強調表示) =====
+function renderHourlyFocus(data) {
+  const totalRateEl = $("hourlyTotalRate");
+  const totalCountEl = $("hourlyTotalCount");
+  const barsHost = $("hourlySymbolBars");
+  if (!totalRateEl || !barsHost) return;
+
+  const row = (data.tf_learning?.timeframes || []).find((r) => r.timeframe === "1h");
+  setText("hourlyGenerated", shortDate(row?.generated_at || data.tf_learning?.generated_at));
+
+  if (!row || Number(row.evaluated || 0) === 0) {
+    totalRateEl.textContent = "--";
+    setText("hourlyTotalCount", "0 / 0 採点");
+    barsHost.replaceChildren();
+    barsHost.appendChild(
+      empty("1時間足の採点済み判断がまだありません(記録から約1時間後に反映されます)"),
+    );
+    return;
+  }
+
+  const evaluated = Number(row.evaluated || 0);
+  const hits = Number(row.hits || 0);
+  const rate = evaluated ? hits / evaluated : null;
+  totalRateEl.textContent = pct(rate);
+  setText("hourlyTotalCount", `${hits} / ${evaluated} 採点`);
+
+  barsHost.replaceChildren();
+  const symbols = (row.symbols || []).slice().sort((a, b) => (b.evaluated || 0) - (a.evaluated || 0));
+  if (!symbols.length) {
+    barsHost.appendChild(empty("ペア別の採点内訳がまだありません"));
+    return;
+  }
+  symbols.forEach((s) => {
+    const symEvaluated = Number(s.evaluated || 0);
+    const symHits = Number(s.hits || 0);
+    const symRate = symEvaluated ? symHits / symEvaluated : null;
+    barsHost.appendChild(
+      barRow(
+        s.symbol || "--",
+        symRate || 0,
+        `${pct(symRate)} (${symHits}/${symEvaluated})`,
+        symRate === null ? "amber" : symRate >= 0.5 ? "green" : "red",
+      ),
+    );
   });
 }
 
@@ -1387,11 +2072,25 @@ function renderMl(data) {
   const base = num(metrics.baseline_brier);
   setText("mlBrier", brier === null ? "--" : brier.toFixed(3));
   setText("mlBaseBrier", base === null ? "--" : base.toFixed(3));
-  setText("mlReasons", (data.ml.reasons || []).join(" / "));
+  const returnHead = data.ml.return_head || {};
+  const returnSummary = returnHead.model
+    ? `純R shadow=${Boolean(returnHead.usable)} / RMSE ${num(returnHead.val_rmse)?.toFixed(3) || "--"} / DSR ${num(returnHead.dsr)?.toFixed(3) || "--"}`
+    : "純Rモデル未学習";
+  const reasons = data.ml.reasons || [];
+  const training = data.ml.training || {};
+  const progress = data.ml.has_model
+    ? ""
+    : `融合24時間判断のPIT適格な初期件数ゲート: 4時間間引き後 ` +
+      `${training.eligible_after_thinning || 0} / ${training.minimum_required || 150}件` +
+      `（採点待ち ${training.pending || 0}件、旧形式除外 ${training.pit_ineligible || 0}件、` +
+      `通過後も追加検証あり）`;
+  const primaryReasons = reasons.length ? reasons : progress ? [progress] : [];
+  setText("mlReasons", [...primaryReasons, returnSummary].join(" / "));
 
   const target = $("importanceBars");
   target.replaceChildren();
   const rows = data.ml.importance || [];
+  renderHistoricalChart(data);
   if (!rows.length) {
     target.appendChild(empty("特徴量重要度はまだありません"));
     return;
@@ -1400,6 +2099,46 @@ function renderMl(data) {
   rows.forEach((row) => {
     target.appendChild(barRow(row.name, row.value / max, row.value.toFixed(3), "cyan"));
   });
+}
+
+function renderHistoricalChart(data) {
+  const target = $("historicalChartSummary");
+  target.replaceChildren();
+  const historical = data.historical_chart || {};
+  const cells = historical.cells || [];
+  if (!historical.exists || !cells.length) {
+    target.appendChild(empty("履歴bid/askデータを準備中です"));
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "condition-item";
+  const title = document.createElement("strong");
+  title.textContent = `${cells.length}セル / ${historical.stage || "shadow"}`;
+  const body = document.createElement("span");
+  const passed = cells.filter((cell) => cell.metrics?.beats_baseline).length;
+  body.textContent = `2020–23学習・2024検証・2025固定テスト / 基準超え ${passed}/${cells.length}`;
+  head.append(title, body);
+  target.appendChild(head);
+  cells.forEach((cell) => {
+    const row = document.createElement("div");
+    row.className = "condition-item";
+    const label = document.createElement("strong");
+    label.textContent = `${cell.pair || "--"} ${cell.timeframe || "--"}`;
+    const detail = document.createElement("span");
+    const metrics = cell.metrics || {};
+    const samples = cell.samples || {};
+    const brier = num(metrics.test_brier);
+    const baselineBrier = num(metrics.baseline_brier);
+    detail.textContent = `精度 ${pct(num(metrics.test_accuracy))} / Brier ${brier?.toFixed(3) || "--"} (基準 ${baselineBrier?.toFixed(3) || "--"}) / quote R ${signedR(num(metrics.mean_quote_r))} (選択n=${metrics.selected || 0}) / test n=${samples.test || 0}`;
+    row.append(label, detail);
+    target.appendChild(row);
+  });
+  const note = document.createElement("p");
+  note.className = "note";
+  note.textContent = historical.canonical_pure_r
+    ? "brokerコスト込み純R"
+    : "実bid/ask spread込み。broker commission/slippage未接続のため昇格不可。";
+  target.appendChild(note);
 }
 
 function renderConditions(data) {
@@ -1424,6 +2163,117 @@ function renderConditions(data) {
   });
 }
 
+function renderDimensions(data) {
+  const target = $("dimensionList");
+  target.replaceChildren();
+  const rows = data.learning.dimensions || [];
+  const outcomeRows = data.dimension_outcomes || [];
+  markPanelEmpty(target, !rows.length && !outcomeRows.length);
+  if (!rows.length && !outcomeRows.length) {
+    target.appendChild(empty("市場セッション・レジームの成熟データはまだありません"));
+    return;
+  }
+  rows.slice(0, 12).forEach((row) => {
+    const div = document.createElement("div");
+    div.className = "condition-item";
+    const title = document.createElement("strong");
+    title.textContent = `${row.dimension}: ${row.bucket} / ${row.direction}`;
+    const body = document.createElement("span");
+    const move = num(row.avg_move_atr);
+    body.textContent = `的中 ${pct(row.hit_rate)} (${row.hits}/${row.evaluated})${
+      move === null ? "" : ` / 平均 ${move >= 0 ? "+" : ""}${move.toFixed(2)} ATR`
+    }`;
+    div.append(title, body);
+    target.appendChild(div);
+  });
+  outcomeRows.slice(0, 12).forEach((row) => {
+    const div = document.createElement("div");
+    div.className = "condition-item";
+    const title = document.createElement("strong");
+    title.textContent = `${row.dimension}: ${row.bucket} / ${row.direction} (純R)`;
+    const body = document.createElement("span");
+    const net = num(row.net_expectancy_r);
+    body.textContent = `平均 ${net === null ? "--" : `${net >= 0 ? "+" : ""}${net.toFixed(2)}R`} ` +
+      `/ label ${row.net_labels || 0} / coverage ${pct(row.net_label_coverage)}`;
+    div.append(title, body);
+    target.appendChild(div);
+  });
+}
+
+function renderShadow(data) {
+  const target = $("shadowList");
+  target.replaceChildren();
+  const shadow = data.shadow || {};
+  const producers = shadow.by_producer || {};
+  const rows = Object.entries(producers);
+  markPanelEmpty(target, !rows.length);
+  if (!rows.length) {
+    target.appendChild(empty("shadow仮説はまだ記録・採点されていません"));
+    return;
+  }
+  rows.forEach(([producer, stat]) => {
+    const div = document.createElement("div");
+    div.className = "condition-item";
+    const title = document.createElement("strong");
+    title.textContent = producer;
+    const body = document.createElement("span");
+    const net = num(stat.net_expectancy_r);
+    const timeframeText = Object.entries(stat.by_timeframe || {})
+      .map(([timeframe, cell]) => `${timeframe}:${pct(cell.hit_rate)}(n=${cell.effective || 0})`)
+      .join(" / ");
+    body.textContent = `${stat.active_version || "unknown"} / 方向 ${pct(stat.hit_rate)} (${stat.hits || 0}/${stat.effective || 0}) / ` +
+      `純R ${net === null ? "--" : `${net >= 0 ? "+" : ""}${net.toFixed(2)}R`} ` +
+      `(label ${stat.net_labels || 0}) / abstain ${stat.abstained || 0}` +
+      `${timeframeText ? ` / TF ${timeframeText}` : ""}`;
+    div.append(title, body);
+    target.appendChild(div);
+  });
+}
+
+function renderInputContext(data) {
+  const target = $("inputContextList");
+  target.replaceChildren();
+  const input = data.input_context || {};
+  markPanelEmpty(target, !input.context_rows);
+  if (!input.context_rows) {
+    target.appendChild(empty("未接続 — 最新判断に版付きinput contextがありません"));
+    return;
+  }
+  const add = (titleText, bodyText) => {
+    const div = document.createElement("div");
+    div.className = "condition-item";
+    const title = document.createElement("strong");
+    title.textContent = titleText;
+    const body = document.createElement("span");
+    body.textContent = bodyText;
+    div.append(title, body);
+    target.appendChild(div);
+  };
+  add(
+    "Context coverage",
+    `${pct(input.coverage)} (${input.context_rows || 0}/${input.rows || 0}) / unique ${input.unique_contexts || 0}`,
+  );
+  Object.entries(input.macro_status || {}).forEach(([status, count]) =>
+    add(`Macro: ${status}`, `${count} context`),
+  );
+  Object.entries(input.liquidity_status || {}).forEach(([status, count]) =>
+    add(`Liquidity: ${status}`, `${count} context`),
+  );
+  Object.entries(input.quote_sources || {}).forEach(([source, count]) =>
+    add(`Quote: ${source}`, `${count} context`),
+  );
+  const spread = input.spread_pips || {};
+  if (spread.n) {
+    add(
+      "Spread distribution",
+      `p50 ${num(spread.p50)?.toFixed(2)} / p90 ${num(spread.p90)?.toFixed(2)} / p99 ${num(spread.p99)?.toFixed(2)} pips (n=${spread.n})`,
+    );
+  }
+  if (input.shadow_would_block) {
+    add("Shadow liquidity gate", `would-block ${input.shadow_would_block} context（未適用）`);
+  }
+}
+
 function renderFiles(data) {
   const target = $("fileList");
   target.replaceChildren();
@@ -1446,7 +2296,7 @@ function renderRecent(data) {
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 6;
+    td.colSpan = 7;
     td.textContent = "判断ログはまだありません";
     tr.appendChild(td);
     target.appendChild(tr);
@@ -1457,6 +2307,7 @@ function renderRecent(data) {
     const cells = [
       shortDate(row.ts),
       row.symbol || "--",
+      TIMEFRAME_LABEL[row.timeframe] || row.timeframe || "融合24h",
       row.direction || "--",
       row.conviction ?? "--",
       row.data_quality === undefined || row.data_quality === null ? "--" : pct(Number(row.data_quality)),
@@ -1476,12 +2327,15 @@ function render(data) {
   $("logDir").value = state.logDir;
   renderReality(data);
   renderLearnedSummary(data);
+  renderHourlyFocus(data);
   renderMetrics(data);
   renderFlow(data);
   renderWeights(data);
   renderStages(data);
   renderSymbolBars(data);
   renderTimeframeBars(data);
+  renderHorizons(data);
+  renderRecentOutcomes(data);
   renderActivity(data);
   renderConditionChart(data);
   renderOps(data);
@@ -1490,6 +2344,9 @@ function render(data) {
   renderCalibration(data);
   renderMl(data);
   renderConditions(data);
+  renderDimensions(data);
+  renderShadow(data);
+  renderInputContext(data);
   renderFiles(data);
   renderRecent(data);
 }

@@ -430,8 +430,12 @@ def evaluate_and_update(
     state: PromotionState,
     now: datetime | None = None,
     require_live_ack: Sequence[str] = (),
+    shadow_outcomes: Sequence[Mapping[str, object]] = (),
 ) -> tuple[PromotionState, dict[str, MemberPerformance]]:
     """ジャーナルから全委員を採点し、段階を更新する(fx_briefingの入口)。"""
+    # research buildでは委員昇格をshadow固定にしている。呼び出し側の共通契約は
+    # 受け入れるが、この証拠を昇格判定へ流して安全制約を弱めない。
+    del shadow_outcomes
     now = now or datetime.now(UTC)
     performances = {member: evaluate_member(member, entries, now=now) for member in MEMBERS}
     update_stages(state, performances, now=now, require_live_ack=require_live_ack)

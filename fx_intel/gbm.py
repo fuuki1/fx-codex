@@ -64,6 +64,28 @@ def brier_score(labels: Sequence[int], probs: Sequence[float]) -> float:
     return sum((p - y) ** 2 for y, p in zip(labels, probs)) / len(labels)
 
 
+def rmse(labels: Sequence[float], predictions: Sequence[float]) -> float:
+    if not labels or len(labels) != len(predictions):
+        return float("nan")
+    return math.sqrt(
+        sum((prediction - label) ** 2 for label, prediction in zip(labels, predictions))
+        / len(labels)
+    )
+
+
+def pinball_loss(labels: Sequence[float], predictions: Sequence[float], quantile: float) -> float:
+    if not labels or len(labels) != len(predictions):
+        return float("nan")
+    return sum(
+        (
+            quantile * (label - prediction)
+            if label >= prediction
+            else (1.0 - quantile) * (prediction - label)
+        )
+        for label, prediction in zip(labels, predictions)
+    ) / len(labels)
+
+
 def _quantile_cuts(values: Sequence[float], max_bins: int) -> list[float]:
     """特徴量1本の分割候補(分位点、重複除去済み・昇順)を返す。"""
     unique = sorted(set(values))
@@ -361,6 +383,170 @@ class GradientBoostingClassifier:
         if isinstance(importance, Mapping):
             model.feature_importance_ = {int(k): float(v) for k, v in importance.items()}
         return model
+
+
+class GradientBoostingRegressor(GradientBoostingClassifier):
+    """Small deterministic GBDT regressor for expected-R and quantiles."""
+
+    def __init__(
+        self, *, objective: str = "squared_error", quantile: float = 0.5, **kwargs
+    ) -> None:
+        if objective not in {"squared_error", "quantile"}:
+            raise ValueError("objective は squared_error / quantile のみ")
+        if not 0.0 < quantile < 1.0:
+            raise ValueError("quantile は (0, 1) で指定する")
+        super().__init__(**kwargs)
+        self.objective = objective
+        self.quantile = quantile
+        self.train_loss_: list[float] = []
+        self.valid_loss_: list[float] = []
+
+    def fit(
+        self,
+        features: Sequence[Sequence[float]],
+        labels: Sequence[float],
+        eval_features: Sequence[Sequence[float]] | None = None,
+        eval_labels: Sequence[float] | None = None,
+    ) -> GradientBoostingRegressor:
+        self._validate_regression_inputs(features, labels)
+        n_rows = len(features)
+        n_features = len(features[0])
+        rng = random.Random(self.seed)
+        cuts = [
+            _quantile_cuts([row[f] for row in features], self.max_bins) for f in range(n_features)
+        ]
+        binned = [[bisect_right(cuts[f], row[f]) for row in features] for f in range(n_features)]
+        self.base_margin_ = (
+            sum(labels) / len(labels)
+            if self.objective == "squared_error"
+            else _sample_quantile(labels, self.quantile)
+        )
+        predictions = [self.base_margin_] * n_rows
+        eval_predictions = [self.base_margin_] * len(eval_features) if eval_features else None
+        self.trees_ = []
+        self.feature_importance_ = {}
+        self.train_loss_ = []
+        self.valid_loss_ = []
+        best_valid = float("inf")
+        best_iteration = 0
+        context = _FitContext(binned=binned, cuts=cuts, gradients=[], hessians=[])
+        all_rows = list(range(n_rows))
+        all_features = list(range(n_features))
+        sample_size = min(
+            max(self.min_samples_leaf * 2, int(round(n_rows * self.subsample))), n_rows
+        )
+        feature_size = max(1, int(round(n_features * self.feature_fraction)))
+
+        for iteration in range(self.n_estimators):
+            if self.objective == "squared_error":
+                context.gradients = [
+                    prediction - label for prediction, label in zip(predictions, labels)
+                ]
+            else:
+                context.gradients = [
+                    -self.quantile if label > prediction else 1.0 - self.quantile
+                    for prediction, label in zip(predictions, labels)
+                ]
+            context.hessians = [1.0] * n_rows
+            rows = sorted(rng.sample(all_rows, sample_size)) if sample_size < n_rows else all_rows
+            columns = (
+                sorted(rng.sample(all_features, feature_size))
+                if feature_size < n_features
+                else all_features
+            )
+            tree = self._grow_tree(context, rows, columns, depth=0)
+            self.trees_.append(tree)
+            for i in range(n_rows):
+                predictions[i] += self.learning_rate * self._predict_tree_binned(tree, context, i)
+            self.train_loss_.append(self._loss(labels, predictions))
+            if eval_features and eval_labels is not None and eval_predictions is not None:
+                for i, row in enumerate(eval_features):
+                    eval_predictions[i] += self.learning_rate * _predict_tree_raw(tree, row)
+                valid_loss = self._loss(eval_labels, eval_predictions)
+                self.valid_loss_.append(valid_loss)
+                if valid_loss < best_valid - 1e-9:
+                    best_valid = valid_loss
+                    best_iteration = iteration + 1
+                elif iteration + 1 - best_iteration >= self.early_stopping_rounds:
+                    break
+            else:
+                best_iteration = iteration + 1
+        self.best_iteration_ = max(1, best_iteration)
+        self.trees_ = self.trees_[: self.best_iteration_]
+        return self
+
+    def _loss(self, labels: Sequence[float], predictions: Sequence[float]) -> float:
+        if self.objective == "squared_error":
+            return rmse(labels, predictions)
+        return pinball_loss(labels, predictions, self.quantile)
+
+    @staticmethod
+    def _validate_regression_inputs(
+        features: Sequence[Sequence[float]], labels: Sequence[float]
+    ) -> None:
+        if not features or len(features) != len(labels):
+            raise ValueError("特徴量とラベルの行数が不一致または空")
+        width = len(features[0])
+        if width <= 0 or any(len(row) != width for row in features):
+            raise ValueError("特徴量の列数が不正")
+        if any(not math.isfinite(value) for row in features for value in row):
+            raise ValueError("特徴量に非有限値が含まれる")
+        if any(not math.isfinite(float(label)) for label in labels):
+            raise ValueError("ラベルに非有限値が含まれる")
+
+    def predict(self, row: Sequence[float]) -> float:
+        margin = self.base_margin_
+        for tree in self.trees_:
+            margin += self.learning_rate * _predict_tree_raw(tree, row)
+        return margin
+
+    def predict_many(self, rows: Sequence[Sequence[float]]) -> list[float]:
+        return [self.predict(row) for row in rows]
+
+    def to_dict(self) -> dict:
+        payload = super().to_dict()
+        payload["algorithm"] = "gbdt_regression"
+        payload["objective"] = self.objective
+        payload["quantile"] = self.quantile
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping) -> GradientBoostingRegressor:
+        params = dict(payload.get("params", {}))
+        model = cls(
+            objective=str(payload.get("objective", "squared_error")),
+            quantile=float(payload.get("quantile", 0.5)),
+            n_estimators=int(params.get("n_estimators", 200)),
+            learning_rate=float(params.get("learning_rate", 0.05)),
+            max_depth=int(params.get("max_depth", 3)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 20)),
+            subsample=float(params.get("subsample", 0.8)),
+            feature_fraction=float(params.get("feature_fraction", 0.9)),
+            reg_lambda=float(params.get("reg_lambda", 1.0)),
+            max_bins=int(params.get("max_bins", 32)),
+            seed=int(params.get("seed", 7)),
+        )
+        model.base_margin_ = float(payload.get("base_margin", 0.0))
+        model.best_iteration_ = int(payload.get("best_iteration", 0))
+        trees = payload.get("trees", [])
+        if not isinstance(trees, list):
+            raise ValueError("trees の形式が不正")
+        model.trees_ = [_validate_tree(tree) for tree in trees]
+        importance = payload.get("feature_importance", {})
+        if isinstance(importance, Mapping):
+            model.feature_importance_ = {int(k): float(v) for k, v in importance.items()}
+        return model
+
+
+def _sample_quantile(values: Sequence[float], quantile: float) -> float:
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    low = int(math.floor(position))
+    high = int(math.ceil(position))
+    if low == high:
+        return ordered[low]
+    fraction = position - low
+    return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
 
 
 def _predict_tree_raw(tree: dict, row: Sequence[float]) -> float:

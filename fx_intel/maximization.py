@@ -653,7 +653,22 @@ def _policy(
             True,
             f"{label}: 期待R {expectancy:+.2f}R、最大化スコア{score:+.2f}。見送り優先",
         )
+    # 複合スコアはドローダウン・較正誤差・安定性など副次指標の減点を積み上げるため、
+    # 期待値・PFが実際にプラスのセルまでスコア単独で見送りにしないよう
+    # ここでは block せず dampen へ落とす(期待値の非正判定は上のブロックが担う)。
     if score < -0.05:
+        if (
+            expectancy is not None
+            and expectancy > 0
+            and profit_factor is not None
+            and profit_factor >= WEAK_PROFIT_FACTOR
+        ):
+            return (
+                "dampen",
+                DAMPEN_FACTOR,
+                False,
+                f"{label}: 最大化スコア{score:+.2f}は低いが期待R{expectancy:+.2f}R・PF{profit_factor:.2f}はプラス。確信度を×{DAMPEN_FACTOR:.2f}に減衰",
+            )
         return (
             "avoid",
             BLOCK_FACTOR,

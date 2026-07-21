@@ -122,6 +122,24 @@ def test_positive_but_unstable_cell_dampens() -> None:
     assert cell.sortino_r is not None and cell.sortino_r > 0
 
 
+def test_low_score_with_positive_expectancy_and_pf_dampens_not_blocks() -> None:
+    """複合スコアの副次ペナルティ(ドローダウン/較正/安定性)が積み重なっても、
+    期待値・PFが実際にプラスなら avoid(block) ではなく dampen に留める。
+    本番でUSDJPY|1h|long等が期待値+0.02R/PF1.18でもscore<-0.05だけでblockされ、
+    long/short方向がneutralに固定され続けていた回帰。
+    """
+    outcomes = [_outcome(0.3) for _ in range(60)] + [_outcome(-0.25) for _ in range(54)]
+
+    cell = maximization.derive_maximization_cell("USDJPY", "1h", "long", outcomes)
+
+    assert cell.expectancy_r is not None and cell.expectancy_r > 0
+    assert cell.profit_factor_r is not None and cell.profit_factor_r >= maximization.WEAK_PROFIT_FACTOR
+    assert cell.score < -0.05
+    assert cell.action == "dampen"
+    assert cell.block is False
+    assert cell.factor == maximization.DAMPEN_FACTOR
+
+
 def test_timeframe_maximization_lookup_uses_symbol_timeframe_direction_cell() -> None:
     outcomes = [_outcome(-1.0) for _ in range(30)]
     cell = maximization.derive_maximization_cell("USDJPY", "1h", "long", outcomes)

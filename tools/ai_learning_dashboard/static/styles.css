@@ -201,6 +201,31 @@ small {
   line-height: 1;
 }
 
+.evaluation-scope {
+  display: grid;
+  grid-template-columns: auto repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.evaluation-scope strong {
+  color: var(--text);
+}
+
+.evaluation-scope span {
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-variant-numeric: tabular-nums;
+}
+
 .flow-panel {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -376,6 +401,31 @@ small {
   display: grid;
   gap: 10px;
 }
+
+.horizon-matrix {
+  display: grid;
+  grid-template-columns: 110px repeat(9, minmax(86px, 1fr));
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+}
+
+.horizon-matrix > strong,
+.horizon-cell {
+  min-width: 86px;
+  padding: 8px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  font-size: 12px;
+  text-align: center;
+}
+
+.horizon-cell.long { border: 1px solid var(--green); }
+.horizon-cell.short { border: 1px solid var(--red); }
+.horizon-cell.standby { border: 1px solid var(--amber); }
+.horizon-cell.closed,
+.horizon-cell.neutral,
+.horizon-cell.missing { color: var(--muted); }
 
 .bars.compact {
   gap: 8px;
@@ -558,6 +608,30 @@ th {
   background: var(--panel-2);
 }
 
+/* ===== Hourly (1h timeframe) focus panel ===== */
+.hourly-panel {
+  min-height: 0;
+}
+
+.hourly-total {
+  display: grid;
+  gap: 2px;
+  padding: 14px;
+  margin: 10px 0 14px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  justify-items: start;
+}
+
+.hourly-total strong {
+  font-size: 32px;
+  line-height: 1;
+}
+
+.hourly-total small {
+  font-size: 12px;
+}
+
 /* ===== Learning contents (what/where learned) ===== */
 .learned-panel {
   min-height: 0;
@@ -609,8 +683,7 @@ th {
   margin-bottom: 10px;
 }
 
-.learned-matrix-head h3,
-.learned-notes-wrap h3 {
+.learned-matrix-head h3 {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
@@ -705,6 +778,36 @@ th {
   margin-top: 18px;
   padding-top: 16px;
   border-top: 1px solid var(--line);
+}
+
+.learned-notes-wrap summary {
+  width: fit-content;
+  padding: 8px 12px;
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--panel-2);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.learned-notes-wrap[open] summary {
+  margin-bottom: 10px;
+}
+
+.secondary-details summary {
+  width: fit-content;
+  padding: 8px 12px;
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--panel-2);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.secondary-details[open] summary {
+  margin-bottom: 12px;
 }
 
 .learned-notes {
@@ -987,6 +1090,10 @@ th {
     grid-template-columns: 1fr;
   }
 
+  .evaluation-scope {
+    grid-template-columns: 1fr;
+  }
+
   .cond-row {
     grid-template-columns: 1fr;
   }
@@ -1018,6 +1125,28 @@ th {
     min-width: 0;
   }
 
+  .panel {
+    min-height: 0;
+  }
+
+  .panel.is-empty-panel {
+    display: none;
+  }
+
+  .learned-notes {
+    max-height: 480px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 4px;
+  }
+
+  .bounded-list,
+  .bounded-table {
+    max-height: 420px;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+
   .toolbar {
     min-width: 0;
   }
@@ -1033,4 +1162,199 @@ th {
   .bar-row output {
     text-align: left;
   }
+}
+
+/* 直近の答え合わせ(予想の的中/外れ)一覧 */
+.outcome-list {
+  display: grid;
+  gap: 8px;
+}
+
+.outcome-row {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) 1fr minmax(310px, auto) minmax(90px, auto);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-left: 3px solid var(--muted);
+}
+
+.outcome-row.hit {
+  border-left-color: var(--green);
+}
+
+.outcome-row.miss {
+  border-left-color: var(--red);
+}
+
+.outcome-row.pending {
+  border-left-color: var(--amber);
+}
+
+.outcome-row.neutral {
+  border-left-color: var(--muted);
+}
+
+.outcome-row.standby {
+  border-left-color: #8d8172;
+}
+
+.outcome-row.closed {
+  border-left-color: #657281;
+}
+
+.outcome-badge {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.outcome-row.hit .outcome-badge {
+  color: var(--green);
+}
+
+.outcome-row.miss .outcome-badge {
+  color: var(--red);
+}
+
+.outcome-row.pending .outcome-badge {
+  color: var(--amber);
+}
+
+.outcome-main {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outcome-move {
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.outcome-ts {
+  text-align: right;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .outcome-row {
+    grid-template-columns: minmax(80px, auto) 1fr;
+  }
+  .outcome-move {
+    display: block;
+    grid-column: 1 / -1;
+    text-align: left;
+    white-space: normal;
+  }
+  .outcome-ts {
+    grid-column: 2;
+  }
+}
+
+/* 直近の答え合わせ: 時間足タブと集計チップ */
+.outcome-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.outcome-tab {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.outcome-tab:hover {
+  color: var(--text);
+}
+
+.outcome-tab.active {
+  color: var(--text);
+  border-color: var(--green);
+  background: rgba(93, 201, 140, 0.12);
+}
+
+.outcome-category-tabs {
+  margin-top: -2px;
+}
+
+.outcome-category-tab.active {
+  border-color: var(--cyan);
+  background: rgba(69, 196, 222, 0.12);
+}
+
+.outcome-period-tabs {
+  margin-bottom: 8px;
+}
+
+.outcome-period-tab.active {
+  border-color: var(--amber);
+  background: rgba(234, 178, 72, 0.12);
+}
+
+.outcome-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.outcome-pagination[hidden] {
+  display: none;
+}
+
+.outcome-pagination button {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.outcome-pagination button:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.outcome-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.outcome-chip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.85rem;
+}
+
+.outcome-chip strong {
+  color: var(--text);
+}
+
+.outcome-chip-recent {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }

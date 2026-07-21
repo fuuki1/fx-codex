@@ -66,11 +66,15 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from .briefing import CONFLICT_THRESHOLD, NEWS_WEIGHT, TECH_WEIGHT
 from .journal import (
+    COUNTERFACTUAL_ENTRY_KEY,
     DEFAULT_ATR_FRACTION,
     DEFAULT_HORIZON_HOURS,
     DEFAULT_TOLERANCE_HOURS,
+    counterfactual_guard_entries,
+    is_pit_eligible_entry,
 )
 from .market import WEEKEND_CLOSURE, open_hours_between
+from .market_session import dimensions_from_mapping
 
 # 学習サンプルの間引き幅。5分周期の高相関な判断を1時間単位へ間引き、
 # サンプル数の水増しを防ぐ。
@@ -233,6 +237,10 @@ class EvaluatedCall:
     # ml.py(確率モデルの教師)と promotion.py(期待値計算)が使う
     move_atr: float | None = None
     data_quality: float | None = None  # 記録時のデータ品質(0.0〜1.0)
+    dimensions: Mapping[str, object] = field(default_factory=dict)
+    # 期待値ガード見送り中のシャドー計画を採点した反実仮想ならTrue。
+    # 実際に推奨した判断の採点(False)と区別してプロファイルに注記する
+    counterfactual: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,6 +271,9 @@ class LearnedProfile:
     evaluated: int = 0  # hit/missとして採点できた件数(flat除く)
     hits: int = 0
     flat: int = 0
+    # evaluatedのうち、期待値ガード見送り中のシャドー計画を採点した反実仮想の件数。
+    # ダッシュボード・Discordが「運用の答え合わせ」と分けて表示するために持つ
+    counterfactual_evaluated: int = 0
     tech_weight: float = TECH_WEIGHT
     news_weight: float = NEWS_WEIGHT
     tech_hit_rate: float | None = None
@@ -279,6 +290,10 @@ class LearnedProfile:
     condition_stats: dict[str, dict[str, dict[str, dict[str, int]]]] = field(default_factory=dict)
     # 苦手な状態×方向の減衰係数: {特徴量キー: {バケット名: {"long"/"short": 係数}}}
     condition_factors: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    # session/regime のカテゴリ周辺集計。初期版は観測専用。
+    dimension_stats: dict[str, dict[str, dict[str, dict[str, object]]]] = field(
+        default_factory=dict
+    )
     notes_ja: list[str] = field(default_factory=list)
 
     @property
@@ -399,6 +414,9 @@ HORIZONS: tuple[HorizonSpec, ...] = (
 def horizon_report_ja(
     entries: Iterable[dict],
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
+    *,
+    require_pit: bool = False,
+    include_guard_counterfactuals: bool = False,
 ) -> str:
     """ホライズン別(短期4h/主24h/スイング72h)の方向的中率1行。データ無しは空文字。"""
     materialized = list(entries)
@@ -409,6 +427,8 @@ def horizon_report_ja(
             materialized,
             horizon_hours=spec.hours,
             tolerance_hours=spec.tolerance_hours,
+            require_pit=require_pit,
+            include_guard_counterfactuals=include_guard_counterfactuals,
         )
         if thin_gap_hours > 0:
             calls = thin_calls(calls, thin_gap_hours)
@@ -429,6 +449,9 @@ def evaluate_history(
     horizon_hours: float = DEFAULT_HORIZON_HOURS,
     tolerance_hours: float = DEFAULT_TOLERANCE_HOURS,
     atr_fraction: float = DEFAULT_ATR_FRACTION,
+    *,
+    require_pit: bool = False,
+    include_guard_counterfactuals: bool = False,
 ) -> list[EvaluatedCall]:
     """ジャーナル履歴内の全方向判断を、後続エントリの終値で採点する。
 
@@ -437,16 +460,27 @@ def evaluate_history(
     値動きが記録時ATR×atr_fraction未満ならflat(判定除外)。
     将来価格がまだ無い判断(未成熟)は結果に含めない。
     """
+    materialized = [entry for entry in entries if isinstance(entry, dict)]
+    if require_pit:
+        materialized = [entry for entry in materialized if is_pit_eligible_entry(entry)]
+    scored_source: list[dict] = materialized
+    if include_guard_counterfactuals:
+        # 価格系列は実記録行だけから作る(合成行は実行の複製で、混ぜると
+        # 同一時刻の終値が二重に載るため)。合成行は採点対象にだけ加える
+        scored_source = [*materialized, *counterfactual_guard_entries(materialized)]
     parsed: list[tuple[datetime, dict]] = []
     prices: dict[str, list[tuple[datetime, float]]] = {}
-    for entry in entries:
+    for entry in materialized:
         ts = _parse_ts(entry.get("ts"))
         if ts is None:
             continue
-        parsed.append((ts, entry))
         close = entry.get("close")
         if isinstance(close, (int, float)):
             prices.setdefault(str(entry.get("symbol", "")), []).append((ts, float(close)))
+    for entry in scored_source:
+        ts = _parse_ts(entry.get("ts"))
+        if ts is not None:
+            parsed.append((ts, entry))
     for series in prices.values():
         series.sort(key=lambda point: point[0])
     # 二分探索用に時刻列を分離(毎時追記で数万行たまっても全走査しないため)
@@ -516,9 +550,69 @@ def evaluate_history(
                 features=features,
                 move_atr=move_atr,
                 data_quality=data_quality,
+                dimensions=dimensions_from_mapping(
+                    entry.get("learning_dimensions"), fallback_ts=ts
+                ),
+                counterfactual=bool(entry.get(COUNTERFACTUAL_ENTRY_KEY)),
             )
         )
     return calls
+
+
+def _derive_dimension_stats(
+    calls: Sequence[EvaluatedCall],
+) -> dict[str, dict[str, dict[str, dict[str, object]]]]:
+    """Aggregate session/regime cells without creating production factors."""
+
+    raw: dict[str, dict[str, dict[str, dict[str, float | int]]]] = {}
+    for call in calls:
+        if call.direction not in ("long", "short"):
+            continue
+        for dimension in ("session_bucket", "regime"):
+            bucket = str(call.dimensions.get(dimension, "unknown") or "unknown")
+            cell = (
+                raw.setdefault(dimension, {})
+                .setdefault(bucket, {})
+                .setdefault(
+                    call.direction,
+                    {
+                        "raw": 0,
+                        "evaluated": 0,
+                        "hits": 0,
+                        "flat": 0,
+                        "move_atr_n": 0,
+                        "move_atr_sum": 0.0,
+                    },
+                )
+            )
+            cell["raw"] += 1
+            if call.outcome in ("hit", "miss"):
+                cell["evaluated"] += 1
+                cell["hits"] += 1 if call.outcome == "hit" else 0
+            elif call.outcome == "flat":
+                cell["flat"] += 1
+            if call.move_atr is not None:
+                cell["move_atr_n"] += 1
+                cell["move_atr_sum"] += float(call.move_atr)
+
+    result: dict[str, dict[str, dict[str, dict[str, object]]]] = {}
+    for dimension, buckets in raw.items():
+        for bucket, directions in buckets.items():
+            for direction, cell in directions.items():
+                evaluated = int(cell["evaluated"])
+                move_n = int(cell["move_atr_n"])
+                result.setdefault(dimension, {}).setdefault(bucket, {})[direction] = {
+                    "raw": int(cell["raw"]),
+                    "evaluated": evaluated,
+                    "hits": int(cell["hits"]),
+                    "flat": int(cell["flat"]),
+                    "hit_rate": (round(int(cell["hits"]) / evaluated, 4) if evaluated else None),
+                    "move_atr_n": move_n,
+                    "avg_move_atr": (
+                        round(float(cell["move_atr_sum"]) / move_n, 4) if move_n else None
+                    ),
+                }
+    return result
 
 
 def calibration_bins(calls: Sequence[EvaluatedCall]) -> list[ConvictionBin]:
@@ -682,6 +776,7 @@ def derive_profile(
         evaluated=len(scored),
         hits=hits,
         flat=flat,
+        counterfactual_evaluated=sum(1 for call in scored if call.counterfactual),
         tech_weight=tech_weight,
         news_weight=news_weight,
         tech_hit_rate=tech_hit_rate,
@@ -693,6 +788,7 @@ def derive_profile(
         symbol_factors=symbol_factors,
         condition_stats=condition_stats,
         condition_factors=condition_factors,
+        dimension_stats=_derive_dimension_stats(calls),
     )
     profile.notes_ja = _build_notes_ja(profile, weights_adjusted, tech_n, news_n, horizon_label)
     profile.notes_ja.extend(reflection_report_ja(scored))
@@ -716,6 +812,11 @@ def _build_notes_ja(
         )
         if profile.flat:
             line += f" (ほか{profile.flat}件は小動きで判定除外)"
+        if profile.counterfactual_evaluated:
+            line += (
+                f"。うち{profile.counterfactual_evaluated}件は期待値ガード見送り中の"
+                "シャドー分析(反実仮想)で、運用推奨の答え合わせとは別枠"
+            )
         notes.append(line)
     elif profile.flat:
         notes.append(f"採点対象{profile.flat}件はいずれも小動きのため判定除外")
@@ -974,6 +1075,7 @@ def save_profile(profile: LearnedProfile, path: str | Path) -> None:
         "evaluated": profile.evaluated,
         "hits": profile.hits,
         "flat": profile.flat,
+        "counterfactual_evaluated": profile.counterfactual_evaluated,
         "tech_weight": profile.tech_weight,
         "news_weight": profile.news_weight,
         "tech_hit_rate": profile.tech_hit_rate,
@@ -988,6 +1090,7 @@ def save_profile(profile: LearnedProfile, path: str | Path) -> None:
         "symbol_factors": profile.symbol_factors,
         "condition_stats": profile.condition_stats,
         "condition_factors": profile.condition_factors,
+        "dimension_stats": profile.dimension_stats,
         "notes_ja": profile.notes_ja,
     }
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1061,6 +1164,7 @@ def load_profile(path: str | Path) -> LearnedProfile:
             evaluated=int(payload.get("evaluated", 0)),
             hits=int(payload.get("hits", 0)),
             flat=int(payload.get("flat", 0)),
+            counterfactual_evaluated=int(payload.get("counterfactual_evaluated", 0) or 0),
             tech_weight=tech_weight,
             news_weight=news_weight,
             tech_hit_rate=float(tech_hit_rate) if tech_hit_rate is not None else None,
@@ -1072,6 +1176,11 @@ def load_profile(path: str | Path) -> LearnedProfile:
             symbol_factors=symbol_factors,
             condition_stats=condition_stats,
             condition_factors=condition_factors,
+            dimension_stats=(
+                dict(payload.get("dimension_stats", {}))
+                if isinstance(payload.get("dimension_stats"), dict)
+                else {}
+            ),
             notes_ja=[str(note) for note in payload.get("notes_ja", [])],
         )
     except (KeyError, TypeError, ValueError):
