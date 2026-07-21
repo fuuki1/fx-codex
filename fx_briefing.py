@@ -107,6 +107,7 @@ from fx_intel import (
     tp_sl_learning,
     timeframe,
     trade_outcome,
+    usd_coherence,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1823,6 +1824,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         plan.checklist = checklist.to_dict()
         plans.append(plan)
+
+    # 9b. USDファクター整合監査(観測専用): 同一実行の判断群でUSD観が内部矛盾して
+    #     いないかを記録する。2026-07-16に3ペア同時longが提示され(USDJPY long=USD強
+    #     ∧ EURUSD/GBPUSD long=USD弱)、USD全面高でEURUSD/GBPUSDのlongが全敗した
+    #     実測が動機。方向・確信度は一切変更せず、gate_traceと警告への記録のみ
+    #     (liquidityゲートと同じshadow運用。減衰の有効化は効果検証後の別PR)
+    usd_report = usd_coherence.audit_usd_coherence(
+        [
+            {
+                "symbol": plan.symbol,
+                "direction": plan.direction,
+                "conviction": plan.conviction,
+                "analysis_direction": plan.analysis_direction,
+                "analysis_conviction": plan.analysis_conviction,
+            }
+            for plan in plans
+        ]
+    )
+    for plan in plans:
+        usd_trace = usd_coherence.plan_trace(usd_report, plan.symbol)
+        if usd_trace is not None:
+            plan.gate_trace.append(usd_trace)
+    usd_warning = usd_coherence.format_warning_ja(usd_report)
+    if usd_warning:
+        fetch_warnings.append(usd_warning)
 
     prediction_time = datetime.now(UTC)
 
