@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import cast
 
 from fx_intel import historical_chart
 
@@ -26,16 +27,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     payload = historical_chart.train_historical_models(args.bars_root)
     historical_chart.save_artifact(payload, args.artifact)
+    cells = cast(list[dict[str, object]], payload["cells"])
     report = dict(payload)
     report["artifact_path"] = str(args.artifact)
     report["cells"] = [
-        {key: value for key, value in cell.items() if key != "model"} for cell in payload["cells"]
+        {key: value for key, value in cell.items() if key != "model"} for cell in cells
     ]
     historical_chart.save_artifact(report, args.dashboard_report)
     summary = {
         "trained_at": payload["trained_at"],
-        "cells": len(payload["cells"]),
-        "beats_baseline": sum(bool(cell["metrics"]["beats_baseline"]) for cell in payload["cells"]),
+        "cells": len(cells),
+        "beats_baseline": sum(
+            bool(cast(dict[str, object], cell["metrics"])["beats_baseline"]) for cell in cells
+        ),
         "artifact": str(args.artifact),
         "report": str(args.dashboard_report),
     }
