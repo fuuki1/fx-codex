@@ -87,10 +87,14 @@ def evaluate_timeframe_history(
     filtered = entries_for_timeframe(entries, timeframe)
     horizon = PRIMARY_HORIZON_HOURS.get(timeframe, 24.0)
     tolerance = tolerance_for(horizon)
-    kwargs: dict[str, float] = {"horizon_hours": horizon, "tolerance_hours": tolerance}
     if atr_fraction is not None:
-        kwargs["atr_fraction"] = atr_fraction
-    return evaluate_history(filtered, **kwargs)
+        return evaluate_history(
+            filtered,
+            horizon_hours=horizon,
+            tolerance_hours=tolerance,
+            atr_fraction=atr_fraction,
+        )
+    return evaluate_history(filtered, horizon_hours=horizon, tolerance_hours=tolerance)
 
 
 def _calls_for_symbol(calls: Sequence[EvaluatedCall], symbol: str) -> list[EvaluatedCall]:
