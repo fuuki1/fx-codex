@@ -29,7 +29,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from .briefing import TradePlan
 from .market import open_hours_between
@@ -38,6 +38,15 @@ from .timeframe import TimeframePlan
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
 DEFAULT_ATR_FRACTION = 0.1  # |値動き| がATRのこの割合未満なら判定しない
+# 期待値ガード反実仮想の対象ゲート。このゲート「だけ」で見送りになった行を
+# counterfactual_guard_entries が復元する。event_window / low_data_quality 等の
+# データ・リスク由来の見送りは、ガードが無くても見送っていた行なので含めない
+# (含めると反実仮想の根拠が汚染される)。
+GUARD_COUNTERFACTUAL_GATE = "expectancy_guard"
+SHADOW_FUSION_PRODUCER = "fusion_raw"
+# 合成行に立てるマーカー。採点側(learning / trade_outcome)はこのキーで
+# 「実際の推奨」と「ガード見送り中のシャドー計画」を区別して集計に注記する。
+COUNTERFACTUAL_ENTRY_KEY = "counterfactual_guard"
 
 
 @dataclass(frozen=True)
@@ -216,6 +225,93 @@ def read_entries(path: str | Path):
             continue
         if isinstance(entry, dict):
             yield entry
+
+
+def blocked_gate_names(entry: Mapping[str, object]) -> set[str]:
+    """gate_traceからstatus=blockedのゲート名集合を返す(observed等は含めない)。"""
+    trace = entry.get("gate_trace")
+    if not isinstance(trace, (list, tuple)):
+        return set()
+    names: set[str] = set()
+    for row in trace:
+        if isinstance(row, Mapping) and row.get("status") == "blocked":
+            name = str(row.get("gate", "")).strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def counterfactual_guard_entries(
+    entries: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """expectancy_guard単独で見送りになった行を、判断時凍結のシャドー計画で復元する。
+
+    期待値ガードは自分がブロックした判断の結果を観測できないため、放置すると
+    根拠サンプルが増えず永久ブロックに陥る(学習飢餓)。この関数は、ゲート前の
+    分析方向(analysis_direction)と判断時に凍結記録済みのシャドーSL/TP
+    (shadow_predictionsのfusion_raw)から「ガードが無ければ推奨していた計画」を
+    合成し、既存の採点エンジンへそのまま流せる行として返す。
+
+    PIT安全性: 合成に使う値はすべて判断時点で記録済みのもの(分析方向・
+    分析確信度・凍結SL/TP)に限る。事後の再計算・推定は行わず、必要な記録が
+    欠けた行は黙って除外する(fail-closed)。
+    """
+    output: list[dict[str, object]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if blocked_gate_names(entry) != {GUARD_COUNTERFACTUAL_GATE}:
+            continue
+        direction = entry.get("analysis_direction")
+        if direction not in ("long", "short"):
+            continue
+        prediction = _fusion_shadow_prediction(entry)
+        if prediction is None:
+            continue
+        if prediction.get("direction") != direction:
+            # 凍結スコアと分析方向の不整合は記録欠陥として採点しない
+            continue
+        stop = _level(prediction.get("stop"))
+        target1 = _level(prediction.get("target1"))
+        target2 = _level(prediction.get("target2"))
+        if stop is None or target1 is None or target2 is None:
+            continue
+        conviction = entry.get("analysis_conviction")
+        target_policy = prediction.get("target_policy")
+        synthesized: dict[str, object] = dict(entry)
+        synthesized["direction"] = str(direction)
+        synthesized["conviction"] = int(conviction) if isinstance(conviction, (int, float)) else 0
+        synthesized["stop"] = stop
+        synthesized["target1"] = target1
+        synthesized["target2"] = target2
+        synthesized["target_policy"] = (
+            dict(target_policy)
+            if isinstance(target_policy, Mapping)
+            else {"policy_id": "shadow-default-atr-v1"}
+        )
+        synthesized[COUNTERFACTUAL_ENTRY_KEY] = True
+        output.append(synthesized)
+    return output
+
+
+def _fusion_shadow_prediction(entry: Mapping[str, object]) -> Mapping[str, object] | None:
+    predictions = entry.get("shadow_predictions")
+    if not isinstance(predictions, (list, tuple)):
+        return None
+    for row in predictions:
+        if (
+            isinstance(row, Mapping)
+            and str(row.get("producer", "")) == SHADOW_FUSION_PRODUCER
+            and row.get("eligible_for_scoring") is True
+        ):
+            return row
+    return None
+
+
+def _level(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def evaluate_directional_accuracy(
