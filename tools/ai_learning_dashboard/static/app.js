@@ -238,6 +238,13 @@ function renderReality(data) {
     if (pending > 0) reasons.push(`${pending}件は採点待ちです。`);
   } else {
     reasons.push(`融合24h判断を${evaluated}件採点済みです。時間足別成績とは分けて表示しています。`);
+    const counterfactual = Number(data.learning?.counterfactual_evaluated || 0);
+    if (counterfactual > 0) {
+      reasons.push(
+        `うち${counterfactual}件は期待値ガード見送り中のシャドー分析(反実仮想)の採点です。` +
+          "運用推奨の答え合わせ(○×)とは分けて数えています。"
+      );
+    }
   }
 
   if (!fusionJournalExists && timeframeJournalExists) {

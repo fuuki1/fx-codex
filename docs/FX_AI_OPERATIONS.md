@@ -78,3 +78,23 @@ cd /Users/fuuki/srv/fx-codex
 - `performance.net_R` と `performance.expected_R` で実現Rと期待Rを見る。
 - `model_expectancy_delta` で `baseline_model` と `learning_model` の expected_R 差分を見る。
 - 改善候補は研究評価に留める。前回値より良い、または警告がないだけでは昇格しない。
+
+## 6. 期待値ガードの根拠更新(シャドー反実仮想)
+
+期待値ガードがblockした判断は `direction=neutral` で記録され採点対象から消えるため、
+実績だけを根拠にするとガードのサンプルが増えず、blockが恒久化する(学習飢餓。
+2026-07-17〜07-21の実機で根拠n=28のまま全新規判断が凍結した実例あり)。
+
+このためガード根拠(`fx_briefing` の `guard_evidence_summary`)は
+「実績 + expectancy_guard単独見送り行のシャドー計画(反実仮想)」で毎時更新する。
+
+- 反実仮想は判断時に凍結記録された値のみから合成する(`journal.counterfactual_guard_entries`):
+  ゲート前の `analysis_direction` / `analysis_conviction` と、`shadow_predictions` の
+  `fusion_raw` に記録済みのSL/TP。事後の再計算はしない(PIT安全)。記録が欠けた行は除外(fail-closed)。
+- `event_window` / `low_data_quality` 等が併発した行は含めない。ガードが無くても
+  見送っていた行であり、根拠に混ぜると反実仮想が汚染されるため。
+- 推奨(`direction`)はガード判定に従いneutralのまま。blockの解除は、反実仮想を含む
+  期待Rが非負に転じたときだけ起きる。負のままなら見送り継続(data/risk vetoの上書きではない)。
+- 監視: 反実仮想の量は `quality.flags.expectancy_guard_counterfactual`、学習側は
+  `briefing_learning.json` の `counterfactual_evaluated` に出る。改善候補レジストリと
+  期待値レポートは従来どおり実績のみを使う。

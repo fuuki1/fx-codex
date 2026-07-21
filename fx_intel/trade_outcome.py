@@ -18,7 +18,12 @@ import json
 import math
 from pathlib import Path
 
-from .journal import DEFAULT_HORIZON_HOURS, DEFAULT_TOLERANCE_HOURS
+from .journal import (
+    COUNTERFACTUAL_ENTRY_KEY,
+    DEFAULT_HORIZON_HOURS,
+    DEFAULT_TOLERANCE_HOURS,
+    counterfactual_guard_entries,
+)
 from .market import WEEKEND_CLOSURE, open_hours_between
 
 MIN_PATH_POINTS = 3
@@ -34,6 +39,9 @@ WEAK_PROFIT_FACTOR = 1.05
 QUALITY_WARN_THRESHOLD = 0.55
 EXPECTANCY_BLOCK_FACTOR = 0.45
 EXPECTANCY_WEAK_FACTOR = 0.75
+# ガード見送り中のシャドー計画を採点した反実仮想アウトカムに付く品質フラグ。
+# quality_summary の flags 集計にそのまま現れ、根拠に占める反実仮想の量を監査できる
+COUNTERFACTUAL_QUALITY_FLAG = "expectancy_guard_counterfactual"
 MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R = 0.05
 DEFAULT_TP1_R_CANDIDATES = (0.75, 1.0, 1.25)
 DEFAULT_TP2_R_CANDIDATES = (1.5, 2.0, 2.5)
@@ -385,18 +393,28 @@ def evaluate_trade_outcomes(
     min_path_points: int = MIN_PATH_POINTS,
     target1_r: float | None = None,
     target2_r: float | None = None,
+    include_guard_counterfactuals: bool = False,
 ) -> list[TradeOutcome]:
     materialized = list(entries)
+    scored_source: list[Mapping[str, object]] = materialized
+    if include_guard_counterfactuals:
+        # 期待値ガード見送り中のシャドー計画(判断時凍結のSL/TP)を採点対象に加える。
+        # 価格系列は実記録行だけから作る: 合成行は実行の複製なので、混ぜると
+        # 同一時刻の終値が二重に載り path 指標が歪む
+        scored_source = [*materialized, *counterfactual_guard_entries(materialized)]
     prices: dict[str, list[PricePathPoint]] = {}
-    parsed_entries: list[tuple[datetime, Mapping[str, object]]] = []
     for entry in materialized:
         ts = _parse_ts(entry.get("ts"))
         if ts is None:
             continue
-        parsed_entries.append((ts, entry))
         point = _price_path_point(ts, entry)
         if point is not None:
             prices.setdefault(str(entry.get("symbol", "")).upper(), []).append(point)
+    parsed_entries: list[tuple[datetime, Mapping[str, object]]] = []
+    for entry in scored_source:
+        ts = _parse_ts(entry.get("ts"))
+        if ts is not None:
+            parsed_entries.append((ts, entry))
     for series in prices.values():
         series.sort(key=lambda point: point.ts)
     price_times = {symbol: [point.ts for point in series] for symbol, series in prices.items()}
@@ -406,6 +424,7 @@ def evaluate_trade_outcomes(
         direction = str(entry.get("direction", ""))
         if direction not in ("long", "short"):
             continue
+        counterfactual = bool(entry.get(COUNTERFACTUAL_ENTRY_KEY))
         symbol = str(entry.get("symbol", "")).upper()
         entry_price = _float(entry.get("close"))
         stop = _float(entry.get("stop"))
@@ -440,6 +459,8 @@ def evaluate_trade_outcomes(
         if target1_r is not None and target2_r is not None and target2_r <= target1_r:
             missing_flags.append("invalid_target_variant")
         if missing_flags:
+            if counterfactual:
+                missing_flags.append(COUNTERFACTUAL_QUALITY_FLAG)
             outcomes.append(
                 TradeOutcome(
                     symbol=symbol,
@@ -508,6 +529,8 @@ def evaluate_trade_outcomes(
         quality, flags, path_source = _path_quality(ts, future, horizon_hours, min_path_points)
         if ambiguous_intrabar:
             flags = tuple(dict.fromkeys((*flags, "ambiguous_intrabar_touch")))
+        if counterfactual:
+            flags = tuple(dict.fromkeys((*flags, COUNTERFACTUAL_QUALITY_FLAG)))
         outcomes.append(
             TradeOutcome(
                 symbol=symbol,
@@ -1370,6 +1393,41 @@ def format_expectancy_report_ja(summary: Mapping[str, object], *, limit: int = 5
         lines.append("改善候補:")
         lines.extend(f"・{finding['label']}: {finding['reason_ja']}" for finding in findings)
     return "\n".join(lines)
+
+
+def counterfactual_outcome_count(summary: Mapping[str, object]) -> int:
+    """summarize_expectancy結果に含まれる反実仮想アウトカム件数(品質フラグ集計から)。"""
+    quality = summary.get("quality")
+    if not isinstance(quality, Mapping):
+        return 0
+    flags = quality.get("flags")
+    if not isinstance(flags, Mapping):
+        return 0
+    value = flags.get(COUNTERFACTUAL_QUALITY_FLAG, 0)
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def format_guard_evidence_note_ja(summary: Mapping[str, object]) -> str:
+    """期待値ガード根拠(実績+反実仮想)の1〜2行ノート。反実仮想ゼロなら空文字。
+
+    ガード根拠が従来(実績のみ)と同一のときに毎回同じ注記を重ねないため、
+    反実仮想が実際に混ざったときだけ表示する。
+    """
+    counterfactuals = counterfactual_outcome_count(summary)
+    if counterfactuals <= 0:
+        return ""
+    overall = summary.get("overall")
+    if not isinstance(overall, Mapping):
+        return ""
+    tradable = _stat_int(overall, "tradable")
+    min_samples = _stat_int(overall, "min_samples")
+    return (
+        "期待値ガード根拠: ガード見送り中のシャドー計画(反実仮想)"
+        f"{counterfactuals}件を含めて更新 — 期待R "
+        f"{_fmt_signed(_stat_float(overall, 'expectancy_r'), 'R')}"
+        f"(n={tradable}/{min_samples})。"
+        "推奨はガード判定に従い、根拠だけを毎時更新する"
+    )
 
 
 def format_improvement_candidates_ja(candidates: Sequence[TradeImprovementCandidate]) -> str:

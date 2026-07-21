@@ -665,3 +665,23 @@ def test_build_state_exposes_horizon_matrix_and_promotion_metrics(server, tmp_pa
     assert state["horizon"]["latest"][0]["horizon"] == "5m"
     assert state["horizon"]["profiles"][0]["permanent_shadow"] is True
     assert state["ops"]["signals"]["has_horizon_track"] is True
+
+
+def test_learning_payload_passes_counterfactual_count_for_fusion(server):
+    """期待値ガード反実仮想の採点件数がフロントへ渡ること(運用○×と分離表示するため)。"""
+    learning = {
+        "generated_at": START.isoformat(),
+        "evaluated": 21,
+        "hits": 6,
+        "flat": 0,
+        "counterfactual_evaluated": 8,
+        "notes_ja": [],
+    }
+    evaluated = {"evaluated": 0, "hits": 0, "flat": 0}
+    payload = server._learning_payload(learning, evaluated, {}, {"mode": "fusion"})
+    assert payload["counterfactual_evaluated"] == 8
+
+    without = dict(learning)
+    del without["counterfactual_evaluated"]
+    payload = server._learning_payload(without, evaluated, {}, {"mode": "fusion"})
+    assert payload["counterfactual_evaluated"] == 0
