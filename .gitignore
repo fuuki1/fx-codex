@@ -34,3 +34,9 @@ data_qa.csv
 walk_forward_summary.csv
 deep-research-report*.md
 
+# trader-mini rescue snapshot 2026-07-21: local-only large datasets, dashboard
+# scratch copies, and env backups. See /Users/fuuki/fx-evidence/trader-mini-wip-20260721
+data/historical_training/
+.dashboard-*/
+*.bak
+.env.save
