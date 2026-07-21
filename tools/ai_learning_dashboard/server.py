@@ -1250,6 +1250,9 @@ def _learning_payload(
         "evaluated": evaluated_count,
         "hits": hits,
         "flat": int(stored_flat if stored_flat is not None else evaluated["flat"]),
+        # 期待値ガード見送り中のシャドー分析(反実仮想)の採点件数。
+        # 運用推奨の答え合わせと分けて表示するためにフロントへ渡す
+        "counterfactual_evaluated": int(_number(learning.get("counterfactual_evaluated")) or 0),
         "hit_rate": hits / evaluated_count if evaluated_count else None,
         "tech_weight": _number(learning.get("tech_weight")) or 0.55,
         "news_weight": _number(learning.get("news_weight")) or 0.45,

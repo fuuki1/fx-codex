@@ -1565,11 +1565,16 @@ def main(argv: list[str] | None = None) -> int:
     calls: list[learning.EvaluatedCall] = []
     journal_entries = list(journal.read_entries(DEFAULT_JOURNAL_PATH))
     if not args.no_learning:
-        calls = learning.evaluate_history(journal_entries)
+        # 期待値ガード見送り中もシャドー計画(反実仮想)を採点対象に含める。
+        # ガードのblockで学習サンプルが枯れて重み・状態学習が凍結する飢餓を防ぐ。
+        # 運用推奨そのものの答え合わせは journal.evaluate_directional_accuracy 側が担う
+        calls = learning.evaluate_history(journal_entries, include_guard_counterfactuals=True)
         profile = learning.derive_profile(calls, now=now)
         learning_note = profile.summary_ja()
         # ホライズン別(4h/24h/72h)の的中率観測。学習は24hのみを使う
-        horizon_line = learning.horizon_report_ja(journal_entries)
+        horizon_line = learning.horizon_report_ja(
+            journal_entries, include_guard_counterfactuals=True
+        )
         if horizon_line:
             learning_note = (learning_note + "\n" + horizon_line).strip()
         if not args.dry_run:
@@ -1643,7 +1648,20 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as error:
                 fetch_warnings.append(f"期待値改善候補レジストリ保存失敗: {error}")
         if not args.no_trade_expectancy_guard:
-            expectancy_adjuster = make_trade_expectancy_adjuster(trade_expectancy_summary)
+            # ガード根拠は「実績+ガード見送り中のシャドー計画(反実仮想)」で毎時更新する。
+            # 実績のみを根拠にすると、ガードが自分のblockでサンプル追加を止め、
+            # 根拠が二度と更新されない恒久ブロック(学習飢餓)に陥るため。
+            # blockの解除は反実仮想を含めた期待Rが非負に転じたときだけ起き、
+            # 負のままなら見送り継続(fail-closedは維持)。改善候補レジストリと
+            # 期待値レポートは従来どおり実績のみ(trade_expectancy_summary)を使う
+            guard_evidence_outcomes = trade_outcome.evaluate_trade_outcomes(
+                journal_entries, include_guard_counterfactuals=True
+            )
+            guard_evidence_summary = trade_outcome.summarize_expectancy(guard_evidence_outcomes)
+            guard_note = trade_outcome.format_guard_evidence_note_ja(guard_evidence_summary)
+            if guard_note:
+                learning_note = append_note(learning_note, guard_note)
+            expectancy_adjuster = make_trade_expectancy_adjuster(guard_evidence_summary)
     expectancy_adjuster = compose_trade_expectancy_adjusters(
         decision_feedback_adjuster,
         expectancy_adjuster,
@@ -1656,7 +1674,9 @@ def main(argv: list[str] | None = None) -> int:
         if not args.train_ml:
             ml_artifact = ml.load_artifact(DEFAULT_ML_MODEL_PATH)
         if args.train_ml or ml_needs_retrain(ml_artifact, now):
-            train_calls = calls or learning.evaluate_history(journal_entries)
+            train_calls = calls or learning.evaluate_history(
+                journal_entries, include_guard_counterfactuals=True
+            )
             # 収益ラベル(trade_outcomeのrealized_net_r)のML接続はMLモデル拡張PRで
             # train_artifact(return_outcomes=...) に配線される
             ml_artifact = ml.train_artifact(train_calls, now=now)
