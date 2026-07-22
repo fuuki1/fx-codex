@@ -7,397 +7,446 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main class="shell">
+    <div class="layout">
+      <aside class="sidebar" aria-label="画面切り替え">
+        <div class="sidebar-brand">
+          <p class="eyebrow">fx_intel learning monitor</p>
+          <h1>AI 学習ダッシュボード</h1>
+        </div>
+        <nav class="sidebar-nav" role="tablist" aria-label="6つの分析画面">
+          <button type="button" class="nav-item active" data-view="now" role="tab" aria-selected="true">
+            <span class="nav-icon" aria-hidden="true">📊</span>
+            <span class="nav-label">現在の予測と運用判断</span>
+          </button>
+          <button type="button" class="nav-item" data-view="performance" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">🎯</span>
+            <span class="nav-label">予測性能と確率較正</span>
+          </button>
+          <button type="button" class="nav-item" data-view="learning" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">🧠</span>
+            <span class="nav-label">学習状態とモデル比較</span>
+          </button>
+          <button type="button" class="nav-item" data-view="forensics" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">🔍</span>
+            <span class="nav-label">外れた原因のフォレンジック</span>
+          </button>
+          <button type="button" class="nav-item" data-view="data" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">🗄️</span>
+            <span class="nav-label">データ基盤・処理系の健全性</span>
+          </button>
+          <button type="button" class="nav-item" data-view="governance" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">🛡️</span>
+            <span class="nav-label">モデル昇格と監査ガバナンス</span>
+          </button>
+        </nav>
+      </aside>
+      <main class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">fx_intel learning monitor</p>
-          <h1>Mac mini AI 学習ダッシュボード</h1>
+          <p class="eyebrow" id="topbarEyebrow">現在の状況</p>
+          <h2 id="topbarTitle" class="topbar-title">現在の予測と運用判断</h2>
         </div>
         <div class="toolbar">
           <input id="logDir" aria-label="ログディレクトリ" />
           <button id="refreshBtn" type="button" title="最新状態を読み込む">更新</button>
         </div>
       </header>
-
-      <section id="realityPanel" class="reality-panel is-waiting" aria-label="現在の学習判定">
-        <div>
-          <span id="realityBadge" class="badge amber">monitor</span>
-          <h2 id="realityTitle">学習状態を確認中</h2>
-          <p id="realityBody" class="note">ログを読み込んでいます。</p>
+      <section class="view" id="view-now" data-view="now" aria-label="現在の予測と運用判断">
+        <div class="view-head">
+          <h2 class="view-title">現在の予測と運用判断</h2>
         </div>
-        <ul id="realityReasons" class="reason-list"></ul>
-      </section>
-
-      <section class="panel wide learned-panel" aria-label="学習の中身">
-        <div class="panel-head">
-          <h2>学習の中身 — どこで・何を学んだか</h2>
-          <span id="learnedSource" class="subtle">未生成</span>
-        </div>
-        <div class="learned-layout">
-          <div class="learned-gauge">
-            <div id="hitRateDonut" class="donut" aria-label="融合24hの方向的中率"></div>
-            <div class="learned-gauge-meta">
-              <span class="metric-label">融合24hの方向的中率</span>
-              <strong id="donutHitRate">--</strong>
-              <small id="donutHitCount">0 / 0 採点</small>
-              <small id="donutSampleNote" class="subtle"></small>
-            </div>
-          </div>
-          <div class="learned-matrix-wrap">
-            <div class="learned-matrix-head">
-              <h3>時間足 × 通貨ペア の的中率</h3>
-              <div class="legend" id="matrixLegend"></div>
-            </div>
-            <div id="learnedMatrix" class="matrix" role="table"></div>
-          </div>
-        </div>
-        <details class="learned-notes-wrap">
-          <summary>AIが書いた学習メモを表示</summary>
-          <div id="learnedNotes" class="learned-notes"></div>
-        </details>
-      </section>
-
-      <section class="status-grid" aria-label="学習概要">
-        <article class="metric">
-          <span class="metric-label">判断ログ（全系統）</span>
-          <strong id="journalTotal">0</strong>
-          <small id="journalLatest">未記録</small>
-        </article>
-        <article class="metric">
-          <span class="metric-label">融合24h・採点済み</span>
-          <strong id="evaluatedTotal">0</strong>
-          <small id="pendingTotal">24h待ち 0</small>
-        </article>
-        <article class="metric">
-          <span class="metric-label">融合24h・方向的中率</span>
-          <strong id="hitRate">--</strong>
-          <small id="hitCount">0 / 0</small>
-        </article>
-        <article class="metric">
-          <span class="metric-label">MLモデル</span>
-          <strong id="mlStatus">未学習</strong>
-          <small id="mlRows">学習0 / 検証0</small>
-        </article>
-      </section>
-
-      <section class="evaluation-scope" aria-label="数字の評価母集団">
-        <strong>数字の読み方</strong>
-        <span id="scopeFusion">融合24h方向: --</span>
-        <span id="scopeTimeframe">時間足別方向: --</span>
-        <span id="scopeExpectancy">売買期待R: --</span>
-      </section>
-
-      <section class="flow-panel" aria-label="学習サイクル">
-        <div class="flow-step" id="flowJournal">
-          <span>1</span>
-          <strong>記録</strong>
-          <small>判断・価格・特徴量</small>
-        </div>
-        <div class="flow-step" id="flowMature">
-          <span>2</span>
-          <strong>成熟</strong>
-          <small>約24時間後に比較</small>
-        </div>
-        <div class="flow-step" id="flowProfile">
-          <span>3</span>
-          <strong>重み調整</strong>
-          <small>tech / news / 条件</small>
-        </div>
-        <div class="flow-step" id="flowMl">
-          <span>4</span>
-          <strong>ML</strong>
-          <small>GBDT + 較正</small>
-        </div>
-        <div class="flow-step" id="flowPromotion">
-          <span>5</span>
-          <strong>昇格</strong>
-          <small>shadow / paper / live</small>
-        </div>
-      </section>
-
-      <section class="panel curve-panel" aria-label="学習の推移">
-        <div class="panel-head">
-          <h2>学習の推移</h2>
-          <span id="curveSummary" class="subtle">採点待ち</span>
-        </div>
-        <p class="note curve-note">
-          採点済み判断を古い順に累積した的中率(緑線)・採点数(シアンの棒)・
-          コスト控除後の純R(琥珀線、儲かっているか)。判断ログから再構築するため、
-          運用が続いて採点が溜まるほど線が伸びます。灰色の点線は基準50%、琥珀の点線は0R。
-          純Rは執行コストが保存された判断でのみ算出されます。
-        </p>
-        <div class="curve-wrap">
-          <canvas id="curveCanvas" role="img"
-            aria-label="累積的中率と累積採点数の推移グラフ"></canvas>
-        </div>
-        <div id="curveEmpty" class="curve-empty" hidden>
-          まだ採点済みの判断がありません。ブリーフィングが回り、判断の主ホライズンが経過すると点が増えます。
-        </div>
-      </section>
-
-      <section class="panel ops-panel" aria-label="運用状態">
-        <div class="panel-head">
-          <h2>運用状態</h2>
-          <span id="opsHealth" class="subtle">確認中</span>
-        </div>
-        <div class="ops-grid">
+        <section id="realityPanel" class="reality-panel is-waiting" aria-label="現在の学習判定">
           <div>
-            <h3>稼働プロセス</h3>
-            <div id="opsProcessList" class="condition-list"></div>
+            <span id="realityBadge" class="badge amber">monitor</span>
+            <h2 id="realityTitle">学習状態を確認中</h2>
+            <p id="realityBody" class="note">ログを読み込んでいます。</p>
           </div>
-          <div>
-            <h3>入力ログ</h3>
-            <div id="opsInputList" class="condition-list"></div>
+          <ul id="realityReasons" class="reason-list"></ul>
+        </section>
+        <section class="status-grid" aria-label="学習概要">
+          <article class="metric">
+            <span class="metric-label">判断ログ（全系統）</span>
+            <strong id="journalTotal">0</strong>
+            <small id="journalLatest">未記録</small>
+          </article>
+          <article class="metric">
+            <span class="metric-label">融合24h・採点済み</span>
+            <strong id="evaluatedTotal">0</strong>
+            <small id="pendingTotal">24h待ち 0</small>
+          </article>
+          <article class="metric">
+            <span class="metric-label">融合24h・方向的中率</span>
+            <strong id="hitRate">--</strong>
+            <small id="hitCount">0 / 0</small>
+          </article>
+          <article class="metric">
+            <span class="metric-label">MLモデル</span>
+            <strong id="mlStatus">未学習</strong>
+            <small id="mlRows">学習0 / 検証0</small>
+          </article>
+        </section>
+        <section class="evaluation-scope" aria-label="数字の評価母集団">
+          <strong>数字の読み方</strong>
+          <span id="scopeFusion">融合24h方向: --</span>
+          <span id="scopeTimeframe">時間足別方向: --</span>
+          <span id="scopeExpectancy">売買期待R: --</span>
+        </section>
+        <section class="panel ops-panel" aria-label="運用状態">
+          <div class="panel-head">
+            <h2>運用状態</h2>
+            <span id="opsHealth" class="subtle">確認中</span>
           </div>
-          <div>
-            <h3>次の確認点</h3>
-            <div id="opsAlertList" class="condition-list"></div>
+          <div class="ops-grid">
+            <div>
+              <h3>稼働プロセス</h3>
+              <div id="opsProcessList" class="condition-list"></div>
+            </div>
+            <div>
+              <h3>入力ログ</h3>
+              <div id="opsInputList" class="condition-list"></div>
+            </div>
+            <div>
+              <h3>次の確認点</h3>
+              <div id="opsAlertList" class="condition-list"></div>
+            </div>
           </div>
+        </section>
+        <div class="view-grid">
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>直近の答え合わせ — すべての判断</h2>
+              <span class="subtle">的中・外れ・小動き・未採点・中立・見送り・休場（新しい順）</span>
+            </div>
+            <div id="outcomeTabs" class="outcome-tabs" role="tablist" aria-label="時間足で絞り込み"></div>
+            <div id="outcomeSymbolTabs" class="outcome-tabs" role="tablist" aria-label="銘柄で絞り込み"></div>
+            <div id="outcomeSummary" class="outcome-summary"></div>
+            <div id="recentOutcomes" class="outcome-list"></div>
+            <div id="outcomePager" class="outcome-pager"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>ホライズン×ペア</h2>
+              <span id="horizonUpdated" class="subtle">9本 / 全セルshadow開始</span>
+            </div>
+            <div id="horizonMatrix" class="horizon-matrix"></div>
+            <div class="panel-subsection">
+              <h3>満期採点・昇格ゲート</h3>
+              <div id="horizonMetrics" class="condition-list"></div>
+            </div>
+          </article>
         </div>
       </section>
-
-      <section class="main-grid">
-        <article class="panel">
+      <section class="view" id="view-performance" data-view="performance" aria-label="予測性能と確率較正" hidden>
+        <div class="view-head">
+          <h2 class="view-title">予測性能と確率較正</h2>
+        </div>
+        <section class="panel curve-panel" aria-label="学習の推移">
           <div class="panel-head">
-            <h2>学習重み</h2>
-            <span id="learningGenerated" class="subtle">未生成</span>
+            <h2>学習の推移</h2>
+            <span id="curveSummary" class="subtle">採点待ち</span>
           </div>
-          <div class="weight-row">
-            <div>
-              <span>テクニカル</span>
-              <strong id="techWeight">55%</strong>
+          <p class="note curve-note">
+            採点済み判断を古い順に累積した的中率(緑線)・採点数(シアンの棒)・
+            コスト控除後の純R(琥珀線、儲かっているか)。判断ログから再構築するため、
+            運用が続いて採点が溜まるほど線が伸びます。灰色の点線は基準50%、琥珀の点線は0R。
+            純Rは執行コストが保存された判断でのみ算出されます。
+          </p>
+          <div class="curve-wrap">
+            <canvas id="curveCanvas" role="img"
+              aria-label="累積的中率と累積採点数の推移グラフ"></canvas>
+          </div>
+          <div id="curveEmpty" class="curve-empty" hidden>
+            まだ採点済みの判断がありません。ブリーフィングが回り、判断の主ホライズンが経過すると点が増えます。
+          </div>
+        </section>
+        <div class="view-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>確信度キャリブレーション</h2>
+              <span id="calibrationSource" class="subtle">確信度帯 → 実際の的中率</span>
             </div>
-            <div class="bar-track"><div id="techWeightBar" class="bar-fill green"></div></div>
-          </div>
-          <div class="weight-row">
-            <div>
-              <span>ニュース</span>
-              <strong id="newsWeight">45%</strong>
+            <p class="chart-note">確信度が高い帯ほど実際に当たっていれば対角線に乗ります。</p>
+            <div id="calibrationChart" class="chart-area"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>融合24h・ペア別の学習成績</h2>
+              <span class="subtle">時間足別とは別集計</span>
             </div>
-            <div class="bar-track"><div id="newsWeightBar" class="bar-fill amber"></div></div>
-          </div>
-          <div class="split-kpis">
-            <div><span>Tech的中</span><strong id="techHit">--</strong></div>
-            <div><span>News的中</span><strong id="newsHit">--</strong></div>
-            <div><span>Brier</span><strong id="brierScore">--</strong></div>
-          </div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>委員の運用段階</h2>
-            <span id="promotionUpdated" class="subtle">未保存</span>
-          </div>
-          <div id="stageList" class="stage-list"></div>
-          <div id="promotionHistory" class="timeline"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>融合24h・ペア別の学習成績</h2>
-            <span class="subtle">時間足別とは別集計</span>
-          </div>
-          <div id="symbolBars" class="bars"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>時間足別の学習成績</h2>
-            <span class="subtle">各主ホライズン / 学習重み</span>
-          </div>
-          <div id="timeframeBars" class="bars"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>ホライズン×ペア</h2>
-            <span id="horizonUpdated" class="subtle">9本 / 全セルshadow開始</span>
-          </div>
-          <div id="horizonMatrix" class="horizon-matrix"></div>
-          <div class="panel-subsection">
-            <h3>満期採点・昇格ゲート</h3>
-            <div id="horizonMetrics" class="condition-list"></div>
-          </div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>直近の答え合わせ — すべての判断</h2>
-            <span class="subtle">的中・外れ・小動き・未採点・中立・見送り・休場（新しい順）</span>
-          </div>
-          <div id="outcomeTabs" class="outcome-tabs" role="tablist" aria-label="時間足で絞り込み"></div>
-          <div id="outcomeSymbolTabs" class="outcome-tabs" role="tablist" aria-label="銘柄で絞り込み"></div>
-          <div id="outcomeSummary" class="outcome-summary"></div>
-          <div id="recentOutcomes" class="outcome-list"></div>
-          <div id="outcomePager" class="outcome-pager"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>記録アクティビティ</h2>
-            <span class="subtle">直近48時間 / 方向別の記録件数</span>
-          </div>
-          <div class="legend" id="activityLegend"></div>
-          <div id="activityChart" class="chart-area"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>市場条件別の学習結果</h2>
-            <span id="conditionChartTf" class="subtle">時間足別</span>
-          </div>
-          <p class="chart-note">どんな相場つき(RSI・ボラティリティ・時間足一致など)で当たり／外れが多かったか。</p>
-          <div id="conditionChart" class="condition-chart"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>期待値・改善候補監視</h2>
-            <span id="tradeMonitorUpdated" class="subtle">未生成</span>
-          </div>
-          <div class="trade-grid">
-            <div class="trade-status">
-              <span>health</span>
-              <strong id="tradeHealth">unknown</strong>
-              <small id="tradeCounts">active 0 / approved 0 / paused 0</small>
+            <div id="symbolBars" class="bars"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>時間足別の学習成績</h2>
+              <span class="subtle">各主ホライズン / 学習重み</span>
             </div>
-            <div>
-              <h3>承認待ち・自動停止</h3>
-              <div id="tradeActionList" class="condition-list"></div>
+            <div id="timeframeBars" class="bars"></div>
+          </article>
+        </div>
+      </section>
+      <section class="view" id="view-learning" data-view="learning" aria-label="学習状態とモデル比較" hidden>
+        <div class="view-head">
+          <h2 class="view-title">学習状態とモデル比較</h2>
+        </div>
+        <section class="panel wide learned-panel" aria-label="学習の中身">
+          <div class="panel-head">
+            <h2>学習の中身 — どこで・何を学んだか</h2>
+            <span id="learnedSource" class="subtle">未生成</span>
+          </div>
+          <div class="learned-layout">
+            <div class="learned-gauge">
+              <div id="hitRateDonut" class="donut" aria-label="融合24hの方向的中率"></div>
+              <div class="learned-gauge-meta">
+                <span class="metric-label">融合24hの方向的中率</span>
+                <strong id="donutHitRate">--</strong>
+                <small id="donutHitCount">0 / 0 採点</small>
+                <small id="donutSampleNote" class="subtle"></small>
+              </div>
             </div>
-            <div>
-              <h3>候補別の期待値</h3>
-              <div id="tradePolicyStats" class="condition-list"></div>
+            <div class="learned-matrix-wrap">
+              <div class="learned-matrix-head">
+                <h3>時間足 × 通貨ペア の的中率</h3>
+                <div class="legend" id="matrixLegend"></div>
+              </div>
+              <div id="learnedMatrix" class="matrix" role="table"></div>
             </div>
           </div>
-          <div class="panel-subsection">
-            <h3>監査イベント</h3>
-            <div id="tradeEvents" class="timeline"></div>
-          </div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>判断期待R監視</h2>
-            <span id="decisionMonitorUpdated" class="subtle">未生成</span>
-          </div>
-          <div class="trade-grid">
-            <div class="trade-status">
-              <span>health</span>
-              <strong id="decisionHealth">unknown</strong>
-              <small id="decisionExpectancy">期待R --</small>
-              <small id="decisionNetR">純R --</small>
-              <small id="decisionNetCoverage">label 0 / scored 0</small>
-              <small id="decisionCounts">scored 0 / cells 0</small>
-            </div>
-            <div>
-              <h3>見送り・減衰セル</h3>
-              <div id="decisionActionList" class="condition-list"></div>
-            </div>
-            <div>
-              <h3>失敗理由</h3>
-              <div id="decisionFailureList" class="condition-list"></div>
-            </div>
-          </div>
-          <div class="panel-subsection">
-            <h3>悪化セル</h3>
-            <div id="decisionWorstCells" class="condition-list"></div>
-          </div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>確信度キャリブレーション</h2>
-            <span id="calibrationSource" class="subtle">確信度帯 → 実際の的中率</span>
-          </div>
-          <p class="chart-note">確信度が高い帯ほど実際に当たっていれば対角線に乗ります。</p>
-          <div id="calibrationChart" class="chart-area"></div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>MLモデル</h2>
-            <span id="mlTrainedAt" class="subtle">未学習</span>
-          </div>
-          <div class="split-kpis">
-            <div><span>usable</span><strong id="mlUsable">false</strong></div>
-            <div><span>Brier</span><strong id="mlBrier">--</strong></div>
-            <div><span>基準</span><strong id="mlBaseBrier">--</strong></div>
-          </div>
-          <div id="importanceBars" class="bars compact"></div>
-          <p id="mlReasons" class="note"></p>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>苦手条件</h2>
-            <span class="subtle">減衰候補</span>
-          </div>
-          <div id="conditionList" class="condition-list"></div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>市場軸別の学習</h2>
-            <span class="subtle">session / regime</span>
-          </div>
-          <div id="dimensionList" class="condition-list"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>Shadow仮説の還流</h2>
-            <span class="subtle">final判断とは分離</span>
-          </div>
-          <div id="shadowList" class="condition-list"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>判断入力の接続状態</h2>
-            <span class="subtle">macro / broker liquidity proxy</span>
-          </div>
-          <div id="inputContextList" class="condition-list"></div>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>ファイル状態</h2>
-            <span id="readOnlyBadge" class="badge">read only</span>
-          </div>
-          <details class="secondary-details">
-            <summary>ファイル一覧を表示</summary>
-            <div id="fileList" class="file-list bounded-list"></div>
+          <details class="learned-notes-wrap">
+            <summary>AIが書いた学習メモを表示</summary>
+            <div id="learnedNotes" class="learned-notes"></div>
           </details>
-        </article>
-
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>最近の判断ログ</h2>
-            <span class="subtle">最新30件</span>
+        </section>
+        <section class="flow-panel" aria-label="学習サイクル">
+          <div class="flow-step" id="flowJournal">
+            <span>1</span>
+            <strong>記録</strong>
+            <small>判断・価格・特徴量</small>
           </div>
-          <details class="secondary-details">
-            <summary>最新30件を表示</summary>
-            <div class="table-wrap bounded-table">
-              <table>
-                <thead>
-                  <tr>
-                    <th>時刻</th>
-                    <th>ペア</th>
-                    <th>時間足</th>
-                    <th>方向</th>
-                    <th>確信度</th>
-                    <th>品質</th>
-                    <th>終値</th>
-                  </tr>
-                </thead>
-                <tbody id="recentRows"></tbody>
-              </table>
+          <div class="flow-step" id="flowMature">
+            <span>2</span>
+            <strong>成熟</strong>
+            <small>約24時間後に比較</small>
+          </div>
+          <div class="flow-step" id="flowProfile">
+            <span>3</span>
+            <strong>重み調整</strong>
+            <small>tech / news / 条件</small>
+          </div>
+          <div class="flow-step" id="flowMl">
+            <span>4</span>
+            <strong>ML</strong>
+            <small>GBDT + 較正</small>
+          </div>
+          <div class="flow-step" id="flowPromotion">
+            <span>5</span>
+            <strong>昇格</strong>
+            <small>shadow / paper / live</small>
+          </div>
+        </section>
+        <div class="view-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>学習重み</h2>
+              <span id="learningGenerated" class="subtle">未生成</span>
             </div>
-          </details>
-        </article>
+            <div class="weight-row">
+              <div>
+                <span>テクニカル</span>
+                <strong id="techWeight">55%</strong>
+              </div>
+              <div class="bar-track"><div id="techWeightBar" class="bar-fill green"></div></div>
+            </div>
+            <div class="weight-row">
+              <div>
+                <span>ニュース</span>
+                <strong id="newsWeight">45%</strong>
+              </div>
+              <div class="bar-track"><div id="newsWeightBar" class="bar-fill amber"></div></div>
+            </div>
+            <div class="split-kpis">
+              <div><span>Tech的中</span><strong id="techHit">--</strong></div>
+              <div><span>News的中</span><strong id="newsHit">--</strong></div>
+              <div><span>Brier</span><strong id="brierScore">--</strong></div>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>MLモデル</h2>
+              <span id="mlTrainedAt" class="subtle">未学習</span>
+            </div>
+            <div class="split-kpis">
+              <div><span>usable</span><strong id="mlUsable">false</strong></div>
+              <div><span>Brier</span><strong id="mlBrier">--</strong></div>
+              <div><span>基準</span><strong id="mlBaseBrier">--</strong></div>
+            </div>
+            <div id="importanceBars" class="bars compact"></div>
+            <p id="mlReasons" class="note"></p>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>Shadow仮説の還流</h2>
+              <span class="subtle">final判断とは分離</span>
+            </div>
+            <div id="shadowList" class="condition-list"></div>
+          </article>
+        </div>
       </section>
-    </main>
+      <section class="view" id="view-forensics" data-view="forensics" aria-label="外れた原因のフォレンジック" hidden>
+        <div class="view-head">
+          <h2 class="view-title">外れた原因のフォレンジック</h2>
+        </div>
+        <div class="view-grid">
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>市場条件別の学習結果</h2>
+              <span id="conditionChartTf" class="subtle">時間足別</span>
+            </div>
+            <p class="chart-note">どんな相場つき(RSI・ボラティリティ・時間足一致など)で当たり／外れが多かったか。</p>
+            <div id="conditionChart" class="condition-chart"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>苦手条件</h2>
+              <span class="subtle">減衰候補</span>
+            </div>
+            <div id="conditionList" class="condition-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>市場軸別の学習</h2>
+              <span class="subtle">session / regime</span>
+            </div>
+            <div id="dimensionList" class="condition-list"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>判断期待R監視</h2>
+              <span id="decisionMonitorUpdated" class="subtle">未生成</span>
+            </div>
+            <div class="trade-grid">
+              <div class="trade-status">
+                <span>health</span>
+                <strong id="decisionHealth">unknown</strong>
+                <small id="decisionExpectancy">期待R --</small>
+                <small id="decisionNetR">純R --</small>
+                <small id="decisionNetCoverage">label 0 / scored 0</small>
+                <small id="decisionCounts">scored 0 / cells 0</small>
+              </div>
+              <div>
+                <h3>見送り・減衰セル</h3>
+                <div id="decisionActionList" class="condition-list"></div>
+              </div>
+              <div>
+                <h3>失敗理由</h3>
+                <div id="decisionFailureList" class="condition-list"></div>
+              </div>
+            </div>
+            <div class="panel-subsection">
+              <h3>悪化セル</h3>
+              <div id="decisionWorstCells" class="condition-list"></div>
+            </div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>記録アクティビティ</h2>
+              <span class="subtle">直近48時間 / 方向別の記録件数</span>
+            </div>
+            <div class="legend" id="activityLegend"></div>
+            <div id="activityChart" class="chart-area"></div>
+          </article>
+        </div>
+      </section>
+      <section class="view" id="view-data" data-view="data" aria-label="データ基盤・処理系の健全性" hidden>
+        <div class="view-head">
+          <h2 class="view-title">データ基盤・処理系の健全性</h2>
+        </div>
+        <div class="view-grid">
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>判断入力の接続状態</h2>
+              <span class="subtle">macro / broker liquidity proxy</span>
+            </div>
+            <div id="inputContextList" class="condition-list"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>ファイル状態</h2>
+              <span id="readOnlyBadge" class="badge">read only</span>
+            </div>
+            <details class="secondary-details">
+              <summary>ファイル一覧を表示</summary>
+              <div id="fileList" class="file-list bounded-list"></div>
+            </details>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>最近の判断ログ</h2>
+              <span class="subtle">最新30件</span>
+            </div>
+            <details class="secondary-details">
+              <summary>最新30件を表示</summary>
+              <div class="table-wrap bounded-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>時刻</th>
+                      <th>ペア</th>
+                      <th>時間足</th>
+                      <th>方向</th>
+                      <th>確信度</th>
+                      <th>品質</th>
+                      <th>終値</th>
+                    </tr>
+                  </thead>
+                  <tbody id="recentRows"></tbody>
+                </table>
+              </div>
+            </details>
+          </article>
+        </div>
+      </section>
+      <section class="view" id="view-governance" data-view="governance" aria-label="モデル昇格と監査ガバナンス" hidden>
+        <div class="view-head">
+          <h2 class="view-title">モデル昇格と監査ガバナンス</h2>
+        </div>
+        <div class="view-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>委員の運用段階</h2>
+              <span id="promotionUpdated" class="subtle">未保存</span>
+            </div>
+            <div id="stageList" class="stage-list"></div>
+            <div id="promotionHistory" class="timeline"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>期待値・改善候補監視</h2>
+              <span id="tradeMonitorUpdated" class="subtle">未生成</span>
+            </div>
+            <div class="trade-grid">
+              <div class="trade-status">
+                <span>health</span>
+                <strong id="tradeHealth">unknown</strong>
+                <small id="tradeCounts">active 0 / approved 0 / paused 0</small>
+              </div>
+              <div>
+                <h3>承認待ち・自動停止</h3>
+                <div id="tradeActionList" class="condition-list"></div>
+              </div>
+              <div>
+                <h3>候補別の期待値</h3>
+                <div id="tradePolicyStats" class="condition-list"></div>
+              </div>
+            </div>
+            <div class="panel-subsection">
+              <h3>監査イベント</h3>
+              <div id="tradeEvents" class="timeline"></div>
+            </div>
+          </article>
+        </div>
+      </section>
+      </main>
+    </div>
     <script src="app.js"></script>
   </body>
 </html>

@@ -2294,6 +2294,43 @@ async function load() {
 
 $("refreshBtn").addEventListener("click", load);
 
+// ===== 左サイドバーによる6画面の切り替え =====
+const VIEW_EYEBROW = {
+  now: "現在の状況",
+  performance: "精度の検証",
+  learning: "学習の中身",
+  forensics: "外れた原因の分析",
+  data: "データ基盤",
+  governance: "昇格と監査",
+};
+
+function switchView(key) {
+  document.querySelectorAll(".view").forEach((section) => {
+    section.hidden = section.dataset.view !== key;
+  });
+  document.querySelectorAll(".nav-item").forEach((button) => {
+    const active = button.dataset.view === key;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const activeSection = document.querySelector(`.view[data-view="${key}"]`);
+  const title = activeSection?.getAttribute("aria-label") || "";
+  setText("topbarTitle", title);
+  setText("topbarEyebrow", VIEW_EYEBROW[key] || "");
+  try {
+    window.localStorage.setItem("fxDashboardView", key);
+  } catch (error) {
+    // localStorage が使えない環境(プライベートモード等)でも画面切り替えは動かす
+  }
+  // hidden の間は幅が 0 で canvas を描けないため、表示された時点で描き直す
+  if (lastCurve.length) drawCurve($("curveCanvas"), lastCurve);
+  window.scrollTo({ top: 0 });
+}
+
+document.querySelectorAll(".nav-item").forEach((button) => {
+  button.addEventListener("click", () => switchView(button.dataset.view));
+});
+
 // ウィンドウ幅が変わったら学習推移グラフだけ再描画(canvasは物理px依存のため)
 let curveResizeTimer = null;
 window.addEventListener("resize", () => {
@@ -2304,6 +2341,16 @@ window.addEventListener("resize", () => {
 $("logDir").addEventListener("keydown", (event) => {
   if (event.key === "Enter") load();
 });
+
+// 前回開いていた画面を復元する(再読み込みのたびに先頭画面へ戻らないように)
+let initialView = "now";
+try {
+  const saved = window.localStorage.getItem("fxDashboardView");
+  if (saved && document.querySelector(`.view[data-view="${saved}"]`)) initialView = saved;
+} catch (error) {
+  // 読めなければ既定の画面のまま
+}
+switchView(initialView);
 
 load();
 setInterval(load, 30000);
