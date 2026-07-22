@@ -834,6 +834,11 @@ const ANALYSIS_OUTCOME_LABEL = {
 // 選択中の時間足タブ("all" or "15m"/"1h"/"4h"/"1d")。5分ポーリングの
 // 再描画でも選択を維持する。
 let outcomeTabSelection = "all";
+// 選択中の銘柄タブ("all" or "USDJPY" 等)。時間足タブと同じく再描画で維持する。
+let outcomeSymbolSelection = "all";
+// 結果リストのページ番号(0始まり)。絞り込みを変えたら先頭に戻す。
+let outcomePage = 0;
+const OUTCOME_PAGE_SIZE = 20;
 
 function outcomeRowElement(row) {
   const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
@@ -957,10 +962,14 @@ function renderRecentOutcomes(data) {
   const target = $("recentOutcomes");
   if (!target) return;
   const tabs = $("outcomeTabs");
+  const symbolTabs = $("outcomeSymbolTabs");
   const summary = $("outcomeSummary");
+  const pager = $("outcomePager");
   target.replaceChildren();
   if (tabs) tabs.replaceChildren();
+  if (symbolTabs) symbolTabs.replaceChildren();
   if (summary) summary.replaceChildren();
+  if (pager) pager.replaceChildren();
 
   const groups = outcomeGroups(data);
   const availableTfs = TIMEFRAME_ORDER.filter((tf) => (groups[tf] || []).length);
@@ -970,6 +979,23 @@ function renderRecentOutcomes(data) {
   }
   if (outcomeTabSelection !== "all" && !availableTfs.includes(outcomeTabSelection)) {
     outcomeTabSelection = "all";
+  }
+
+  // 時間足タブで絞り込んだ後の行(銘柄タブの選択肢集計に使う)
+  const tfFilteredRows =
+    outcomeTabSelection === "all"
+      ? Object.values(groups).flat()
+      : groups[outcomeTabSelection] || [];
+  const bySymbolFilter = (rows) =>
+    outcomeSymbolSelection === "all"
+      ? rows
+      : rows.filter((row) => (row.symbol || "") === outcomeSymbolSelection);
+
+  const availableSymbols = Array.from(
+    new Set(tfFilteredRows.map((row) => row.symbol).filter(Boolean)),
+  ).sort();
+  if (outcomeSymbolSelection !== "all" && !availableSymbols.includes(outcomeSymbolSelection)) {
+    outcomeSymbolSelection = "all";
   }
 
   // 時間足タブ(すべて / 15分足 / 1時間足 / 4時間足 / 日足)
@@ -986,34 +1012,99 @@ function renderRecentOutcomes(data) {
       button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
       button.addEventListener("click", () => {
         outcomeTabSelection = key;
+        outcomeSymbolSelection = "all";
+        outcomePage = 0;
         renderRecentOutcomes(data);
       });
       tabs.appendChild(button);
     });
   }
 
-  // 選択中タブの集計チップ(直近の✅❌⚪と通算的中率)
+  // 銘柄タブ(すべて / USDJPY / EURUSD 等、選択中の時間足に存在するものだけ)
+  if (symbolTabs) {
+    const options = [["all", "すべて"], ...availableSymbols.map((sym) => [sym, sym])];
+    options.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab${outcomeSymbolSelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeSymbolSelection === key ? "true" : "false");
+      const rows =
+        key === "all" ? tfFilteredRows : tfFilteredRows.filter((row) => row.symbol === key);
+      const counts = outcomeCounts(rows);
+      button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
+      button.addEventListener("click", () => {
+        outcomeSymbolSelection = key;
+        outcomePage = 0;
+        renderRecentOutcomes(data);
+      });
+      symbolTabs.appendChild(button);
+    });
+  }
+
+  // 選択中タブの集計チップ(直近の✅❌⚪と通算的中率)。銘柄タブで絞り込んでいる間は
+  // 通算的中率の分母(by_timeframe)が銘柄横断のままになるため、そのチップは省く。
   const byTimeframe = data.evaluation?.by_timeframe || {};
   const analysisByTimeframe = data.evaluation?.analysis?.by_timeframe || {};
   if (summary) {
     const tfsToShow = outcomeTabSelection === "all" ? availableTfs : [outcomeTabSelection];
     tfsToShow.forEach((tf) => {
       summary.appendChild(
-        outcomeSummaryChip(tf, groups[tf] || [], byTimeframe, analysisByTimeframe),
+        outcomeSummaryChip(
+          tf,
+          bySymbolFilter(groups[tf] || []),
+          outcomeSymbolSelection === "all" ? byTimeframe : null,
+          outcomeSymbolSelection === "all" ? analysisByTimeframe : null,
+        ),
       );
     });
   }
 
-  // 結果リスト(新しい順)。「すべて」は全時間足を時刻でマージして20件まで
+  // 結果リスト(新しい順)。「すべて」は全時間足を時刻でマージする。
+  // 表示は20件区切りのページ送りにして、選択中の絞り込みに該当する全件を
+  // 一気に描画しない(件数が多いと重いのと、まず新しい判断から見たいため)。
   const parseTs = (row) => {
     const t = new Date(row.ts || 0).getTime();
     return Number.isNaN(t) ? 0 : t;
   };
-  const rows =
+  const allRows =
     outcomeTabSelection === "all"
-      ? Object.values(groups).flat().sort((a, b) => parseTs(b) - parseTs(a)).slice(0, 20)
-      : [...(groups[outcomeTabSelection] || [])].reverse();
-  rows.forEach((row) => target.appendChild(outcomeRowElement(row)));
+      ? bySymbolFilter(Object.values(groups).flat()).sort((a, b) => parseTs(b) - parseTs(a))
+      : [...bySymbolFilter(groups[outcomeTabSelection] || [])].reverse();
+  if (!allRows.length) {
+    target.appendChild(empty("この絞り込みに該当する判断はまだありません"));
+    return;
+  }
+  const pageCount = Math.max(1, Math.ceil(allRows.length / OUTCOME_PAGE_SIZE));
+  if (outcomePage >= pageCount) outcomePage = pageCount - 1;
+  if (outcomePage < 0) outcomePage = 0;
+  const pageStart = outcomePage * OUTCOME_PAGE_SIZE;
+  allRows
+    .slice(pageStart, pageStart + OUTCOME_PAGE_SIZE)
+    .forEach((row) => target.appendChild(outcomeRowElement(row)));
+
+  if (pager && pageCount > 1) {
+    const goToPage = (page) => {
+      outcomePage = page;
+      renderRecentOutcomes(data);
+    };
+    const prevButton = document.createElement("button");
+    prevButton.type = "button";
+    prevButton.className = "outcome-pager-btn";
+    prevButton.textContent = "← 前へ";
+    prevButton.disabled = outcomePage === 0;
+    prevButton.addEventListener("click", () => goToPage(outcomePage - 1));
+    const status = document.createElement("span");
+    status.className = "outcome-pager-status subtle";
+    status.textContent = `${outcomePage + 1} / ${pageCount} ページ（全${allRows.length}件）`;
+    const nextButton = document.createElement("button");
+    nextButton.type = "button";
+    nextButton.className = "outcome-pager-btn";
+    nextButton.textContent = "次へ →";
+    nextButton.disabled = outcomePage >= pageCount - 1;
+    nextButton.addEventListener("click", () => goToPage(outcomePage + 1));
+    pager.append(prevButton, status, nextButton);
+  }
 }
 
 function renderOps(data) {
