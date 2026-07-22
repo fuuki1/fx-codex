@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -349,3 +350,78 @@ def test_repo_default_config_is_valid(monitor):
         assert target.warn_after_seconds > target.expected_interval_seconds
         if target.critical_after_seconds is not None:
             assert target.critical_after_seconds > target.warn_after_seconds
+
+
+def test_report_is_written_before_notification_io(monitor, tmp_path):
+    """通知I/Oより先にレポートを書く。
+
+    fx_briefing側の鮮度ゲートは「レポート自体の経過秒数」でvetoするため、
+    通知が遅い/ハングしている間もレポートが更新されていないと、データが
+    新鮮でも全ペア・全時間足が中立へ落ちる。
+    """
+    config = _write_config(tmp_path)
+    _touch_jsonl(tmp_path, age_seconds=3000)
+    report_path = tmp_path / "logs" / "report.json"
+    seen: dict[str, object] = {}
+
+    def sender(_url, _payload):
+        # 送信中(=通知I/Oの最中)にレポートが既に存在し、判定が読めること
+        seen["exists"] = report_path.is_file()
+        if report_path.is_file():
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            seen["overall"] = payload.get("overall")
+            seen["pending"] = payload.get("notifications_pending")
+        return True
+
+    report = monitor.run_monitor(
+        tmp_path,
+        config,
+        tmp_path / "logs" / "state.json",
+        report_path,
+        now=NOW,
+        sender=sender,
+        notify=True,
+    )
+
+    assert seen["exists"] is True
+    assert seen["overall"] == "critical"  # 鮮度ゲートが必要とする判定が揃っている
+    assert seen["pending"] is True  # 通知結果が未確定であることを明示
+
+    # 送信後に結果を確定させたレポートで上書きされる
+    final = json.loads(report_path.read_text(encoding="utf-8"))
+    assert final["notifications"][0]["sent"] is True
+    assert "notifications_pending" not in final
+    assert report["overall"] == "critical"
+
+
+def test_slow_notification_does_not_age_the_report(monitor, tmp_path):
+    """通知が遅くても monitor_timestamp は書き出し直前の時刻になる。
+
+    実行開始時刻のままだと、通知に時間がかかった分だけ「生まれた瞬間から
+    古いレポート」になり、600秒のゲート閾値に対する余裕を自ら削ってしまう。
+    """
+    config = _write_config(tmp_path)
+    _touch_jsonl(tmp_path, age_seconds=3000)
+    report_path = tmp_path / "logs" / "report.json"
+
+    def slow_sender(_url, _payload):
+        # 通知に時間がかかる状況を模す
+        time.sleep(0.2)
+        return True
+
+    before = datetime.now(UTC)
+    monitor.run_monitor(
+        tmp_path,
+        config,
+        tmp_path / "logs" / "state.json",
+        report_path,
+        now=NOW,  # 過去日時を渡しても、実時刻で打刻される
+        sender=slow_sender,
+        notify=True,
+    )
+    after = datetime.now(UTC)
+
+    final = json.loads(report_path.read_text(encoding="utf-8"))
+    stamped = datetime.fromisoformat(str(final["monitor_timestamp"]))
+    assert stamped.tzinfo is not None  # aware UTCを維持
+    assert before <= stamped <= after
