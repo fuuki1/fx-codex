@@ -11,6 +11,10 @@ launchd(com.fx-codex.health)から5分間隔のワンショットで起動され
   logs/freshness_state.json に永続化し、プロセス再起動をまたいで重複抑止する
 - Discord送信失敗はWARNINGログを残すだけで監視自体は失敗させない
   (通知経路の障害がデータ収集や監視の停止に波及しない)
+- 通知の遅延も波及させない: レポートはDiscord送信より先に書き出し、
+  送信結果が出てから結果入りで上書きする。fx_briefing側の鮮度ゲートは
+  「レポート自体の経過秒数」でvetoするため、通知I/Oの遅さをレポートに
+  持ち込むと、データが新鮮でも全ペア・全時間足が中立へ落ちてしまう
 - 状態・レポートのJSON書込みは tmp→fsync→atomic rename で破損を防ぐ
 - 欠損は隠さない: 監視レポートに age_seconds / last_ok / 遷移履歴を必ず残す
 """
@@ -477,15 +481,45 @@ def run_monitor(
     sender: NotifySender | None = None,
     notify: bool = True,
 ) -> dict[str, object]:
-    """監視を1回実行し、レポートdictを返す(launchdから5分毎に呼ばれる)。"""
+    """監視を1回実行し、レポートdictを返す(launchdから5分毎に呼ばれる)。
+
+    判定結果のレポートはDiscord通知より先に書き出す。fx_briefing側の鮮度ゲート
+    (fx_intel/freshness.evaluate_freshness_report)は「レポート自体の経過秒数」で
+    veto するため、通知I/Oの遅延をレポートに持ち込むと、データが新鮮でも
+    レポートが古いという理由だけで全ペア・全時間足が中立へ落ちる。
+    """
     now = now or datetime.now(UTC)
     targets, cooldown = load_config(config_path)
     results = [check_target(target, root, now) for target in targets]
     states = load_states(state_path)
     new_states, notifications = evaluate(results, states, now, cooldown)
 
+    def build_report(sent: list[dict[str, object]], *, notify_pending: bool) -> dict[str, object]:
+        # monitor_timestampは書き出し直前に打つ。実行開始時刻のままだと、
+        # 通知に時間がかかった分だけ「生まれた瞬間から古いレポート」になる
+        report: dict[str, object] = {
+            "monitor_timestamp": datetime.now(UTC).isoformat(),
+            "host": socket.gethostname(),
+            "targets": [result.to_dict() for result in results],
+            "notifications": sent,
+            "overall": max(
+                (result.status for result in results),
+                key=lambda status: STATUS_ORDER[status],
+                default=STATUS_OK,
+            ),
+        }
+        if notify_pending:
+            # 通知結果が未確定であることを明示する。鮮度ゲートはoverallしか
+            # 見ないので、この中間レポートでもvetoの判断材料は揃っている
+            report["notifications_pending"] = True
+        return report
+
+    pending_notifications = bool(notify and notifications)
+    report = build_report([], notify_pending=pending_notifications)
+    atomic_write_json(report_path, report)
+
     sent: list[dict[str, object]] = []
-    if notify and notifications:
+    if pending_notifications:
         webhook_url = load_webhook_url(root)
         for notification in notifications:
             ok = False
@@ -507,18 +541,10 @@ def run_monitor(
                     notification.severity if notification.severity != "recovery" else STATUS_OK
                 )
                 state.last_notified_at = now.isoformat()
+        # 送信結果を確定させたレポートで上書きする(失敗も隠さず残す)
+        report = build_report(sent, notify_pending=False)
+        atomic_write_json(report_path, report)
 
-    report: dict[str, object] = {
-        "monitor_timestamp": now.isoformat(),
-        "host": socket.gethostname(),
-        "targets": [result.to_dict() for result in results],
-        "notifications": sent,
-        "overall": max(
-            (result.status for result in results),
-            key=lambda status: STATUS_ORDER[status],
-            default=STATUS_OK,
-        ),
-    }
     if notify:
         atomic_write_json(
             state_path,
@@ -527,7 +553,6 @@ def run_monitor(
                 "targets": {k: v.to_dict() for k, v in new_states.items()},
             },
         )
-    atomic_write_json(report_path, report)
     return report
 
 
