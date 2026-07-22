@@ -949,3 +949,44 @@ def test_timeframe_summary_exposes_symbols_and_conditions(server, tmp_path) -> N
         c["feature"] == "rsi_1h" and c["bucket"] == "中立圏(35-65)" for c in row["conditions"]
     )
     assert row["notes_ja"]
+
+
+def test_flat_counted_in_by_timeframe_and_by_symbol(server) -> None:
+    """小動き(flat)も時間足別・銘柄別の内訳に計上される。
+
+    flat は的中率の分母(evaluated)には入れないが、表示側は
+    「○ 小動き」として件数を出すため、内訳の flat が 0 のままだと
+    全体集計と時間足別集計が食い違う。
+    """
+    # 15m long: 15分後の変動が threshold(atr*0.1=0.005) 以下 → flat
+    entries = [
+        _row(START, "15m", 0.25, "long", 150.0, atr=0.05),
+        _row(START + timedelta(minutes=15), "15m", 0.25, "long", 150.001, atr=0.05),
+    ]
+    result = server._evaluate_journal(entries)
+
+    # 全体集計では flat として数えられている(既存の挙動)
+    assert result["flat"] == 1
+    assert result["evaluated"] == 0
+
+    # 内訳にも同じ1件が反映されること
+    assert result["by_timeframe"]["15m"] == {"evaluated": 0, "hits": 0, "flat": 1}
+    assert result["by_symbol"]["USDJPY"] == {"evaluated": 0, "hits": 0, "flat": 1}
+
+
+def test_flat_does_not_inflate_hit_rate_denominator(server) -> None:
+    """flat を内訳に足しても、的中率の分母は evaluated のままであること。"""
+    entries = [
+        # hit になる 15m
+        _row(START, "15m", 0.25, "long", 150.0, atr=0.05),
+        _row(START + timedelta(minutes=15), "15m", 0.25, "long", 150.5, atr=0.05),
+        # flat になる 15m
+        _row(START + timedelta(hours=1), "15m", 0.25, "long", 151.0, atr=0.05),
+        _row(START + timedelta(hours=1, minutes=15), "15m", 0.25, "long", 151.001, atr=0.05),
+    ]
+    result = server._evaluate_journal(entries)
+
+    cell = result["by_timeframe"]["15m"]
+    assert cell == {"evaluated": 1, "hits": 1, "flat": 1}
+    # 的中率は flat を含まない 1/1
+    assert result["hit_rate"] == 1.0

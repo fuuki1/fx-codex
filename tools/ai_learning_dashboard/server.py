@@ -731,20 +731,29 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             cost_r = _number(entry.get("execution_cost_r"))
             if cost_r is not None:
                 net_r = round(realized_r_atr - cost_r, 4)
+        # flat も内訳(by_symbol/by_timeframe)に計上する。的中率の分母は
+        # evaluated のままなので、flat を数えても hit_rate は変わらない。
+        stat = by_symbol.setdefault(symbol, {"evaluated": 0, "hits": 0, "flat": 0})
+        tf_stat = (
+            by_timeframe.setdefault(timeframe, {"evaluated": 0, "hits": 0, "flat": 0})
+            if timeframe
+            else None
+        )
         if abs(signed) <= threshold:
             flat += 1
             outcome = "flat"
+            stat["flat"] += 1
+            if tf_stat is not None:
+                tf_stat["flat"] += 1
         else:
             evaluated += 1
             if pit_eligible:
                 ml_pit_evaluated += 1
             hit = signed > 0
             hits += int(hit)
-            stat = by_symbol.setdefault(symbol, {"evaluated": 0, "hits": 0, "flat": 0})
             stat["evaluated"] += 1
             stat["hits"] += int(hit)
-            if timeframe:
-                tf_stat = by_timeframe.setdefault(timeframe, {"evaluated": 0, "hits": 0, "flat": 0})
+            if tf_stat is not None:
                 tf_stat["evaluated"] += 1
                 tf_stat["hits"] += int(hit)
             outcome = "hit" if hit else "miss"
