@@ -374,6 +374,189 @@ function renderFlow(data) {
   );
 }
 
+// 直近描画したcurveを保持し、ウィンドウリサイズ時に再描画する(canvasは物理px依存)。
+let lastCurve = [];
+
+function cssVar(name, fallback) {
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function renderCurve(data) {
+  const curve = Array.isArray(data.evaluation?.curve) ? data.evaluation.curve : [];
+  lastCurve = curve;
+  const canvas = $("curveCanvas");
+  const emptyEl = $("curveEmpty");
+  const summaryEl = $("curveSummary");
+  if (!canvas) return;
+
+  if (!curve.length) {
+    canvas.hidden = true;
+    if (emptyEl) emptyEl.hidden = false;
+    if (summaryEl) summaryEl.textContent = "採点待ち";
+    return;
+  }
+  canvas.hidden = false;
+  if (emptyEl) emptyEl.hidden = true;
+
+  const last = curve[curve.length - 1];
+  if (summaryEl) {
+    let summary = `採点 ${last.scored}件 / 累積的中率 ${pct(last.hit_rate)}`;
+    if ((last.net_r_points || 0) > 0) {
+      const netR = Number(last.cum_net_r);
+      summary += ` / 純R ${(netR >= 0 ? "+" : "") + netR.toFixed(2)}R(${last.net_r_points}件)`;
+    }
+    summaryEl.textContent = summary;
+  }
+  drawCurve(canvas, curve);
+}
+
+function drawCurve(canvas, curve) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // 高解像度対応: CSSサイズ×devicePixelRatio の物理pxで描く
+  const ratio = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 640;
+  const cssHeight = 240;
+  canvas.width = Math.round(cssWidth * ratio);
+  canvas.height = Math.round(cssHeight * ratio);
+  canvas.style.height = `${cssHeight}px`;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const padL = 44;
+  const padR = 44;
+  const padT = 16;
+  const padB = 28;
+  const plotW = cssWidth - padL - padR;
+  const plotH = cssHeight - padT - padB;
+
+  const line = cssVar("--line", "#3c3f37");
+  const muted = cssVar("--muted", "#aaa79c");
+  const cyan = cssVar("--cyan", "#66b7c9");
+  const green = cssVar("--green", "#5dc98c");
+  const amber = cssVar("--amber", "#d6a64b");
+  const text = cssVar("--text", "#f3f1e9");
+
+  const n = curve.length;
+  const maxScored = Math.max(1, ...curve.map((p) => p.scored));
+  const xFor = (i) => padL + (n === 1 ? plotW / 2 : (plotW * i) / (n - 1));
+  const yRate = (rate) => padT + plotH * (1 - rate); // 0..1 を上下反転
+  const yScored = (s) => padT + plotH * (1 - s / maxScored);
+
+  // グリッド(0/25/50/75/100%)と左軸ラベル
+  ctx.strokeStyle = line;
+  ctx.fillStyle = muted;
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  ctx.textBaseline = "middle";
+  [0, 0.25, 0.5, 0.75, 1].forEach((r) => {
+    const y = yRate(r);
+    ctx.globalAlpha = r === 0.5 ? 0.55 : 0.25;
+    ctx.beginPath();
+    if (r === 0.5) ctx.setLineDash([4, 4]);
+    else ctx.setLineDash([]);
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
+    ctx.textAlign = "right";
+    ctx.fillText(`${Math.round(r * 100)}%`, padL - 8, y);
+  });
+
+  // 累積採点数の棒(薄いシアン)。右軸スケール
+  const barW = Math.max(2, Math.min(18, (plotW / n) * 0.5));
+  ctx.fillStyle = cyan;
+  ctx.globalAlpha = 0.22;
+  curve.forEach((p, i) => {
+    const x = xFor(i);
+    const y = yScored(p.scored);
+    ctx.fillRect(x - barW / 2, y, barW, padT + plotH - y);
+  });
+  ctx.globalAlpha = 1;
+  // 右軸(採点数)の上端ラベル
+  ctx.fillStyle = cyan;
+  ctx.textAlign = "left";
+  ctx.fillText(`${maxScored}件`, padL + plotW + 8, yScored(maxScored));
+  ctx.fillStyle = muted;
+  ctx.fillText("0", padL + plotW + 8, padT + plotH);
+
+  // 累積的中率の折れ線(緑)
+  ctx.strokeStyle = green;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  curve.forEach((p, i) => {
+    const x = xFor(i);
+    const y = yRate(p.hit_rate);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  // 各採点点のマーカー
+  ctx.fillStyle = green;
+  curve.forEach((p, i) => {
+    ctx.beginPath();
+    ctx.arc(xFor(i), yRate(p.hit_rate), n > 40 ? 1.5 : 3, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // 累積純R(コスト控除後)の折れ線(琥珀)。net_rを持つ採点があれば重畳する。
+  // 0を中心にした対称スケールで、儲かっているか(正/負)を同じ時間軸で見る。
+  const hasNetR = curve.some((p) => (p.net_r_points || 0) > 0);
+  if (hasNetR) {
+    const netVals = curve.map((p) => Number(p.cum_net_r) || 0);
+    const maxAbs = Math.max(0.5, ...netVals.map((v) => Math.abs(v)));
+    const yNet = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2); // -maxAbs..+maxAbs
+    // 0Rの基準線(琥珀の点線)
+    ctx.strokeStyle = amber;
+    ctx.globalAlpha = 0.35;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(padL, yNet(0));
+    ctx.lineTo(padL + plotW, yNet(0));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    // 累積純Rの線
+    ctx.strokeStyle = amber;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    curve.forEach((p, i) => {
+      const y = yNet(Number(p.cum_net_r) || 0);
+      if (i === 0) ctx.moveTo(xFor(i), y);
+      else ctx.lineTo(xFor(i), y);
+    });
+    ctx.stroke();
+    // 純R軸のレンジラベル(琥珀)。左軸(%)と重ならないよう plot 内側の左上/左下へ置く
+    ctx.fillStyle = amber;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(`純R +${maxAbs.toFixed(1)}`, padL + 4, padT + 2);
+    ctx.textBaseline = "bottom";
+    ctx.fillText(`-${maxAbs.toFixed(1)}`, padL + 4, padT + plotH - 2);
+  }
+
+  // 最新値のラベル
+  const lp = curve[curve.length - 1];
+  ctx.fillStyle = text;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.font = "600 12px system-ui, sans-serif";
+  ctx.fillText(pct(lp.hit_rate), padL + plotW, yRate(lp.hit_rate) - 6);
+  if (hasNetR) {
+    const netVals = curve.map((p) => Number(p.cum_net_r) || 0);
+    const maxAbs = Math.max(0.5, ...netVals.map((v) => Math.abs(v)));
+    const yNet = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2);
+    ctx.fillStyle = amber;
+    ctx.fillText(
+      `${(lp.cum_net_r >= 0 ? "+" : "") + Number(lp.cum_net_r).toFixed(2)}R`,
+      padL + plotW,
+      yNet(Number(lp.cum_net_r) || 0) - 6,
+    );
+  }
+}
+
 function renderMetrics(data) {
   setText("journalTotal", String(data.journal.total));
   setText(
@@ -651,50 +834,11 @@ const ANALYSIS_OUTCOME_LABEL = {
 // 選択中の時間足タブ("all" or "15m"/"1h"/"4h"/"1d")。5分ポーリングの
 // 再描画でも選択を維持する。
 let outcomeTabSelection = "all";
-let outcomeCategorySelection = "all";
-let outcomePeriodSelection = "recent";
-let outcomeHistoryPage = 1;
-let outcomeHistoryPayload = null;
-let outcomeHistoryRequestId = 0;
-let outcomeDashboardData = null;
-
-const OUTCOME_PERIOD_OPTIONS = [
-  ["recent", "直近"],
-  ["today", "今日"],
-  ["day_before_yesterday", "一昨日"],
-  ["last_week", "先週"],
-  ["all", "全期間"],
-];
-
-const OUTCOME_CATEGORY_OPTIONS = [
-  ["all", "すべて"],
-  ["pending", "採点中"],
-  ["scored", "採点結果"],
-  ["other", "対象外"],
-];
-const SCORED_OUTCOMES = new Set(["hit", "miss", "flat"]);
-
-function outcomeCategory(row) {
-  if (SCORED_OUTCOMES.has(row.outcome)) return "scored";
-  if (row.outcome === "pending") return "pending";
-  if (SCORED_OUTCOMES.has(row.analysis_outcome)) return "scored";
-  if (row.analysis_outcome === "pending") return "pending";
-  return "other";
-}
-
-function outcomeCategoryCounts(rows) {
-  const counts = { all: rows.length, pending: 0, scored: 0, other: 0 };
-  rows.forEach((row) => {
-    counts[outcomeCategory(row)] += 1;
-  });
-  return counts;
-}
-
-function formatOutcomePrice(symbol, value) {
-  const numeric = num(value);
-  if (numeric === null) return "--";
-  return numeric.toFixed(String(symbol || "").endsWith("JPY") ? 3 : 5);
-}
+// 選択中の銘柄タブ("all" or "USDJPY"等)。時間足タブと独立に絞り込む。
+let outcomeSymbolSelection = "all";
+// 判断リストのページ番号(0始まり)。時間足/銘柄タブを切り替えたら1ページ目に戻す。
+let outcomePage = 0;
+const OUTCOME_PAGE_SIZE = 20;
 
 function outcomeRowElement(row) {
   const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
@@ -744,17 +888,7 @@ function outcomeRowElement(row) {
   const move = document.createElement("span");
   move.className = "outcome-move";
   const moveValue = num(row.move ?? row.analysis_move);
-  const predictionValue = num(row.prediction_value);
-  const resultValue = num(row.result_value);
-  const resultText = resultValue === null
-    ? "待ち"
-    : formatOutcomePrice(row.symbol, resultValue);
-  const differenceText = moveValue === null
-    ? ""
-    : ` / 差 ${moveValue > 0 ? "+" : ""}${formatOutcomePrice(row.symbol, moveValue)}`;
-  move.textContent = predictionValue === null
-    ? (moveValue === null ? "--" : `差 ${moveValue > 0 ? "+" : ""}${formatOutcomePrice(row.symbol, moveValue)}`)
-    : `予想時値 ${formatOutcomePrice(row.symbol, predictionValue)} → 結果値 ${resultText}${differenceText}`;
+  move.textContent = moveValue === null ? "--" : `${moveValue > 0 ? "+" : ""}${moveValue}`;
   const ts = document.createElement("span");
   ts.className = "outcome-ts subtle";
   ts.textContent = shortDate(row.ts);
@@ -824,205 +958,16 @@ function outcomeSummaryChip(tf, rows, byTimeframe, analysisByTimeframe) {
   return chip;
 }
 
-function renderOutcomePeriodTabs(data) {
-  const target = $("outcomePeriodTabs");
-  if (!target) return;
-  target.replaceChildren();
-  OUTCOME_PERIOD_OPTIONS.forEach(([key, label]) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `outcome-tab outcome-period-tab${outcomePeriodSelection === key ? " active" : ""}`;
-    button.setAttribute("role", "tab");
-    button.setAttribute("aria-selected", outcomePeriodSelection === key ? "true" : "false");
-    button.textContent = label;
-    button.addEventListener("click", () => {
-      if (outcomePeriodSelection === key) return;
-      outcomePeriodSelection = key;
-      outcomeHistoryPage = 1;
-      outcomeHistoryPayload = null;
-      if (key === "recent") {
-        renderRecentOutcomes(data);
-      } else {
-        loadOutcomeHistory(data, 1);
-      }
-    });
-    target.appendChild(button);
-  });
-}
-
-function outcomeHistorySummaryChip(tf, summary, periodLabel) {
-  const chip = document.createElement("div");
-  chip.className = "outcome-chip";
-  const label = document.createElement("strong");
-  label.textContent = `${TIMEFRAME_LABEL[tf] || tf} / ${periodLabel}`;
-  const action = summary?.action || {};
-  const actionLine = document.createElement("span");
-  actionLine.className = "outcome-chip-recent";
-  actionLine.textContent = `判断: ✅${action.hit || 0} ❌${action.miss || 0} ○${action.flat || 0} ⏳${action.pending || 0}`;
-  const analysis = summary?.analysis || {};
-  const analysisLine = document.createElement("span");
-  analysisLine.className = "subtle";
-  analysisLine.textContent = `分析仮説 ${pct(summary?.analysis_hit_rate)} (${analysis.hit || 0}/${summary?.analysis_evaluated || 0}) / 小動き${analysis.flat || 0} / 未採点${analysis.pending || 0}`;
-  chip.append(label, actionLine, analysisLine);
-  return chip;
-}
-
-function outcomeHistoryMatches(payload) {
-  return payload
-    && payload.period === outcomePeriodSelection
-    && payload.timeframe === outcomeTabSelection
-    && payload.category === outcomeCategorySelection
-    && Number(payload.page) === outcomeHistoryPage;
-}
-
-async function loadOutcomeHistory(data, page = 1) {
-  outcomeDashboardData = data || outcomeDashboardData;
-  outcomeHistoryPage = Math.max(1, Number(page) || 1);
-  renderOutcomePeriodTabs(outcomeDashboardData);
-  const target = $("recentOutcomes");
-  const meta = $("outcomeHistoryMeta");
-  const pagination = $("outcomePagination");
-  $("outcomeTabs")?.replaceChildren();
-  $("outcomeCategoryTabs")?.replaceChildren();
-  $("outcomeSummary")?.replaceChildren();
-  if (target) {
-    target.replaceChildren(empty("履歴を集計中です…"));
-  }
-  if (meta) meta.textContent = "履歴を読み込み中";
-  if (pagination) pagination.hidden = true;
-
-  const params = new URLSearchParams({
-    period: outcomePeriodSelection,
-    timeframe: outcomeTabSelection,
-    category: outcomeCategorySelection,
-    page: String(outcomeHistoryPage),
-    pageSize: "50",
-  });
-  const logDir = outcomeDashboardData?.log_dir || state.logDir;
-  if (logDir) params.set("logDir", logDir);
-  const requestId = ++outcomeHistoryRequestId;
-  try {
-    const response = await fetch(`/api/outcome-history?${params.toString()}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = await response.json();
-    if (requestId !== outcomeHistoryRequestId || outcomePeriodSelection === "recent") return;
-    outcomeHistoryPayload = payload;
-    outcomeHistoryPage = Number(payload.page) || 1;
-    renderRecentOutcomes(outcomeDashboardData);
-  } catch (error) {
-    if (requestId !== outcomeHistoryRequestId) return;
-    console.error(error);
-    if (target) target.replaceChildren(empty(`履歴の読み込みに失敗しました: ${error.message}`));
-    if (meta) meta.textContent = "履歴を読み込めません";
-  }
-}
-
-function renderOutcomeHistory(data, payload) {
-  const target = $("recentOutcomes");
-  const tabs = $("outcomeTabs");
-  const categoryTabs = $("outcomeCategoryTabs");
-  const summary = $("outcomeSummary");
-  const meta = $("outcomeHistoryMeta");
-  const pagination = $("outcomePagination");
-  target.replaceChildren();
-  if (tabs) tabs.replaceChildren();
-  if (categoryTabs) categoryTabs.replaceChildren();
-  if (summary) summary.replaceChildren();
-
-  if (tabs) {
-    const options = [["all", "すべて"], ...TIMEFRAME_ORDER.map((tf) => [tf, TIMEFRAME_LABEL[tf] || tf])];
-    options.forEach(([key, label]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `outcome-tab${outcomeTabSelection === key ? " active" : ""}`;
-      button.setAttribute("role", "tab");
-      button.setAttribute("aria-selected", outcomeTabSelection === key ? "true" : "false");
-      button.textContent = `${label} ${payload.timeframe_counts?.[key] || 0}`;
-      button.addEventListener("click", () => {
-        outcomeTabSelection = key;
-        outcomeHistoryPayload = null;
-        loadOutcomeHistory(data, 1);
-      });
-      tabs.appendChild(button);
-    });
-  }
-
-  if (categoryTabs) {
-    OUTCOME_CATEGORY_OPTIONS.forEach(([key, label]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `outcome-tab outcome-category-tab${outcomeCategorySelection === key ? " active" : ""}`;
-      button.setAttribute("role", "tab");
-      button.setAttribute("aria-selected", outcomeCategorySelection === key ? "true" : "false");
-      button.textContent = `${label} ${payload.category_counts?.[key] || 0}`;
-      button.addEventListener("click", () => {
-        outcomeCategorySelection = key;
-        outcomeHistoryPayload = null;
-        loadOutcomeHistory(data, 1);
-      });
-      categoryTabs.appendChild(button);
-    });
-  }
-
-  if (summary) {
-    const tfsToShow = outcomeTabSelection === "all"
-      ? TIMEFRAME_ORDER.filter((tf) => Number(payload.timeframe_counts?.[tf] || 0) > 0)
-      : [outcomeTabSelection];
-    tfsToShow.forEach((tf) => {
-      summary.appendChild(
-        outcomeHistorySummaryChip(tf, payload.summaries?.[tf], payload.period_label || "履歴"),
-      );
-    });
-  }
-
-  const rows = payload.rows || [];
-  if (!rows.length) {
-    target.appendChild(empty("選択中の期間・分類に該当する判断はありません"));
-  } else {
-    rows.forEach((row) => target.appendChild(outcomeRowElement(row)));
-  }
-
-  if (meta) {
-    meta.textContent = `${payload.period_label || "履歴"} / ${payload.total_rows || 0}件 / ${payload.page || 1}/${payload.total_pages || 1}ページ（1ページ50件）`;
-  }
-  if (pagination) {
-    pagination.hidden = false;
-    const previous = $("outcomePrevPage");
-    const next = $("outcomeNextPage");
-    const pageLabel = $("outcomePageLabel");
-    previous.disabled = Number(payload.page) <= 1;
-    next.disabled = Number(payload.page) >= Number(payload.total_pages);
-    pageLabel.textContent = `${payload.page || 1} / ${payload.total_pages || 1}`;
-    previous.onclick = () => loadOutcomeHistory(data, Number(payload.page) - 1);
-    next.onclick = () => loadOutcomeHistory(data, Number(payload.page) + 1);
-  }
-}
-
 function renderRecentOutcomes(data) {
-  outcomeDashboardData = data;
-  renderOutcomePeriodTabs(data);
-  if (outcomePeriodSelection !== "recent") {
-    if (outcomeHistoryMatches(outcomeHistoryPayload)) {
-      renderOutcomeHistory(data, outcomeHistoryPayload);
-    } else {
-      loadOutcomeHistory(data, outcomeHistoryPage);
-    }
-    return;
-  }
-  outcomeHistoryRequestId += 1;
   const target = $("recentOutcomes");
   if (!target) return;
   const tabs = $("outcomeTabs");
-  const categoryTabs = $("outcomeCategoryTabs");
+  const symbolTabs = $("outcomeSymbolTabs");
   const summary = $("outcomeSummary");
-  const meta = $("outcomeHistoryMeta");
-  const pagination = $("outcomePagination");
   target.replaceChildren();
   if (tabs) tabs.replaceChildren();
-  if (categoryTabs) categoryTabs.replaceChildren();
+  if (symbolTabs) symbolTabs.replaceChildren();
   if (summary) summary.replaceChildren();
-  if (meta) meta.textContent = "各時間足の直近12件";
-  if (pagination) pagination.hidden = true;
 
   const groups = outcomeGroups(data);
   const availableTfs = TIMEFRAME_ORDER.filter((tf) => (groups[tf] || []).length);
@@ -1032,6 +977,23 @@ function renderRecentOutcomes(data) {
   }
   if (outcomeTabSelection !== "all" && !availableTfs.includes(outcomeTabSelection)) {
     outcomeTabSelection = "all";
+  }
+
+  // 時間足タブで絞り込んだ後の行(銘柄タブの選択肢集計に使う)
+  const tfFilteredRows =
+    outcomeTabSelection === "all"
+      ? Object.values(groups).flat()
+      : groups[outcomeTabSelection] || [];
+  const bySymbolFilter = (rows) =>
+    outcomeSymbolSelection === "all"
+      ? rows
+      : rows.filter((row) => (row.symbol || "") === outcomeSymbolSelection);
+
+  const availableSymbols = Array.from(
+    new Set(tfFilteredRows.map((row) => row.symbol).filter(Boolean)),
+  ).sort();
+  if (outcomeSymbolSelection !== "all" && !availableSymbols.includes(outcomeSymbolSelection)) {
+    outcomeSymbolSelection = "all";
   }
 
   // 時間足タブ(すべて / 15分足 / 1時間足 / 4時間足 / 日足)
@@ -1048,64 +1010,104 @@ function renderRecentOutcomes(data) {
       button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
       button.addEventListener("click", () => {
         outcomeTabSelection = key;
+        outcomeSymbolSelection = "all";
+        outcomePage = 0;
         renderRecentOutcomes(data);
       });
       tabs.appendChild(button);
     });
   }
 
-  // 選択中タブの集計チップ(直近の✅❌⚪と通算的中率)
+  // 銘柄タブ(すべて / USDJPY / EURUSD / GBPUSD 等、選択中の時間足に存在するものだけ)
+  if (symbolTabs) {
+    const options = [["all", "すべて"], ...availableSymbols.map((sym) => [sym, sym])];
+    options.forEach(([key, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `outcome-tab${outcomeSymbolSelection === key ? " active" : ""}`;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", outcomeSymbolSelection === key ? "true" : "false");
+      const rows = key === "all" ? tfFilteredRows : tfFilteredRows.filter((row) => row.symbol === key);
+      const counts = outcomeCounts(rows);
+      button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
+      button.addEventListener("click", () => {
+        outcomeSymbolSelection = key;
+        outcomePage = 0;
+        renderRecentOutcomes(data);
+      });
+      symbolTabs.appendChild(button);
+    });
+  }
+
+  // 選択中タブの集計チップ(直近の✅❌⚪と通算的中率)。銘柄タブで絞り込んでいる間は
+  // 通算的中率の分母(by_timeframe)が銘柄横断のままになるため、そのチップは省く。
   const byTimeframe = data.evaluation?.by_timeframe || {};
   const analysisByTimeframe = data.evaluation?.analysis?.by_timeframe || {};
   if (summary) {
     const tfsToShow = outcomeTabSelection === "all" ? availableTfs : [outcomeTabSelection];
     tfsToShow.forEach((tf) => {
+      const rows = bySymbolFilter(groups[tf] || []);
       summary.appendChild(
-        outcomeSummaryChip(tf, groups[tf] || [], byTimeframe, analysisByTimeframe),
+        outcomeSummaryChip(
+          tf,
+          rows,
+          outcomeSymbolSelection === "all" ? byTimeframe : null,
+          outcomeSymbolSelection === "all" ? analysisByTimeframe : null,
+        ),
       );
     });
   }
 
-  // 結果リスト(新しい順)。「すべて」は全時間足を時刻でマージして20件まで
-  const selectedRows = outcomeTabSelection === "all"
-    ? Object.values(groups).flat()
-    : [...(groups[outcomeTabSelection] || [])];
-
-  // 時間足ごとに「採点中 / 採点結果 / 対象外」を分ける。
-  // 中立・見送りでも分析仮説が採点済みなら「採点結果」に含める。
-  if (categoryTabs) {
-    const counts = outcomeCategoryCounts(selectedRows);
-    OUTCOME_CATEGORY_OPTIONS.forEach(([key, label]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `outcome-tab outcome-category-tab${outcomeCategorySelection === key ? " active" : ""}`;
-      button.setAttribute("role", "tab");
-      button.setAttribute("aria-selected", outcomeCategorySelection === key ? "true" : "false");
-      button.textContent = `${label} ${counts[key]}`;
-      button.addEventListener("click", () => {
-        outcomeCategorySelection = key;
-        renderRecentOutcomes(data);
-      });
-      categoryTabs.appendChild(button);
-    });
-  }
-
+  // 結果リスト(新しい順)。「すべて」は全時間足を時刻でマージする。
+  // 表示は20件区切りのページ送りにして、選択中の絞り込みに該当する全件を
+  // 一気に描画しない(件数が多いと重いのと、まず新しい判断から見たいため)。
   const parseTs = (row) => {
     const t = new Date(row.ts || 0).getTime();
     return Number.isNaN(t) ? 0 : t;
   };
-  const categoryRows = outcomeCategorySelection === "all"
-    ? selectedRows
-    : selectedRows.filter((row) => outcomeCategory(row) === outcomeCategorySelection);
-  const rows = outcomeTabSelection === "all"
-    ? categoryRows.sort((a, b) => parseTs(b) - parseTs(a)).slice(0, 20)
-    : categoryRows.reverse();
-  if (!rows.length) {
-    const selectedLabel = OUTCOME_CATEGORY_OPTIONS.find(([key]) => key === outcomeCategorySelection)?.[1];
-    target.appendChild(empty(`${selectedLabel || "選択中の分類"}に該当する判断はありません`));
+  const allRows =
+    outcomeTabSelection === "all"
+      ? bySymbolFilter(Object.values(groups).flat()).sort((a, b) => parseTs(b) - parseTs(a))
+      : [...bySymbolFilter(groups[outcomeTabSelection] || [])].reverse();
+  if (!allRows.length) {
+    target.appendChild(empty("この絞り込みに該当する判断はまだありません"));
+    const pager = $("outcomePager");
+    if (pager) pager.replaceChildren();
     return;
   }
-  rows.forEach((row) => target.appendChild(outcomeRowElement(row)));
+  const pageCount = Math.max(1, Math.ceil(allRows.length / OUTCOME_PAGE_SIZE));
+  if (outcomePage >= pageCount) outcomePage = pageCount - 1;
+  if (outcomePage < 0) outcomePage = 0;
+  const pageStart = outcomePage * OUTCOME_PAGE_SIZE;
+  const pageRows = allRows.slice(pageStart, pageStart + OUTCOME_PAGE_SIZE);
+  pageRows.forEach((row) => target.appendChild(outcomeRowElement(row)));
+
+  const pager = $("outcomePager");
+  if (pager) {
+    pager.replaceChildren();
+    if (pageCount > 1) {
+      const goToPage = (page) => {
+        outcomePage = page;
+        renderRecentOutcomes(data);
+      };
+      const prevButton = document.createElement("button");
+      prevButton.type = "button";
+      prevButton.className = "outcome-pager-btn";
+      prevButton.textContent = "← 前へ";
+      prevButton.disabled = outcomePage === 0;
+      prevButton.addEventListener("click", () => goToPage(outcomePage - 1));
+      const status = document.createElement("span");
+      status.className = "outcome-pager-status subtle";
+      status.textContent = `${outcomePage + 1} / ${pageCount} ページ（全${allRows.length}件）`;
+      const nextButton = document.createElement("button");
+      nextButton.type = "button";
+      nextButton.className = "outcome-pager-btn";
+      nextButton.textContent = "次へ →";
+      nextButton.disabled = outcomePage >= pageCount - 1;
+      nextButton.addEventListener("click", () => goToPage(outcomePage + 1));
+      pager.append(prevButton, status, nextButton);
+    }
+  }
 }
 
 function renderOps(data) {
@@ -1584,19 +1586,40 @@ function renderMatrixLegend() {
 // ===== 学習の中身: AIが書いた学習メモ =====
 const NOTE_TF_COLOR = { "15m": "#3987e5", "1h": "#1baf7a", "4h": "#c98500", "1d": "#9085e9", fusion: "#d55181" };
 
+// 実行ごとの履歴(notes_history)を優先して時系列カードにする。1時間おきの
+// briefing実行のたびに新しいカードが積み上がっていくので、「いつの分析か」
+// が一目で分かるようにタイムスタンプを添える。履歴がまだ無い(旧サーバ/
+// 初回起動直後)場合は、直近1回分だけのフォールバック表示に落ちる。
 function renderLearnedNotes(data) {
   const host = $("learnedNotes");
   if (!host) return;
   host.replaceChildren();
 
+  const history = data.learning?.notes_history;
   const cards = [];
-  (data.tf_learning?.timeframes || []).forEach((row) => {
-    const notes = (row.notes_ja || []).filter(Boolean);
-    if (notes.length) cards.push({ tf: row.timeframe, label: TF_LABEL[row.timeframe] || row.timeframe, notes });
-  });
-  const fusionNotes = (data.learning?.notes_ja || []).filter(Boolean);
-  if (data.learning?.source === "fusion" && fusionNotes.length) {
-    cards.push({ tf: "fusion", label: "融合1判断", notes: fusionNotes });
+  if (Array.isArray(history) && history.length) {
+    history.forEach((row) => {
+      const notes = (row.notes_ja || []).filter(Boolean);
+      if (!notes.length) return;
+      cards.push({
+        tf: row.timeframe || row.source || "fusion",
+        label: TF_LABEL[row.timeframe] || row.timeframe || (row.source === "fusion" ? "融合1判断" : row.source),
+        notes,
+        ts: row.generated_at,
+      });
+    });
+  } else {
+    // フォールバック: 履歴ファイルがまだ無い環境向けに、直近1回分だけ表示する
+    (data.tf_learning?.timeframes || []).forEach((row) => {
+      const notes = (row.notes_ja || []).filter(Boolean);
+      if (notes.length) {
+        cards.push({ tf: row.timeframe, label: TF_LABEL[row.timeframe] || row.timeframe, notes, ts: null });
+      }
+    });
+    const fusionNotes = (data.learning?.notes_ja || []).filter(Boolean);
+    if (data.learning?.source === "fusion" && fusionNotes.length) {
+      cards.push({ tf: "fusion", label: "融合1判断", notes: fusionNotes, ts: null });
+    }
   }
 
   if (!cards.length) {
@@ -1614,6 +1637,12 @@ function renderLearnedNotes(data) {
     pill.style.background = NOTE_TF_COLOR[card.tf] || "var(--viz-1)";
     pill.textContent = card.label;
     h4.appendChild(pill);
+    if (card.ts) {
+      const ts = document.createElement("span");
+      ts.className = "note-card-ts subtle";
+      ts.textContent = shortDate(card.ts);
+      h4.appendChild(ts);
+    }
     el.appendChild(h4);
     const ul = document.createElement("ul");
     card.notes.forEach((note) => {
@@ -1623,53 +1652,6 @@ function renderLearnedNotes(data) {
     });
     el.appendChild(ul);
     host.appendChild(el);
-  });
-}
-
-// ===== 直近1時間足の分析(毎時の判断結果を強調表示) =====
-function renderHourlyFocus(data) {
-  const totalRateEl = $("hourlyTotalRate");
-  const totalCountEl = $("hourlyTotalCount");
-  const barsHost = $("hourlySymbolBars");
-  if (!totalRateEl || !barsHost) return;
-
-  const row = (data.tf_learning?.timeframes || []).find((r) => r.timeframe === "1h");
-  setText("hourlyGenerated", shortDate(row?.generated_at || data.tf_learning?.generated_at));
-
-  if (!row || Number(row.evaluated || 0) === 0) {
-    totalRateEl.textContent = "--";
-    setText("hourlyTotalCount", "0 / 0 採点");
-    barsHost.replaceChildren();
-    barsHost.appendChild(
-      empty("1時間足の採点済み判断がまだありません(記録から約1時間後に反映されます)"),
-    );
-    return;
-  }
-
-  const evaluated = Number(row.evaluated || 0);
-  const hits = Number(row.hits || 0);
-  const rate = evaluated ? hits / evaluated : null;
-  totalRateEl.textContent = pct(rate);
-  setText("hourlyTotalCount", `${hits} / ${evaluated} 採点`);
-
-  barsHost.replaceChildren();
-  const symbols = (row.symbols || []).slice().sort((a, b) => (b.evaluated || 0) - (a.evaluated || 0));
-  if (!symbols.length) {
-    barsHost.appendChild(empty("ペア別の採点内訳がまだありません"));
-    return;
-  }
-  symbols.forEach((s) => {
-    const symEvaluated = Number(s.evaluated || 0);
-    const symHits = Number(s.hits || 0);
-    const symRate = symEvaluated ? symHits / symEvaluated : null;
-    barsHost.appendChild(
-      barRow(
-        s.symbol || "--",
-        symRate || 0,
-        `${pct(symRate)} (${symHits}/${symEvaluated})`,
-        symRate === null ? "amber" : symRate >= 0.5 ? "green" : "red",
-      ),
-    );
   });
 }
 
@@ -2066,79 +2048,95 @@ function conditionRow(c, featureLabel) {
 
 function renderMl(data) {
   setText("mlTrainedAt", shortDate(data.ml.trained_at));
-  setText("mlUsable", String(Boolean(data.ml.usable)));
-  const metrics = data.ml.metrics || {};
-  const brier = num(metrics.val_brier);
-  const base = num(metrics.baseline_brier);
-  setText("mlBrier", brier === null ? "--" : brier.toFixed(3));
-  setText("mlBaseBrier", base === null ? "--" : base.toFixed(3));
-  const returnHead = data.ml.return_head || {};
-  const returnSummary = returnHead.model
-    ? `純R shadow=${Boolean(returnHead.usable)} / RMSE ${num(returnHead.val_rmse)?.toFixed(3) || "--"} / DSR ${num(returnHead.dsr)?.toFixed(3) || "--"}`
-    : "純Rモデル未学習";
-  const reasons = data.ml.reasons || [];
+  const usable = Boolean(data.ml.usable);
   const training = data.ml.training || {};
-  const progress = data.ml.has_model
-    ? ""
-    : `融合24時間判断のPIT適格な初期件数ゲート: 4時間間引き後 ` +
-      `${training.eligible_after_thinning || 0} / ${training.minimum_required || 150}件` +
-      `（採点待ち ${training.pending || 0}件、旧形式除外 ${training.pit_ineligible || 0}件、` +
-      `通過後も追加検証あり）`;
-  const primaryReasons = reasons.length ? reasons : progress ? [progress] : [];
-  setText("mlReasons", [...primaryReasons, returnSummary].join(" / "));
+  const have = training.eligible_after_thinning || 0;
+  const need = training.minimum_required || 150;
+
+  // 状態バナー: 「使える/準備中」を一目で色分けして伝える
+  const banner = $("mlStatusBanner");
+  banner.replaceChildren();
+  const bannerEl = document.createElement("div");
+  bannerEl.className = `ml-status-banner-inner ${usable ? "is-good" : "is-waiting"}`;
+  const bannerTitle = document.createElement("strong");
+  bannerTitle.textContent = usable ? "AI予測: 判断に使用中" : "AI予測: 準備中（まだ判断には使われていません）";
+  bannerEl.appendChild(bannerTitle);
+  if (data.ml.has_model) {
+    const metrics = data.ml.metrics || {};
+    const brier = num(metrics.val_brier);
+    const base = num(metrics.baseline_brier);
+    const detail = document.createElement("span");
+    if (brier !== null && base !== null) {
+      const better = brier < base;
+      detail.textContent = `予測の外れ具合(小さいほど良い): ${brier.toFixed(3)}（当てずっぽうの基準 ${base.toFixed(3)} と比べて${better ? "良い" : "悪い"}）`;
+    } else {
+      detail.textContent = "モデルは作成済み、精度の検証はこれから";
+    }
+    bannerEl.appendChild(detail);
+  }
+  banner.appendChild(bannerEl);
+
+  // 進捗バー: 学習に必要な件数のうち、今どれだけ貯まっているか
+  const progressHost = $("mlProgress");
+  progressHost.replaceChildren();
+  if (!data.ml.has_model) {
+    const wrap = document.createElement("div");
+    wrap.className = "ml-progress-wrap";
+    const label = document.createElement("div");
+    label.className = "ml-progress-label";
+    const ratio = need ? Math.min(1, have / need) : 0;
+    const labelSpan = document.createElement("span");
+    labelSpan.textContent = "学習に使える判断ログ";
+    const labelStrong = document.createElement("strong");
+    labelStrong.textContent = `${have} / ${need} 件`;
+    label.append(labelSpan, labelStrong);
+    const track = document.createElement("div");
+    track.className = "bar-track";
+    const fill = document.createElement("div");
+    fill.className = "bar-fill cyan";
+    fill.style.width = `${Math.round(ratio * 100)}%`;
+    track.appendChild(fill);
+    wrap.append(label, track);
+    progressHost.appendChild(wrap);
+
+    const detailRows = document.createElement("div");
+    detailRows.className = "ml-progress-detail subtle";
+    const pending = training.pending || 0;
+    const ineligible = training.pit_ineligible || 0;
+    detailRows.textContent =
+      `内訳: 採点待ちがあと${pending}件、古い形式で対象外になったものが${ineligible}件` +
+      `${pending || ineligible ? "。これらが揃うと学習が始まります。" : ""}`;
+    progressHost.appendChild(detailRows);
+  }
+
+  // 収益(純R)予測モデルの状態(別モデル、方向予測とは別枠)
+  const returnHead = data.ml.return_head || {};
+  const reasons = data.ml.reasons || [];
+  const reasonsHost = $("mlReasons");
+  reasonsHost.replaceChildren();
+  if (reasons.length) {
+    const p = document.createElement("p");
+    p.textContent = `使われていない理由: ${reasons.join(" / ")}`;
+    reasonsHost.appendChild(p);
+  }
+  const returnP = document.createElement("p");
+  returnP.className = "subtle";
+  returnP.textContent = returnHead.model
+    ? `損益(純R)を予測するモデル: ${returnHead.usable ? "検証を通過し利用可能" : "作成済みだが検証待ち"}`
+    : "損益(純R)を予測するモデル: まだ学習されていません";
+  reasonsHost.appendChild(returnP);
 
   const target = $("importanceBars");
   target.replaceChildren();
   const rows = data.ml.importance || [];
-  renderHistoricalChart(data);
   if (!rows.length) {
-    target.appendChild(empty("特徴量重要度はまだありません"));
+    target.appendChild(empty("特徴量重要度はまだありません（モデル作成後に表示されます）"));
     return;
   }
   const max = Math.max(...rows.map((row) => row.value), 1);
   rows.forEach((row) => {
     target.appendChild(barRow(row.name, row.value / max, row.value.toFixed(3), "cyan"));
   });
-}
-
-function renderHistoricalChart(data) {
-  const target = $("historicalChartSummary");
-  target.replaceChildren();
-  const historical = data.historical_chart || {};
-  const cells = historical.cells || [];
-  if (!historical.exists || !cells.length) {
-    target.appendChild(empty("履歴bid/askデータを準備中です"));
-    return;
-  }
-  const head = document.createElement("div");
-  head.className = "condition-item";
-  const title = document.createElement("strong");
-  title.textContent = `${cells.length}セル / ${historical.stage || "shadow"}`;
-  const body = document.createElement("span");
-  const passed = cells.filter((cell) => cell.metrics?.beats_baseline).length;
-  body.textContent = `2020–23学習・2024検証・2025固定テスト / 基準超え ${passed}/${cells.length}`;
-  head.append(title, body);
-  target.appendChild(head);
-  cells.forEach((cell) => {
-    const row = document.createElement("div");
-    row.className = "condition-item";
-    const label = document.createElement("strong");
-    label.textContent = `${cell.pair || "--"} ${cell.timeframe || "--"}`;
-    const detail = document.createElement("span");
-    const metrics = cell.metrics || {};
-    const samples = cell.samples || {};
-    const brier = num(metrics.test_brier);
-    const baselineBrier = num(metrics.baseline_brier);
-    detail.textContent = `精度 ${pct(num(metrics.test_accuracy))} / Brier ${brier?.toFixed(3) || "--"} (基準 ${baselineBrier?.toFixed(3) || "--"}) / quote R ${signedR(num(metrics.mean_quote_r))} (選択n=${metrics.selected || 0}) / test n=${samples.test || 0}`;
-    row.append(label, detail);
-    target.appendChild(row);
-  });
-  const note = document.createElement("p");
-  note.className = "note";
-  note.textContent = historical.canonical_pure_r
-    ? "brokerコスト込み純R"
-    : "実bid/ask spread込み。broker commission/slippage未接続のため昇格不可。";
-  target.appendChild(note);
 }
 
 function renderConditions(data) {
@@ -2200,6 +2198,14 @@ function renderDimensions(data) {
   });
 }
 
+// producer(内部名) → 日本語の見出し・一言説明。実際の売買判断には使われて
+// いない「もしこのロジックだけで判断していたら」という仮想シナリオの名前。
+const SHADOW_PRODUCER_LABEL = {
+  fusion_raw: { title: "テクニカル+ニュース合成(採用中)", note: "実際の判断の元になっているスコア" },
+  macro: { title: "マクロ指標だけで判断したら", note: "VIX・金利差・USD指数などのみで判断" },
+  timeframe_raw: { title: "時間足別モードのスコアのみ", note: "時間足別ブリーフィングのスコアをそのまま使用" },
+};
+
 function renderShadow(data) {
   const target = $("shadowList");
   target.replaceChildren();
@@ -2208,24 +2214,65 @@ function renderShadow(data) {
   const rows = Object.entries(producers);
   markPanelEmpty(target, !rows.length);
   if (!rows.length) {
-    target.appendChild(empty("shadow仮説はまだ記録・採点されていません"));
+    target.appendChild(empty("シャドー判定の記録・採点はまだありません"));
     return;
   }
   rows.forEach(([producer, stat]) => {
     const div = document.createElement("div");
-    div.className = "condition-item";
+    div.className = "condition-item shadow-item";
+    const label = SHADOW_PRODUCER_LABEL[producer] || { title: producer, note: "" };
     const title = document.createElement("strong");
-    title.textContent = producer;
-    const body = document.createElement("span");
+    title.textContent = label.title;
+    div.appendChild(title);
+    if (label.note) {
+      const note = document.createElement("span");
+      note.className = "shadow-note subtle";
+      note.textContent = label.note;
+      div.appendChild(note);
+    }
+
+    const rate = num(stat.hit_rate);
+    const hitRow = document.createElement("div");
+    hitRow.className = "shadow-stat-row";
+    const hitLabel = document.createElement("span");
+    hitLabel.textContent = "方向の的中率";
+    const hitValue = document.createElement("strong");
+    hitValue.textContent = `${pct(stat.hit_rate)}（${stat.hits || 0}/${stat.effective || 0}件）`;
+    hitValue.style.color = hitColor(rate);
+    hitRow.append(hitLabel, hitValue);
+    div.appendChild(hitRow);
+
     const net = num(stat.net_expectancy_r);
+    if (net !== null) {
+      const netRow = document.createElement("div");
+      netRow.className = "shadow-stat-row";
+      const netLabel = document.createElement("span");
+      netLabel.textContent = "損益(純R)";
+      const netValue = document.createElement("strong");
+      netValue.textContent = `${net >= 0 ? "+" : ""}${net.toFixed(2)}R（${stat.net_labels || 0}件で算出）`;
+      netValue.style.color = net >= 0 ? "var(--green)" : "var(--red)";
+      netRow.append(netLabel, netValue);
+      div.appendChild(netRow);
+    }
+
+    const skipped = stat.abstained || 0;
+    if (skipped) {
+      const skipRow = document.createElement("small");
+      skipRow.className = "subtle";
+      skipRow.textContent = `様子見(見送り)扱い: ${skipped}件`;
+      div.appendChild(skipRow);
+    }
+
     const timeframeText = Object.entries(stat.by_timeframe || {})
-      .map(([timeframe, cell]) => `${timeframe}:${pct(cell.hit_rate)}(n=${cell.effective || 0})`)
+      .map(([timeframe, cell]) => `${TF_LABEL[timeframe] || timeframe} ${pct(cell.hit_rate)}（${cell.effective || 0}件）`)
       .join(" / ");
-    body.textContent = `${stat.active_version || "unknown"} / 方向 ${pct(stat.hit_rate)} (${stat.hits || 0}/${stat.effective || 0}) / ` +
-      `純R ${net === null ? "--" : `${net >= 0 ? "+" : ""}${net.toFixed(2)}R`} ` +
-      `(label ${stat.net_labels || 0}) / abstain ${stat.abstained || 0}` +
-      `${timeframeText ? ` / TF ${timeframeText}` : ""}`;
-    div.append(title, body);
+    if (timeframeText) {
+      const tfRow = document.createElement("small");
+      tfRow.className = "subtle";
+      tfRow.textContent = `時間足別: ${timeframeText}`;
+      div.appendChild(tfRow);
+    }
+
     target.appendChild(div);
   });
 }
@@ -2327,9 +2374,9 @@ function render(data) {
   $("logDir").value = state.logDir;
   renderReality(data);
   renderLearnedSummary(data);
-  renderHourlyFocus(data);
   renderMetrics(data);
   renderFlow(data);
+  renderCurve(data);
   renderWeights(data);
   renderStages(data);
   renderSymbolBars(data);
@@ -2351,6 +2398,11 @@ function render(data) {
   renderRecent(data);
 }
 
+// 直近の応答が数秒〜十数秒かかることがあるため、30秒ポーリングが前回の
+// fetchを追い越して同時に走らないようにする(SSHトンネル越しだと特に、
+// 重なったリクエストが片方 "Failed to fetch" になりやすい)。
+let loadInFlight = false;
+
 async function load() {
   if (window.location.protocol === "file:") {
     setReality({
@@ -2365,6 +2417,8 @@ async function load() {
     });
     return;
   }
+  if (loadInFlight) return;
+  loadInFlight = true;
   const logDir = $("logDir").value.trim();
   const url = logDir ? `/api/state?logDir=${encodeURIComponent(logDir)}` : "/api/state";
   $("refreshBtn").disabled = true;
@@ -2374,17 +2428,76 @@ async function load() {
     const data = await response.json();
     render(data);
   } catch (error) {
+    // 失敗のたびにalert()で割り込むと、応答が遅い環境でポップアップ地獄になる。
+    // コンソールに出しつつ画面上部の状態表示にだけ静かに反映する。
     console.error(error);
-    alert(`読み込みに失敗しました: ${error.message}`);
+    const badge = document.getElementById("realityBadge");
+    if (badge) badge.textContent = "読み込み失敗(再試行中)";
   } finally {
+    loadInFlight = false;
     $("refreshBtn").disabled = false;
   }
 }
 
 $("refreshBtn").addEventListener("click", load);
+
+// ===== 左サイドバーによる6画面の切り替え =====
+const VIEW_EYEBROW = {
+  now: "現在の状況",
+  performance: "精度の検証",
+  learning: "学習の中身",
+  forensics: "外れた原因の分析",
+  data: "データ基盤",
+  governance: "昇格と監査",
+};
+
+function switchView(key) {
+  document.querySelectorAll(".view").forEach((section) => {
+    section.hidden = section.dataset.view !== key;
+  });
+  document.querySelectorAll(".nav-item").forEach((button) => {
+    const active = button.dataset.view === key;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const activeSection = document.querySelector(`.view[data-view="${key}"]`);
+  const title = activeSection?.getAttribute("aria-label") || "";
+  setText("topbarTitle", title);
+  setText("topbarEyebrow", VIEW_EYEBROW[key] || "");
+  try {
+    window.localStorage.setItem("fxDashboardView", key);
+  } catch (error) {
+    // localStorage が使えない環境(プライベートモード等)でも画面切り替えは動かす
+  }
+  // hidden の間は幅が 0 で canvas を描けないため、表示された時点で描き直す
+  if (lastCurve.length) drawCurve($("curveCanvas"), lastCurve);
+  window.scrollTo({ top: 0 });
+}
+
+document.querySelectorAll(".nav-item").forEach((button) => {
+  button.addEventListener("click", () => switchView(button.dataset.view));
+});
+
+// ウィンドウ幅が変わったら学習推移グラフだけ再描画(canvasは物理px依存のため)
+let curveResizeTimer = null;
+window.addEventListener("resize", () => {
+  if (!lastCurve.length) return;
+  window.clearTimeout(curveResizeTimer);
+  curveResizeTimer = window.setTimeout(() => drawCurve($("curveCanvas"), lastCurve), 150);
+});
 $("logDir").addEventListener("keydown", (event) => {
   if (event.key === "Enter") load();
 });
+
+// 前回開いていた画面を復元する(再読み込みのたびに先頭画面へ戻らないように)
+let initialView = "now";
+try {
+  const saved = window.localStorage.getItem("fxDashboardView");
+  if (saved && document.querySelector(`.view[data-view="${saved}"]`)) initialView = saved;
+} catch (error) {
+  // 読めなければ既定の画面のまま
+}
+switchView(initialView);
 
 load();
 setInterval(load, 30000);

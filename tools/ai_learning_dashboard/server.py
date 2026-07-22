@@ -15,15 +15,12 @@ import math
 import mimetypes
 import os
 import subprocess
-import threading
-import time
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
-from zoneinfo import ZoneInfo
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
@@ -45,6 +42,11 @@ DECISION_MONITOR_FILE = "decision_expectancy_monitor.json"
 # 時間足別モード(fx_briefing --per-timeframe)の記録
 TF_JOURNAL_FILE = "briefing_tf_journal.jsonl"
 TF_LEARNING_FILE = "briefing_tf_learning.json"
+# 「AIが書いた学習メモ」の実行ごとの履歴(fx_briefing.pyが追記専用で書く)。
+# briefing_learning.json / briefing_tf_learning.json は上書きのため直近1回分
+# しか持たないが、こちらは時系列に並べて表示するための追記ログ。
+LEARNING_NOTES_HISTORY_FILE = "briefing_learning_notes.jsonl"
+LEARNING_NOTES_HISTORY_LIMIT = 48
 # 5分ごとの価格スナップショット(fx_tf_snapshot.py)。短い足の採点窓に入る
 # 将来価格を密に供給する価格専用系列。採点の将来価格解決に使う(判断は無い)。
 TF_PRICES_FILE = "briefing_tf_prices.jsonl"
@@ -54,9 +56,7 @@ TF_PRICES_STALE_MINUTES = 15
 _TIMEFRAME_ORDER = {"15m": 0, "1h": 1, "4h": 2, "1d": 3}
 _HORIZON_ORDER = {
     label: index
-    for index, label in enumerate(
-        ("5m", "15m", "30m", "1h", "3h", "6h", "12h", "24h", "3d")
-    )
+    for index, label in enumerate(("5m", "15m", "30m", "1h", "3h", "6h", "12h", "24h", "3d"))
 }
 LAUNCHD_SERVICES = (
     ("snapshot_service", "価格スナップショット定期サービス", "com.fx-codex.snapshot"),
@@ -142,10 +142,7 @@ def _is_pit_eligible_fusion_row(entry: dict[str, Any]) -> bool:
     prediction = aware(entry.get("prediction_time"))
     source_cutoff = aware(entry.get("source_cutoff"))
     feature_available = aware(entry.get("max_feature_available_time"))
-    if any(
-        value is None
-        for value in (recorded, prediction, source_cutoff, feature_available)
-    ):
+    if any(value is None for value in (recorded, prediction, source_cutoff, feature_available)):
         return False
     assert recorded is not None
     assert prediction is not None
@@ -234,9 +231,7 @@ def _process_table(ps_output: str | None = None) -> list[dict[str, Any]]:
     return rows
 
 
-def _matching_processes(
-    rows: list[dict[str, Any]], needle: str
-) -> list[dict[str, Any]]:
+def _matching_processes(rows: list[dict[str, Any]], needle: str) -> list[dict[str, Any]]:
     return [
         {"pid": row["pid"], "command": row["command"]}
         for row in rows
@@ -246,9 +241,7 @@ def _matching_processes(
     ]
 
 
-def _runtime_process_status(
-    rows: list[dict[str, Any]], key: str, label: str, needle: str
-) -> dict:
+def _runtime_process_status(rows: list[dict[str, Any]], key: str, label: str, needle: str) -> dict:
     matches = _matching_processes(rows, needle)
     return {
         "key": key,
@@ -337,9 +330,7 @@ def _ops_status(
         _runtime_log_status(log_dir, JOURNAL_FILE, "融合1判断ログ", now),
         _runtime_log_status(log_dir, TF_JOURNAL_FILE, "時間足別判断ログ", now),
         _runtime_log_status(log_dir, TF_PRICES_FILE, "価格スナップショットログ", now),
-        _runtime_log_status(
-            log_dir, HORIZON_JOURNAL_FILE, "9ホライズンshadowログ", now
-        ),
+        _runtime_log_status(log_dir, HORIZON_JOURNAL_FILE, "9ホライズンshadowログ", now),
         _runtime_log_status(log_dir, TRADE_MONITOR_FILE, "改善候補監視JSON", now),
         _runtime_log_status(log_dir, DECISION_MONITOR_FILE, "判断期待R監視JSON", now),
     ]
@@ -360,9 +351,7 @@ def _ops_status(
                     "action_ja": f"{service}の状態とOperations runbookの復旧手順を確認してください",
                 }
             )
-    if file_exists.get(DECISION_LOG_FILE) and not file_exists.get(
-        DECISION_MONITOR_FILE
-    ):
+    if file_exists.get(DECISION_LOG_FILE) and not file_exists.get(DECISION_MONITOR_FILE):
         alerts.append(
             {
                 "severity": "warn",
@@ -477,18 +466,21 @@ def _future_close(
     # オープン時間は壁時計を超えないため、候補は壁時計で
     # [下限, 上限 + 週末クローズ1回分] に限られる
     window_lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
-    window_upper = (
-        ts + timedelta(hours=horizon_hours + tolerance_hours) + _WEEKEND_CLOSURE
-    )
+    window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + _WEEKEND_CLOSURE
     best: tuple[float, float] | None = None
     start_index = bisect_left(series, (window_lower, -math.inf))
     for point_ts, close in series[start_index:]:
         if point_ts > window_upper:
             break
         age = _open_hours_between(ts, point_ts)
-        if not (
-            horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours
-        ):
+        if age > horizon_hours + tolerance_hours:
+            # age は point_ts に対して単調非減少(_open_hours_betweenは終点が
+            # 後ろに行くほど経過時間が増える)。上限を超えたら以降の候補も
+            # 全て範囲外なので、壁時計側の window_upper より先に安全に打ち切れる。
+            # window_upper は週末クローズ分の余裕を持たせているため壁時計では
+            # まだ続く区間でも、オープン時間はここで頭打ちになることが多い。
+            break
+        if age < horizon_hours - tolerance_hours:
             continue
         gap = abs(age - horizon_hours)
         if best is None or gap < best[0]:
@@ -636,12 +628,8 @@ def _evaluate_analysis_hypotheses(
             "direction": direction,
             "conviction": _analysis_conviction_for_entry(entry),
             "outcome": outcome,
-            "prediction_value": close,
-            "result_value": future,
             "move": round(move, 6) if move is not None else None,
-            "source": (
-                "explicit" if entry.get("analysis_direction") else "composite_fallback"
-            ),
+            "source": "explicit" if entry.get("analysis_direction") else "composite_fallback",
         }
         outcomes.append(row)
         by_key[(ts_text, symbol, timeframe)] = row
@@ -660,11 +648,7 @@ def _evaluate_analysis_hypotheses(
     )
 
 
-def _evaluate_journal(
-    entries: list[dict[str, Any]],
-    *,
-    recent_per_timeframe: int | None = 12,
-) -> dict[str, Any]:
+def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
     # 価格系列は (symbol, timeframe) 別に持つ。timeframe を持たない旧スキーマ行は
     # timeframe="" のキー(融合1判断)に入り、従来どおり24h採点される。
     prices: dict[tuple[str, str], list[tuple[datetime, float]]] = {}
@@ -702,14 +686,11 @@ def _evaluate_journal(
         timeframe = str(entry.get("timeframe") or "").strip().lower()
         pit_eligible = _is_pit_eligible_fusion_row(entry) if not timeframe else False
         ts_text = ts.isoformat()
-        prediction_value = _number(entry.get("close"))
         display_base = {
             "ts": ts_text,
             "symbol": symbol,
             "timeframe": timeframe,
             "direction": direction,
-            "prediction_value": prediction_value,
-            "result_value": None,
             "analysis_direction": _analysis_direction_for_entry(entry),
             "analysis_conviction": _analysis_conviction_for_entry(entry),
             "analysis_score": _number(entry.get("composite")),
@@ -720,31 +701,22 @@ def _evaluate_journal(
         display_base["analysis_outcome"] = (
             analysis_result.get("outcome") if analysis_result else None
         )
-        display_base["analysis_move"] = (
-            analysis_result.get("move") if analysis_result else None
-        )
-        display_base["result_value"] = (
-            analysis_result.get("result_value") if analysis_result else None
-        )
+        display_base["analysis_move"] = analysis_result.get("move") if analysis_result else None
         if direction not in {"long", "short"}:
             if direction in {"neutral", "standby", "closed"} and symbol:
-                display_decisions.append(
-                    {**display_base, "outcome": direction, "move": None}
-                )
+                display_decisions.append({**display_base, "outcome": direction, "move": None})
             continue
         directional += 1
         if not timeframe and not pit_eligible:
             ml_pit_ineligible += 1
-        close = prediction_value
+        close = _number(entry.get("close"))
         atr = _number(entry.get("atr"))
         if close is None or not symbol:
             pending += 1
             if pit_eligible:
                 ml_pit_pending += 1
             if symbol:
-                display_decisions.append(
-                    {**display_base, "outcome": "pending", "move": None}
-                )
+                display_decisions.append({**display_base, "outcome": "pending", "move": None})
             continue
         # その足の主ホライズンで採点(旧スキーマ行=24h)
         horizon = _number(entry.get("horizon_hours")) or 24.0
@@ -758,13 +730,19 @@ def _evaluate_journal(
             pending += 1
             if pit_eligible:
                 ml_pit_pending += 1
-            display_decisions.append(
-                {**display_base, "outcome": "pending", "move": None}
-            )
+            display_decisions.append({**display_base, "outcome": "pending", "move": None})
             continue
         move = future - close
         signed = move if direction == "long" else -move
         threshold = (atr or 0.0) * 0.1
+        # 収益R: 判断方向の値動きをATR換算(=learning.move_atr相当)し、判断時に保存した
+        # 執行コスト(R換算)を引いてコスト控除後の実現Rにする。atr・コストが揃う時だけ。
+        net_r: float | None = None
+        if atr and atr > 0:
+            realized_r_atr = signed / atr
+            cost_r = _number(entry.get("execution_cost_r"))
+            if cost_r is not None:
+                net_r = round(realized_r_atr - cost_r, 4)
         if abs(signed) <= threshold:
             flat += 1
             outcome = "flat"
@@ -778,17 +756,15 @@ def _evaluate_journal(
             stat["evaluated"] += 1
             stat["hits"] += int(hit)
             if timeframe:
-                tf_stat = by_timeframe.setdefault(
-                    timeframe, {"evaluated": 0, "hits": 0, "flat": 0}
-                )
+                tf_stat = by_timeframe.setdefault(timeframe, {"evaluated": 0, "hits": 0, "flat": 0})
                 tf_stat["evaluated"] += 1
                 tf_stat["hits"] += int(hit)
             outcome = "hit" if hit else "miss"
         outcome_row = {
             **display_base,
             "outcome": outcome,
-            "result_value": future,
             "move": round(move, 6),
+            "net_r": net_r,
         }
         outcomes.append(outcome_row)
         display_decisions.append(outcome_row)
@@ -803,19 +779,14 @@ def _evaluate_journal(
         "by_timeframe": by_timeframe,
         "analysis": analysis_evaluation,
         "recent_outcomes": outcomes[-20:],
+        "curve": _learning_curve(outcomes),
         # 時間足タブ表示用。全体の直近20件だけだと特定の時間足が数件しか
         # 残らないため、時間足ごとに直近12件ずつ保持する(UIはこちらを優先し、
         # 無ければrecent_outcomesを自前でグルーピングして後方互換)。
-        "recent_outcomes_by_timeframe": _recent_outcomes_by_timeframe(
-            outcomes,
-            per_timeframe=recent_per_timeframe,
-        ),
+        "recent_outcomes_by_timeframe": _recent_outcomes_by_timeframe(outcomes),
         # 表示専用。的中率や学習件数には混ぜず、方向判断だけでなく
         # neutral / standby / closed / 未成熟も時間足ごとに保持する。
-        "recent_decisions_by_timeframe": _recent_outcomes_by_timeframe(
-            display_decisions,
-            per_timeframe=recent_per_timeframe,
-        ),
+        "recent_decisions_by_timeframe": _recent_outcomes_by_timeframe(display_decisions),
         "ml_eligible_after_thinning": _thinned_outcome_count(outcomes),
         "ml_pit_evaluated": ml_pit_evaluated,
         "ml_pit_pending": ml_pit_pending,
@@ -824,224 +795,22 @@ def _evaluate_journal(
 
 
 def _recent_outcomes_by_timeframe(
-    outcomes: list[dict[str, Any]], per_timeframe: int | None = 12
+    outcomes: list[dict[str, Any]], per_timeframe: int = 300
 ) -> dict[str, list[dict[str, Any]]]:
-    """満期採点済みの結果を時間足ごとに直近per_timeframe件ずつ返す。"""
+    """満期採点済みの結果を時間足ごとに直近per_timeframe件ずつ返す。
+
+    300件は15分足で約3日分(1日あたり市場休場を除き約80〜96件)をカバーする
+    目安。直近数日分をタブで通しで見たいという要望から12件→300件に拡大。
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in outcomes:
         timeframe = str(row.get("timeframe") or "")
         if not timeframe:
             continue
         grouped.setdefault(timeframe, []).append(row)
-    sorted_groups = {
-        timeframe: sorted(rows, key=lambda row: str(row.get("ts") or ""))
+    return {
+        timeframe: sorted(rows, key=lambda row: str(row.get("ts") or ""))[-per_timeframe:]
         for timeframe, rows in grouped.items()
-    }
-    if per_timeframe is None:
-        return sorted_groups
-    return {
-        timeframe: rows[-per_timeframe:] for timeframe, rows in sorted_groups.items()
-    }
-
-
-_HISTORY_CACHE_TTL_SECONDS = 60.0
-_HISTORY_CACHE_LOCK = threading.Lock()
-_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_HISTORY_TIMEZONE = ZoneInfo("Asia/Tokyo")
-_HISTORY_PERIOD_LABELS = {
-    "today": "今日",
-    "day_before_yesterday": "一昨日",
-    "last_week": "先週",
-    "all": "全期間",
-}
-
-
-def _history_period_bounds(
-    period: str,
-    *,
-    now: datetime | None = None,
-) -> tuple[datetime | None, datetime | None]:
-    """Return a JST calendar window converted to aware UTC boundaries."""
-    current = now or datetime.now(UTC)
-    if current.tzinfo is None:
-        raise ValueError("history now must be timezone-aware")
-    local_now = current.astimezone(_HISTORY_TIMEZONE)
-    today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if period == "today":
-        start, end = today_start, today_start + timedelta(days=1)
-    elif period == "day_before_yesterday":
-        start, end = today_start - timedelta(days=2), today_start - timedelta(days=1)
-    elif period == "last_week":
-        this_week_start = today_start - timedelta(days=today_start.weekday())
-        start, end = this_week_start - timedelta(days=7), this_week_start
-    elif period == "all":
-        return None, None
-    else:
-        raise ValueError(f"unsupported history period: {period}")
-    return start.astimezone(UTC), end.astimezone(UTC)
-
-
-def _history_outcome_category(row: Mapping[str, Any]) -> str:
-    scored = {"hit", "miss", "flat"}
-    if row.get("outcome") in scored:
-        return "scored"
-    if row.get("outcome") == "pending":
-        return "pending"
-    if row.get("analysis_outcome") in scored:
-        return "scored"
-    if row.get("analysis_outcome") == "pending":
-        return "pending"
-    return "other"
-
-
-def _history_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    action = {
-        key: 0
-        for key in ("hit", "miss", "flat", "pending", "neutral", "standby", "closed")
-    }
-    analysis = {key: 0 for key in ("hit", "miss", "flat", "pending")}
-    for row in rows:
-        outcome = str(row.get("outcome") or "")
-        analysis_outcome = str(row.get("analysis_outcome") or "")
-        if outcome in action:
-            action[outcome] += 1
-        if analysis_outcome in analysis:
-            analysis[analysis_outcome] += 1
-    action_evaluated = action["hit"] + action["miss"]
-    analysis_evaluated = analysis["hit"] + analysis["miss"]
-    return {
-        "rows": len(rows),
-        "action": action,
-        "action_evaluated": action_evaluated,
-        "action_hit_rate": (
-            action["hit"] / action_evaluated if action_evaluated else None
-        ),
-        "analysis": analysis,
-        "analysis_evaluated": analysis_evaluated,
-        "analysis_hit_rate": (
-            analysis["hit"] / analysis_evaluated if analysis_evaluated else None
-        ),
-    }
-
-
-def _all_history_rows(log_dir: Path) -> list[dict[str, Any]]:
-    cache_key = str(log_dir)
-    with _HISTORY_CACHE_LOCK:
-        now_monotonic = time.monotonic()
-        cached = _HISTORY_CACHE.get(cache_key)
-        if cached and cached[0] > now_monotonic:
-            return cached[1]
-        # Single-flight: rapid period/tab clicks reuse one scoring pass instead of
-        # running several expensive evaluations concurrently.
-        decisions = _read_journal(log_dir / TF_JOURNAL_FILE)
-        prices = _read_journal(log_dir / TF_PRICES_FILE)
-        evaluated = _evaluate_journal(
-            decisions + prices,
-            recent_per_timeframe=None,
-        )
-        grouped = evaluated.get("recent_decisions_by_timeframe", {})
-        rows = [
-            dict(row)
-            for timeframe_rows in grouped.values()
-            for row in timeframe_rows
-            if isinstance(row, dict)
-        ]
-        rows.sort(key=lambda row: str(row.get("ts") or ""), reverse=True)
-        _HISTORY_CACHE[cache_key] = (
-            time.monotonic() + _HISTORY_CACHE_TTL_SECONDS,
-            rows,
-        )
-        return rows
-
-
-def build_outcome_history(
-    log_dir: Path,
-    *,
-    period: str = "today",
-    timeframe: str = "all",
-    category: str = "all",
-    page: int = 1,
-    page_size: int = 50,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    """Build a bounded, server-paginated view of historical timeframe outcomes."""
-    if period not in _HISTORY_PERIOD_LABELS:
-        period = "today"
-    if timeframe not in {"all", "15m", "1h", "4h", "1d"}:
-        timeframe = "all"
-    if category not in {"all", "pending", "scored", "other"}:
-        category = "all"
-    page_size = max(1, min(int(page_size), 100))
-    page = max(1, int(page))
-
-    start, end = _history_period_bounds(period, now=now)
-    all_rows = _all_history_rows(log_dir)
-    period_rows: list[dict[str, Any]] = []
-    for row in all_rows:
-        stamp = _parse_ts(row.get("ts"))
-        if stamp is None:
-            continue
-        if start is not None and stamp < start:
-            continue
-        if end is not None and stamp >= end:
-            continue
-        period_rows.append(row)
-
-    timeframe_counts = {"all": len(period_rows), "15m": 0, "1h": 0, "4h": 0, "1d": 0}
-    for row in period_rows:
-        key = str(row.get("timeframe") or "")
-        if key in timeframe_counts:
-            timeframe_counts[key] += 1
-
-    timeframe_rows = (
-        period_rows
-        if timeframe == "all"
-        else [row for row in period_rows if row.get("timeframe") == timeframe]
-    )
-    category_counts = {
-        "all": len(timeframe_rows),
-        "pending": 0,
-        "scored": 0,
-        "other": 0,
-    }
-    for row in timeframe_rows:
-        category_counts[_history_outcome_category(row)] += 1
-    filtered_rows = (
-        timeframe_rows
-        if category == "all"
-        else [
-            row for row in timeframe_rows if _history_outcome_category(row) == category
-        ]
-    )
-
-    total_rows = len(filtered_rows)
-    total_pages = max(1, math.ceil(total_rows / page_size))
-    page = min(page, total_pages)
-    offset = (page - 1) * page_size
-    summaries = {
-        key: _history_summary(
-            period_rows
-            if key == "all"
-            else [row for row in period_rows if row.get("timeframe") == key]
-        )
-        for key in ("all", "15m", "1h", "4h", "1d")
-    }
-    return {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "period": period,
-        "period_label": _HISTORY_PERIOD_LABELS[period],
-        "period_start": start.isoformat() if start else None,
-        "period_end": end.isoformat() if end else None,
-        "timeframe": timeframe,
-        "category": category,
-        "page": page,
-        "page_size": page_size,
-        "total_rows": total_rows,
-        "total_pages": total_pages,
-        "timeframe_counts": timeframe_counts,
-        "category_counts": category_counts,
-        "summaries": summaries,
-        "rows": filtered_rows[offset : offset + page_size],
     }
 
 
@@ -1076,6 +845,46 @@ def _thinned_outcome_count(
     return kept
 
 
+def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """採点済み判断を時系列に並べ、累積の採点数と累積的中率の推移を返す。
+
+    学習プロファイル(briefing_learning.json)は毎回上書きされ履歴が残らないため、
+    「学習が進んでいるか」の推移は append-only の判断ログから再構築する。各点は
+    その判断までの累積で、flat(小動き)は的中率の分母から除く(hits/evaluated と同義)。
+    データが1日分でも点が増えるほど曲線が伸び、的中率が基準に収束していく様子が見える。
+
+    的中率(方向)に加え、コスト控除後の累積純R(cum_net_r)も持つ。的中率が高くても
+    薄利でコスト負けしていないか=「儲かっているか」を同じ時間軸で見るため。net_r は
+    execution_cost_r が保存された判断でだけ算出されるので、cum_net_r は net_r を持つ
+    採点のみを累積し、net_r_points にその件数を持たせる(欠損時は前値を据え置き)。
+    """
+    scored = sorted(
+        (o for o in outcomes if o.get("outcome") in {"hit", "miss"}),
+        key=lambda o: str(o.get("ts") or ""),
+    )
+    curve: list[dict[str, Any]] = []
+    cumulative_hits = 0
+    cumulative_net_r = 0.0
+    net_r_points = 0
+    for index, outcome in enumerate(scored, start=1):
+        cumulative_hits += int(outcome.get("outcome") == "hit")
+        net_r = outcome.get("net_r")
+        if isinstance(net_r, (int, float)):
+            cumulative_net_r += float(net_r)
+            net_r_points += 1
+        curve.append(
+            {
+                "ts": outcome.get("ts"),
+                "scored": index,
+                "hits": cumulative_hits,
+                "hit_rate": round(cumulative_hits / index, 4),
+                "cum_net_r": round(cumulative_net_r, 4),
+                "net_r_points": net_r_points,
+            }
+        )
+    return curve
+
+
 def _journal_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
     by_symbol: dict[str, int] = {}
     by_direction: dict[str, int] = {}
@@ -1104,9 +913,7 @@ def _journal_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
 _ACTIVITY_DIRECTIONS = ("long", "short", "neutral", "standby")
 
 
-def _journal_activity(
-    entries: list[dict[str, Any]], *, buckets: int = 48
-) -> dict[str, Any]:
+def _journal_activity(entries: list[dict[str, Any]], *, buckets: int = 48) -> dict[str, Any]:
     """判断ログを1時間刻みで集計し、方向別の積み上げ用データを返す。
 
     「どこで何を」学習しているかの前段として、記録がいつ・どの方向で・どの
@@ -1149,9 +956,7 @@ def _journal_activity(
     }
 
 
-def _symbol_rows(
-    learning: dict[str, Any], evaluated: dict[str, Any]
-) -> list[dict[str, Any]]:
+def _symbol_rows(learning: dict[str, Any], evaluated: dict[str, Any]) -> list[dict[str, Any]]:
     raw_stats = learning.get("symbol_stats")
     if not isinstance(raw_stats, dict):
         raw_stats = evaluated.get("by_symbol", {})
@@ -1325,8 +1130,7 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
         flat = int(raw_profile.get("flat", 0) or 0)
         row: dict[str, Any] = {
             "timeframe": str(timeframe),
-            "generated_at": raw_profile.get("generated_at")
-            or payload.get("generated_at"),
+            "generated_at": raw_profile.get("generated_at") or payload.get("generated_at"),
             "evaluated": evaluated,
             "hits": hits,
             "flat": flat,
@@ -1337,15 +1141,9 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "news_hit_rate": _number(raw_profile.get("news_hit_rate")),
             "conviction_brier": _number(raw_profile.get("conviction_brier")),
             "conviction_brier_base": _number(raw_profile.get("conviction_brier_base")),
-            "bins": (
-                raw_profile.get("bins")
-                if isinstance(raw_profile.get("bins"), list)
-                else []
-            ),
+            "bins": (raw_profile.get("bins") if isinstance(raw_profile.get("bins"), list) else []),
             "notes_ja": (
-                raw_profile.get("notes_ja")
-                if isinstance(raw_profile.get("notes_ja"), list)
-                else []
+                raw_profile.get("notes_ja") if isinstance(raw_profile.get("notes_ja"), list) else []
             ),
             # どのペア・どの市場条件で学習したか(採点実体)。融合1判断と同じ
             # 抽出器を各時間足プロファイルに適用する。
@@ -1451,9 +1249,7 @@ def _learning_payload(
             "notes_ja": [],
             "symbols": [],
             "conditions": [],
-            "dimensions": _dimension_rows_from_stats(
-                tf_learning.get("dimension_stats")
-            ),
+            "dimensions": _dimension_rows_from_stats(tf_learning.get("dimension_stats")),
         }
 
     stored_evaluated = _number(learning.get("evaluated"))
@@ -1482,9 +1278,7 @@ def _learning_payload(
         "conviction_brier_base": _number(learning.get("conviction_brier_base")),
         "bins": learning.get("bins") if isinstance(learning.get("bins"), list) else [],
         "notes_ja": (
-            learning.get("notes_ja")
-            if isinstance(learning.get("notes_ja"), list)
-            else []
+            learning.get("notes_ja") if isinstance(learning.get("notes_ja"), list) else []
         ),
         "symbols": _symbol_rows(learning, evaluated),
         "conditions": _condition_rows(learning),
@@ -1510,9 +1304,7 @@ def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
         }
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     raw_return_head = payload.get("return_head")
-    return_head: dict[str, Any] = (
-        raw_return_head if isinstance(raw_return_head, dict) else {}
-    )
+    return_head: dict[str, Any] = raw_return_head if isinstance(raw_return_head, dict) else {}
     importance = payload.get("importance_by_name")
     if not isinstance(importance, dict):
         importance = {}
@@ -1529,9 +1321,7 @@ def _ml_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "n_valid": int(payload.get("n_valid", 0) or 0),
         "base_rate": _number(payload.get("base_rate")),
         "metrics": metrics,
-        "reasons": (
-            payload.get("reasons") if isinstance(payload.get("reasons"), list) else []
-        ),
+        "reasons": (payload.get("reasons") if isinstance(payload.get("reasons"), list) else []),
         "importance": importance_rows[:12],
         "has_model": payload.get("model") is not None,
         "return_head": dict(return_head),
@@ -1544,9 +1334,7 @@ def _ml_training_progress(evaluated: dict[str, Any]) -> dict[str, Any]:
         "source": JOURNAL_FILE,
         "horizon_hours": 24,
         "evaluated": int(evaluated.get("ml_pit_evaluated", 0) or 0),
-        "eligible_after_thinning": int(
-            evaluated.get("ml_eligible_after_thinning", 0) or 0
-        ),
+        "eligible_after_thinning": int(evaluated.get("ml_eligible_after_thinning", 0) or 0),
         "pending": int(evaluated.get("ml_pit_pending", 0) or 0),
         "pit_ineligible": int(evaluated.get("ml_pit_ineligible", 0) or 0),
         "minimum_required": ML_MIN_TRAIN_ROWS,
@@ -1561,21 +1349,15 @@ def _historical_chart_summary(payload: dict[str, Any]) -> dict[str, Any]:
         for raw in raw_cells:
             if not isinstance(raw, dict):
                 continue
+            metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+            samples = raw.get("samples") if isinstance(raw.get("samples"), dict) else {}
             cells.append(
                 {
                     "pair": raw.get("pair"),
                     "timeframe": raw.get("timeframe"),
                     "stage": raw.get("stage", "shadow"),
-                    "samples": (
-                        raw.get("samples")
-                        if isinstance(raw.get("samples"), dict)
-                        else {}
-                    ),
-                    "metrics": (
-                        raw.get("metrics")
-                        if isinstance(raw.get("metrics"), dict)
-                        else {}
-                    ),
+                    "samples": samples,
+                    "metrics": metrics,
                 }
             )
     return {
@@ -1584,9 +1366,7 @@ def _historical_chart_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "stage": payload.get("stage", "shadow"),
         "source_contract": payload.get("source_contract"),
         "data_windows": (
-            payload.get("data_windows")
-            if isinstance(payload.get("data_windows"), dict)
-            else {}
+            payload.get("data_windows") if isinstance(payload.get("data_windows"), dict) else {}
         ),
         "operational_log_mixed": bool(payload.get("operational_log_mixed", False)),
         "promotion_admissible": bool(payload.get("promotion_admissible", False)),
@@ -1681,31 +1461,26 @@ def _trade_monitor_summary(
             return value
         return sum(1 for record in active if record.get("stage") == stage)
 
-    paper_ready = _list_from_payload(
-        monitor_registry, "paper_ready"
-    ) or _registry_records_by_stage(registry, "paper_ready")
-    approved = _list_from_payload(
-        monitor_registry, "approved"
-    ) or _registry_records_by_stage(registry, "approved")
-    auto_paused = _list_from_payload(
-        monitor_registry, "auto_paused"
-    ) or _registry_records_by_stage(registry, "auto_paused")
-    rejected = _list_from_payload(
-        monitor_registry, "rejected"
-    ) or _registry_records_by_stage(registry, "rejected")
+    paper_ready = _list_from_payload(monitor_registry, "paper_ready") or _registry_records_by_stage(
+        registry, "paper_ready"
+    )
+    approved = _list_from_payload(monitor_registry, "approved") or _registry_records_by_stage(
+        registry, "approved"
+    )
+    auto_paused = _list_from_payload(monitor_registry, "auto_paused") or _registry_records_by_stage(
+        registry, "auto_paused"
+    )
+    rejected = _list_from_payload(monitor_registry, "rejected") or _registry_records_by_stage(
+        registry, "rejected"
+    )
     recent_events = (
-        _list_from_payload(monitor, "recent_events")
-        or _list_from_payload(registry, "events")[-20:]
+        _list_from_payload(monitor, "recent_events") or _list_from_payload(registry, "events")[-20:]
     )
     return {
         "generated_at": monitor.get("generated_at") or registry.get("generated_at"),
-        "status": monitor.get("status")
-        or monitor.get("health", {}).get("status")
-        or "unknown",
+        "status": monitor.get("status") or monitor.get("health", {}).get("status") or "unknown",
         "exit_code": int(monitor.get("exit_code", 0) or 0),
-        "health": (
-            monitor.get("health") if isinstance(monitor.get("health"), dict) else {}
-        ),
+        "health": (monitor.get("health") if isinstance(monitor.get("health"), dict) else {}),
         "counts": {
             "active": int(monitor_registry.get("active_count", len(active)) or 0),
             "paper_ready": _count("paper_ready"),
@@ -1715,11 +1490,7 @@ def _trade_monitor_summary(
             "resolved": int(
                 monitor_registry.get(
                     "resolved_count",
-                    sum(
-                        1
-                        for record in records.values()
-                        if record.get("status") == "resolved"
-                    ),
+                    sum(1 for record in records.values() if record.get("status") == "resolved"),
                 )
                 or 0
             ),
@@ -1729,9 +1500,7 @@ def _trade_monitor_summary(
         "approved": approved[:10],
         "auto_paused": auto_paused[:10],
         "rejected": rejected[:10],
-        "approved_policy_stats": _list_from_payload(monitor, "approved_policy_stats")[
-            :20
-        ],
+        "approved_policy_stats": _list_from_payload(monitor, "approved_policy_stats")[:20],
         "recent_events": recent_events[-20:],
     }
 
@@ -1743,9 +1512,7 @@ def _decision_monitor_summary(
     summary = _mapping(monitor.get("summary"))
     overall = _mapping(summary.get("overall"))
     counts = _mapping(summary.get("action_counts"))
-    profile = (
-        monitor.get("profile") if isinstance(monitor.get("profile"), dict) else feedback
-    )
+    profile = monitor.get("profile") if isinstance(monitor.get("profile"), dict) else feedback
     raw_cells = _mapping(profile.get("cells") if isinstance(profile, dict) else None)
     cells = [dict(row) for row in raw_cells.values() if isinstance(row, dict)]
     rank = {
@@ -1756,9 +1523,7 @@ def _decision_monitor_summary(
         "collect_samples": 4,
     }
     actionable = [
-        row
-        for row in cells
-        if str(row.get("action")) in {"avoid", "dampen", "quality_guard"}
+        row for row in cells if str(row.get("action")) in {"avoid", "dampen", "quality_guard"}
     ]
     actionable.sort(
         key=lambda row: (
@@ -1817,9 +1582,7 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
     values = [float(row["realized_net_r"]) for row in labeled]
     cumulative = 0.0
     curve: list[dict[str, Any]] = []
-    for row, value in sorted(
-        zip(labeled, values), key=lambda item: str(item[0].get("ts", ""))
-    ):
+    for row, value in sorted(zip(labeled, values), key=lambda item: str(item[0].get("ts", ""))):
         cumulative += value
         curve.append(
             {
@@ -1874,9 +1637,7 @@ def _input_context_summary(
             for key, raw in masks.items():
                 name = str(key)
                 feature_total[name] = feature_total.get(name, 0) + 1
-                feature_available[name] = feature_available.get(name, 0) + int(
-                    bool(raw)
-                )
+                feature_available[name] = feature_available.get(name, 0) + int(bool(raw))
 
     contexts: dict[str, dict[str, Any]] = {}
     for event in decision_events:
@@ -1886,9 +1647,7 @@ def _input_context_summary(
         context = decision.get("input_context")
         if not isinstance(context, dict):
             continue
-        context_id = str(
-            context.get("context_id") or decision.get("input_context_id") or ""
-        )
+        context_id = str(context.get("context_id") or decision.get("input_context_id") or "")
         if context_id:
             contexts[context_id] = context
 
@@ -1928,9 +1687,7 @@ def _input_context_summary(
             {
                 "timeframe": timeframe,
                 **counts,
-                "coverage": (
-                    counts["context"] / counts["rows"] if counts["rows"] else 0.0
-                ),
+                "coverage": counts["context"] / counts["rows"] if counts["rows"] else 0.0,
             }
             for timeframe, counts in sorted(by_timeframe.items())
         ],
@@ -1963,9 +1720,7 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     return values[index]
 
 
-def _horizon_summary(
-    payload: dict[str, Any], entries: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _horizon_summary(payload: dict[str, Any], entries: list[dict[str, Any]]) -> dict[str, Any]:
     raw_profiles = payload.get("profiles")
     profiles = raw_profiles if isinstance(raw_profiles, dict) else {}
     rows: list[dict[str, Any]] = []
@@ -2021,7 +1776,7 @@ def _horizon_summary(
         }
         for (symbol, horizon), row in latest.items()
     ]
-    matrix.sort(key=lambda row: (row["symbol"], _HORIZON_ORDER.get(row["horizon"], 99)))
+    matrix.sort(key=lambda row: (str(row["symbol"]), _HORIZON_ORDER.get(str(row["horizon"]), 99)))
     return {
         "generated_at": payload.get("generated_at"),
         "contract": payload.get("contract", "horizon-pit-v1"),
@@ -2034,6 +1789,36 @@ def _horizon_summary(
         "latest": matrix,
         "journal_rows": len(entries),
     }
+
+
+def _learning_notes_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """「AIが書いた学習メモ」の実行ごとの履歴を新しい順に整形する。
+
+    fx_briefing.py が briefing_learning_notes.jsonl へ1行ずつ追記したものを
+    そのまま読み、壊れた行・空メモは除いて新しい順に並べる。無制限に肥大化
+    しても表示側が重くならないよう直近 LEARNING_NOTES_HISTORY_LIMIT 件に絞る。
+    """
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        generated_at = row.get("generated_at")
+        source = row.get("source")
+        timeframe = row.get("timeframe")
+        notes = row.get("notes_ja")
+        if not generated_at or not isinstance(notes, list):
+            continue
+        clean_notes = [str(note) for note in notes if note]
+        if not clean_notes:
+            continue
+        history.append(
+            {
+                "generated_at": str(generated_at),
+                "source": str(source or ""),
+                "timeframe": str(timeframe or ""),
+                "notes_ja": clean_notes,
+            }
+        )
+    history.sort(key=lambda row: row["generated_at"], reverse=True)
+    return history[:LEARNING_NOTES_HISTORY_LIMIT]
 
 
 def build_state(
@@ -2058,9 +1843,10 @@ def build_state(
     tf_journal_path = log_dir / TF_JOURNAL_FILE
     tf_learning_path = log_dir / TF_LEARNING_FILE
     tf_prices_path = log_dir / TF_PRICES_FILE
+    historical_chart_path = log_dir / HISTORICAL_CHART_FILE
     horizon_journal_path = log_dir / HORIZON_JOURNAL_FILE
     horizon_learning_path = log_dir / HORIZON_LEARNING_FILE
-    historical_chart_path = log_dir / HISTORICAL_CHART_FILE
+    learning_notes_history_path = log_dir / LEARNING_NOTES_HISTORY_FILE
 
     entries = _read_journal(journal_path)
     tf_entries = _read_journal(tf_journal_path)
@@ -2071,6 +1857,7 @@ def build_state(
     horizon_learning = _load_json(horizon_learning_path)
     learning = _load_json(learning_path)
     tf_learning = _timeframe_learning_summary(_load_json(tf_learning_path))
+    learning_notes_history = _learning_notes_history(_read_journal(learning_notes_history_path))
     ml = _load_json(ml_path)
     historical_chart = _load_json(historical_chart_path)
     promotion = _load_json(promotion_path)
@@ -2097,6 +1884,7 @@ def build_state(
 
     source = _learning_source(learning, tf_learning, evaluated)
     learning_payload = _learning_payload(learning, evaluated, tf_learning, source)
+    learning_payload["notes_history"] = learning_notes_history
     journal_summary = _journal_summary(entries + tf_entries)
     journal_summary["fusion_total"] = len(entries)
     journal_summary["timeframe_total"] = len(tf_entries)
@@ -2119,6 +1907,7 @@ def build_state(
         TF_PRICES_FILE: _file_status(tf_prices_path),
         HORIZON_JOURNAL_FILE: _file_status(horizon_journal_path),
         HORIZON_LEARNING_FILE: _file_status(horizon_learning_path),
+        LEARNING_NOTES_HISTORY_FILE: _file_status(learning_notes_history_path),
     }
 
     return {
@@ -2146,13 +1935,9 @@ def build_state(
         "historical_chart": _historical_chart_summary(historical_chart),
         "promotion": _promotion_summary(promotion),
         "trade_monitor": _trade_monitor_summary(trade_monitor, trade_registry),
-        "decision_monitor": _decision_monitor_summary(
-            decision_monitor, decision_feedback
-        ),
+        "decision_monitor": _decision_monitor_summary(decision_monitor, decision_feedback),
         "net_r": _net_r_summary(decision_outcomes),
-        "dimension_outcomes": _outcome_dimension_rows(
-            decision_outcomes.get("dimension_summary")
-        ),
+        "dimension_outcomes": _outcome_dimension_rows(decision_outcomes.get("dimension_summary")),
         "shadow": (
             dict(decision_outcomes.get("shadow_summary", {}))
             if isinstance(decision_outcomes.get("shadow_summary"), dict)
@@ -2173,34 +1958,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             log_dir = Path(raw_log_dir).expanduser().resolve()
             self._send_json(build_state(log_dir))
             return
-        if parsed.path == "/api/outcome-history":
-            query = parse_qs(parsed.query)
-            raw_log_dir = query.get("logDir", [str(self.server.log_dir)])[0]  # type: ignore[attr-defined]
-            log_dir = Path(raw_log_dir).expanduser().resolve()
-            try:
-                page = int(query.get("page", ["1"])[0])
-                page_size = int(query.get("pageSize", ["50"])[0])
-            except ValueError:
-                page, page_size = 1, 50
-            self._send_json(
-                build_outcome_history(
-                    log_dir,
-                    period=query.get("period", ["today"])[0],
-                    timeframe=query.get("timeframe", ["all"])[0],
-                    category=query.get("category", ["all"])[0],
-                    page=page,
-                    page_size=page_size,
-                )
-            )
-            return
         if parsed.path in {"", "/"}:
             self._send_file(STATIC_DIR / "index.html")
             return
         target = (STATIC_DIR / parsed.path.lstrip("/")).resolve()
-        if (
-            not str(target).startswith(str(STATIC_DIR.resolve()))
-            or not target.is_file()
-        ):
+        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
             return
         self._send_file(target)
@@ -2232,9 +1994,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Read-only fx_intel learning dashboard"
-    )
+    parser = argparse.ArgumentParser(description="Read-only fx_intel learning dashboard")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
