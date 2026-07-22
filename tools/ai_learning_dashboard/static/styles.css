@@ -45,10 +45,101 @@ body {
     "Yu Gothic", sans-serif;
 }
 
+/* ===== 左サイドバー + 本文の2カラムレイアウト ===== */
+.layout {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px 16px;
+  border-right: 1px solid var(--line);
+  background: #191a16;
+  overflow-y: auto;
+}
+
+.sidebar-brand h1 {
+  font-size: 19px;
+  line-height: 1.25;
+}
+
+.sidebar-nav {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: auto;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 130ms ease,
+    color 130ms ease;
+}
+
+.nav-item:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.nav-item.active {
+  color: var(--text);
+  background: rgba(93, 201, 140, 0.14);
+  border-color: rgba(93, 201, 140, 0.45);
+}
+
+.nav-icon {
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.nav-label {
+  line-height: 1.35;
+}
+
 .shell {
   width: min(1440px, 100%);
   margin: 0 auto;
   padding: 24px;
+}
+
+.topbar-title {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+/* 画面名はトップバーに出すので、各viewの見出しは視覚的には隠す
+   (スクリーンリーダー向けにDOMには残す) */
+.view-head {
+  display: none;
+}
+
+.view-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
 }
 
 .topbar {
@@ -1060,6 +1151,38 @@ th {
 @media (max-width: 980px) {
   .shell {
     padding: 16px;
+  }
+
+  /* 狭い画面ではサイドバーを上部の横スクロールタブへ切り替える。
+     minmax(0, 1fr) にしないと、幅の広い子(表・グラフ)が
+     トラック幅を押し広げて画面全体が横スクロールする。 */
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: static;
+    height: auto;
+    gap: 16px;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    overflow-y: visible;
+  }
+
+  .sidebar-nav {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .nav-item {
+    width: auto;
+    white-space: nowrap;
+  }
+
+  .view-grid {
+    grid-template-columns: 1fr;
   }
 
   .learned-layout {
