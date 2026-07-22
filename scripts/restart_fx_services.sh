@@ -1,7 +1,7 @@
 #!/bin/zsh
 # fx-codex収集サービスを再起動する(kickstart -k = 実行中なら殺してから再実行)。
 set -u
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health)
+LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
 LEGACY_LABELS=(com.fx-codex.briefing.hourly)
 overall_status=0
 

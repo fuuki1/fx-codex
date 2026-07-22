@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path
 
+from .journal import DEFAULT_ATR_FRACTION
 from .learning import (
     DERIVE_THIN_GAP_HOURS,
     EvaluatedCall,
@@ -87,10 +88,12 @@ def evaluate_timeframe_history(
     filtered = entries_for_timeframe(entries, timeframe)
     horizon = PRIMARY_HORIZON_HOURS.get(timeframe, 24.0)
     tolerance = tolerance_for(horizon)
-    kwargs: dict[str, float] = {"horizon_hours": horizon, "tolerance_hours": tolerance}
-    if atr_fraction is not None:
-        kwargs["atr_fraction"] = atr_fraction
-    return evaluate_history(filtered, **kwargs)
+    return evaluate_history(
+        filtered,
+        horizon_hours=horizon,
+        tolerance_hours=tolerance,
+        atr_fraction=atr_fraction if atr_fraction is not None else DEFAULT_ATR_FRACTION,
+    )
 
 
 def _calls_for_symbol(calls: Sequence[EvaluatedCall], symbol: str) -> list[EvaluatedCall]:
@@ -280,5 +283,6 @@ def _profile_to_dict(profile: LearnedProfile) -> dict:
         "symbol_factors": profile.symbol_factors,
         "condition_stats": profile.condition_stats,
         "condition_factors": profile.condition_factors,
+        "dimension_stats": profile.dimension_stats,
         "notes_ja": profile.notes_ja,
     }

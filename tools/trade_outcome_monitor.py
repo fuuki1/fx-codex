@@ -47,12 +47,15 @@ def run_trade_outcome_monitor(
 ) -> dict[str, Any]:
     """Run the full trade-outcome monitoring pass and write JSON artifacts."""
     generated_at = _utc(now or datetime.now(UTC))
-    entries = list(journal.read_entries(journal_path))
+    all_entries = list(journal.read_entries(journal_path))
+    entries = [entry for entry in all_entries if journal.is_pit_eligible_entry(entry)]
     outcomes = trade_outcome.evaluate_trade_outcomes(entries)
     summary = trade_outcome.summarize_expectancy(outcomes)
     findings = trade_outcome.expectancy_findings(summary)
     expectancy_candidates = trade_outcome.improvement_candidates(summary)
     registry = trade_outcome.load_improvement_registry(registry_path) if update_registry else {}
+    if registry.get("data_contract") != journal.FUSION_PIT_DATA_CONTRACT:
+        registry = {}
     registry_updated = False
     variant_report: dict[str, Any] | None = None
     variant_candidates: list[trade_outcome.TradeImprovementCandidate] = []
@@ -63,6 +66,7 @@ def run_trade_outcome_monitor(
             expectancy_candidates,
             managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
             now=generated_at,
+            data_contract=journal.FUSION_PIT_DATA_CONTRACT,
         )
         registry_updated = True
 
@@ -79,6 +83,7 @@ def run_trade_outcome_monitor(
                 variant_candidates,
                 managed_action_types=trade_outcome.VARIANT_CANDIDATE_ACTION_TYPES,
                 now=generated_at,
+                data_contract=journal.FUSION_PIT_DATA_CONTRACT,
             )
             registry_updated = True
 
@@ -111,6 +116,8 @@ def run_trade_outcome_monitor(
         "registry_updated": registry_updated,
         "retest_variants": retest_variants,
         "outcome_count": len(outcomes),
+        "pit_eligible_journal_rows": len(entries),
+        "pit_ineligible_journal_rows": len(all_entries) - len(entries),
         "finding_count": len(findings),
         "expectancy_candidate_count": len(expectancy_candidates),
         "variant_candidate_count": len(variant_candidates),

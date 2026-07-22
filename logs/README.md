@@ -14,7 +14,9 @@
 | `briefing_learning.json` | 融合モードの学習プロファイル(重み・確信度較正・状態別成績) | `fx_briefing.py` |
 | `briefing_tf_journal.jsonl` | 時間足別モード(`--per-timeframe`)の判断ジャーナル | `fx_briefing.py --per-timeframe` |
 | `briefing_tf_learning.json` | 時間足別の学習プロファイル | `fx_briefing.py --per-timeframe` |
-| `briefing_tf_prices.jsonl` | 5分ごとの価格スナップショット(短い足の採点用・判断なし) | `fx_tf_snapshot.py` |
+| `briefing_tf_prices.jsonl` | OANDA完了済みM5 bid/ask OHLC(短い足の採点用・判断なし) | `fx_tf_snapshot.py` |
+| `briefing_horizon_forecasts.jsonl` | `horizon-pit-v1`の9ホライズン予測(本番候補8本+5m恒久shadow) | `fx_briefing.py --horizon-only` |
+| `briefing_horizon_learning.json` | symbol×horizonの採点・較正・経験帯・昇格ゲート | `fx_briefing.py --horizon-only` |
 | `macro_cache.json` | マクロデータのTTLキャッシュ | `fx_intel/macro.py` |
 | `ml_model.json` | ML確率モデル(GBDT)の保存物 | `fx_briefing.py` |
 | `promotion_state.json` | 委員のshadow/paper/live昇格状態 | `fx_intel/promotion.py` |
@@ -35,6 +37,7 @@
 | `fx_briefing.log` | 毎時の融合ブリーフィング実行ログ | `fx_briefing_loop.sh` |
 | `fx_briefing_tf.log` | 毎時の時間足別ブリーフィング実行ログ | `fx_briefing_loop.sh` |
 | `fx_tf_snapshot.log` | 5分ごとの価格スナップショット実行ログ | `fx_tf_snapshot_loop.sh` |
+| `fx_horizon.log` | 5分ごとのマルチホライズンshadow実行ログ | `scripts/fx_horizon_once.sh` |
 
 ## 読み手
 

@@ -3,9 +3,13 @@
 set -u
 setopt NULL_GLOB
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health)
+LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
 LEGACY_LABELS=(com.fx-codex.briefing.hourly)
 overall_status=0
+PYTHON="$ROOT/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="$(command -v python3 || true)"
+fi
 
 echo "=== launchd サービス ==="
 for label in $LABELS; do
@@ -42,8 +46,12 @@ fi
 echo ""
 echo "=== データ鮮度(最新レポート) ==="
 if [ -f "$ROOT/logs/freshness_report.json" ]; then
-  python3 - "$ROOT/logs/freshness_report.json" <<'PYEOF'
-from datetime import UTC, datetime
+  if [ -z "$PYTHON" ]; then
+    echo "  CRITICAL: freshness report確認用Pythonが見つからない"
+    exit 2
+  fi
+  "$PYTHON" - "$ROOT/logs/freshness_report.json" <<'PYEOF'
+from datetime import datetime, timezone
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
@@ -67,7 +75,7 @@ try:
     monitored = datetime.fromisoformat(str(report.get("monitor_timestamp")))
     if monitored.tzinfo is None:
         raise ValueError("timezone missing")
-    report_age = (datetime.now(UTC) - monitored.astimezone(UTC)).total_seconds()
+    report_age = (datetime.now(timezone.utc) - monitored.astimezone(timezone.utc)).total_seconds()
 except (TypeError, ValueError):
     print("  CRITICAL: monitor_timestampが不正")
     raise SystemExit(2)
@@ -96,7 +104,7 @@ fi
 
 echo ""
 echo "=== 主要ログの最終更新 ==="
-for f in logs/briefing_tf_prices.jsonl logs/briefing_journal.jsonl logs/briefing_tf_journal.jsonl; do
+for f in logs/briefing_tf_prices.jsonl logs/briefing_journal.jsonl logs/briefing_tf_journal.jsonl logs/briefing_horizon_forecasts.jsonl logs/briefing_horizon_learning.json logs/trade_outcome_monitor.json logs/decision_expectancy_monitor.json; do
   if [ -f "$ROOT/$f" ]; then
     ls -laT "$ROOT/$f" | awk '{printf "  %s %s %s %s  %s\n", $6, $7, $8, $9, $NF}'
   fi

@@ -29,7 +29,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from .briefing import TradePlan
 from .market import open_hours_between
@@ -38,6 +38,55 @@ from .timeframe import TimeframePlan
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
 DEFAULT_ATR_FRACTION = 0.1  # |値動き| がATRのこの割合未満なら判定しない
+FUSION_PIT_DATA_CONTRACT = "fusion-pit-v1"
+
+
+class PointInTimeError(ValueError):
+    """Raised when a journal row cannot prove feature availability before prediction."""
+
+
+def _aware_utc(value: datetime, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise PointInTimeError(f"{field_name} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _parse_aware_ts(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
+    """Return whether a fusion row proves all inputs were available before prediction."""
+    if entry.get("pit_eligible") is not True:
+        return False
+    recorded = _parse_aware_ts(entry.get("ts"))
+    prediction = _parse_aware_ts(entry.get("prediction_time"))
+    source_cutoff = _parse_aware_ts(entry.get("source_cutoff"))
+    feature_available = _parse_aware_ts(entry.get("max_feature_available_time"))
+    if None in (recorded, prediction, source_cutoff, feature_available):
+        return False
+    assert recorded is not None
+    assert prediction is not None
+    assert source_cutoff is not None
+    assert feature_available is not None
+    return recorded == prediction and source_cutoff <= feature_available <= prediction
+
+
+# 期待値ガード反実仮想の対象ゲート。このゲート「だけ」で見送りになった行を
+# counterfactual_guard_entries が復元する。event_window / low_data_quality 等の
+# データ・リスク由来の見送りは、ガードが無くても見送っていた行なので含めない
+# (含めると反実仮想の根拠が汚染される)。
+GUARD_COUNTERFACTUAL_GATE = "expectancy_guard"
+SHADOW_FUSION_PRODUCER = "fusion_raw"
+# 合成行に立てるマーカー。採点側(learning / trade_outcome)はこのキーで
+# 「実際の推奨」と「ガード見送り中のシャドー計画」を区別して集計に注記する。
+COUNTERFACTUAL_ENTRY_KEY = "counterfactual_guard"
 
 
 @dataclass(frozen=True)
@@ -55,9 +104,33 @@ class DirectionalStats:
         return self.hits / self.evaluated
 
 
-def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | None = None) -> None:
-    """今回の判断をJSONLへ追記する(1プラン1行)。"""
-    now = now or datetime.now(UTC)
+def append_plans(
+    path: str | Path,
+    plans: Sequence[TradePlan],
+    now: datetime | None = None,
+    *,
+    source_cutoff: datetime | None = None,
+    max_feature_available_time: datetime | None = None,
+) -> None:
+    """今回の判断をJSONLへ追記する(1プラン1行)。
+
+    source_cutoff と max_feature_available_time の両方がある行だけをGBDTの
+    PIT適格行として記録する。旧呼出しは互換のため記録できるが、学習対象外になる。
+    """
+    now = _aware_utc(now or datetime.now(UTC), "prediction_time")
+    pit_eligible = source_cutoff is not None and max_feature_available_time is not None
+    source_utc: datetime | None = None
+    feature_utc: datetime | None = None
+    if pit_eligible:
+        assert source_cutoff is not None
+        assert max_feature_available_time is not None
+        source_utc = _aware_utc(source_cutoff, "source_cutoff")
+        feature_utc = _aware_utc(max_feature_available_time, "max_feature_available_time")
+        if not source_utc <= feature_utc <= now:
+            raise PointInTimeError(
+                "PIT ordering must satisfy source_cutoff <= "
+                "max_feature_available_time <= prediction_time"
+            )
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
@@ -66,8 +139,16 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                 json.dumps(
                     {
                         "ts": now.isoformat(),
+                        "prediction_time": now.isoformat(),
+                        "source_cutoff": source_utc.isoformat() if source_utc else None,
+                        "max_feature_available_time": (
+                            feature_utc.isoformat() if feature_utc else None
+                        ),
+                        "pit_eligible": pit_eligible,
                         "symbol": plan.symbol,
                         "direction": plan.direction,
+                        "analysis_direction": plan.analysis_direction,
+                        "analysis_conviction": plan.analysis_conviction,
                         "conviction": plan.conviction,
                         "composite": plan.composite,
                         "tech_score": plan.tech_score,
@@ -77,6 +158,13 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                         "stop": plan.stop,
                         "target1": plan.target1,
                         "target2": plan.target2,
+                        "entry_bid": plan.entry_bid,
+                        "entry_ask": plan.entry_ask,
+                        "quote_observed_at": plan.quote_observed_at,
+                        "cost_model_id": plan.cost_model_id,
+                        "slippage_r": plan.slippage_r,
+                        "commission_r": plan.commission_r,
+                        "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
                         "data_quality": plan.data_quality,
                         # チャート状態の特徴量(learning.pyの状態別学習に使う)
@@ -86,6 +174,15 @@ def append_plans(path: str | Path, plans: Sequence[TradePlan], now: datetime | N
                         # 執行コスト(R換算)と期待R予測。採点(trade_outcome)が
                         # realized_net_r を作る入力で、MLの収益ラベルの源になる。
                         **_plan_execution(plan),
+                        "learning_dimensions": plan.learning_dimensions,
+                        "gate_trace": plan.gate_trace,
+                        "shadow_predictions": plan.shadow_predictions,
+                        "input_context_id": plan.input_context_id,
+                        "input_features": plan.input_features,
+                        "input_feature_masks": plan.input_feature_masks,
+                        "input_context_schema_version": plan.input_context.get(
+                            "context_schema_version"
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -121,6 +218,8 @@ def append_timeframe_plans(
                         "timeframe": plan.timeframe,
                         "horizon_hours": plan.horizon_hours,
                         "direction": plan.direction,
+                        "analysis_direction": plan.analysis_direction,
+                        "analysis_conviction": plan.analysis_conviction,
                         "conviction": plan.conviction,
                         "composite": plan.composite,
                         # 融合版の tech_score に相当(時間足単体の方向スコア)。
@@ -134,11 +233,27 @@ def append_timeframe_plans(
                         "stop": plan.stop,
                         "target1": plan.target1,
                         "target2": plan.target2,
+                        "entry_bid": plan.entry_bid,
+                        "entry_ask": plan.entry_ask,
+                        "quote_observed_at": plan.quote_observed_at,
+                        "cost_model_id": plan.cost_model_id,
+                        "slippage_r": plan.slippage_r,
+                        "commission_r": plan.commission_r,
+                        "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
                         "data_quality": plan.data_quality,
                         "features": plan.features,
                         "components": plan.components,
                         **_plan_execution(plan),
+                        "learning_dimensions": plan.learning_dimensions,
+                        "gate_trace": plan.gate_trace,
+                        "shadow_predictions": plan.shadow_predictions,
+                        "input_context_id": plan.input_context_id,
+                        "input_features": plan.input_features,
+                        "input_feature_masks": plan.input_feature_masks,
+                        "input_context_schema_version": plan.input_context.get(
+                            "context_schema_version"
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -180,6 +295,93 @@ def read_entries(path: str | Path):
             continue
         if isinstance(entry, dict):
             yield entry
+
+
+def blocked_gate_names(entry: Mapping[str, object]) -> set[str]:
+    """gate_traceからstatus=blockedのゲート名集合を返す(observed等は含めない)。"""
+    trace = entry.get("gate_trace")
+    if not isinstance(trace, (list, tuple)):
+        return set()
+    names: set[str] = set()
+    for row in trace:
+        if isinstance(row, Mapping) and row.get("status") == "blocked":
+            name = str(row.get("gate", "")).strip()
+            if name:
+                names.add(name)
+    return names
+
+
+def counterfactual_guard_entries(
+    entries: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """expectancy_guard単独で見送りになった行を、判断時凍結のシャドー計画で復元する。
+
+    期待値ガードは自分がブロックした判断の結果を観測できないため、放置すると
+    根拠サンプルが増えず永久ブロックに陥る(学習飢餓)。この関数は、ゲート前の
+    分析方向(analysis_direction)と判断時に凍結記録済みのシャドーSL/TP
+    (shadow_predictionsのfusion_raw)から「ガードが無ければ推奨していた計画」を
+    合成し、既存の採点エンジンへそのまま流せる行として返す。
+
+    PIT安全性: 合成に使う値はすべて判断時点で記録済みのもの(分析方向・
+    分析確信度・凍結SL/TP)に限る。事後の再計算・推定は行わず、必要な記録が
+    欠けた行は黙って除外する(fail-closed)。
+    """
+    output: list[dict[str, object]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if blocked_gate_names(entry) != {GUARD_COUNTERFACTUAL_GATE}:
+            continue
+        direction = entry.get("analysis_direction")
+        if direction not in ("long", "short"):
+            continue
+        prediction = _fusion_shadow_prediction(entry)
+        if prediction is None:
+            continue
+        if prediction.get("direction") != direction:
+            # 凍結スコアと分析方向の不整合は記録欠陥として採点しない
+            continue
+        stop = _level(prediction.get("stop"))
+        target1 = _level(prediction.get("target1"))
+        target2 = _level(prediction.get("target2"))
+        if stop is None or target1 is None or target2 is None:
+            continue
+        conviction = entry.get("analysis_conviction")
+        target_policy = prediction.get("target_policy")
+        synthesized: dict[str, object] = dict(entry)
+        synthesized["direction"] = str(direction)
+        synthesized["conviction"] = int(conviction) if isinstance(conviction, (int, float)) else 0
+        synthesized["stop"] = stop
+        synthesized["target1"] = target1
+        synthesized["target2"] = target2
+        synthesized["target_policy"] = (
+            dict(target_policy)
+            if isinstance(target_policy, Mapping)
+            else {"policy_id": "shadow-default-atr-v1"}
+        )
+        synthesized[COUNTERFACTUAL_ENTRY_KEY] = True
+        output.append(synthesized)
+    return output
+
+
+def _fusion_shadow_prediction(entry: Mapping[str, object]) -> Mapping[str, object] | None:
+    predictions = entry.get("shadow_predictions")
+    if not isinstance(predictions, (list, tuple)):
+        return None
+    for row in predictions:
+        if (
+            isinstance(row, Mapping)
+            and str(row.get("producer", "")) == SHADOW_FUSION_PRODUCER
+            and row.get("eligible_for_scoring") is True
+        ):
+            return row
+    return None
+
+
+def _level(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def evaluate_directional_accuracy(

@@ -1,0 +1,380 @@
+{
+  "schema": 1,
+  "generated_at": "2026-07-16T05:49:38.210386+00:00",
+  "log_dir": "logs",
+  "window_hours": 24.0,
+  "overall_status": "warn",
+  "sections": {
+    "data_collection": {
+      "status": "warn",
+      "summary_ja": "窓内に最大153分の収集ギャップ、5分スロットの実効カバレッジ最小40%",
+      "evidence": {
+        "path": "logs/briefing_tf_prices.jsonl",
+        "exists": true,
+        "total_lines": 22386,
+        "malformed_lines": 0,
+        "window_open_hours": 24.0,
+        "expected_5m_slots_per_cell": 288.0,
+        "cells": {
+          "EURUSD:15m": {
+            "rows": 114,
+            "distinct_5m_slots": 114,
+            "window_coverage_ratio": 0.3958,
+            "effective_coverage_ratio": 0.3992,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 152.9,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "EURUSD:1d": {
+            "rows": 120,
+            "distinct_5m_slots": 120,
+            "window_coverage_ratio": 0.4167,
+            "effective_coverage_ratio": 0.4202,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 142.8,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "EURUSD:1h": {
+            "rows": 116,
+            "distinct_5m_slots": 116,
+            "window_coverage_ratio": 0.4028,
+            "effective_coverage_ratio": 0.4062,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 152.9,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "EURUSD:4h": {
+            "rows": 119,
+            "distinct_5m_slots": 119,
+            "window_coverage_ratio": 0.4132,
+            "effective_coverage_ratio": 0.4167,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 142.8,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "GBPUSD:15m": {
+            "rows": 114,
+            "distinct_5m_slots": 114,
+            "window_coverage_ratio": 0.3958,
+            "effective_coverage_ratio": 0.3992,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 152.9,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "GBPUSD:1d": {
+            "rows": 120,
+            "distinct_5m_slots": 120,
+            "window_coverage_ratio": 0.4167,
+            "effective_coverage_ratio": 0.4202,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 142.8,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "GBPUSD:1h": {
+            "rows": 116,
+            "distinct_5m_slots": 116,
+            "window_coverage_ratio": 0.4028,
+            "effective_coverage_ratio": 0.4062,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 152.9,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "GBPUSD:4h": {
+            "rows": 119,
+            "distinct_5m_slots": 119,
+            "window_coverage_ratio": 0.4132,
+            "effective_coverage_ratio": 0.4167,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 142.8,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "USDJPY:15m": {
+            "rows": 114,
+            "distinct_5m_slots": 114,
+            "window_coverage_ratio": 0.3958,
+            "effective_coverage_ratio": 0.3992,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 152.9,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "USDJPY:1d": {
+            "rows": 120,
+            "distinct_5m_slots": 120,
+            "window_coverage_ratio": 0.4167,
+            "effective_coverage_ratio": 0.4202,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 142.8,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "USDJPY:1h": {
+            "rows": 116,
+            "distinct_5m_slots": 116,
+            "window_coverage_ratio": 0.4028,
+            "effective_coverage_ratio": 0.4062,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 152.9,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          },
+          "USDJPY:4h": {
+            "rows": 119,
+            "distinct_5m_slots": 119,
+            "window_coverage_ratio": 0.4132,
+            "effective_coverage_ratio": 0.4167,
+            "first_ts": "2026-07-15T06:01:49.529721+00:00",
+            "max_open_market_gap_minutes": 142.8,
+            "last_ts": "2026-07-16T05:47:09.537161+00:00"
+          }
+        },
+        "min_effective_coverage_ratio": 0.3992,
+        "worst_open_market_gap_minutes": 152.9,
+        "last_price_age_open_minutes": 2.5
+      }
+    },
+    "prediction_capture": {
+      "status": "pass",
+      "summary_ja": "時間足別・融合の予測記録は継続",
+      "evidence": {
+        "tf_journal": {
+          "path": "logs/briefing_tf_journal.jsonl",
+          "exists": true,
+          "total_lines": 8812,
+          "malformed_lines": 0
+        },
+        "fusion_journal": {
+          "path": "logs/briefing_journal.jsonl",
+          "exists": true,
+          "total_lines": 595,
+          "malformed_lines": 0
+        },
+        "tf_rows_in_window": 2304,
+        "tf_rows_per_timeframe": {
+          "15m": 576,
+          "1h": 576,
+          "4h": 576,
+          "1d": 576
+        },
+        "tf_direction_counts": {
+          "neutral": 1915,
+          "long": 128,
+          "short": 37,
+          "standby": 224
+        },
+        "tf_last_ts": "2026-07-16T05:45:05.788268+00:00",
+        "tf_last_age_open_minutes": 4.5,
+        "fusion_rows_in_window": 10,
+        "fusion_pit_rows_in_window": 6,
+        "fusion_median_run_gap_minutes": 59.9
+      }
+    },
+    "outcome_maturation": {
+      "status": "pass",
+      "summary_ja": "満期1979件中1869件を採点済み",
+      "evidence": {
+        "matured_scored": 1869,
+        "matured_unresolved": 110,
+        "immature": 110,
+        "resolved_ratio": 0.9444,
+        "outcome_counts": {
+          "hit": 759,
+          "miss": 797,
+          "flat": 313
+        },
+        "unresolved_reasons": {
+          "no_future_price_in_tolerance": 110
+        },
+        "scored_per_cell": {
+          "USDJPY:1h": 146,
+          "USDJPY:4h": 187,
+          "EURUSD:1h": 164,
+          "EURUSD:4h": 139,
+          "GBPUSD:1h": 138,
+          "GBPUSD:4h": 149,
+          "USDJPY:15m": 173,
+          "USDJPY:1d": 201,
+          "EURUSD:15m": 194,
+          "EURUSD:1d": 172,
+          "GBPUSD:15m": 130,
+          "GBPUSD:1d": 76
+        }
+      }
+    },
+    "trade_outcome": {
+      "status": "pass",
+      "summary_ja": "MFE/MAE/TP/SL先着の期待値監査が生成されている",
+      "evidence": {
+        "decision_outcomes_overall": {
+          "evaluated": 290,
+          "tradable": 266,
+          "wins": 110,
+          "losses": 154,
+          "win_rate": 0.4135,
+          "expectancy_r": -0.0386,
+          "avg_mfe_r": 0.0838,
+          "avg_mae_r": 0.1414,
+          "tp1_rate": 0.0,
+          "tp2_rate": 0.0,
+          "sl_rate": 0.0,
+          "sample_ok": true
+        },
+        "decision_outcomes_mtime": "2026-07-16T05:46:20.668645+00:00",
+        "trade_outcome_monitor": null
+      }
+    },
+    "learning_update": {
+      "status": "pass",
+      "summary_ja": "学習セル12件が採点済み(重み調整9/確信度減衰2/条件補正9)",
+      "evidence": {
+        "tf_learning_mtime": "2026-07-16T05:45:15.641918+00:00",
+        "cells_with_scored_samples": 12,
+        "cells_with_adjusted_weights": 9,
+        "cells_with_conviction_damping": 2,
+        "cells_with_condition_factors": 9,
+        "cell_scored_samples": {
+          "EURUSD|15m": 52,
+          "USDJPY|15m": 57,
+          "GBPUSD|15m": 38,
+          "EURUSD|1h": 41,
+          "USDJPY|1h": 40,
+          "GBPUSD|1h": 39,
+          "EURUSD|4h": 39,
+          "USDJPY|4h": 44,
+          "GBPUSD|4h": 37,
+          "EURUSD|1d": 62,
+          "USDJPY|1d": 67,
+          "GBPUSD|1d": 22
+        },
+        "fusion_learning": {
+          "generated_at": "2026-07-16T05:41:31.866860+00:00",
+          "evaluated": 0,
+          "tech_weight": 0.55,
+          "news_weight": 0.45
+        }
+      }
+    },
+    "decision_application": {
+      "status": "pass",
+      "summary_ja": "非既定重み1728行/期待値注入0行を確認",
+      "evidence": {
+        "rows_in_window": 2304,
+        "rows_with_nondefault_tech_weight": 1728,
+        "rows_with_net_expected_r": 0,
+        "rows_with_target_policy": 0,
+        "last_nondefault_weight_ts": "2026-07-16T05:45:05.788268+00:00",
+        "learned_weight_cells": 9
+      }
+    },
+    "duplicate_detection": {
+      "status": "warn",
+      "summary_ja": "errログにduplicate writer痕跡1件(競合ガード発火)",
+      "evidence": {
+        "journal_rows_in_window": 2304,
+        "journal_duplicate_rows": 0,
+        "price_rows_in_window": 1407,
+        "price_duplicate_rows": 0,
+        "err_log_duplicate_writer_hits": 1
+      }
+    },
+    "freshness": {
+      "status": "pass",
+      "summary_ja": "鮮度レポート4分前・対象status={'tf_price_snapshot': 'ok', 'tf_journal': 'ok'}",
+      "evidence": {
+        "monitor_timestamp": "2026-07-16T05:45:52.634413+00:00",
+        "report_age_minutes": 3.8,
+        "target_statuses": {
+          "tf_price_snapshot": "ok",
+          "tf_journal": "ok"
+        }
+      }
+    },
+    "scanner_429": {
+      "status": "warn",
+      "summary_ja": "末尾200行に429/decode痕跡151件(時刻無し。現在の価格収集は健全のため修正前の残存と推定。ログrotateで解消可)",
+      "evidence": {
+        "all_time_scanner_error_lines": 1478,
+        "recent_scanner_error_lines_tail200": 151,
+        "recent_timeout_lines_tail200": 0,
+        "collection_currently_healthy": true,
+        "per_file": {
+          "logs/launchd/snapshot.err.log": {
+            "total_lines": 2321,
+            "scanner_pattern_counts": {
+              "Expecting value": 1478
+            },
+            "last_scanner_match_line": 2309
+          },
+          "logs/fx_integrated_briefing.log": {
+            "total_lines": 918,
+            "scanner_pattern_counts": {},
+            "last_scanner_match_line": null
+          },
+          "logs/fx_fusion_capture.log": {
+            "total_lines": 41,
+            "scanner_pattern_counts": {},
+            "last_scanner_match_line": null
+          }
+        }
+      }
+    },
+    "sample_sufficiency": {
+      "status": "pass",
+      "summary_ja": "重み学習可能セル12件/減衰可能セル12件",
+      "evidence": {
+        "scored_samples_per_cell": {
+          "USDJPY:1h": 146,
+          "USDJPY:4h": 187,
+          "EURUSD:1h": 164,
+          "EURUSD:4h": 139,
+          "GBPUSD:1h": 138,
+          "GBPUSD:4h": 149,
+          "USDJPY:15m": 173,
+          "USDJPY:1d": 201,
+          "EURUSD:15m": 194,
+          "EURUSD:1d": 172,
+          "GBPUSD:15m": 130,
+          "GBPUSD:1d": 76
+        },
+        "cells_at_or_above_weight_min_20": 12,
+        "cells_at_or_above_symbol_min_8": 12,
+        "condition_cell_min": 12,
+        "fusion_pit_directional_rows_total": 2,
+        "ml_min_train_rows": 150
+      }
+    },
+    "blocking_reasons": {
+      "status": "pass",
+      "summary_ja": "負期待値の判断行0件(窓内)",
+      "evidence": {
+        "negative_net_expected_r_rows_in_window": 0,
+        "decision_feedback": {
+          "generated_at": "2026-07-16T05:45:05.788268+00:00",
+          "cells_total": 7,
+          "cells_dampened": 6,
+          "cells_blocked": 0
+        }
+      }
+    },
+    "launchd": {
+      "status": "warn",
+      "summary_ja": "com.fx-codex.briefing の最終exit=5",
+      "evidence": {
+        "services": {
+          "com.fx-codex.snapshot": {
+            "loaded": true,
+            "last_exit_code": 0,
+            "runs": 57
+          },
+          "com.fx-codex.briefing": {
+            "loaded": true,
+            "last_exit_code": 5,
+            "runs": 56
+          },
+          "com.fx-codex.health": {
+            "loaded": true,
+            "last_exit_code": 0,
+            "runs": 57
+          }
+        }
+      }
+    }
+  }
+}

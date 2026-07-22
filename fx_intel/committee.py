@@ -33,6 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from .briefing import (
     DEFAULT_ATR_MULTIPLE,
     DEFAULT_RISK_PCT,
+    DIRECTION_THRESHOLD,
     NEWS_WEIGHT,
     TECH_WEIGHT,
     ScoreComponent,
@@ -43,10 +44,11 @@ from .briefing import (
 )
 from .calendar import RiskWindow, symbol_currencies
 from .macro import MacroSnapshot, macro_pair_view
-from .ml import MLArtifact
+from .ml import MLArtifact, SCHEMA_VERSION as ML_SCHEMA_VERSION
 from .news import NewsItem
 from .sentiment import CurrencySentiment
 from .technicals import PairTechnicals
+from .shadow_learning import prediction_draft
 
 # 追加委員の生重み(tech+news=1.0に対する相対値。合成時に全体正規化)
 MACRO_WEIGHT = 0.15
@@ -69,6 +71,7 @@ class Opinion:
     weight: float  # 合成時の生重み(activeな場合のみ使用)
     stage: str  # research buildでは常にshadow
     active: bool
+    producer_version: str = "score-v1"
     rationale_ja: list[str] = field(default_factory=list)
 
     def note_ja(self) -> str:
@@ -101,6 +104,7 @@ def macro_opinion(
         weight=round(MACRO_WEIGHT * confidence, 4),
         stage=stage,
         active=stage in STAGE_ACTIVE,
+        producer_version="macro-score-v1",
         rationale_ja=notes,
     )
 
@@ -112,6 +116,7 @@ def ml_opinion(
     chart_features: Mapping[str, float],
     data_quality: float | None = None,
     stage: str = "shadow",
+    learning_dimensions: Mapping[str, object] | None = None,
 ) -> Opinion | None:
     """MLアナリストの意見。P(hit|long)とP(hit|short)の差を方向スコアにする。
 
@@ -121,7 +126,9 @@ def ml_opinion(
     if artifact is None:
         return None
     stage = stage if stage in STAGE_LABEL_JA else "shadow"
-    edge = artifact.direction_edge(tech_score, news_score, chart_features, data_quality)
+    edge = artifact.direction_edge(
+        tech_score, news_score, chart_features, data_quality, learning_dimensions
+    )
     if edge is None:
         return None
     p_long, p_short = edge
@@ -139,7 +146,15 @@ def ml_opinion(
     # 収益ヘッド(期待R回帰+分位点)の見立てを shadow 表示。score(=二値の優位差)には
     # 影響させない。return_usable でない時は accessor が None を返し、行は足さない。
     rationale.extend(
-        _ml_return_head_notes(artifact, score, tech_score, news_score, chart_features, data_quality)
+        _ml_return_head_notes(
+            artifact,
+            score,
+            tech_score,
+            news_score,
+            chart_features,
+            data_quality,
+            learning_dimensions,
+        )
     )
     return Opinion(
         role="ml",
@@ -148,6 +163,7 @@ def ml_opinion(
         weight=ML_WEIGHT,
         stage=stage,
         active=stage in STAGE_ACTIVE,
+        producer_version=f"ml-v{ML_SCHEMA_VERSION}@{artifact.trained_at or 'unknown'}",
         rationale_ja=rationale,
     )
 
@@ -159,6 +175,7 @@ def _ml_return_head_notes(
     news_score: float,
     chart_features: Mapping[str, float],
     data_quality: float | None,
+    learning_dimensions: Mapping[str, object] | None = None,
 ) -> list[str]:
     """収益ヘッドの期待純R・分位点帯を表示用の行にする(shadow=判断に不影響)。
 
@@ -167,13 +184,13 @@ def _ml_return_head_notes(
     """
     direction = "long" if score > 0 else "short"
     expected = artifact.expected_net_r(
-        direction, tech_score, news_score, chart_features, data_quality
+        direction, tech_score, news_score, chart_features, data_quality, learning_dimensions
     )
     if expected is None:
         return []
     notes = [f"期待純R(コスト控除後) {expected:+.2f}R ※参考(判断には不使用)"]
     interval = artifact.net_r_interval(
-        direction, tech_score, news_score, chart_features, data_quality
+        direction, tech_score, news_score, chart_features, data_quality, learning_dimensions
     )
     if interval is not None and "p10" in interval and "p90" in interval:
         notes.append(f"純R帯 p10 {interval['p10']:+.2f}R 〜 p90 {interval['p90']:+.2f}R")
@@ -201,6 +218,9 @@ def deliberate(
     macro_snapshot: MacroSnapshot | None = None,
     ml_artifact: MLArtifact | None = None,
     stages: Mapping[str, str] | None = None,
+    direction_threshold: float = DIRECTION_THRESHOLD,
+    learning_dimensions: Mapping[str, object] | None = None,
+    input_context: Mapping[str, object] | None = None,
 ) -> TradePlan:
     """1ペアぶんの委員会審議。build_trade_planの上位互換ラッパー。
 
@@ -238,6 +258,7 @@ def deliberate(
         chart_features,
         data_quality=None,  # 品質はbuild_trade_plan内で確定するため学習時は中央値補完
         stage=stages.get("ml", "shadow"),
+        learning_dimensions=learning_dimensions,
     )
     if ml is not None:
         opinions.append(ml)
@@ -260,6 +281,15 @@ def deliberate(
         extra_features[key] = opinion.score
 
     committee_notes = [opinion.note_ja() for opinion in opinions]
+    shadow_prediction_drafts = [
+        prediction_draft(
+            "ml_direction" if opinion.role == "ml" else opinion.role,
+            opinion.score,
+            stage=opinion.stage,
+            producer_version=opinion.producer_version,
+        )
+        for opinion in opinions
+    ]
 
     return build_trade_plan(
         symbol,
@@ -282,4 +312,8 @@ def deliberate(
         extra_components=extra_components,
         extra_features=extra_features,
         committee_notes=committee_notes,
+        direction_threshold=direction_threshold,
+        learning_dimensions=learning_dimensions,
+        shadow_prediction_drafts=shadow_prediction_drafts,
+        input_context=input_context,
     )

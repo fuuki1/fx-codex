@@ -45,8 +45,13 @@ from .gbm import (
 )
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
+from .journal import FUSION_PIT_DATA_CONTRACT
 
-SCHEMA_VERSION = 3
+# 4: 入力コンテキスト特徴量(マクロ/流動性/セッション/レジーム)を追加。
+#    特徴量集合が変わると保存済みモデルのベクトル次元が合わなくなるため、
+#    旧スキーマのアーティファクトは load_artifact が破損扱いで捨てる(再学習で復元)。
+SCHEMA_VERSION = 4
+TRAINING_CONTRACT = FUSION_PIT_DATA_CONTRACT
 
 # 方向依存(判断方向の符号を掛ける)特徴量と方向非依存の特徴量
 FEATURE_NAMES: tuple[str, ...] = (
@@ -61,6 +66,42 @@ FEATURE_NAMES: tuple[str, ...] = (
     "tf_agreement",
     "news_count",
     "data_quality",
+    # 入力コンテキスト(input_context)がジャーナルへ固定したマクロ特徴。
+    # 判断時点で取得済みの値のみ(PIT)。欠損はNone→中央値補完
+    "macro_vix_level",
+    "macro_vix_change_5d_pct",
+    "macro_us10y_change_5d_bp",
+    "macro_curve_2s10s_bp",
+    "macro_usd_index_change_5d_pct",
+    "dir_cot_pair_diff",
+    # 流動性proxy(liquidity)。spread系はコスト環境、statusはone-hot
+    "liquidity_spread_pips",
+    "liquidity_spread_bps",
+    "liquidity_spread_percentile",
+    "liquidity_quote_age_sec",
+    "liquidity_spread_atr",
+    "liquidity_is_rollover_window",
+    "liquidity_status_normal",
+    "liquidity_status_thin",
+    "liquidity_status_stressed",
+    "liquidity_status_unknown",
+    "liquidity_status_invalid",
+    # 可用性マスク: 「値が無い」こと自体を特徴量にする(欠損の情報量を保持)
+    "macro_vix_available",
+    "macro_cot_available",
+    "liquidity_spread_available",
+    "liquidity_baseline_available",
+    # 学習次元(learning_dimensions)のカテゴリone-hot
+    "session_tokyo",
+    "session_tokyo_london_overlap",
+    "session_london",
+    "session_london_new_york_overlap",
+    "session_new_york",
+    "session_other_overlap",
+    "session_unknown",
+    "regime_risk_on",
+    "regime_risk_off",
+    "regime_unknown",
 )
 
 MIN_TRAIN_ROWS = 150  # 間引き後の採点済みサンプルがこれ未満なら学習しない
@@ -123,17 +164,24 @@ def direction_features(
     news_score: float,
     chart: Mapping[str, float],
     data_quality: float | None = None,
+    dimensions: Mapping[str, object] | None = None,
 ) -> dict[str, float | None]:
     """判断1件を方向符号付きの特徴量辞書にする(学習・予測で共通)。
 
     「ロングで当たるか」と「ショートで当たるか」を同じモデルで扱えるよう、
     向きの意味を持つ特徴量に方向符号を掛けて「判断方向への追い風の強さ」に
     正規化する。取得できていない特徴量はNone(後段で中央値補完)。
+
+    chart には判断時点の features(journal保存済み)を渡す。入力コンテキスト由来の
+    キー(macro__* / liquidity__*)は判断配線が固定した値で、学習・予測とも同じ
+    経路から読む(PIT対称性)。dimensions は learning_dimensions(session/regime)。
     """
     sign = 1.0 if direction == "long" else -1.0
     rsi = chart.get("rsi_1h")
     ma_gap = chart.get("ma_gap_atr")
-    macro = chart.get("macro_score")
+    # macro_score が無い古い行は入力コンテキストのペアスコアへフォールバック
+    macro = chart.get("macro_score", chart.get("macro__macro_pair_score"))
+    cot_pair_diff = _maybe_float(chart.get("macro__cot_pair_diff"))
     # 上位足レーティングは4h/1dの取得できた方の平均(欠損耐性を細かい重み差より優先)
     htf_values = [
         float(value)
@@ -141,7 +189,7 @@ def direction_features(
         if isinstance(value, (int, float))
     ]
     htf = sum(htf_values) / len(htf_values) if htf_values else None
-    return {
+    values: dict[str, float | None] = {
         "dir_tech": tech_score * sign,
         "dir_news": news_score * sign,
         "dir_rsi": ((float(rsi) - 50.0) / 50.0) * sign if isinstance(rsi, (int, float)) else None,
@@ -153,7 +201,46 @@ def direction_features(
         "tf_agreement": _maybe_float(chart.get("tf_agreement")),
         "news_count": _maybe_float(chart.get("news_count")),
         "data_quality": float(data_quality) if isinstance(data_quality, (int, float)) else None,
+        "macro_vix_level": _maybe_float(chart.get("macro__vix_level")),
+        "macro_vix_change_5d_pct": _maybe_float(chart.get("macro__vix_change_5d_pct")),
+        "macro_us10y_change_5d_bp": _maybe_float(chart.get("macro__us10y_change_5d_bp")),
+        "macro_curve_2s10s_bp": _maybe_float(chart.get("macro__curve_2s10s_bp")),
+        "macro_usd_index_change_5d_pct": _maybe_float(chart.get("macro__usd_index_change_5d_pct")),
+        "dir_cot_pair_diff": cot_pair_diff * sign if cot_pair_diff is not None else None,
+        "liquidity_spread_pips": _maybe_float(chart.get("liquidity__spread_pips")),
+        "liquidity_spread_bps": _maybe_float(chart.get("liquidity__spread_bps")),
+        "liquidity_spread_percentile": _maybe_float(chart.get("liquidity__spread_percentile")),
+        "liquidity_quote_age_sec": _maybe_float(chart.get("liquidity__quote_age_sec")),
+        "liquidity_spread_atr": _maybe_float(chart.get("liquidity__spread_atr")),
+        "liquidity_is_rollover_window": _maybe_float(chart.get("liquidity__is_rollover_window")),
+        "liquidity_status_normal": _maybe_float(chart.get("liquidity__status_normal")),
+        "liquidity_status_thin": _maybe_float(chart.get("liquidity__status_thin")),
+        "liquidity_status_stressed": _maybe_float(chart.get("liquidity__status_stressed")),
+        "liquidity_status_unknown": _maybe_float(chart.get("liquidity__status_unknown")),
+        "liquidity_status_invalid": _maybe_float(chart.get("liquidity__status_invalid")),
+        "macro_vix_available": _maybe_float(chart.get("macro__vix_level__available")),
+        "macro_cot_available": _maybe_float(chart.get("macro__cot_pair_diff__available")),
+        "liquidity_spread_available": _maybe_float(chart.get("liquidity__spread_pips__available")),
+        "liquidity_baseline_available": _maybe_float(
+            chart.get("liquidity__spread_percentile__available")
+        ),
     }
+    dimensions = dimensions or {}
+    session = str(dimensions.get("session_bucket", "unknown") or "unknown")
+    regime = str(dimensions.get("regime", "unknown") or "unknown")
+    for bucket in (
+        "tokyo",
+        "tokyo_london_overlap",
+        "london",
+        "london_new_york_overlap",
+        "new_york",
+        "other_overlap",
+        "unknown",
+    ):
+        values[f"session_{bucket}"] = 1.0 if session == bucket else 0.0
+    for bucket in ("risk_on", "risk_off", "unknown"):
+        values[f"regime_{bucket}"] = 1.0 if regime == bucket else 0.0
+    return values
 
 
 def _maybe_float(value: object) -> float | None:
@@ -199,6 +286,7 @@ def build_dataset(
                 call.news_score,
                 call.features,
                 data_quality=call.data_quality,
+                dimensions=call.dimensions,
             )
         )
         labels.append(1 if call.outcome == "hit" else 0)
@@ -285,6 +373,7 @@ class MLArtifact:
         news_score: float,
         chart: Mapping[str, float],
         data_quality: float | None = None,
+        dimensions: Mapping[str, object] | None = None,
     ) -> float | None:
         """期待純R(コスト控除後)。return_usableでない・回帰モデル無しはNone。"""
         if (
@@ -293,7 +382,7 @@ class MLArtifact:
             or direction not in ("long", "short")
         ):
             return None
-        row = direction_features(direction, tech_score, news_score, chart, data_quality)
+        row = direction_features(direction, tech_score, news_score, chart, data_quality, dimensions)
         return round(self.return_model.predict(vectorize(row, self.medians)), 4)
 
     def net_r_interval(
@@ -303,6 +392,7 @@ class MLArtifact:
         news_score: float,
         chart: Mapping[str, float],
         data_quality: float | None = None,
+        dimensions: Mapping[str, object] | None = None,
     ) -> dict[str, float] | None:
         """分位点予測(p10/p50/p90)の純R。ダウンサイド把握用。モデル無しはNone。"""
         if (
@@ -312,7 +402,7 @@ class MLArtifact:
         ):
             return None
         row = vectorize(
-            direction_features(direction, tech_score, news_score, chart, data_quality),
+            direction_features(direction, tech_score, news_score, chart, data_quality, dimensions),
             self.medians,
         )
         return {name: round(model.predict(row), 4) for name, model in self.quantile_models.items()}
@@ -324,11 +414,12 @@ class MLArtifact:
         news_score: float,
         chart: Mapping[str, float],
         data_quality: float | None = None,
+        dimensions: Mapping[str, object] | None = None,
     ) -> float | None:
         """P(hit | 特徴量, 方向)。usableでない・モデル無しはNone。"""
         if not self.usable or self.model is None or direction not in ("long", "short"):
             return None
-        row = direction_features(direction, tech_score, news_score, chart, data_quality)
+        row = direction_features(direction, tech_score, news_score, chart, data_quality, dimensions)
         margin = self.model.predict_margin(vectorize(row, self.medians))
         return round(self.calibration.apply(margin), 4)
 
@@ -338,10 +429,15 @@ class MLArtifact:
         news_score: float,
         chart: Mapping[str, float],
         data_quality: float | None = None,
+        dimensions: Mapping[str, object] | None = None,
     ) -> tuple[float, float] | None:
         """(P(hit|long), P(hit|short))。committeeのML委員の入力。"""
-        p_long = self.predict_hit_probability("long", tech_score, news_score, chart, data_quality)
-        p_short = self.predict_hit_probability("short", tech_score, news_score, chart, data_quality)
+        p_long = self.predict_hit_probability(
+            "long", tech_score, news_score, chart, data_quality, dimensions
+        )
+        p_short = self.predict_hit_probability(
+            "short", tech_score, news_score, chart, data_quality, dimensions
+        )
         if p_long is None or p_short is None:
             return None
         return p_long, p_short
@@ -766,6 +862,7 @@ def _binary_auc(labels: Sequence[int], probabilities: Sequence[float]) -> float:
 def save_artifact(artifact: MLArtifact, path: str | Path) -> None:
     payload = {
         "schema": SCHEMA_VERSION,
+        "training_contract": TRAINING_CONTRACT,
         "trained_at": artifact.trained_at,
         "n_train": artifact.n_train,
         "n_valid": artifact.n_valid,
@@ -824,6 +921,8 @@ def load_artifact(path: str | Path) -> MLArtifact:
         return MLArtifact()
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA_VERSION:
         return MLArtifact(reasons=["モデルファイルのスキーマ不一致"])
+    if payload.get("training_contract") != TRAINING_CONTRACT:
+        return MLArtifact(reasons=["モデルのPIT学習契約が現行と不一致(要再学習)"])
     if payload.get("feature_names") != list(FEATURE_NAMES):
         # 特徴量定義が変わった古いモデルを黙って使うと列がずれるため拒否
         return MLArtifact(reasons=["特徴量定義が現行と不一致(要再学習)"])

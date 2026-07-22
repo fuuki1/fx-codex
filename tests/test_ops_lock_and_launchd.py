@@ -161,6 +161,8 @@ PLIST_TEMPLATES = [
     "com.fx-codex.snapshot.plist.tmpl",
     "com.fx-codex.briefing.plist.tmpl",
     "com.fx-codex.health.plist.tmpl",
+    "com.fx-codex.horizon.plist.tmpl",
+    "com.fx-codex.monitors.plist.tmpl",
 ]
 
 
@@ -231,7 +233,13 @@ def test_install_script_dry_run_makes_no_changes(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "dry-run" in result.stdout
-    for label in ("com.fx-codex.snapshot", "com.fx-codex.briefing", "com.fx-codex.health"):
+    for label in (
+        "com.fx-codex.snapshot",
+        "com.fx-codex.briefing",
+        "com.fx-codex.health",
+        "com.fx-codex.horizon",
+        "com.fx-codex.monitors",
+    ):
         assert label in result.stdout
     # 展開済みパスが含まれ、プレースホルダは残らない
     assert "__FX_ROOT__" not in result.stdout
@@ -245,6 +253,8 @@ def test_shell_scripts_parse(tmp_path):
         "status_fx_services.sh",
         "restart_fx_services.sh",
         "fx_briefing_once.sh",
+        "fx_horizon_once.sh",
+        "fx_monitors_once.sh",
     ):
         result = subprocess.run(
             [_ZSH, "-n", str(_ROOT / "scripts" / script)],
@@ -279,10 +289,7 @@ def test_restart_script_fails_if_any_service_is_not_loaded(tmp_path):
     assert "restarted:" not in result.stdout
 
 
-@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
-def test_briefing_wrapper_runs_one_integrated_briefing_and_propagates_failure(tmp_path):
-    # cc8fbe8で定期通知経路を--signal-boardから統合ブリーフィング(--per-timeframe)へ切替済み。
-    # 単一呼び出しであること・子の終了コードを透過することを検証する。
+def _make_briefing_wrapper_repo(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "repo"
     scripts = root / "scripts"
     python_dir = root / ".venv" / "bin"
@@ -294,16 +301,50 @@ def test_briefing_wrapper_runs_one_integrated_briefing_and_propagates_failure(tm
         "#!/bin/sh\n"
         'root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)\n'
         'printf "%s\\n" "$*" >> "$root/invocations.txt"\n'
-        "exit 7\n",
+        'if [ "$1" = "tools/fusion_capture_schedule.py" ] '
+        '&& [ "${USE_REAL_SCHEDULE:-0}" = "1" ]; then\n'
+        '  script="$1"\n'
+        "  shift\n"
+        '  exec "$REAL_PYTHON" "$root/$script" "$@"\n'
+        "fi\n"
+        'case "$1" in\n'
+        '  tools/fusion_capture_schedule.py) exit "${SCHEDULE_EXIT:-3}";;\n'
+        "  fx_briefing.py)\n"
+        '    case " $* " in\n'
+        '      *" --per-timeframe "*) exit "${PER_TIMEFRAME_EXIT:-0}";;\n'
+        "      *)\n"
+        '        if [ "${WRITE_FUSION_JOURNAL:-0}" = "1" ]; then\n'
+        '          "$REAL_PYTHON" -c '
+        "'import json,sys; from datetime import datetime,timezone; "
+        "p=sys.argv[1]; ts=datetime.now(timezone.utc).isoformat(); "
+        'f=open(p, "a", encoding="utf-8"); '
+        'f.writelines(json.dumps({"ts":ts,"symbol":s})+"\\n" '
+        'for s in ("USDJPY","EURUSD","GBPUSD")); f.close()\' '
+        '"$root/logs/briefing_journal.jsonl"\n'
+        "        fi\n"
+        '        exit "${FUSION_EXIT:-0}";;\n'
+        "    esac\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 99\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
+    return root, scripts
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_briefing_wrapper_skips_fusion_after_non_notification_failure(tmp_path):
+    root, scripts = _make_briefing_wrapper_repo(tmp_path)
+    env = dict(os.environ)
+    env.update(PER_TIMEFRAME_EXIT="7", SCHEDULE_EXIT="0")
 
     result = subprocess.run(
         [_ZSH, str(scripts / "fx_briefing_once.sh")],
         capture_output=True,
         text=True,
         timeout=10,
+        env=env,
     )
 
     assert result.returncode == 7
@@ -315,6 +356,153 @@ def test_briefing_wrapper_runs_one_integrated_briefing_and_propagates_failure(tm
     assert "--require-freshness" in invocation
     assert "--signal-board" not in invocation
     assert "USDJPY EURUSD" in invocation
+    assert "fusion capture skipped" in result.stderr
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_briefing_wrapper_continues_fusion_after_notification_failure(tmp_path):
+    root, scripts = _make_briefing_wrapper_repo(tmp_path)
+    env = dict(os.environ)
+    env.update(PER_TIMEFRAME_EXIT="5", SCHEDULE_EXIT="0")
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 5
+    invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
+    assert len(invocations) == 3
+    assert "--no-discord" in invocations[2]
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_briefing_wrapper_real_schedule_runs_once_then_skips(tmp_path):
+    root, scripts = _make_briefing_wrapper_repo(tmp_path)
+    tools_dir = root / "tools"
+    tools_dir.mkdir()
+    shutil.copy2(_ROOT / "tools" / "fusion_capture_schedule.py", tools_dir)
+    env = dict(os.environ)
+    env.update(
+        USE_REAL_SCHEDULE="1",
+        WRITE_FUSION_JOURNAL="1",
+        REAL_PYTHON=sys.executable,
+    )
+
+    first = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    second = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert first.returncode == 0
+    assert second.returncode == 0
+    invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
+    fusion_calls = [
+        invocation
+        for invocation in invocations
+        if invocation.startswith("fx_briefing.py ") and "--per-timeframe" not in invocation
+    ]
+    assert len(invocations) == 5
+    assert len(fusion_calls) == 1
+    rows = (root / "logs" / "briefing_journal.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 3
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_briefing_wrapper_runs_due_fusion_without_discord_or_price_write(tmp_path):
+    root, scripts = _make_briefing_wrapper_repo(tmp_path)
+    env = dict(os.environ)
+    env.update(SCHEDULE_EXIT="0")
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
+    assert len(invocations) == 3
+    assert "--per-timeframe" in invocations[0]
+    assert "GBPUSD" not in invocations[0]
+    fusion = invocations[2]
+    assert fusion.startswith("fx_briefing.py ")
+    assert "--per-timeframe" not in fusion
+    assert "--no-discord" in fusion
+    assert "--no-price-write" in fusion
+    assert "--require-freshness" in fusion
+    assert "USDJPY EURUSD GBPUSD" in fusion
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_briefing_wrapper_propagates_fusion_or_schedule_failure(tmp_path):
+    root, scripts = _make_briefing_wrapper_repo(tmp_path)
+    env = dict(os.environ)
+    env.update(SCHEDULE_EXIT="0", FUSION_EXIT="9")
+    fusion_failure = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert fusion_failure.returncode == 9
+
+    (root / "invocations.txt").unlink()
+    env.update(SCHEDULE_EXIT="2", FUSION_EXIT="0")
+    schedule_failure = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert schedule_failure.returncode == 2
+    assert "schedule check failed" in schedule_failure.stderr
+    invocations = (root / "invocations.txt").read_text(encoding="utf-8").splitlines()
+    assert len(invocations) == 2
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+@pytest.mark.parametrize(
+    ("schedule_exit", "fusion_exit", "expected"),
+    [("0", "4", 4), ("2", "0", 2)],
+)
+def test_briefing_wrapper_prioritizes_writer_failure_over_notification_failure(
+    tmp_path, schedule_exit, fusion_exit, expected
+):
+    _, scripts = _make_briefing_wrapper_repo(tmp_path)
+    env = dict(os.environ)
+    env.update(
+        PER_TIMEFRAME_EXIT="5",
+        SCHEDULE_EXIT=schedule_exit,
+        FUSION_EXIT=fusion_exit,
+    )
+
+    result = subprocess.run(
+        [_ZSH, str(scripts / "fx_briefing_once.sh")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert result.returncode == expected
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")

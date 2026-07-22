@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, UTC
 from typing import cast
 
@@ -24,9 +25,11 @@ from fx_intel.market import is_market_open, open_hours_between
 from fx_intel.news import NewsItem, dedupe_and_sort, parse_rss, tag_currencies
 from fx_intel.journal import (
     DirectionalStats,
+    PointInTimeError,
     append_plans,
     evaluate_directional_accuracy,
     format_stats_ja,
+    is_pit_eligible_entry,
 )
 from fx_intel.sentiment import (
     CurrencySentiment,
@@ -540,9 +543,14 @@ def test_build_trade_plan_standby_in_event_window() -> None:
     }
     plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, windows, [], now=NOW)
     assert plan.direction == "standby"
+    assert plan.analysis_direction == "long"
+    assert plan.analysis_conviction > 0
     assert plan.conviction <= briefing.STANDBY_CONVICTION_CAP
     assert plan.stop is None
     assert any("イベント警戒中" in w for w in plan.warnings)
+    event_gate = next(trace for trace in plan.gate_trace if trace["gate"] == "event_window")
+    assert event_gate["event_title"] == "FOMC"
+    assert event_gate["blocked_until"] == windows[0].end.isoformat()
 
 
 def test_build_trade_plan_neutral_when_signals_conflict() -> None:
@@ -710,8 +718,6 @@ def test_journal_weekend_gap_uses_market_open_hours(tmp_path) -> None:
 
 def test_journal_records_score_breakdown_and_levels(tmp_path) -> None:
     """スコア内訳とSL/TPが記録され、後からキャリブレーション分析に使える。"""
-    import json as jsonlib
-
     path = tmp_path / "journal.jsonl"
     currencies = {
         "USD": CurrencySentiment("USD", score=0.5),
@@ -720,13 +726,48 @@ def test_journal_records_score_breakdown_and_levels(tmp_path) -> None:
     plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
     append_plans(path, [plan], now=NOW)
 
-    entry = jsonlib.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    entry = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert entry["tech_score"] == plan.tech_score
     assert entry["news_score"] == plan.news_score
     assert entry["atr"] == 0.5
     assert entry["stop"] == plan.stop
     assert entry["target1"] == plan.target1
     assert entry["target2"] == plan.target2
+    assert entry["pit_eligible"] is False
+
+
+def test_journal_records_and_validates_pit_provenance(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    source_cutoff = NOW - timedelta(minutes=2)
+    feature_available = NOW - timedelta(seconds=1)
+
+    append_plans(
+        path,
+        [plan],
+        now=NOW,
+        source_cutoff=source_cutoff,
+        max_feature_available_time=feature_available,
+    )
+
+    entry = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["prediction_time"] == NOW.isoformat()
+    assert entry["source_cutoff"] == source_cutoff.isoformat()
+    assert entry["max_feature_available_time"] == feature_available.isoformat()
+    assert is_pit_eligible_entry(entry)
+
+    with pytest.raises(PointInTimeError, match="PIT ordering"):
+        append_plans(
+            path,
+            [plan],
+            now=NOW,
+            source_cutoff=source_cutoff,
+            max_feature_available_time=NOW + timedelta(seconds=1),
+        )
 
 
 def test_journal_skips_non_directional_entries(tmp_path) -> None:

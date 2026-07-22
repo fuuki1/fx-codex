@@ -12,9 +12,20 @@ tail -n 80 logs/launchd/snapshot.err.log
 tail -n 80 logs/launchd/briefing.err.log
 tail -n 80 logs/launchd/health.err.log
 tail -n 5 logs/briefing_tf_prices.jsonl
+tail -n 20 logs/fx_fusion_capture.log
+tail -n 5 logs/briefing_journal.jsonl
 ```
 
-正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・時間足別統合通知）、`com.fx-codex.health`（5分）です。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
+正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・時間足別統合通知、同じ排他ロック内で最大1時間ごとの融合判断）、`com.fx-codex.health`（5分）です。融合判断は`--no-discord --no-price-write`で動き、ログは`logs/fx_fusion_capture.log`に残ります。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
+
+時間足別Discord通知はUSDJPY/EURUSD、融合判断とGBDT候補収集はUSDJPY/EURUSD/GBPUSDです。
+GBPUSDを含む3ペア×4時間足の価格完全性は`com.fx-codex.snapshot`とfreshness monitorが監視します。
+GBDTは`source_cutoff`・`max_feature_available_time`・`prediction_time`の順序を検証できる
+PIT適格な融合行だけを学習・昇格に使います。旧形式行は監査用に保持しますが学習件数には含めません。
+
+時間足別処理の一般失敗では融合処理を開始しません。主要ジャーナル書込み失敗は終了コード4、
+Discord通知だけの失敗は終了コード5です。通知失敗時はlaunchdへ非ゼロを返しつつ、保存済みの判断とは
+独立した融合取得を継続します。
 
 開発機 `/Users/takahashifuuki/Desktop/fx-codex` は検証用であり、Mac miniの収集責務を代替しません。
 
@@ -29,6 +40,9 @@ tail -n 5 logs/briefing_tf_prices.jsonl
 ```
 
 `data_freshness_monitor --no-notify`は指定した一時reportだけを更新し、canonical notification state/reportを消費しません。`journal_gap_audit`は入力を変更しません。`decision_expectancy_monitor.py`、`learning_capture.py`とoutcome/feedback更新は書き込み処理なので、正規briefing稼働中の読み取り専用確認には使いません。
+
+融合判断の鮮度は、自己依存するhard gateを避けるためcanonical freshness reportの対象外です。
+学習ダッシュボードの融合最終時刻と`fx_fusion_capture.log`を併用して確認します。
 
 鮮度監視を無効化した結果を運用判断に使ってはいけません。
 
@@ -64,3 +78,40 @@ cd /Users/fuuki/srv/fx-codex
 - `performance.net_R` と `performance.expected_R` で実現Rと期待Rを見る。
 - `model_expectancy_delta` で `baseline_model` と `learning_model` の expected_R 差分を見る。
 - 改善候補は研究評価に留める。前回値より良い、または警告がないだけでは昇格しない。
+
+## 6. 期待値ガードの根拠更新(シャドー反実仮想)
+
+期待値ガードがblockした判断は `direction=neutral` で記録され採点対象から消えるため、
+実績だけを根拠にするとガードのサンプルが増えず、blockが恒久化する(学習飢餓。
+2026-07-17〜07-21の実機で根拠n=28のまま全新規判断が凍結した実例あり)。
+
+このためガード根拠(`fx_briefing` の `guard_evidence_summary`)は
+「実績 + expectancy_guard単独見送り行のシャドー計画(反実仮想)」で毎時更新する。
+
+- 反実仮想は判断時に凍結記録された値のみから合成する(`journal.counterfactual_guard_entries`):
+  ゲート前の `analysis_direction` / `analysis_conviction` と、`shadow_predictions` の
+  `fusion_raw` に記録済みのSL/TP。事後の再計算はしない(PIT安全)。記録が欠けた行は除外(fail-closed)。
+- `event_window` / `low_data_quality` 等が併発した行は含めない。ガードが無くても
+  見送っていた行であり、根拠に混ぜると反実仮想が汚染されるため。
+- 推奨(`direction`)はガード判定に従いneutralのまま。blockの解除は、反実仮想を含む
+  期待Rが非負に転じたときだけ起きる。負のままなら見送り継続(data/risk vetoの上書きではない)。
+- 監視: 反実仮想の量は `quality.flags.expectancy_guard_counterfactual`、学習側は
+  `briefing_learning.json` の `counterfactual_evaluated` に出る。改善候補レジストリと
+  期待値レポートは従来どおり実績のみを使う。
+
+## 7. USDファクター整合監査(観測専用)
+
+同一実行で提示された判断群のUSD観の内部矛盾(例: USDJPY long=USD強 ∧
+EURUSD/GBPUSD long=USD弱)を `fx_intel/usd_coherence.py` が監査する。
+2026-07-16に3ペア同時longがUSD全面高で相関全敗した実測が動機。
+
+- 各判断行の `gate_trace` に `gate: usd_factor_coherence / status: observed` が付く。
+  recommended(ゲート後の推奨)とanalysis(ゲート前の分析)の2トラックで、
+  スタンス(+1=USD強/-1=USD弱)・矛盾有無・確信度加重の少数派(`would_dampen`)を記録する。
+- **観測専用**: 方向・確信度は変更しない(`applied: false`)。ガードで推奨が全て
+  neutral化されている期間もanalysis側で観測が続く。
+- 矛盾検出時はDiscord警告「🧭 USD観の内部矛盾を検出」が出る。
+- 減衰(`DAMPEN_FACTOR_PROPOSAL`)の有効化は、蓄積した観測での期待値改善が
+  独立レビューで確認されてからの別PR。レトロ検証では7/16(推奨9実行)と
+  7/17・7/20(分析3+14実行、少数派=GBPUSD)を検出し、GBPUSDシャドー全敗5件は
+  すべて検出ウィンドウ内だった。
