@@ -1286,6 +1286,7 @@ th {
   color: var(--muted);
   border: 1px dashed var(--line);
   border-radius: 8px;
+}
 
 /* 直近の答え合わせ(予想の的中/外れ)一覧 */
 .outcome-list {
@@ -1337,13 +1338,17 @@ th {
 
 .outcome-row {
   display: grid;
-  grid-template-columns: minmax(88px, auto) 1fr minmax(60px, auto) minmax(90px, auto);
+  grid-template-columns: 92px minmax(0, 1fr) minmax(56px, auto) 96px;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
+  gap: 12px;
+  padding: 9px 12px;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.03);
   border-left: 3px solid var(--muted);
+}
+
+.outcome-row + .outcome-row {
+  margin-top: 6px;
 }
 
 .outcome-row.hit {
@@ -1370,21 +1375,37 @@ th {
   border-left-color: #657281;
 }
 
+/* 判定バッジは色付きピルにして、行の左端で結果が一目で分かるようにする。 */
 .outcome-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 0.78rem;
   font-weight: 600;
   white-space: nowrap;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
 }
 
 .outcome-row.hit .outcome-badge {
   color: var(--green);
+  background: rgba(93, 201, 140, 0.16);
 }
 
 .outcome-row.miss .outcome-badge {
   color: var(--red);
+  background: rgba(222, 110, 100, 0.16);
 }
 
 .outcome-row.pending .outcome-badge {
   color: var(--amber);
+  background: rgba(214, 166, 75, 0.16);
+}
+
+.outcome-row.flat .outcome-badge {
+  color: var(--text);
 }
 
 .outcome-main {
@@ -1400,6 +1421,14 @@ th {
   font-variant-numeric: tabular-nums;
 }
 
+.outcome-move.up {
+  color: var(--green);
+}
+
+.outcome-move.down {
+  color: var(--red);
+}
+
 .outcome-ts {
   text-align: right;
   white-space: nowrap;
@@ -1407,7 +1436,7 @@ th {
 
 @media (max-width: 720px) {
   .outcome-row {
-    grid-template-columns: minmax(80px, auto) 1fr;
+    grid-template-columns: 88px minmax(0, 1fr);
   }
   .outcome-move,
   .outcome-ts {
@@ -1424,12 +1453,15 @@ th {
 }
 
 .outcome-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   appearance: none;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(255, 255, 255, 0.03);
   color: var(--muted);
   border-radius: 999px;
-  padding: 5px 12px;
+  padding: 5px 8px 5px 12px;
   font-size: 0.85rem;
   cursor: pointer;
   white-space: nowrap;
@@ -1445,29 +1477,80 @@ th {
   background: rgba(93, 201, 140, 0.12);
 }
 
-.outcome-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 10px;
+.outcome-tab-label {
+  font-weight: 600;
 }
 
-.outcome-chip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: baseline;
-  padding: 6px 10px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.04);
-  font-size: 0.85rem;
+/* タブ末尾の件数バッジ。総数だけを小さく添える。 */
+.outcome-tab-count {
+  min-width: 1.4em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
-.outcome-chip strong {
+.outcome-tab.active .outcome-tab-count {
+  background: rgba(93, 201, 140, 0.22);
   color: var(--text);
 }
 
+.outcome-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+/* 集計チップを縦積みの小カードにして、内訳・通算・分析仮説を行で分ける。 */
+.outcome-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+
+.outcome-chip-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.outcome-chip-head strong {
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
 .outcome-chip-recent {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.outcome-chip-tag {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.outcome-chip-rate {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.outcome-chip-rate strong {
   color: var(--text);
   font-variant-numeric: tabular-nums;
 }
