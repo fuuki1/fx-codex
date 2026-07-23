@@ -12,6 +12,15 @@ from fx_briefing import (
     score_trade_outcomes_cli,
 )
 from fx_intel import briefing, journal, trade_outcome as to
+from fx_intel.evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import IntervalView, PairTechnicals
 
@@ -27,14 +36,20 @@ def _outcome(
     quality: float = 0.70,
     conviction: int = 60,
     target_policy_id: str | None = None,
+    index: int = 0,
+    net_r: float | None = None,
 ) -> to.TradeOutcome:
+    prediction = NOW + timedelta(days=index * 2)
+    realized_net_r = r_multiple - 0.2 if net_r is None else net_r
     return to.TradeOutcome(
         symbol=symbol,
         direction=direction,
-        ts=NOW.isoformat(),
+        ts=prediction.isoformat(),
         horizon_hours=24.0,
         conviction=conviction,
         data_quality=0.90,
+        timeframe="1h",
+        decision_id=f"decision-{symbol}-{direction}-{index}",
         entry=100.0,
         stop=99.0 if direction == "long" else 101.0,
         target1=101.0 if direction == "long" else 99.0,
@@ -57,9 +72,30 @@ def _outcome(
             else "tp1" if r_multiple >= 1.0 else "sl" if r_multiple <= -1.0 else "none"
         ),
         realized_r=r_multiple,
+        realized_net_r=realized_net_r,
+        net_label_eligible=True,
+        label_version=NET_LABEL_VERSION,
+        label_provenance=NET_LABEL_PROVENANCE,
+        entry_bid=99.9,
+        entry_ask=100.1,
+        quote_realized_r=realized_net_r,
+        entry_spread_r=0.2,
+        slippage_r=0.0,
+        commission_r=0.0,
+        financing_r=0.0,
+        additional_cost_r=0.0,
+        execution_cost_r=r_multiple - realized_net_r,
+        cost_model_id=DEFAULT_COST_MODEL_ID,
+        cost_model_version=DEFAULT_COST_MODEL_VERSION,
+        cost_status=DEFAULT_COST_STATUS,
+        entry_quote_source="fixture",
+        spread_source="fixture",
+        slippage_model_id=DEFAULT_SLIPPAGE_MODEL_ID,
+        commission_model_id=DEFAULT_COMMISSION_MODEL_ID,
+        cost_quality_flags=(),
         path_points=6,
-        path_start=(NOW + timedelta(hours=4)).isoformat(),
-        path_end=(NOW + DAY).isoformat(),
+        path_start=(prediction + timedelta(hours=4)).isoformat(),
+        path_end=(prediction + DAY).isoformat(),
         path_coverage=1.0,
         path_quality=quality,
         quality_flags=("close_only_path",),
@@ -113,6 +149,23 @@ def _write_jsonl(path, rows: list[dict]) -> None:
     )
 
 
+def _net_tp_evidence(
+    *,
+    baseline: float,
+    candidate: float,
+) -> dict[str, object]:
+    return {
+        "label_version": NET_LABEL_VERSION,
+        "label_provenance": NET_LABEL_PROVENANCE,
+        "cost_model_id": DEFAULT_COST_MODEL_ID,
+        "net_label_samples": to.MIN_EXPECTANCY_SAMPLES,
+        "net_label_coverage": 1.0,
+        "baseline_net_expectancy_r": baseline,
+        "candidate_net_expectancy_r": candidate,
+        "delta_net_expectancy_r": candidate - baseline,
+    }
+
+
 def _bullish_tech() -> PairTechnicals:
     tech = PairTechnicals(symbol="USDJPY", fast_window=20, slow_window=100)
     tech.views["1h"] = IntervalView(
@@ -139,7 +192,7 @@ def _bullish_tech() -> PairTechnicals:
 
 
 def test_expectancy_findings_flag_negative_expectancy_cells() -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
 
     findings = to.expectancy_findings(summary)
@@ -148,11 +201,12 @@ def test_expectancy_findings_flag_negative_expectancy_cells() -> None:
         finding["label"] == "全体" and finding["severity"] == "block" for finding in findings
     )
     assert summary["overall"]["sample_ok"] is True
-    assert summary["overall"]["expectancy_r"] == -1.0
+    assert summary["overall"]["gross_expectancy_r"] == -1.0
+    assert summary["overall"]["net_expectancy_r"] == -1.2
 
 
 def test_expectancy_findings_mark_sample_guard() -> None:
-    outcomes = [_outcome(1.0) for _ in range(3)]
+    outcomes = [_outcome(1.0, index=index) for index in range(3)]
     summary = to.summarize_expectancy(outcomes, min_samples=5, group_min_samples=5)
 
     findings = to.expectancy_findings(summary)
@@ -162,7 +216,9 @@ def test_expectancy_findings_mark_sample_guard() -> None:
 
 
 def test_decision_adjustment_blocks_matching_symbol_direction() -> None:
-    outcomes = [_outcome(-1.0, symbol="USDJPY", direction="long") for _ in range(12)]
+    outcomes = [
+        _outcome(-1.0, symbol="USDJPY", direction="long", index=index) for index in range(12)
+    ]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
 
     adjustment = to.decision_adjustment(summary, "USDJPY", "long", 60)
@@ -173,8 +229,25 @@ def test_decision_adjustment_blocks_matching_symbol_direction() -> None:
     assert adjustment.matched_scope == "通貨ペア×方向"
 
 
+def test_gross_positive_but_canonical_net_negative_is_blocked() -> None:
+    outcomes = [
+        _outcome(0.1, net_r=-0.1, index=index) for index in range(to.MIN_EXPECTANCY_SAMPLES)
+    ]
+    summary = to.summarize_expectancy(
+        outcomes,
+        min_samples=to.MIN_EXPECTANCY_SAMPLES,
+        group_min_samples=to.MIN_GROUP_EXPECTANCY_SAMPLES,
+    )
+
+    assert summary["overall"]["gross_expectancy_r"] == 0.1
+    assert summary["overall"]["net_expectancy_r"] == -0.1
+    adjustment = to.decision_adjustment(summary, "USDJPY", "long", 60)
+    assert adjustment.block is True
+    assert adjustment.expectancy_r == -0.1
+
+
 def test_decision_adjustment_keeps_sample_guard_non_blocking() -> None:
-    outcomes = [_outcome(1.0, symbol="USDJPY", direction="long") for _ in range(3)]
+    outcomes = [_outcome(1.0, symbol="USDJPY", direction="long", index=index) for index in range(3)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
 
     adjustment = to.decision_adjustment(summary, "USDJPY", "long", 60)
@@ -270,7 +343,7 @@ def test_target_policy_is_written_to_journal_and_scored_by_policy(tmp_path) -> N
 
 
 def test_improvement_registry_tracks_active_ready_and_resolved_candidates() -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
     candidate = next(
         candidate
@@ -308,7 +381,7 @@ def test_improvement_registry_tracks_active_ready_and_resolved_candidates() -> N
 
 
 def test_improvement_registry_preserves_unmanaged_candidate_types() -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
     expectancy_candidate = to.improvement_candidates(summary)[0]
     registry = to.update_improvement_registry(None, [expectancy_candidate], now=NOW)
@@ -329,20 +402,20 @@ def test_improvement_registry_preserves_unmanaged_candidate_types() -> None:
             }
         ],
     }
-    variant_candidate = to.variant_improvement_candidates(variant_report)[0]
+    variant_candidates = to.variant_improvement_candidates(variant_report)
     registry = to.update_improvement_registry(
         registry,
-        [variant_candidate],
+        variant_candidates,
         now=NOW + timedelta(hours=1),
         managed_action_types=to.VARIANT_CANDIDATE_ACTION_TYPES,
     )
 
+    assert variant_candidates == []
     assert registry["candidates"][expectancy_candidate.candidate_id]["status"] == "active"
-    assert registry["candidates"][variant_candidate.candidate_id]["status"] == "active"
 
 
 def test_improvement_candidate_approval_requires_paper_ready_and_is_preserved() -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
     candidate = to.improvement_candidates(summary)[0]
     registry = to.update_improvement_registry(None, [candidate], now=NOW)
@@ -433,9 +506,7 @@ def test_select_approved_target_policy_prefers_specific_approved_candidate() -> 
             "target2_r": 1.6,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.3,
-            "delta_expectancy_r": 1.3,
+            **_net_tp_evidence(baseline=-1.0, candidate=0.3),
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
@@ -454,9 +525,7 @@ def test_select_approved_target_policy_prefers_specific_approved_candidate() -> 
             "target2_r": 1.5,
             "scope": "by_symbol_direction",
             "key": "USDJPY:long",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.4,
-            "delta_expectancy_r": 1.4,
+            **_net_tp_evidence(baseline=-1.0, candidate=0.4),
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
@@ -509,9 +578,7 @@ def test_auto_pause_underperforming_approved_target_policy() -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            **_net_tp_evidence(baseline=-1.0, candidate=0.75),
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
@@ -533,8 +600,8 @@ def test_auto_pause_underperforming_approved_target_policy() -> None:
         now=NOW + timedelta(hours=2),
     )
     outcomes = [
-        _outcome(-1.0, target_policy_id=candidate.candidate_id)
-        for _ in range(to.MIN_GROUP_EXPECTANCY_SAMPLES)
+        _outcome(-1.0, target_policy_id=candidate.candidate_id, index=index)
+        for index in range(to.MIN_GROUP_EXPECTANCY_SAMPLES)
     ]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
 
@@ -550,7 +617,10 @@ def test_auto_pause_underperforming_approved_target_policy() -> None:
     assert record["stage"] == "auto_paused"
     assert paused_registry["auto_paused_count"] == 1
     assert paused_registry["events"][-1]["event_type"] == "auto_paused"
-    assert paused_registry["events"][-1]["details"]["tradable"] == to.MIN_GROUP_EXPECTANCY_SAMPLES
+    assert (
+        paused_registry["events"][-1]["details"]["net_label_samples"]
+        == to.MIN_GROUP_EXPECTANCY_SAMPLES
+    )
     assert (
         to.select_approved_target_policy(
             paused_registry,
@@ -576,9 +646,7 @@ def test_resume_auto_paused_candidate_restores_approved_policy() -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            **_net_tp_evidence(baseline=-1.0, candidate=0.75),
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
@@ -594,8 +662,8 @@ def test_resume_auto_paused_candidate_restores_approved_policy() -> None:
     )
     summary = to.summarize_expectancy(
         [
-            _outcome(-1.0, target_policy_id=candidate.candidate_id)
-            for _ in range(to.MIN_GROUP_EXPECTANCY_SAMPLES)
+            _outcome(-1.0, target_policy_id=candidate.candidate_id, index=index)
+            for index in range(to.MIN_GROUP_EXPECTANCY_SAMPLES)
         ],
         min_samples=20,
         group_min_samples=12,
@@ -636,7 +704,7 @@ def test_resume_auto_paused_candidate_restores_approved_policy() -> None:
 
 
 def test_monitoring_snapshot_includes_health_and_ready_candidates() -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
     candidate = to.improvement_candidates(summary)[0]
     registry = to.update_improvement_registry(None, [candidate], now=NOW)
@@ -653,7 +721,7 @@ def test_monitoring_snapshot_includes_health_and_ready_candidates() -> None:
 
 
 def test_approve_trade_candidate_cli_updates_registry(tmp_path) -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
     candidate = to.improvement_candidates(summary)[0]
     registry = to.update_improvement_registry(
@@ -697,9 +765,7 @@ def test_resume_trade_candidate_cli_updates_auto_paused_registry(tmp_path) -> No
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            **_net_tp_evidence(baseline=-1.0, candidate=0.75),
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
@@ -722,8 +788,8 @@ def test_resume_trade_candidate_cli_updates_auto_paused_registry(tmp_path) -> No
     )
     summary = to.summarize_expectancy(
         [
-            _outcome(-1.0, target_policy_id=candidate.candidate_id)
-            for _ in range(to.MIN_GROUP_EXPECTANCY_SAMPLES)
+            _outcome(-1.0, target_policy_id=candidate.candidate_id, index=index)
+            for index in range(to.MIN_GROUP_EXPECTANCY_SAMPLES)
         ],
         min_samples=20,
         group_min_samples=12,
@@ -753,7 +819,7 @@ def test_resume_trade_candidate_cli_updates_auto_paused_registry(tmp_path) -> No
 
 
 def test_expectancy_health_warns_for_sample_guard() -> None:
-    outcomes = [_outcome(1.0) for _ in range(3)]
+    outcomes = [_outcome(1.0, index=index) for index in range(3)]
     summary = to.summarize_expectancy(outcomes, min_samples=5, group_min_samples=5)
 
     report = to.check_expectancy_health(summary)
@@ -763,7 +829,7 @@ def test_expectancy_health_warns_for_sample_guard() -> None:
 
 
 def test_expectancy_health_fails_for_negative_expectancy() -> None:
-    outcomes = [_outcome(-1.0) for _ in range(20)]
+    outcomes = [_outcome(-1.0, index=index) for index in range(20)]
     summary = to.summarize_expectancy(outcomes, min_samples=20, group_min_samples=12)
 
     report = to.check_expectancy_health(summary)
@@ -1018,7 +1084,7 @@ def test_mfe_and_mae_stop_at_the_first_exit_touch() -> None:
     assert outcome.mae_r == 0.2
 
 
-def test_retest_trade_variants_cli_writes_paper_candidate(tmp_path) -> None:
+def test_retest_trade_variants_cli_does_not_promote_legacy_gross_candidate(tmp_path) -> None:
     journal_path = tmp_path / "journal.jsonl"
     report_path = tmp_path / "variants.json"
     registry_path = tmp_path / "registry.json"
@@ -1055,12 +1121,14 @@ def test_retest_trade_variants_cli_writes_paper_candidate(tmp_path) -> None:
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
 
     assert exit_code == 0
-    assert payload["baseline"]["overall"]["expectancy_r"] == -1.0
-    assert payload["best"]["recommendation"] == "paper_test"
-    assert payload["best"]["target1_r"] == 0.75
-    assert payload["best"]["expectancy_r"] == 0.75
-    assert payload["improvement_candidates"][0]["action_type"] == "tp_sl_variant_paper_test"
-    assert registry["active_count"] == len(payload["improvement_candidates"])
+    assert payload["baseline"]["overall"]["gross_expectancy_r"] == -1.0
+    assert payload["baseline"]["overall"]["net_expectancy_r"] is None
+    assert payload["best"] is None
+    assert payload["variants"][0]["recommendation"] == "sample_guard"
+    assert payload["variants"][0]["target1_r"] == 0.75
+    assert payload["variants"][0]["expectancy_r"] is None
+    assert payload["improvement_candidates"] == []
+    assert registry["active_count"] == 0
 
 
 def test_retest_trade_variants_reports_symbol_direction_cell_candidates() -> None:
@@ -1096,15 +1164,11 @@ def test_retest_trade_variants_reports_symbol_direction_cell_candidates() -> Non
     candidates = to.variant_improvement_candidates(report, limit=5)
 
     assert report["baseline"]["overall"]["sample_ok"] is False
-    assert cell["baseline"]["sample_ok"] is True
-    assert cell["best"]["recommendation"] == "paper_test"
-    assert cell["best"]["target1_r"] == 0.75
-    assert any(
-        candidate.action_type == "tp_sl_variant_paper_test"
-        and candidate.proposed_change["scope"] == "by_symbol_direction"
-        and candidate.proposed_change["key"] == "USDJPY:long"
-        for candidate in candidates
-    )
+    assert cell["baseline"]["sample_ok"] is False
+    assert cell["best"] is None
+    assert cell["variants"][0]["recommendation"] == "sample_guard"
+    assert cell["variants"][0]["target1_r"] == 0.75
+    assert candidates == []
 
 
 def test_check_trade_outcome_health_cli_returns_failure_for_negative_expectancy(tmp_path) -> None:

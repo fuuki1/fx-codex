@@ -1380,12 +1380,15 @@ function renderTradeMonitor(data) {
     policyStats.appendChild(empty("承認済みTP/SL候補の採点はまだありません"));
   }
   stats.slice(0, 8).forEach((row) => {
-    const expectancy = num(row.expectancy_r);
+    const netExpectancy = num(row.net_expectancy_r);
+    const grossExpectancy = num(row.gross_expectancy_r);
     policyStats.appendChild(
       tradeItem(
         `${row.stage || "--"} ${row.candidate_id || "--"}`,
-        `gross期待R ${signedR(expectancy)} / PF ${num(row.profit_factor_r)?.toFixed(2) || "--"} / n=${row.tradable || 0}`,
-        expectancy !== null && expectancy < 0 ? "red-text" : "green-text",
+        `canonical net期待R ${signedR(netExpectancy)} / net PF ${
+          num(row.net_profit_factor_r)?.toFixed(2) || "--"
+        } / gross診断 ${signedR(grossExpectancy)} / net n=${row.net_label_samples || 0}`,
+        netExpectancy !== null && netExpectancy < 0 ? "red-text" : "green-text",
       ),
     );
   });
@@ -1411,8 +1414,10 @@ function renderDecisionMonitor(data) {
   const performance = decision.performance || {};
   const modelDelta = decision.model_expectancy_delta || {};
   const counts = decision.counts || {};
-  const expectancy = num(overall.expectancy_r);
-  const profitFactor = num(overall.profit_factor_r);
+  const grossExpectancy = num(overall.gross_expectancy_r);
+  const netExpectancy = num(overall.net_expectancy_r);
+  const grossProfitFactor = num(overall.gross_profit_factor_r);
+  const netProfitFactor = num(overall.net_profit_factor_r);
   const netR = num(performance.net_R);
   const deltaExpected = num(modelDelta.delta_expected_R);
   const cellCount = Object.values(counts).reduce((total, value) => total + Number(value || 0), 0);
@@ -1422,9 +1427,11 @@ function renderDecisionMonitor(data) {
   setText("decisionHealth", decision.status || "unknown");
   setText(
     "decisionExpectancy",
-    `gross期待R ${signedR(expectancy)} / legacy net proxy ${signedR(netR)} / Δ ${signedR(deltaExpected)} / PF ${
-      profitFactor === null ? "--" : profitFactor.toFixed(2)
-    }`,
+    `canonical net期待R ${signedR(netExpectancy)} / 累積net ${signedR(netR)} / gross診断 ${signedR(
+      grossExpectancy,
+    )} / Δ ${signedR(deltaExpected)} / net PF ${
+      netProfitFactor === null ? "--" : netProfitFactor.toFixed(2)
+    } / gross PF ${grossProfitFactor === null ? "--" : grossProfitFactor.toFixed(2)}`,
   );
   setText(
     "decisionCounts",

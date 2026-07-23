@@ -709,13 +709,20 @@ def format_timeframe_expectancy_report_ja(summaries: Mapping[str, Mapping[str, o
         if evaluated <= 0:
             continue
         tradable = int(overall.get("tradable", 0) or 0)
+        net_samples = int(overall.get("net_label_samples", 0) or 0)
+        effective_samples = int(overall.get("effective_samples", 0) or 0)
         min_samples = int(overall.get("min_samples", 0) or 0)
-        sample_status = "OK" if bool(overall.get("sample_ok")) else f"不足 {tradable}/{min_samples}"
+        sample_status = (
+            "OK" if bool(overall.get("sample_ok")) else f"不足 {effective_samples}/{min_samples}"
+        )
         lines.append(
-            f"・{tf}: 期待R {_fmt_expectancy_value(overall.get('expectancy_r'), 'R')}"
-            f" / PF {_fmt_expectancy_value(overall.get('profit_factor_r'), '')}"
+            f"・{tf}: canonical net期待R "
+            f"{_fmt_expectancy_value(overall.get('net_expectancy_r'), 'R')}"
+            f" / net PF {_fmt_expectancy_value(overall.get('net_profit_factor_r'), '')}"
+            f" / gross診断 "
+            f"{_fmt_expectancy_value(overall.get('gross_expectancy_r'), 'R')}"
             f" / SL {_fmt_expectancy_pct(overall.get('sl_rate'))}"
-            f" (n={tradable}/{evaluated}, sample={sample_status})"
+            f" (net n={net_samples}, gross n={tradable}/{evaluated}, sample={sample_status})"
         )
     return "\n".join(lines) if len(lines) > 1 else ""
 
@@ -1746,12 +1753,8 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as error:
                 fetch_warnings.append(f"期待値改善候補レジストリ保存失敗: {error}")
         if not args.no_trade_expectancy_guard:
-            # ガード根拠は「実績+ガード見送り中のシャドー計画(反実仮想)」で毎時更新する。
-            # 実績のみを根拠にすると、ガードが自分のblockでサンプル追加を止め、
-            # 根拠が二度と更新されない恒久ブロック(学習飢餓)に陥るため。
-            # blockの解除は反実仮想を含めた期待Rが非負に転じたときだけ起き、
-            # 負のままなら見送り継続(fail-closedは維持)。改善候補レジストリと
-            # 期待値レポートは従来どおり実績のみ(trade_expectancy_summary)を使う
+            # legacy close/OHLC反実仮想は経路診断の更新に限る。canonical bid/ask net
+            # labelへjoinされるまではblock/boost/approvalの根拠にしない。
             guard_evidence_outcomes = trade_outcome.evaluate_trade_outcomes(
                 journal_entries, include_guard_counterfactuals=True
             )

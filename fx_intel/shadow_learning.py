@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, UTC
 
+from .evaluation_labels import canonical_net_label_contract_flags
+
 SHADOW_SCHEMA_VERSION = 1
 SHADOW_DEADBAND = 0.05
 SHADOW_LABEL_PROVENANCE = "shadow_counterfactual_quote_model"
@@ -302,7 +304,7 @@ def _stats(
         value
         for row in rows
         if (value := _number(row.get("realized_net_r"))) is not None
-        and bool(row.get("net_label_eligible", False))
+        and not canonical_net_label_contract_flags(row)
     ]
     abstained = sum(1 for row in predictions if bool(row.get("abstained", False)))
     return {

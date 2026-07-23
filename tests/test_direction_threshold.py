@@ -6,7 +6,15 @@ import json
 import pytest
 
 from fx_intel import direction_threshold as dt
-from fx_intel.evaluation_labels import DEFAULT_COST_MODEL_ID, NET_LABEL_VERSION
+from fx_intel.evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 
 NOW = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
 
@@ -26,10 +34,29 @@ def _outcomes(count: int = 300, *, losing: bool = False) -> list[dict[str, objec
                 "composite": composite,
                 "realized_r": net_r + 0.1,
                 "realized_net_r": net_r + (index % 5) * 0.01,
+                "gross_realized_r": net_r + 0.1,
+                "quote_realized_r": net_r + (index % 5) * 0.01,
                 "tradable": True,
                 "net_label_eligible": True,
                 "label_version": NET_LABEL_VERSION,
+                "label_provenance": NET_LABEL_PROVENANCE,
                 "cost_model_id": DEFAULT_COST_MODEL_ID,
+                "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+                "cost_status": DEFAULT_COST_STATUS,
+                "entry_bid": 99.9,
+                "entry_ask": 100.1,
+                "planned_risk_distance": 1.0,
+                "entry_spread_r": 0.2,
+                "slippage_r": 0.0,
+                "commission_r": 0.0,
+                "financing_r": 0.0,
+                "additional_cost_r": 0.0,
+                "execution_cost_r": 0.1 - (index % 5) * 0.01,
+                "entry_quote_source": "fixture",
+                "spread_source": "fixture",
+                "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
+                "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
+                "cost_quality_flags": [],
             }
         )
     return rows
@@ -89,8 +116,8 @@ def test_active_policy_auto_pauses_when_recent_net_r_lcb_is_nonpositive() -> Non
     assert dt.effective_threshold(paused, now=NOW) == dt.DEFAULT_THRESHOLD
 
 
-def test_mixed_label_accounting_is_rejected() -> None:
+def test_invalid_label_accounting_is_rejected() -> None:
     rows = _outcomes()
     rows[-1]["label_version"] = "legacy-net-label"
-    with pytest.raises(ValueError, match="混在"):
+    with pytest.raises(ValueError, match="invalid canonical net label"):
         dt.evaluate_threshold_candidates(rows, now=NOW)

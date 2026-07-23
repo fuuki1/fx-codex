@@ -1,6 +1,15 @@
 from datetime import datetime, timedelta, UTC
 
 from fx_intel import decision_log, promotion
+from fx_intel.evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.shadow_learning import (
     SHADOW_LABEL_PROVENANCE,
     assign_prediction_ids,
@@ -14,6 +23,35 @@ from fx_intel.timeframe import TimeframePlan
 
 NOW = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
 DIMENSIONS = {"session_bucket": "london", "regime": "risk_off"}
+
+
+def _canonical_net_fields(index: int, *, gross_r: float, net_r: float) -> dict[str, object]:
+    return {
+        "decision_id": f"canonical-{index}",
+        "net_label_eligible": True,
+        "label_version": NET_LABEL_VERSION,
+        "label_provenance": NET_LABEL_PROVENANCE,
+        "gross_realized_r": gross_r,
+        "quote_realized_r": net_r,
+        "realized_net_r": net_r,
+        "entry_bid": 99.9,
+        "entry_ask": 100.1,
+        "planned_risk_distance": 1.0,
+        "entry_spread_r": 0.2,
+        "slippage_r": 0.0,
+        "commission_r": 0.0,
+        "financing_r": 0.0,
+        "additional_cost_r": 0.0,
+        "execution_cost_r": gross_r - net_r,
+        "cost_model_id": DEFAULT_COST_MODEL_ID,
+        "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+        "cost_status": DEFAULT_COST_STATUS,
+        "entry_quote_source": "fixture",
+        "spread_source": "fixture",
+        "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
+        "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
+        "cost_quality_flags": [],
+    }
 
 
 def _prediction(score: float = 0.12) -> dict[str, object]:
@@ -157,8 +195,11 @@ def test_shadow_summary_and_promotion_use_separate_producer_stream() -> None:
                 "symbol": "USDJPY",
                 "producer": "ml_direction",
                 "direction_outcome": "hit" if index < 35 else "miss",
-                "realized_net_r": 0.2 if index < 35 else -0.1,
-                "net_label_eligible": True,
+                **_canonical_net_fields(
+                    index,
+                    gross_r=0.4 if index < 35 else -0.2,
+                    net_r=0.2 if index < 35 else -0.1,
+                ),
                 "learning_dimensions": DIMENSIONS,
             }
         )
@@ -178,8 +219,11 @@ def test_final_outcomes_aggregate_net_r_by_regime() -> None:
             "symbol": "USDJPY",
             "direction": "long",
             "realized_r": 0.4 if index == 0 else -0.2,
-            "realized_net_r": 0.3 if index == 0 else -0.3,
-            "net_label_eligible": True,
+            **_canonical_net_fields(
+                index,
+                gross_r=0.4 if index == 0 else -0.2,
+                net_r=0.3 if index == 0 else -0.3,
+            ),
             "learning_dimensions": DIMENSIONS,
         }
         for index in range(2)

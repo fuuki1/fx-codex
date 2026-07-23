@@ -180,6 +180,24 @@ def test_canonical_aggregate_gates_on_effective_not_raw_samples() -> None:
     assert summary["sample_ok"] is False
 
 
+def test_canonical_aggregate_revalidates_accounting_before_using_net_r() -> None:
+    valid = replace(score_canonical_outcome(_request()), decision_id="valid")
+    invalid = replace(
+        valid,
+        decision_id="tampered",
+        prediction_time=(NOW + timedelta(hours=2)).isoformat(),
+        holding_end_time=(NOW + timedelta(hours=3)).isoformat(),
+        realized_net_r=99.0,
+    )
+
+    summary = aggregate_canonical_expectancy([valid, invalid], min_samples=1)
+
+    assert summary["gross_samples"] == 2
+    assert summary["net_label_samples"] == 1
+    assert summary["effective_samples"] == 1
+    assert summary["net_expectancy_r"] == valid.realized_net_r
+
+
 def test_short_uses_bid_entry_and_ask_exit() -> None:
     path = (
         _bar(

@@ -242,6 +242,7 @@ class EvaluatedCall:
     # move_atrとexecution_cost_rの分母が異なるため、このフィールドを生成しない。
     realized_net_r: float | None = None
     net_expected_r: float | None = None
+    net_label_metadata: Mapping[str, object] = field(default_factory=dict)
     dimensions: Mapping[str, object] = field(default_factory=dict)
     # 期待値ガード見送り中のシャドー計画を採点した反実仮想ならTrue。
     # 実際に推奨した判断の採点(False)と区別してプロファイルに注記する

@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
+from .evaluation_labels import canonical_net_label_contract_flags
 from .market import WEEKEND_CLOSURE, WeekendOpenHours
 from .ml import THIN_MIN_GAP_HOURS
 
@@ -46,7 +47,7 @@ MEMBER_SHADOW_PRODUCER = {"macro": "macro", "ml": "ml_direction"}
 # legacy診断の参考閾値（段階昇格には使用しない）
 PROMOTE_MIN_SAMPLES = 40  # 自己相関間引き後の実効採点数
 PROMOTE_MIN_HIT_RATE = 0.52  # 方向的中率の下限
-PROMOTE_MIN_EXPECTANCY = 0.02  # ATR換算の1トレード期待値の下限
+PROMOTE_MIN_EXPECTANCY = 0.02  # canonical純Rの1トレード期待値の下限
 PROMOTE_MAX_PVALUE = 0.10  # 「偶然50%超」の確率がこれ以下なら有意
 
 # 委員の意見が「方向あり」とみなす最小の絶対スコア(中立票を採点から除く)
@@ -86,13 +87,14 @@ class MemberPerformance:
         if rate is None or rate < PROMOTE_MIN_HIT_RATE:
             shown = f"{rate:.0%}" if rate is not None else "—"
             reasons.append(f"的中率不足({shown}<{PROMOTE_MIN_HIT_RATE:.0%})")
-        expectancy = (
-            self.net_expectancy_r if self.net_expectancy_r is not None else self.expectancy_atr
-        )
+        if self.net_r_samples < PROMOTE_MIN_SAMPLES:
+            reasons.append(
+                f"canonical純Rサンプル不足({self.net_r_samples}/{PROMOTE_MIN_SAMPLES}件)"
+            )
+        expectancy = self.net_expectancy_r
         if expectancy is None or expectancy < PROMOTE_MIN_EXPECTANCY:
             shown = f"{expectancy:+.3f}" if expectancy is not None else "—"
-            unit = "純R" if self.net_expectancy_r is not None else "ATR換算"
-            reasons.append(f"期待値不足({unit}{shown}<{PROMOTE_MIN_EXPECTANCY:+.3f})")
+            reasons.append(f"期待値不足(純R{shown}<{PROMOTE_MIN_EXPECTANCY:+.3f})")
         if self.p_value is None or self.p_value > PROMOTE_MAX_PVALUE:
             shown = f"{self.p_value:.2f}" if self.p_value is not None else "—"
             reasons.append(f"有意性不足(p={shown}>{PROMOTE_MAX_PVALUE:.2f})")
@@ -284,7 +286,7 @@ def evaluate_shadow_member(
     net_values = [
         value
         for row in effective
-        if bool(row.get("net_label_eligible", False))
+        if not canonical_net_label_contract_flags(row)
         and (value := _float(row.get("realized_net_r"))) is not None
     ]
     net_expectancy_r = sum(net_values) / len(net_values) if net_values else None

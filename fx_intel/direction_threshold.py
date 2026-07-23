@@ -10,6 +10,8 @@ import json
 import math
 from pathlib import Path
 
+from .evaluation_labels import canonical_net_label_contract_flags
+
 SCHEMA_VERSION = 1
 DEFAULT_THRESHOLD = 0.15
 # Phase D4 only permits stricter challengers. Lowering the threshold increases
@@ -264,7 +266,13 @@ def _eligible_rows(
 ) -> list[tuple[datetime, float, float, str, str, str]]:
     rows: list[tuple[datetime, float, float, str, str, str]] = []
     for outcome in outcomes:
-        if not bool(outcome.get("net_label_eligible", outcome.get("tradable", False))):
+        contract_flags = canonical_net_label_contract_flags(outcome)
+        if contract_flags:
+            if (
+                outcome.get("net_label_eligible") is True
+                or outcome.get("realized_net_r") is not None
+            ):
+                raise ValueError("invalid canonical net label: " + ",".join(contract_flags))
             continue
         ts = _parse_ts(outcome.get("ts"))
         composite = _float(outcome.get("composite"))

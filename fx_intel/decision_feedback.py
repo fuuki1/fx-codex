@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from .evaluation_labels import canonical_net_label_contract_flags
 from .market import open_hours_between
 from .trade_outcome import json_safe
 
@@ -109,7 +110,12 @@ class DecisionFeedbackCell:
     losses: int = 0
     unscored: int = 0
     low_quality: int = 0
+    gross_samples: int = 0
+    net_label_samples: int = 0
+    net_label_coverage: float | None = None
     hit_rate: float | None = None
+    gross_expectancy_r: float | None = None
+    net_expectancy_r: float | None = None
     expectancy_r: float | None = None
     avg_mfe_r: float | None = None
     avg_mae_r: float | None = None
@@ -133,7 +139,12 @@ class DecisionFeedbackCell:
             "losses": self.losses,
             "unscored": self.unscored,
             "low_quality": self.low_quality,
+            "gross_samples": self.gross_samples,
+            "net_label_samples": self.net_label_samples,
+            "net_label_coverage": self.net_label_coverage,
             "hit_rate": self.hit_rate,
+            "gross_expectancy_r": self.gross_expectancy_r,
+            "net_expectancy_r": self.net_expectancy_r,
             "expectancy_r": self.expectancy_r,
             "avg_mfe_r": self.avg_mfe_r,
             "avg_mae_r": self.avg_mae_r,
@@ -521,14 +532,20 @@ def _derive_cell(
     rows: list[Mapping[str, object]],
 ) -> DecisionFeedbackCell:
     evaluated = len(rows)
-    tradable_rows = [
+    gross_rows = [
         row
         for row in rows
         if bool(row.get("tradable")) and _float(row.get("realized_r")) is not None
     ]
+    tradable_rows = [row for row in gross_rows if not canonical_net_label_contract_flags(row)]
     r_values = [
         value
-        for value in (_float(row.get("realized_r")) for row in tradable_rows)
+        for value in (_float(row.get("realized_net_r")) for row in tradable_rows)
+        if value is not None
+    ]
+    gross_values = [
+        value
+        for value in (_float(row.get("realized_r")) for row in gross_rows)
         if value is not None
     ]
     wins = sum(1 for value in r_values if value > 0)
@@ -582,7 +599,12 @@ def _derive_cell(
         losses=losses,
         unscored=unscored,
         low_quality=low_quality,
+        gross_samples=len(gross_rows),
+        net_label_samples=tradable,
+        net_label_coverage=(tradable / len(gross_rows) if gross_rows else None),
         hit_rate=_round(hit_rate),
+        gross_expectancy_r=_round(_mean(gross_values)),
+        net_expectancy_r=_round(expectancy),
         expectancy_r=_round(expectancy),
         avg_mfe_r=_round(avg_mfe),
         avg_mae_r=_round(avg_mae),
@@ -907,13 +929,23 @@ def _performance_summary(report: Mapping[str, object]) -> dict[str, object]:
     mfe_values = [_float(row.get("mfe_r")) for row in tradable]
     mae_values = [_float(row.get("mae_r")) for row in tradable]
     r_numbers = [value for value in r_values if value is not None]
+    net_numbers = [
+        value
+        for row in tradable
+        if not canonical_net_label_contract_flags(row)
+        and (value := _float(row.get("realized_net_r"))) is not None
+    ]
     mfe_numbers = [value for value in mfe_values if value is not None]
     mae_numbers = [value for value in mae_values if value is not None]
     return {
         "evaluated": len(outcomes),
         "tradable": len(tradable),
-        "net_R": _round(sum(r_numbers)) if r_numbers else None,
-        "expected_R": _round(_mean(r_numbers)),
+        "gross_R": _round(sum(r_numbers)) if r_numbers else None,
+        "gross_expected_R": _round(_mean(r_numbers)),
+        "net_R": _round(sum(net_numbers)) if net_numbers else None,
+        "net_expected_R": _round(_mean(net_numbers)),
+        "net_label_samples": len(net_numbers),
+        "net_label_coverage": len(net_numbers) / len(r_numbers) if r_numbers else None,
         "avg_mfe_R": _round(_mean(mfe_numbers)),
         "avg_mae_R": _round(_mean(mae_numbers)),
     }
@@ -922,8 +954,12 @@ def _performance_summary(report: Mapping[str, object]) -> dict[str, object]:
 def _model_expectancy_delta(report: Mapping[str, object]) -> dict[str, object]:
     buckets: dict[str, list[float]] = {"baseline_model": [], "learning_model": []}
     for row in _iter_outcomes(report):
-        realized = _float(row.get("realized_r"))
-        if realized is None or not bool(row.get("tradable")):
+        realized = _float(row.get("realized_net_r"))
+        if (
+            realized is None
+            or not bool(row.get("tradable"))
+            or canonical_net_label_contract_flags(row)
+        ):
             continue
         bucket = (
             "learning_model"

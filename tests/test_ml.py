@@ -6,6 +6,15 @@ import json
 import random
 from datetime import datetime, timedelta, UTC
 
+from fx_intel.evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.learning import EvaluatedCall
 from fx_intel.ml import (
     FEATURE_NAMES,
@@ -58,6 +67,35 @@ def _make_calls(
             realized_net_r = None
             if net_r_mean is not None:
                 realized_net_r = round(net_r_mean + 0.5 * (tech * sign) + rng.gauss(0, 0.25), 4)
+            net_label_metadata = (
+                {
+                    "decision_id": f"decision-{symbol}-{i}",
+                    "net_label_eligible": True,
+                    "label_version": NET_LABEL_VERSION,
+                    "label_provenance": NET_LABEL_PROVENANCE,
+                    "gross_realized_r": realized_net_r + 0.2,
+                    "quote_realized_r": realized_net_r,
+                    "entry_bid": 99.9,
+                    "entry_ask": 100.1,
+                    "planned_risk_distance": 1.0,
+                    "entry_spread_r": 0.2,
+                    "slippage_r": 0.0,
+                    "commission_r": 0.0,
+                    "financing_r": 0.0,
+                    "additional_cost_r": 0.0,
+                    "execution_cost_r": 0.2,
+                    "cost_model_id": DEFAULT_COST_MODEL_ID,
+                    "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+                    "cost_status": DEFAULT_COST_STATUS,
+                    "entry_quote_source": "fixture",
+                    "spread_source": "fixture",
+                    "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
+                    "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
+                    "cost_quality_flags": [],
+                }
+                if realized_net_r is not None
+                else {}
+            )
             calls.append(
                 EvaluatedCall(
                     symbol=symbol,
@@ -79,6 +117,7 @@ def _make_calls(
                     data_quality=0.9,
                     realized_net_r=realized_net_r,
                     net_expected_r=0.15 if net_r_mean is not None else None,
+                    net_label_metadata=net_label_metadata,
                 )
             )
     return calls

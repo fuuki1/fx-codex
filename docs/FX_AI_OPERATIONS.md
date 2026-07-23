@@ -93,8 +93,10 @@ cd /Users/fuuki/srv/fx-codex
   `fusion_raw` に記録済みのSL/TP。事後の再計算はしない(PIT安全)。記録が欠けた行は除外(fail-closed)。
 - `event_window` / `low_data_quality` 等が併発した行は含めない。ガードが無くても
   見送っていた行であり、根拠に混ぜると反実仮想が汚染されるため。
-- 推奨(`direction`)はガード判定に従いneutralのまま。blockの解除は、反実仮想を含む
-  期待Rが非負に転じたときだけ起きる。負のままなら見送り継続(data/risk vetoの上書きではない)。
+- 推奨(`direction`)はガード判定に従いneutralのまま。反実仮想がcanonical bid/ask
+  scorerで採点され、現行label/cost契約と十分なeffective sampleを満たした場合だけ
+  block解除の根拠にできる。legacy close/OHLC反実仮想は経路診断に限り、解除・boost・
+  approvalへは使わない。
 - 監視: 反実仮想の量は `quality.flags.expectancy_guard_counterfactual`、学習側は
   `briefing_learning.json` の `counterfactual_evaluated` に出る。改善候補レジストリと
   期待値レポートは従来どおり実績のみを使う。

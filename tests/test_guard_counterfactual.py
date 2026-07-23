@@ -340,12 +340,7 @@ def _losing_counterfactual_row(ts: datetime) -> list[dict]:
     ]
 
 
-def test_guard_evidence_releases_block_only_when_counterfactuals_turn_positive() -> None:
-    """デッドロック回帰テスト: 実績のみだと根拠が凍結してblockが恒久化する。
-
-    反実仮想を根拠に加えると、シャドー計画の期待Rが正に転じたときだけ
-    blockが解除され、負のままなら見送りが続く(fail-closed維持)。
-    """
+def test_legacy_gross_counterfactuals_cannot_drive_guard_release() -> None:
     rows: list[dict] = []
     for i in range(8):
         rows.extend(_losing_real_row(MONDAY + i * 4 * HOUR))
@@ -359,7 +354,8 @@ def test_guard_evidence_releases_block_only_when_counterfactuals_turn_positive()
         group_min_samples=4,
     )
     real_adjustment = to.decision_adjustment(real_only, "USDJPY", "long", 55)
-    assert real_adjustment.block is True
+    assert real_adjustment.action == "sample_guard"
+    assert real_adjustment.block is False
 
     with_counterfactuals = to.summarize_expectancy(
         to.evaluate_trade_outcomes(
@@ -370,13 +366,15 @@ def test_guard_evidence_releases_block_only_when_counterfactuals_turn_positive()
     )
     overall = with_counterfactuals["overall"]
     assert overall["tradable"] == 16
-    assert overall["expectancy_r"] > 0
+    assert overall["gross_expectancy_r"] > 0
+    assert overall["net_expectancy_r"] is None
     assert to.counterfactual_outcome_count(with_counterfactuals) == 8
     released = to.decision_adjustment(with_counterfactuals, "USDJPY", "long", 55)
+    assert released.action == "sample_guard"
     assert released.block is False
 
 
-def test_guard_evidence_stays_blocked_while_counterfactuals_lose() -> None:
+def test_legacy_losing_counterfactuals_remain_evaluation_unavailable() -> None:
     rows: list[dict] = []
     for i in range(8):
         rows.extend(_losing_real_row(MONDAY + i * 4 * HOUR))
@@ -392,7 +390,8 @@ def test_guard_evidence_stays_blocked_while_counterfactuals_lose() -> None:
         group_min_samples=4,
     )
     adjustment = to.decision_adjustment(summary, "USDJPY", "long", 55)
-    assert adjustment.block is True
+    assert adjustment.action == "sample_guard"
+    assert adjustment.block is False
 
 
 def test_format_guard_evidence_note_only_mentions_counterfactuals_when_present() -> None:

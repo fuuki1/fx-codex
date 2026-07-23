@@ -10,6 +10,11 @@ import pytest
 
 import fx_briefing
 from fx_intel.calendar import EconomicEvent
+from fx_intel.evaluation_labels import (
+    DEFAULT_COST_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel import trade_outcome as to
@@ -105,9 +110,14 @@ def _approved_tp_registry(path) -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            "label_version": NET_LABEL_VERSION,
+            "label_provenance": NET_LABEL_PROVENANCE,
+            "cost_model_id": DEFAULT_COST_MODEL_ID,
+            "net_label_samples": to.MIN_EXPECTANCY_SAMPLES,
+            "net_label_coverage": 1.0,
+            "baseline_net_expectancy_r": -1.0,
+            "candidate_net_expectancy_r": 0.75,
+            "delta_net_expectancy_r": 1.75,
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
@@ -479,7 +489,8 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
     assert rc == 0
     out = capsys.readouterr().out
     assert "時間足別期待値監視" in out
-    assert "・1h: 期待R -1.00R" in out
+    assert "・1h: canonical net期待R n/a" in out
+    assert "gross診断 -1.00R" in out
     assert "期待値ガード" in out
     assert "1時間足" in out
 

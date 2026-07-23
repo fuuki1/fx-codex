@@ -43,6 +43,7 @@ from .gbm import (
     platt_calibrate,
     rmse,
 )
+from .evaluation_labels import canonical_net_label_contract_flags
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
 from .journal import FUSION_PIT_DATA_CONTRACT
@@ -291,7 +292,16 @@ def build_dataset(
         )
         labels.append(1 if call.outcome == "hit" else 0)
         stamps.append(ts)
-        r_labels.append(call.realized_net_r)
+        net_label_record = {
+            **call.net_label_metadata,
+            "realized_net_r": call.realized_net_r,
+        }
+        r_labels.append(
+            call.realized_net_r
+            if call.realized_net_r is not None
+            and not canonical_net_label_contract_flags(net_label_record)
+            else None
+        )
     return rows, labels, stamps, r_labels
 
 

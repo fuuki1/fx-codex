@@ -9,6 +9,7 @@ change must use a new model id and label version.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import math
 
@@ -124,6 +125,115 @@ def cost_model_contract_flags(cost: CostModelResult) -> tuple[str, ...]:
     return tuple(flags)
 
 
+def canonical_net_label_contract_flags(record: Mapping[str, object]) -> tuple[str, ...]:
+    """Validate one persisted canonical net-R label at a downstream read boundary."""
+
+    flags: list[str] = []
+    if record.get("net_label_eligible") is not True:
+        flags.append("net_label_not_eligible")
+    if not str(record.get("decision_id") or "").strip():
+        flags.append("missing_decision_id")
+    if record.get("label_version") not in KNOWN_NET_LABEL_VERSIONS:
+        flags.append("unknown_label_version")
+    if record.get("label_provenance") not in KNOWN_NET_LABEL_PROVENANCES:
+        flags.append("unknown_label_provenance")
+
+    required = {
+        name: _number(record.get(name))
+        for name in (
+            "entry_bid",
+            "entry_ask",
+            "planned_risk_distance",
+            "quote_realized_r",
+            "gross_realized_r",
+            "entry_spread_r",
+            "slippage_r",
+            "commission_r",
+            "financing_r",
+            "additional_cost_r",
+            "execution_cost_r",
+            "realized_net_r",
+        )
+    }
+    for name, value in required.items():
+        if value is None:
+            flags.append(f"missing_or_invalid_{name}")
+
+    string_fields = {
+        name: record.get(name)
+        for name in (
+            "cost_model_id",
+            "cost_model_version",
+            "cost_status",
+            "entry_quote_source",
+            "spread_source",
+            "slippage_model_id",
+            "commission_model_id",
+        )
+    }
+    for string_name, string_value in string_fields.items():
+        if not isinstance(string_value, str) or not string_value:
+            flags.append(f"missing_or_invalid_{string_name}")
+    raw_cost_flags = record.get("cost_quality_flags")
+    if not isinstance(raw_cost_flags, (list, tuple)) or any(
+        not isinstance(flag, str) for flag in raw_cost_flags
+    ):
+        flags.append("invalid_cost_quality_flags")
+
+    if flags:
+        return tuple(dict.fromkeys(flags))
+
+    numeric = {name: float(value) for name, value in required.items() if value is not None}
+    cost_quality_flags = tuple(raw_cost_flags) if isinstance(raw_cost_flags, (list, tuple)) else ()
+    cost = CostModelResult(
+        cost_model_id=str(string_fields["cost_model_id"]),
+        cost_model_version=str(string_fields["cost_model_version"]),
+        entry_quote_source=str(string_fields["entry_quote_source"]),
+        spread_source=str(string_fields["spread_source"]),
+        slippage_model_id=str(string_fields["slippage_model_id"]),
+        commission_model_id=str(string_fields["commission_model_id"]),
+        entry_spread_r=numeric["entry_spread_r"],
+        slippage_r=numeric["slippage_r"],
+        commission_r=numeric["commission_r"],
+        financing_r=numeric["financing_r"],
+        cost_status=str(string_fields["cost_status"]),
+        quality_flags=cost_quality_flags,
+    )
+    flags.extend(cost_model_contract_flags(cost))
+    entry_bid = numeric["entry_bid"]
+    entry_ask = numeric["entry_ask"]
+    planned_risk = numeric["planned_risk_distance"]
+    if not (0 < entry_bid <= entry_ask):
+        flags.append("invalid_entry_quote")
+    if planned_risk <= 0:
+        flags.append("invalid_planned_risk_distance")
+    if planned_risk > 0 and not math.isclose(
+        numeric["entry_spread_r"],
+        (entry_ask - entry_bid) / planned_risk,
+        abs_tol=1e-8,
+    ):
+        flags.append("entry_spread_r_mismatch")
+    if not math.isclose(
+        numeric["additional_cost_r"],
+        numeric["slippage_r"] + numeric["commission_r"] + numeric["financing_r"],
+        abs_tol=1e-8,
+    ):
+        flags.append("additional_cost_identity_mismatch")
+    if not math.isclose(
+        numeric["realized_net_r"],
+        numeric["quote_realized_r"] - numeric["additional_cost_r"],
+        abs_tol=1e-8,
+    ):
+        flags.append("net_r_identity_mismatch")
+    if not math.isclose(
+        numeric["execution_cost_r"],
+        numeric["gross_realized_r"] - numeric["realized_net_r"],
+        abs_tol=1e-8,
+    ):
+        flags.append("execution_cost_identity_mismatch")
+    return tuple(dict.fromkeys(flags))
+
+
 def has_executable_entry(entry_bid: float | None, entry_ask: float | None) -> bool:
     """Return whether a valid, ordered decision-time quote is available."""
 
@@ -140,3 +250,10 @@ def has_executable_entry(entry_bid: float | None, entry_ask: float | None) -> bo
 
 def _is_zero(value: float) -> bool:
     return math.isfinite(value) and abs(value) <= ZERO_COST_TOLERANCE
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None

@@ -321,6 +321,13 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   `spread-plus-modelled-slippage-diagnostic-v1 / diagnostic_only`として分離し、
   legacy close/OHLC採点から`realized_net_r`を生成しない。正準net Rは完了bid/ask
   pathを使うcanonical scorerだけが生成する。
+- downstreamのguard、decision feedback、maximization、TP/SL学習、改善候補承認、
+  auto-pause、direction threshold、shadow集計、promotion参考判定、ML return headは、
+  現行label version/provenanceとcost component/accounting恒等式を満たす行だけを
+  canonical net証拠として読む。legacy `realized_r`は`gross_expectancy_r`等の診断欄に
+  限定し、`expectancy_r` / `profit_factor_r`互換欄やblock/boostへ代入しない。
+  canonical net不足は`sample_ok=false`またはevaluation unavailableであり、
+  gross黒字を使った代替昇格・ガード解除は行わない。
 - canonical outcomeは `prediction_time` と `holding_end_time` を保存する。
   `effective_samples.summarize_effective_samples()` は5分の最小間隔、保有区間の重複、
   同一symbol、同じ符号の共通通貨エクスポージャー、FX市場日を使い、

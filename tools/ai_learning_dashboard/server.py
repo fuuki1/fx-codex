@@ -32,12 +32,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from fx_intel.effective_samples import summarize_effective_samples  # noqa: E402
 from fx_intel.evaluation_labels import (  # noqa: E402
-    DEFAULT_COST_STATUS,
     KNOWN_EXECUTABLE_COST_MODEL_IDS,
     KNOWN_NET_LABEL_PROVENANCES,
     KNOWN_NET_LABEL_VERSIONS,
-    CostModelResult,
-    cost_model_contract_flags,
+    canonical_net_label_contract_flags,
 )
 
 JOURNAL_FILE = "briefing_journal.jsonl"
@@ -1616,7 +1614,7 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
             and row.get("label_version") in KNOWN_NET_LABEL_VERSIONS
             and row.get("label_provenance") in KNOWN_NET_LABEL_PROVENANCES
             and row.get("cost_model_id") in KNOWN_EXECUTABLE_COST_MODEL_IDS
-            and _canonical_cost_accounting_valid(row)
+            and not canonical_net_label_contract_flags(row)
         )
 
     labeled = [row for row in scored if canonical(row)]
@@ -1684,91 +1682,6 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "missing_reasons": dict(sorted(missing.items())),
         "curve": curve,
     }
-
-
-def _canonical_cost_accounting_valid(row: Mapping[str, Any]) -> bool:
-    """Fail closed when stored net-R cost provenance or arithmetic is incomplete."""
-
-    required = {
-        name: _number(row.get(name))
-        for name in (
-            "entry_bid",
-            "entry_ask",
-            "planned_risk_distance",
-            "quote_realized_r",
-            "gross_realized_r",
-            "entry_spread_r",
-            "slippage_r",
-            "commission_r",
-            "financing_r",
-            "additional_cost_r",
-            "execution_cost_r",
-            "realized_net_r",
-        )
-    }
-    if any(value is None for value in required.values()):
-        return False
-    entry_source = row.get("entry_quote_source")
-    spread_source = row.get("spread_source")
-    slippage_model_id = row.get("slippage_model_id")
-    commission_model_id = row.get("commission_model_id")
-    cost_model_version = row.get("cost_model_version")
-    cost_quality_flags = row.get("cost_quality_flags")
-    if (
-        not isinstance(entry_source, str)
-        or not isinstance(spread_source, str)
-        or not isinstance(slippage_model_id, str)
-        or not isinstance(commission_model_id, str)
-        or not isinstance(cost_model_version, str)
-        or not isinstance(cost_quality_flags, list)
-        or any(not isinstance(flag, str) for flag in cost_quality_flags)
-    ):
-        return False
-    assert all(value is not None for value in required.values())
-    values = {name: float(value) for name, value in required.items() if value is not None}
-    cost = CostModelResult(
-        cost_model_id=str(row.get("cost_model_id") or ""),
-        cost_model_version=cost_model_version,
-        entry_quote_source=entry_source,
-        spread_source=spread_source,
-        slippage_model_id=slippage_model_id,
-        commission_model_id=commission_model_id,
-        entry_spread_r=values["entry_spread_r"],
-        slippage_r=values["slippage_r"],
-        commission_r=values["commission_r"],
-        financing_r=values["financing_r"],
-        cost_status=str(row.get("cost_status") or ""),
-        quality_flags=tuple(cost_quality_flags),
-    )
-    entry_bid = values["entry_bid"]
-    entry_ask = values["entry_ask"]
-    planned_risk = values["planned_risk_distance"]
-    return (
-        not cost_model_contract_flags(cost)
-        and cost.cost_status == DEFAULT_COST_STATUS
-        and 0 < entry_bid <= entry_ask
-        and planned_risk > 0
-        and math.isclose(
-            values["entry_spread_r"],
-            (entry_ask - entry_bid) / planned_risk,
-            abs_tol=1e-8,
-        )
-        and math.isclose(
-            values["additional_cost_r"],
-            values["slippage_r"] + values["commission_r"] + values["financing_r"],
-            abs_tol=1e-8,
-        )
-        and math.isclose(
-            values["realized_net_r"],
-            values["quote_realized_r"] - values["additional_cost_r"],
-            abs_tol=1e-8,
-        )
-        and math.isclose(
-            values["execution_cost_r"],
-            values["gross_realized_r"] - values["realized_net_r"],
-            abs_tol=1e-8,
-        )
-    )
 
 
 def _input_context_summary(

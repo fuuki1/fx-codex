@@ -24,9 +24,11 @@ from .effective_samples import (
 )
 from .evaluation_labels import (
     DEFAULT_COST_STATUS,
+    KNOWN_EXECUTABLE_COST_MODEL_IDS,
     KNOWN_NET_LABEL_PROVENANCES,
     KNOWN_NET_LABEL_VERSIONS,
     CostModelResult,
+    canonical_net_label_contract_flags,
     cost_model_contract_flags,
 )
 from .journal import (
@@ -355,28 +357,32 @@ def aggregate_canonical_expectancy(
         for outcome in outcomes
         if outcome.gross_realized_r is not None
     ]
-    net_outcomes = [
-        outcome
+    valid_net_records = [
+        outcome.to_dict()
         for outcome in outcomes
-        if outcome.net_label_eligible and outcome.realized_net_r is not None
+        if not canonical_net_label_contract_flags(outcome.to_dict())
     ]
-    net_values = [
-        float(outcome.realized_net_r)
-        for outcome in net_outcomes
-        if outcome.realized_net_r is not None
+    effective = summarize_effective_samples(valid_net_records, min_samples=min_samples)
+    selected_keys = set(effective.selected_keys)
+    effective_net_values = [
+        value
+        for record in valid_net_records
+        if f"{record['decision_id']}+{record['label_version']}" in selected_keys
+        and (value := _float(record.get("realized_net_r"))) is not None
     ]
-    effective = summarize_effective_samples(net_outcomes, min_samples=min_samples)
     return {
         **effective.to_dict(),
         "raw_samples": len(outcomes),
         "effective_input_samples": effective.raw_samples,
         "gross_samples": len(gross_values),
-        "net_label_samples": len(net_values),
-        "net_label_coverage": (len(net_values) / len(gross_values) if gross_values else None),
+        "net_label_samples": len(valid_net_records),
+        "net_label_coverage": (
+            len(valid_net_records) / len(gross_values) if gross_values else None
+        ),
         "gross_expectancy_r": _canonical_round(_mean(gross_values)),
-        "net_expectancy_r": _canonical_round(_mean(net_values)),
+        "net_expectancy_r": _canonical_round(_mean(effective_net_values)),
         "gross_profit_factor": _canonical_profit_factor(gross_values),
-        "net_profit_factor": _canonical_profit_factor(net_values),
+        "net_profit_factor": _canonical_profit_factor(effective_net_values),
     }
 
 
@@ -759,6 +765,7 @@ class TradeOutcome:
     horizon_hours: float
     conviction: int
     data_quality: float | None
+    timeframe: str = "fusion"
     # 判断ログ行の識別子(shadow予測の満期照合キー)。無い行は None。
     decision_id: str | None = None
     entry: float | None = None
@@ -788,6 +795,25 @@ class TradeOutcome:
     net_expected_r: float | None = None
     diagnostic_execution_cost_r: float | None = None
     diagnostic_net_expected_r: float | None = None
+    net_label_eligible: bool = False
+    label_version: str = ""
+    label_provenance: str = ""
+    entry_bid: float | None = None
+    entry_ask: float | None = None
+    quote_realized_r: float | None = None
+    entry_spread_r: float | None = None
+    slippage_r: float | None = None
+    commission_r: float | None = None
+    financing_r: float | None = None
+    additional_cost_r: float | None = None
+    cost_model_id: str = "missing"
+    cost_model_version: str = ""
+    cost_status: str = "missing"
+    entry_quote_source: str = ""
+    spread_source: str = ""
+    slippage_model_id: str = ""
+    commission_model_id: str = ""
+    cost_quality_flags: tuple[str, ...] = field(default_factory=tuple)
     path_points: int = 0
     path_start: str | None = None
     path_end: str | None = None
@@ -804,7 +830,10 @@ class TradeOutcome:
         return {
             "symbol": self.symbol,
             "direction": self.direction,
+            "timeframe": self.timeframe,
             "ts": self.ts,
+            "prediction_time": self.ts,
+            "holding_end_time": self.path_end,
             "horizon_hours": self.horizon_hours,
             "conviction": self.conviction,
             "data_quality": self.data_quality,
@@ -829,12 +858,33 @@ class TradeOutcome:
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
             "realized_r": self.realized_r,
+            "gross_realized_r": self.realized_r,
+            "quote_realized_r": self.quote_realized_r,
             "realized_net_r": self.realized_net_r,
+            "net_label_eligible": self.net_label_eligible,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
             "decision_id": self.decision_id,
             "execution_cost_r": self.execution_cost_r,
             "net_expected_r": self.net_expected_r,
             "diagnostic_execution_cost_r": self.diagnostic_execution_cost_r,
             "diagnostic_net_expected_r": self.diagnostic_net_expected_r,
+            "entry_bid": self.entry_bid,
+            "entry_ask": self.entry_ask,
+            "planned_risk_distance": self.risk_distance,
+            "entry_spread_r": self.entry_spread_r,
+            "slippage_r": self.slippage_r,
+            "commission_r": self.commission_r,
+            "financing_r": self.financing_r,
+            "additional_cost_r": self.additional_cost_r,
+            "cost_model_id": self.cost_model_id,
+            "cost_model_version": self.cost_model_version,
+            "cost_status": self.cost_status,
+            "entry_quote_source": self.entry_quote_source,
+            "spread_source": self.spread_source,
+            "slippage_model_id": self.slippage_model_id,
+            "commission_model_id": self.commission_model_id,
+            "cost_quality_flags": list(self.cost_quality_flags),
             "path_points": self.path_points,
             "path_start": self.path_start,
             "path_end": self.path_end,
@@ -851,6 +901,18 @@ class ExpectancyStats:
     evaluated: int = 0
     tradable: int = 0
     low_quality: int = 0
+    raw_samples: int = 0
+    effective_samples: int = 0
+    gross_samples: int = 0
+    net_label_samples: int = 0
+    net_label_coverage: float | None = None
+    overlap_ratio: float | None = None
+    cluster_count: int = 0
+    market_days: int = 0
+    gross_expectancy_r: float | None = None
+    net_expectancy_r: float | None = None
+    gross_profit_factor_r: float | None = None
+    net_profit_factor_r: float | None = None
     wins: int = 0
     losses: int = 0
     win_rate: float | None = None
@@ -872,6 +934,18 @@ class ExpectancyStats:
             "evaluated": self.evaluated,
             "tradable": self.tradable,
             "low_quality": self.low_quality,
+            "raw_samples": self.raw_samples,
+            "effective_samples": self.effective_samples,
+            "gross_samples": self.gross_samples,
+            "net_label_samples": self.net_label_samples,
+            "net_label_coverage": self.net_label_coverage,
+            "overlap_ratio": self.overlap_ratio,
+            "cluster_count": self.cluster_count,
+            "market_days": self.market_days,
+            "gross_expectancy_r": self.gross_expectancy_r,
+            "net_expectancy_r": self.net_expectancy_r,
+            "gross_profit_factor_r": self.gross_profit_factor_r,
+            "net_profit_factor_r": self.net_profit_factor_r,
             "wins": self.wins,
             "losses": self.losses,
             "win_rate": self.win_rate,
@@ -1097,6 +1171,7 @@ def evaluate_trade_outcomes(
             continue
         counterfactual = bool(entry.get(COUNTERFACTUAL_ENTRY_KEY))
         symbol = str(entry.get("symbol", "")).upper()
+        timeframe = str(entry.get("timeframe") or "fusion")
         entry_price = _float(entry.get("close"))
         stop = _float(entry.get("stop"))
         target1 = _float(entry.get("target1"))
@@ -1140,6 +1215,7 @@ def evaluate_trade_outcomes(
                     horizon_hours=horizon_hours,
                     conviction=conviction,
                     data_quality=data_quality,
+                    timeframe=timeframe,
                     entry=entry_price,
                     stop=stop,
                     target1=target1,
@@ -1211,6 +1287,7 @@ def evaluate_trade_outcomes(
                 horizon_hours=horizon_hours,
                 conviction=conviction,
                 data_quality=data_quality,
+                timeframe=timeframe,
                 entry=entry_price,
                 stop=stop,
                 target1=target1,
@@ -1289,10 +1366,35 @@ def aggregate_expectancy(
     usable = [outcome for outcome in outcomes if outcome.realized_r is not None]
     tradable = [outcome for outcome in usable if outcome.tradable]
     r_values = [float(outcome.realized_r) for outcome in tradable if outcome.realized_r is not None]
-    wins = sum(1 for value in r_values if value > 0)
-    losses = sum(1 for value in r_values if value < 0)
     gross_win = sum(value for value in r_values if value > 0)
     gross_loss = abs(sum(value for value in r_values if value < 0))
+    gross_expectancy = _round(_mean(r_values))
+    gross_profit_factor = (
+        _round(gross_win / gross_loss)
+        if gross_loss > 0
+        else (None if gross_win <= 0 else float("inf"))
+    )
+    valid_net_records = [
+        outcome.to_dict()
+        for outcome in tradable
+        if not canonical_net_label_contract_flags(outcome.to_dict())
+    ]
+    effective = summarize_effective_samples(valid_net_records, min_samples=min_samples)
+    selected_keys = set(effective.selected_keys)
+    effective_net_values = [
+        float(record["realized_net_r"])
+        for record in valid_net_records
+        if f"{record['decision_id']}+{record['label_version']}" in selected_keys
+        and record.get("realized_net_r") is not None
+    ]
+    net_wins = sum(value for value in effective_net_values if value > 0)
+    net_losses = abs(sum(value for value in effective_net_values if value < 0))
+    net_expectancy = _round(_mean(effective_net_values))
+    net_profit_factor = (
+        _round(net_wins / net_losses)
+        if net_losses > 0
+        else (None if net_wins <= 0 else float("inf"))
+    )
     mfe_values = [float(outcome.mfe_r) for outcome in tradable if outcome.mfe_r is not None]
     mae_values = [float(outcome.mae_r) for outcome in tradable if outcome.mae_r is not None]
     qualities = [outcome.path_quality for outcome in usable]
@@ -1300,17 +1402,31 @@ def aggregate_expectancy(
         evaluated=evaluated,
         tradable=len(tradable),
         low_quality=evaluated - len(tradable),
-        wins=wins,
-        losses=losses,
-        win_rate=_round(wins / len(r_values)) if r_values else None,
-        expectancy_r=_round(_mean(r_values)),
-        avg_win_r=_round(_mean([value for value in r_values if value > 0])),
-        avg_loss_r=_round(_mean([value for value in r_values if value < 0])),
-        profit_factor_r=(
-            _round(gross_win / gross_loss)
-            if gross_loss > 0
-            else (None if gross_win <= 0 else float("inf"))
+        raw_samples=evaluated,
+        effective_samples=effective.effective_samples,
+        gross_samples=len(r_values),
+        net_label_samples=len(valid_net_records),
+        net_label_coverage=(len(valid_net_records) / len(r_values) if r_values else None),
+        overlap_ratio=effective.overlap_ratio,
+        cluster_count=effective.cluster_count,
+        market_days=effective.market_days,
+        gross_expectancy_r=gross_expectancy,
+        net_expectancy_r=net_expectancy,
+        gross_profit_factor_r=gross_profit_factor,
+        net_profit_factor_r=net_profit_factor,
+        wins=sum(1 for value in effective_net_values if value > 0),
+        losses=sum(1 for value in effective_net_values if value < 0),
+        win_rate=(
+            _round(
+                sum(1 for value in effective_net_values if value > 0) / len(effective_net_values)
+            )
+            if effective_net_values
+            else None
         ),
+        expectancy_r=net_expectancy,
+        avg_win_r=_round(_mean([value for value in effective_net_values if value > 0])),
+        avg_loss_r=_round(_mean([value for value in effective_net_values if value < 0])),
+        profit_factor_r=net_profit_factor,
         avg_mfe_r=_round(_mean(mfe_values)),
         avg_mae_r=_round(_mean(mae_values)),
         tp1_rate=(
@@ -1329,7 +1445,7 @@ def aggregate_expectancy(
             else None
         ),
         avg_path_quality=_round(_mean(qualities)),
-        sample_ok=len(tradable) >= min_samples,
+        sample_ok=effective.sample_ok,
         min_samples=min_samples,
     )
 
@@ -1403,7 +1519,9 @@ def variant_improvement_candidates(
     baseline_overall = baseline.get("overall") if isinstance(baseline, Mapping) else {}
     if isinstance(variants, Sequence):
         for raw in [item for item in variants if isinstance(item, Mapping)]:
-            if raw.get("recommendation") != "paper_test":
+            if raw.get("recommendation") != "paper_test" or not _variant_has_canonical_net_evidence(
+                raw
+            ):
                 continue
             output.append(_candidate_from_variant(raw, baseline_overall, len(output) + 1))
             if len(output) >= limit:
@@ -1421,7 +1539,9 @@ def variant_improvement_candidates(
                 if not isinstance(cell_variants, Sequence):
                     continue
                 for raw in [item for item in cell_variants if isinstance(item, Mapping)]:
-                    if raw.get("recommendation") != "paper_test":
+                    if raw.get(
+                        "recommendation"
+                    ) != "paper_test" or not _variant_has_canonical_net_evidence(raw):
                         continue
                     output.append(
                         _candidate_from_variant(
@@ -1885,6 +2005,9 @@ def approved_target_policies(registry: Mapping[str, object] | None) -> list[Appr
             continue
         if record.get("action_type") != "tp_sl_variant_paper_test":
             continue
+        improvement_ok, _ = _approval_improvement_gate(record)
+        if not improvement_ok:
+            continue
         proposed = record.get("proposed_change")
         if not isinstance(proposed, Mapping):
             continue
@@ -1955,8 +2078,12 @@ def approved_policy_stats(
                 "tradable": _stat_int(stats, "tradable"),
                 "evaluated": _stat_int(stats, "evaluated"),
                 "sample_ok": bool(stats.get("sample_ok")),
-                "expectancy_r": _stat_float(stats, "expectancy_r"),
-                "profit_factor_r": _stat_float(stats, "profit_factor_r"),
+                "gross_expectancy_r": _stat_float(stats, "gross_expectancy_r"),
+                "net_expectancy_r": _stat_float(stats, "net_expectancy_r"),
+                "gross_profit_factor_r": _stat_float(stats, "gross_profit_factor_r"),
+                "net_profit_factor_r": _stat_float(stats, "net_profit_factor_r"),
+                "net_label_samples": _stat_int(stats, "net_label_samples"),
+                "net_label_coverage": _stat_float(stats, "net_label_coverage"),
                 "avg_path_quality": _stat_float(stats, "avg_path_quality"),
             }
         )
@@ -1973,9 +2100,8 @@ def auto_pause_underperforming_approved_policies(
     generated_at = _utc(now or datetime.now(UTC)).isoformat()
     records = _registry_records(registry)
     events = _registry_events(registry)
-    by_policy = summary.get("by_target_policy")
-    if not isinstance(by_policy, Mapping):
-        return _registry_payload(records, generated_at, _bounded_registry_events(events)), []
+    raw_by_policy = summary.get("by_target_policy")
+    by_policy = raw_by_policy if isinstance(raw_by_policy, Mapping) else {}
 
     paused: list[dict] = []
     for candidate_id, record in list(records.items()):
@@ -1984,9 +2110,16 @@ def auto_pause_underperforming_approved_policies(
         if record.get("action_type") != "tp_sl_variant_paper_test":
             continue
         stats = by_policy.get(candidate_id)
-        if not isinstance(stats, Mapping) or not bool(stats.get("sample_ok")):
-            continue
-        reason = _policy_pause_reason(stats)
+        if not isinstance(stats, Mapping):
+            reason = "承認済みTP/SLのcanonical純R証拠が取得不能"
+            stats = {}
+        elif not bool(stats.get("sample_ok")) or _stat_int(stats, "net_label_samples") <= 0:
+            reason = (
+                "承認済みTP/SLのcanonical純Rサンプル不足"
+                f"(n={_stat_int(stats, 'net_label_samples')})"
+            )
+        else:
+            reason = _policy_pause_reason(stats)
         if not reason:
             continue
         updated = dict(record)
@@ -2003,18 +2136,18 @@ def auto_pause_underperforming_approved_policies(
             to_stage="auto_paused",
             details={
                 "reason_ja": reason,
-                "expectancy_r": _stat_float(stats, "expectancy_r"),
-                "profit_factor_r": _stat_float(stats, "profit_factor_r"),
-                "tradable": _stat_int(stats, "tradable"),
+                "net_expectancy_r": _stat_float(stats, "net_expectancy_r"),
+                "net_profit_factor_r": _stat_float(stats, "net_profit_factor_r"),
+                "net_label_samples": _stat_int(stats, "net_label_samples"),
             },
         )
         paused.append(
             {
                 "candidate_id": candidate_id,
                 "reason_ja": reason,
-                "expectancy_r": _stat_float(stats, "expectancy_r"),
-                "profit_factor_r": _stat_float(stats, "profit_factor_r"),
-                "tradable": _stat_int(stats, "tradable"),
+                "net_expectancy_r": _stat_float(stats, "net_expectancy_r"),
+                "net_profit_factor_r": _stat_float(stats, "net_profit_factor_r"),
+                "net_label_samples": _stat_int(stats, "net_label_samples"),
             }
         )
     return _registry_payload(records, generated_at, _bounded_registry_events(events)), paused
@@ -2041,15 +2174,17 @@ def format_expectancy_report_ja(summary: Mapping[str, object], *, limit: int = 5
     sample_status = "サンプルOK" if bool(overall.get("sample_ok")) else "サンプル不足"
     lines = [
         "トレード期待値監視(MFE/MAE/TP/SL): "
-        f"期待R {_fmt_signed(_stat_float(overall, 'expectancy_r'), 'R')}"
-        f" / PF {_fmt_number(_stat_float(overall, 'profit_factor_r'))}"
+        f"canonical net期待R {_fmt_signed(_stat_float(overall, 'net_expectancy_r'), 'R')}"
+        f" / net PF {_fmt_number(_stat_float(overall, 'net_profit_factor_r'))}"
+        f" / gross診断 {_fmt_signed(_stat_float(overall, 'gross_expectancy_r'), 'R')}"
         f" / TP1 {_fmt_pct(_stat_float(overall, 'tp1_rate'))}"
         f" / TP2 {_fmt_pct(_stat_float(overall, 'tp2_rate'))}"
         f" / SL {_fmt_pct(_stat_float(overall, 'sl_rate'))}"
         f" / 平均MFE {_fmt_signed(_stat_float(overall, 'avg_mfe_r'), 'R')}"
         f" / 平均MAE {_fmt_number(_stat_float(overall, 'avg_mae_r'), 'R')}"
-        f" (n={tradable}/{evaluated}, {sample_status}"
-        + (f" {tradable}/{min_samples}" if min_samples else "")
+        f" (net n={_stat_int(overall, 'net_label_samples')}, gross n={tradable}/{evaluated}, "
+        f"{sample_status}"
+        + (f" {_stat_int(overall, 'effective_samples')}/{min_samples}" if min_samples else "")
         + ")"
     ]
     quality = summary.get("quality")
@@ -2155,9 +2290,12 @@ def format_variant_retest_report_ja(report: Mapping[str, object], *, limit: int 
         return "TP/SL候補paper再採点: 対象なし"
     lines = [
         "TP/SL候補paper再採点: "
-        f"現行 期待R {_fmt_signed(_stat_float(overall, 'expectancy_r'), 'R')}"
-        f" / PF {_fmt_number(_stat_float(overall, 'profit_factor_r'))}"
-        f" / n={_stat_int(overall, 'tradable')}/{_stat_int(overall, 'evaluated')}"
+        f"現行 canonical net期待R "
+        f"{_fmt_signed(_stat_float(overall, 'net_expectancy_r'), 'R')}"
+        f" / net PF {_fmt_number(_stat_float(overall, 'net_profit_factor_r'))}"
+        f" / gross診断 {_fmt_signed(_stat_float(overall, 'gross_expectancy_r'), 'R')}"
+        f" / net n={_stat_int(overall, 'net_label_samples')}"
+        f" / gross n={_stat_int(overall, 'tradable')}/{_stat_int(overall, 'evaluated')}"
     ]
     best = report.get("best")
     if isinstance(best, Mapping):
@@ -2204,6 +2342,8 @@ def check_expectancy_health(
         )
     evaluated = _stat_int(overall, "evaluated")
     tradable = _stat_int(overall, "tradable")
+    net_label_samples = _stat_int(overall, "net_label_samples")
+    effective_samples = _stat_int(overall, "effective_samples")
     min_samples = _stat_int(overall, "min_samples")
     sample_ok = bool(overall.get("sample_ok"))
     expectancy_r = _stat_float(overall, "expectancy_r")
@@ -2215,13 +2355,22 @@ def check_expectancy_health(
         checks.append(
             TradeOutcomeHealthCheck("sample", STATUS_FAIL, "期待値計算に使える判断がありません")
         )
+    elif net_label_samples <= 0:
+        checks.append(
+            TradeOutcomeHealthCheck(
+                "sample",
+                STATUS_FAIL,
+                "canonical純Rラベルがなく期待値を判定できません",
+                {"gross_samples": tradable, "net_label_samples": net_label_samples},
+            )
+        )
     elif not sample_ok:
         checks.append(
             TradeOutcomeHealthCheck(
                 "sample",
                 STATUS_FAIL if require_sample_ok else STATUS_WARN,
                 "期待値サンプルが不足しています",
-                {"tradable": tradable, "min_samples": min_samples},
+                {"effective_samples": effective_samples, "min_samples": min_samples},
             )
         )
     else:
@@ -2810,9 +2959,9 @@ def _candidate_from_variant(
     baseline = baseline_overall if isinstance(baseline_overall, Mapping) else {}
     target1_r = _stat_float(variant, "target1_r")
     target2_r = _stat_float(variant, "target2_r")
-    expectancy = _stat_float(variant, "expectancy_r")
-    delta = _stat_float(variant, "delta_expectancy_r")
-    profit_factor = _stat_float(variant, "profit_factor_r")
+    expectancy = _stat_float(variant, "net_expectancy_r")
+    delta = _stat_float(variant, "delta_net_expectancy_r")
+    profit_factor = _stat_float(variant, "net_profit_factor_r")
     variant_id = str(variant.get("variant_id") or f"variant-{index}")
     scope_label = _variant_scope_label(scope, key)
     title = (
@@ -2836,9 +2985,14 @@ def _candidate_from_variant(
             "target1_r": target1_r,
             "target2_r": target2_r,
             "execution_policy": "paper_ab_test",
-            "baseline_expectancy_r": _stat_float(baseline, "expectancy_r"),
-            "candidate_expectancy_r": expectancy,
-            "delta_expectancy_r": delta,
+            "baseline_net_expectancy_r": _stat_float(baseline, "net_expectancy_r"),
+            "candidate_net_expectancy_r": expectancy,
+            "delta_net_expectancy_r": delta,
+            "label_version": str(variant.get("label_version") or ""),
+            "label_provenance": str(variant.get("label_provenance") or ""),
+            "cost_model_id": str(variant.get("cost_model_id") or ""),
+            "net_label_samples": _stat_int(variant, "net_label_samples"),
+            "net_label_coverage": _stat_float(variant, "net_label_coverage"),
             "scope": scope,
             "key": key,
             "min_expected_improvement_r": MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
@@ -2846,6 +3000,22 @@ def _candidate_from_variant(
         "paper期間で期待Rが現行比+0.05R以上、PF>=1.05、最低サンプル数を維持することを確認",
         "live反映はpaper_ready後も即時採用せず、人間承認とデータ品質確認を必須にする",
         {"variant": dict(variant), "baseline_overall": dict(baseline), "scope": scope, "key": key},
+    )
+
+
+def _variant_has_canonical_net_evidence(variant: Mapping[str, object]) -> bool:
+    return (
+        variant.get("label_version") in KNOWN_NET_LABEL_VERSIONS
+        and variant.get("label_provenance") in KNOWN_NET_LABEL_PROVENANCES
+        and variant.get("cost_model_id") in KNOWN_EXECUTABLE_COST_MODEL_IDS
+        and _stat_int(variant, "net_label_samples") >= MIN_EXPECTANCY_SAMPLES
+        and math.isclose(
+            _stat_float(variant, "net_label_coverage") or 0.0,
+            1.0,
+            abs_tol=1e-12,
+        )
+        and _stat_float(variant, "net_expectancy_r") is not None
+        and _stat_float(variant, "delta_net_expectancy_r") is not None
     )
 
 
@@ -3074,22 +3244,40 @@ def _approval_improvement_gate(record: Mapping[str, object]) -> tuple[bool, str]
     proposed = record.get("proposed_change")
     if not isinstance(proposed, Mapping):
         return False, "TP/SL候補の改善根拠がないため昇格できません"
-    delta = _stat_float(proposed, "delta_expectancy_r")
-    candidate = _stat_float(proposed, "candidate_expectancy_r")
+    label_version = str(proposed.get("label_version") or "")
+    label_provenance = str(proposed.get("label_provenance") or "")
+    cost_model_id = str(proposed.get("cost_model_id") or "")
+    net_samples = _stat_int(proposed, "net_label_samples")
+    net_coverage = _stat_float(proposed, "net_label_coverage")
+    if (
+        label_version not in KNOWN_NET_LABEL_VERSIONS
+        or label_provenance not in KNOWN_NET_LABEL_PROVENANCES
+        or cost_model_id not in KNOWN_EXECUTABLE_COST_MODEL_IDS
+    ):
+        return False, "TP/SL候補のcanonical純R来歴が不明なため昇格できません"
+    if net_samples < MIN_EXPECTANCY_SAMPLES:
+        return (
+            False,
+            f"TP/SL候補のcanonical純Rサンプル不足({net_samples}/{MIN_EXPECTANCY_SAMPLES}件)",
+        )
+    if net_coverage is None or not math.isclose(net_coverage, 1.0, abs_tol=1e-12):
+        return False, "TP/SL候補のcanonical純R coverage不足のため昇格できません"
+    delta = _stat_float(proposed, "delta_net_expectancy_r")
+    candidate = _stat_float(proposed, "candidate_net_expectancy_r")
     min_delta = _stat_float(proposed, "min_expected_improvement_r")
     if min_delta is None:
         min_delta = MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R
     if delta is None:
-        return False, "TP/SL候補の期待R改善幅が未記録のため昇格できません"
+        return False, "TP/SL候補の純R改善幅が未記録のため昇格できません"
     if delta < min_delta:
         return (
             False,
-            f"TP/SL候補の期待R改善幅が不足しています({delta:+.2f}R<{min_delta:+.2f}R)",
+            f"TP/SL候補の純R改善幅が不足しています({delta:+.2f}R<{min_delta:+.2f}R)",
         )
     if candidate is None:
-        return False, "TP/SL候補の候補期待Rが未記録のため昇格できません"
+        return False, "TP/SL候補の候補純Rが未記録のため昇格できません"
     if candidate <= 0:
-        return False, f"TP/SL候補の候補期待Rが非正です({candidate:+.2f}R)"
+        return False, f"TP/SL候補の候補純Rが非正です({candidate:+.2f}R)"
     return True, ""
 
 
@@ -3261,10 +3449,10 @@ def _policy_specificity(policy: ApprovedTargetPolicy) -> int:
 
 
 def _policy_pause_reason(stats: Mapping[str, object]) -> str:
-    expectancy = _stat_float(stats, "expectancy_r")
-    profit_factor = _stat_float(stats, "profit_factor_r")
+    expectancy = _stat_float(stats, "net_expectancy_r")
+    profit_factor = _stat_float(stats, "net_profit_factor_r")
     avg_quality = _stat_float(stats, "avg_path_quality")
-    tradable = _stat_int(stats, "tradable")
+    tradable = _stat_int(stats, "net_label_samples")
     if expectancy is not None and expectancy <= 0:
         return f"承認済みTP/SLの適用後期待Rが{_fmt_signed(expectancy, 'R')}に悪化(n={tradable})"
     if profit_factor is not None and profit_factor < 1.0:

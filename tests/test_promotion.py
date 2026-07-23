@@ -83,11 +83,12 @@ def test_good_legacy_signal_remains_shadow_even_after_improvement() -> None:
     assert any("shadow固定" in note for note in state.notes_ja)
 
 
-def test_good_signal_without_previous_improvement_stays_shadow() -> None:
+def test_good_legacy_signal_without_canonical_net_stays_unqualified_shadow() -> None:
     entries = _journal_with_signal(500, hit_prob=0.72, seed=1)
     perf = evaluate_member("ml", entries, now=NOW)
     ok, reasons = perf.meets_reference_thresholds()
-    assert ok, reasons
+    assert not ok
+    assert any("canonical純Rサンプル不足" in reason for reason in reasons)
     state = PromotionState()
     update_stages(state, {"ml": perf}, now=NOW)
     assert state.stage_of("ml") == "shadow"

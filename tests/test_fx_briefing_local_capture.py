@@ -10,6 +10,11 @@ import pytest
 
 import fx_briefing
 from fx_intel import trade_outcome as to
+from fx_intel.evaluation_labels import (
+    DEFAULT_COST_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.market import is_market_open
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -195,9 +200,14 @@ def _approved_overall_policy_registry(path, candidate_id: str) -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            "label_version": NET_LABEL_VERSION,
+            "label_provenance": NET_LABEL_PROVENANCE,
+            "cost_model_id": DEFAULT_COST_MODEL_ID,
+            "net_label_samples": to.MIN_EXPECTANCY_SAMPLES,
+            "net_label_coverage": 1.0,
+            "baseline_net_expectancy_r": -1.0,
+            "candidate_net_expectancy_r": 0.75,
+            "delta_net_expectancy_r": 1.75,
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
         },
         "paper",
