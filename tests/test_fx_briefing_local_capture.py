@@ -19,6 +19,8 @@ def _view(interval: str, rec: str, close: float, atr: float = 0.15):
     summary = {"RECOMMENDATION": rec, "BUY": 10, "SELL": 2, "NEUTRAL": 5}
     indicators = {
         "close": close,
+        "bid": close - 0.005,
+        "ask": close + 0.005,
         "RSI": 55.0,
         "ADX": 25.0,
         "ATR": atr,
@@ -52,6 +54,24 @@ def _analysis():
         },
         summary="",
     )
+
+
+def test_load_pit_decision_outcome_report_rejects_legacy_or_unrequired(tmp_path) -> None:
+    path = tmp_path / "outcomes.json"
+    path.write_text(json.dumps({"outcomes": [{"realized_net_r": 1.0}]}), encoding="utf-8")
+    assert fx_briefing.load_pit_decision_outcome_report(path) == {}
+
+    path.write_text(
+        json.dumps(
+            {
+                "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+                "pit_required": False,
+                "outcomes": [{"realized_net_r": 1.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert fx_briefing.load_pit_decision_outcome_report(path) == {}
 
 
 def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None:
@@ -112,8 +132,13 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
         <= datetime.fromisoformat(rows[0]["prediction_time"])
     )
     assert rows[0]["ts"] == rows[0]["prediction_time"]
+    assert rows[0]["decision_id"] == decision_rows[0]["decision_id"]
+    assert rows[0]["source_record_ids"]
+    assert rows[0]["pit_contract"] == fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT
     assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
     assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
+    assert outcome_report["pit_required"] is True
+    assert outcome_report["pit_eligible_decision_events"] == 1
     assert "cells" in feedback
     assert "evaluated" in profile
     assert "Discord送信なし" in capsys.readouterr().out
@@ -222,6 +247,13 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
                         prediction_time - timedelta(seconds=1)
                     ).isoformat(),
                     "pit_eligible": True,
+                    "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+                    "decision_id": f"decision:{prediction_time.isoformat()}",
+                    "mode": "fusion",
+                    "producer": fx_briefing.journal.FUSION_PRODUCER,
+                    "producer_version": fx_briefing.journal.FUSION_PRODUCER_VERSION,
+                    "input_context_id": f"context:{prediction_time.isoformat()}",
+                    "source_record_ids": [f"source:{prediction_time.isoformat()}"],
                     "symbol": "USDJPY",
                     "direction": "long",
                     "conviction": 20,

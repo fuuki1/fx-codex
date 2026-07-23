@@ -7,7 +7,13 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from fx_intel import price_history as ph
-from fx_intel.journal import append_timeframe_plans, read_entries
+from fx_intel.journal import (
+    DECISION_JOURNAL_PIT_CONTRACT,
+    PointInTimeError,
+    append_timeframe_plans,
+    is_pit_eligible_entry,
+    read_entries,
+)
 from fx_intel.timeframe import TimeframePlan
 
 # 月曜 09:00 UTC = 市場オープン中
@@ -29,6 +35,13 @@ def _plan(timeframe: str, horizon: float, direction: str, close: float) -> Timef
         rsi=55.0,
         adx=25.0,
     )
+
+
+def _pit_ready_plan() -> TimeframePlan:
+    plan = _plan("1h", 1.0, "long", 156.0)
+    plan.input_context_id = "context-1"
+    plan.input_context = {"liquidity": {"quote": {"source_record_id": "USDJPY:quote:1"}}}
+    return plan
 
 
 # ------------------------------------------------- journal 拡張
@@ -72,6 +85,67 @@ def test_append_timeframe_plans_appends(tmp_path) -> None:
     append_timeframe_plans(path, [_plan("1h", 1.0, "long", 156.0)], now=T0)
     append_timeframe_plans(path, [_plan("1h", 1.0, "long", 156.3)], now=T0 + timedelta(hours=1))
     assert len(list(read_entries(path))) == 2
+
+
+def test_append_timeframe_plans_enforces_full_pit_contract(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    source_cutoff = T0 - timedelta(minutes=2)
+    feature_available = T0 - timedelta(seconds=1)
+
+    append_timeframe_plans(
+        path,
+        [_pit_ready_plan()],
+        now=T0,
+        source_cutoff=source_cutoff,
+        max_feature_available_time=feature_available,
+        decision_ids=["decision-1"],
+    )
+
+    row = next(read_entries(path))
+    assert row["prediction_time"] == T0.isoformat()
+    assert row["source_cutoff"] == source_cutoff.isoformat()
+    assert row["max_feature_available_time"] == feature_available.isoformat()
+    assert row["pit_contract"] == DECISION_JOURNAL_PIT_CONTRACT
+    assert row["decision_id"] == "decision-1"
+    assert row["mode"] == "per_timeframe"
+    assert row["producer"] == "timeframe_raw"
+    assert row["source_record_ids"] == ["USDJPY:quote:1"]
+    assert is_pit_eligible_entry(row)
+
+
+def test_append_timeframe_plans_keeps_incomplete_rows_diagnostic_only(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    append_timeframe_plans(path, [_plan("1h", 1.0, "long", 156.0)], now=T0)
+
+    row = next(read_entries(path))
+    assert row["pit_eligible"] is False
+    assert row["decision_id"] is None
+    assert row["source_cutoff"] is None
+    assert row["max_feature_available_time"] is None
+    assert not is_pit_eligible_entry(row)
+
+
+def test_append_timeframe_plans_rejects_naive_or_future_times(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    with pytest.raises(PointInTimeError, match="timezone-aware"):
+        append_timeframe_plans(
+            path,
+            [_pit_ready_plan()],
+            now=T0.replace(tzinfo=None),
+            source_cutoff=T0 - timedelta(minutes=2),
+            max_feature_available_time=T0 - timedelta(seconds=1),
+            decision_ids=["decision-1"],
+        )
+
+    with pytest.raises(PointInTimeError, match="PIT ordering"):
+        append_timeframe_plans(
+            path,
+            [_pit_ready_plan()],
+            now=T0,
+            source_cutoff=T0 - timedelta(minutes=2),
+            max_feature_available_time=T0 + timedelta(seconds=1),
+            decision_ids=["decision-1"],
+        )
 
 
 # ------------------------------------------------- build_close_series

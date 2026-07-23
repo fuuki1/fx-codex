@@ -8,11 +8,20 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import journal
 from tools import learning_loop_audit as audit
 
 # 2026-07-13(月) 12:00 UTC を基準にすると、直近72hに前週末クローズが1回入る
 MONDAY_NOON = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
 TUESDAY_NOON = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
+
+
+def test_pit_contract_mirror_matches_research_pipeline() -> None:
+    assert audit.DECISION_JOURNAL_PIT_CONTRACT == journal.DECISION_JOURNAL_PIT_CONTRACT
+    assert audit.DECISION_PRODUCER_IDENTITIES == {
+        "fusion": (journal.FUSION_PRODUCER, journal.FUSION_PRODUCER_VERSION),
+        "per_timeframe": (journal.TIMEFRAME_PRODUCER, journal.TIMEFRAME_PRODUCER_VERSION),
+    }
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -359,10 +368,20 @@ def _build_log_dir(tmp_path: Path, now: datetime) -> Path:
         [
             {
                 "ts": base.isoformat(),
+                "prediction_time": base.isoformat(),
+                "source_cutoff": (base - timedelta(minutes=2)).isoformat(),
+                "max_feature_available_time": (base - timedelta(seconds=1)).isoformat(),
                 "symbol": "USDJPY",
                 "direction": "long",
                 "close": 150.0,
                 "pit_eligible": True,
+                "pit_contract": audit.DECISION_JOURNAL_PIT_CONTRACT,
+                "decision_id": f"decision:{base.isoformat()}",
+                "mode": "fusion",
+                "producer": "fusion_raw",
+                "producer_version": "fusion-journal-v2",
+                "input_context_id": f"context:{base.isoformat()}",
+                "source_record_ids": [f"source:{base.isoformat()}"],
             }
         ],
     )

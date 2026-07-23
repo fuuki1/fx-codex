@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import journal
+
 _SERVER_PATH = Path(__file__).resolve().parents[1] / "tools" / "ai_learning_dashboard" / "server.py"
 
 
@@ -727,13 +729,43 @@ def test_learning_payload_passes_counterfactual_count_for_fusion(server):
 
 def _pit(row: dict) -> dict:
     prediction = datetime.fromisoformat(row["ts"])
+    timeframe = str(row.get("timeframe") or "")
+    mode = "per_timeframe" if timeframe else "fusion"
+    producer = "timeframe_raw" if timeframe else "fusion_raw"
+    producer_version = "timeframe-journal-v2" if timeframe else "fusion-journal-v2"
     return {
         **row,
         "prediction_time": prediction.isoformat(),
         "source_cutoff": (prediction - timedelta(minutes=2)).isoformat(),
         "max_feature_available_time": (prediction - timedelta(seconds=1)).isoformat(),
         "pit_eligible": True,
+        "pit_contract": "decision-journal-pit-v2",
+        "decision_id": f"decision:{prediction.isoformat()}:{timeframe or 'fusion'}",
+        "mode": mode,
+        "producer": producer,
+        "producer_version": producer_version,
+        "input_context_id": f"context:{prediction.isoformat()}",
+        "source_record_ids": [f"source:{prediction.isoformat()}"],
     }
+
+
+def test_dashboard_mirrors_full_pit_contract_for_fusion_and_timeframe(server) -> None:
+    assert server.DECISION_JOURNAL_PIT_CONTRACT == journal.DECISION_JOURNAL_PIT_CONTRACT
+    assert server.DECISION_PRODUCER_IDENTITIES == {
+        "fusion": (journal.FUSION_PRODUCER, journal.FUSION_PRODUCER_VERSION),
+        "per_timeframe": (journal.TIMEFRAME_PRODUCER, journal.TIMEFRAME_PRODUCER_VERSION),
+    }
+    fusion = _pit(_row(START, "", 24.0, "long", 150.0))
+    timeframe = _pit(_row(START, "1h", 1.0, "long", 150.0))
+
+    assert server._is_pit_eligible_decision_row(fusion)
+    assert server._is_pit_eligible_decision_row(timeframe)
+    assert not server._is_pit_eligible_decision_row(
+        {**fusion, "producer_version": "fusion-journal-v999"}
+    )
+    assert not server._is_pit_eligible_decision_row(
+        {key: value for key, value in fusion.items() if key != "decision_id"}
+    )
 
 
 def test_build_state_excludes_legacy_fusion_rows_from_gbdt(server, tmp_path) -> None:

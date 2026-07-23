@@ -6,7 +6,7 @@ from datetime import datetime, UTC
 import json
 from types import SimpleNamespace
 
-from fx_intel import decision_log, learning, maximization, tf_learning, tp_sl_learning
+from fx_intel import decision_log, journal, learning, maximization, tf_learning, tp_sl_learning
 from fx_intel.briefing import TradePlan
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -213,6 +213,56 @@ def test_score_decision_events_uses_tp_sl_mfe_mae(tmp_path) -> None:
     assert outcome["mfe_r"] == 1.2
     assert outcome["mae_r"] == 0.0
     assert outcome["decision_id"] == events[0]["decision_id"]
+
+
+def test_score_decision_events_require_pit_excludes_incomplete_events() -> None:
+    plan = _plan()
+    plan.input_context_id = "context-1"
+    events = decision_log.build_timeframe_decision_events(
+        {"USDJPY": [plan]},
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+    )
+    price_rows = [
+        {
+            "ts": "2026-07-08T09:00:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 150.8,
+            "high": 150.9,
+            "low": 150.3,
+        }
+    ]
+
+    incomplete = decision_log.score_decision_events(
+        events,
+        price_entries=price_rows,
+        now=NOW,
+        require_pit=True,
+    )
+    assert incomplete["decision_events"] == 0
+    assert incomplete["pit_ineligible_decision_events"] == 1
+
+    events[0].update(
+        journal.pit_metadata_for_plan(
+            plan,
+            prediction_time=NOW,
+            source_cutoff=NOW,
+            max_feature_available_time=NOW,
+            decision_id=str(events[0]["decision_id"]),
+            mode="per_timeframe",
+        )
+    )
+    complete = decision_log.score_decision_events(
+        events,
+        price_entries=price_rows,
+        now=NOW,
+        require_pit=True,
+    )
+    assert complete["pit_contract"] == journal.DECISION_JOURNAL_PIT_CONTRACT
+    assert complete["decision_events"] == 1
+    assert complete["pit_eligible_decision_events"] == 1
 
 
 def test_score_decision_events_classifies_failure_reasons() -> None:

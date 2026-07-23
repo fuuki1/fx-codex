@@ -8,6 +8,7 @@ from itertools import count
 import pytest
 
 from fx_intel import briefing, learning
+from fx_intel import journal
 from fx_intel.journal import append_plans, read_entries
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -62,6 +63,13 @@ def pit_entry(ts: datetime, **kwargs) -> dict:
             "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
             "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
             "pit_eligible": True,
+            "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+            "decision_id": f"decision:{row['symbol']}:{ts.isoformat()}",
+            "mode": "fusion",
+            "producer": journal.FUSION_PRODUCER,
+            "producer_version": journal.FUSION_PRODUCER_VERSION,
+            "input_context_id": f"context:{ts.isoformat()}",
+            "source_record_ids": [f"source:{ts.isoformat()}"],
         }
     )
     return row

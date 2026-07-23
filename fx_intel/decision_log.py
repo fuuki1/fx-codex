@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import journal
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
 from .shadow_learning import (
@@ -477,11 +478,14 @@ def score_decision_events(
     *,
     price_entries: Iterable[Mapping[str, object]] = (),
     now: datetime | None = None,
+    require_pit: bool = False,
 ) -> dict[str, object]:
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    materialized_events = list(events)
+    input_events = list(events)
+    pit_eligible_events = [event for event in input_events if journal.is_pit_eligible_entry(event)]
+    materialized_events = pit_eligible_events if require_pit else input_events
     event_entries = [
         entry
         for event in materialized_events
@@ -638,6 +642,11 @@ def score_decision_events(
         {
             "schema": SCHEMA_VERSION,
             "generated_at": generated_at.isoformat(),
+            "pit_contract": (journal.DECISION_JOURNAL_PIT_CONTRACT if require_pit else None),
+            "pit_required": require_pit,
+            "input_decision_events": len(input_events),
+            "pit_eligible_decision_events": len(pit_eligible_events),
+            "pit_ineligible_decision_events": len(input_events) - len(pit_eligible_events),
             "scoring_method": SCORING_METHOD,
             "metrics": list(SCORING_METRICS),
             "decision_events": len(event_entries),

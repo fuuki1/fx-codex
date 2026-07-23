@@ -77,7 +77,12 @@ LAUNCHD_SERVICES = (
 ML_MIN_TRAIN_ROWS = 150
 ML_THIN_MIN_GAP_HOURS = 4.0
 ML_ARTIFACT_SCHEMA = 4
-ML_TRAINING_CONTRACT = "fusion-pit-v1"
+ML_TRAINING_CONTRACT = "decision-journal-pit-v2"
+DECISION_JOURNAL_PIT_CONTRACT = ML_TRAINING_CONTRACT
+DECISION_PRODUCER_IDENTITIES = {
+    "fusion": ("fusion_raw", "fusion-journal-v2"),
+    "per_timeframe": ("timeframe_raw", "timeframe-journal-v2"),
+}
 
 # 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
 # ダッシュボードは fx_intel に依存しない方針なのでここに独立して持つ。
@@ -127,9 +132,30 @@ def _parse_ts(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _is_pit_eligible_fusion_row(entry: dict[str, Any]) -> bool:
-    """Mirror fx_intel.journal's fail-closed fusion learning provenance contract."""
+def _is_pit_eligible_decision_row(entry: dict[str, Any]) -> bool:
+    """Mirror fx_intel.journal's fail-closed decision provenance contract."""
     if entry.get("pit_eligible") is not True:
+        return False
+    if entry.get("pit_contract") != DECISION_JOURNAL_PIT_CONTRACT:
+        return False
+    identity = DECISION_PRODUCER_IDENTITIES.get(str(entry.get("mode") or ""))
+    if (
+        identity is None
+        or (
+            str(entry.get("producer") or ""),
+            str(entry.get("producer_version") or ""),
+        )
+        != identity
+    ):
+        return False
+    if not str(entry.get("decision_id") or "").strip():
+        return False
+    if not str(entry.get("input_context_id") or "").strip():
+        return False
+    source_record_ids = entry.get("source_record_ids")
+    if not isinstance(source_record_ids, list) or not any(
+        str(value).strip() for value in source_record_ids
+    ):
         return False
 
     def aware(value: object) -> datetime | None:
@@ -662,7 +688,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         parsed.append((ts, entry))
         if close is not None and symbol:
             prices.setdefault((symbol, timeframe), []).append((ts, close))
-            if not timeframe and _is_pit_eligible_fusion_row(entry):
+            if not timeframe and _is_pit_eligible_decision_row(entry):
                 pit_prices.setdefault((symbol, timeframe), []).append((ts, close))
     for series in prices.values():
         series.sort(key=lambda row: row[0])
@@ -682,7 +708,8 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         direction = str(entry.get("direction") or "").strip().lower()
         symbol = str(entry.get("symbol") or "")
         timeframe = str(entry.get("timeframe") or "").strip().lower()
-        pit_eligible = _is_pit_eligible_fusion_row(entry) if not timeframe else False
+        pit_eligible = _is_pit_eligible_decision_row(entry)
+        ml_pit_eligible = pit_eligible and not timeframe
         ts_text = ts.isoformat()
         display_base = {
             "ts": ts_text,
@@ -711,7 +738,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         atr = _number(entry.get("atr"))
         if close is None or not symbol:
             pending += 1
-            if pit_eligible:
+            if ml_pit_eligible:
                 ml_pit_pending += 1
             if symbol:
                 display_decisions.append({**display_base, "outcome": "pending", "move": None})
@@ -719,14 +746,14 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         # その足の主ホライズンで採点(旧スキーマ行=24h)
         horizon = _number(entry.get("horizon_hours")) or 24.0
         future = _future_close(
-            (pit_prices if pit_eligible else prices).get((symbol, timeframe), []),
+            (pit_prices if ml_pit_eligible else prices).get((symbol, timeframe), []),
             ts,
             horizon_hours=horizon,
             tolerance_hours=_tolerance_for(horizon),
         )
         if future is None:
             pending += 1
-            if pit_eligible:
+            if ml_pit_eligible:
                 ml_pit_pending += 1
             display_decisions.append({**display_base, "outcome": "pending", "move": None})
             continue
@@ -752,7 +779,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 tf_stat["flat"] += 1
         else:
             evaluated += 1
-            if pit_eligible:
+            if ml_pit_eligible:
                 ml_pit_evaluated += 1
             hit = signed > 0
             hits += int(hit)

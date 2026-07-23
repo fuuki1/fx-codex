@@ -38,7 +38,14 @@ from .timeframe import TimeframePlan
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
 DEFAULT_ATR_FRACTION = 0.1  # |値動き| がATRのこの割合未満なら判定しない
-FUSION_PIT_DATA_CONTRACT = "fusion-pit-v1"
+DECISION_JOURNAL_PIT_CONTRACT = "decision-journal-pit-v2"
+# 既存のML・改善候補レジストリが参照する公開名。時間足別と融合判断を
+# 同じPIT水準に揃えたため、値は共通のdecision journal契約を指す。
+FUSION_PIT_DATA_CONTRACT = DECISION_JOURNAL_PIT_CONTRACT
+FUSION_PRODUCER = "fusion_raw"
+TIMEFRAME_PRODUCER = "timeframe_raw"
+FUSION_PRODUCER_VERSION = "fusion-journal-v2"
+TIMEFRAME_PRODUCER_VERSION = "timeframe-journal-v2"
 
 
 class PointInTimeError(ValueError):
@@ -62,8 +69,28 @@ def _parse_aware_ts(value: object) -> datetime | None:
 
 
 def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
-    """Return whether a fusion row proves all inputs were available before prediction."""
+    """Return whether a decision row proves identity, provenance, and temporal ordering."""
     if entry.get("pit_eligible") is not True:
+        return False
+    if entry.get("pit_contract") != DECISION_JOURNAL_PIT_CONTRACT:
+        return False
+    mode = str(entry.get("mode") or "")
+    producer = str(entry.get("producer") or "")
+    expected_identity = {
+        "fusion": (FUSION_PRODUCER, FUSION_PRODUCER_VERSION),
+        "per_timeframe": (TIMEFRAME_PRODUCER, TIMEFRAME_PRODUCER_VERSION),
+    }.get(mode)
+    producer_version = str(entry.get("producer_version") or "")
+    if expected_identity is None or (producer, producer_version) != expected_identity:
+        return False
+    if not str(entry.get("decision_id") or "").strip():
+        return False
+    if not str(entry.get("input_context_id") or "").strip():
+        return False
+    raw_source_ids = entry.get("source_record_ids")
+    if not isinstance(raw_source_ids, Sequence) or isinstance(raw_source_ids, (str, bytes)):
+        return False
+    if not any(str(value).strip() for value in raw_source_ids):
         return False
     recorded = _parse_aware_ts(entry.get("ts"))
     prediction = _parse_aware_ts(entry.get("prediction_time"))
@@ -76,6 +103,135 @@ def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
     assert source_cutoff is not None
     assert feature_available is not None
     return recorded == prediction and source_cutoff <= feature_available <= prediction
+
+
+def _pit_times(
+    prediction_time: datetime | None,
+    source_cutoff: datetime | None,
+    max_feature_available_time: datetime | None,
+) -> tuple[datetime, datetime | None, datetime | None]:
+    prediction = _aware_utc(prediction_time or datetime.now(UTC), "prediction_time")
+    source = _aware_utc(source_cutoff, "source_cutoff") if source_cutoff is not None else None
+    feature = (
+        _aware_utc(max_feature_available_time, "max_feature_available_time")
+        if max_feature_available_time is not None
+        else None
+    )
+    if source is not None and source > prediction:
+        raise PointInTimeError(
+            "PIT ordering must satisfy source_cutoff <= "
+            "max_feature_available_time <= prediction_time"
+        )
+    if feature is not None and feature > prediction:
+        raise PointInTimeError(
+            "PIT ordering must satisfy source_cutoff <= "
+            "max_feature_available_time <= prediction_time"
+        )
+    if source is not None and feature is not None and source > feature:
+        raise PointInTimeError(
+            "PIT ordering must satisfy source_cutoff <= "
+            "max_feature_available_time <= prediction_time"
+        )
+    return prediction, source, feature
+
+
+def _decision_id_at(decision_ids: Sequence[str] | None, index: int) -> str:
+    if decision_ids is None:
+        return ""
+    return str(decision_ids[index]).strip()
+
+
+def _source_record_ids(plan: object) -> list[str]:
+    """Collect raw source record IDs already carried by the immutable input context."""
+
+    values: list[str] = []
+
+    def add(value: object) -> None:
+        text = str(value or "").strip()
+        if text and text not in values:
+            values.append(text)
+
+    add(getattr(plan, "quote_source_record_id", ""))
+    context = getattr(plan, "input_context", None)
+    if not isinstance(context, Mapping):
+        return sorted(values)
+    macro = context.get("macro")
+    if isinstance(macro, Mapping):
+        raw_values = macro.get("values")
+        if isinstance(raw_values, Mapping):
+            for raw in raw_values.values():
+                if isinstance(raw, Mapping):
+                    add(raw.get("source_record_id"))
+    liquidity = context.get("liquidity")
+    if isinstance(liquidity, Mapping):
+        quote = liquidity.get("quote")
+        if isinstance(quote, Mapping):
+            add(quote.get("source_record_id"))
+    return sorted(values)
+
+
+def _row_pit_eligible(
+    *,
+    source_cutoff: datetime | None,
+    max_feature_available_time: datetime | None,
+    decision_id: str,
+    input_context_id: str,
+    source_record_ids: Sequence[str],
+) -> bool:
+    return (
+        source_cutoff is not None
+        and max_feature_available_time is not None
+        and bool(decision_id)
+        and bool(input_context_id)
+        and bool(source_record_ids)
+    )
+
+
+def pit_metadata_for_plan(
+    plan: object,
+    *,
+    prediction_time: datetime,
+    source_cutoff: datetime | None,
+    max_feature_available_time: datetime | None,
+    decision_id: str,
+    mode: str,
+) -> dict[str, object]:
+    """Build the canonical PIT envelope shared by journals and full decision events."""
+
+    prediction, source, feature = _pit_times(
+        prediction_time,
+        source_cutoff,
+        max_feature_available_time,
+    )
+    identity = {
+        "fusion": (FUSION_PRODUCER, FUSION_PRODUCER_VERSION),
+        "per_timeframe": (TIMEFRAME_PRODUCER, TIMEFRAME_PRODUCER_VERSION),
+    }.get(mode)
+    if identity is None:
+        raise PointInTimeError(f"unsupported decision mode: {mode}")
+    producer, producer_version = identity
+    normalized_decision_id = str(decision_id).strip()
+    input_context_id = str(getattr(plan, "input_context_id", "") or "").strip()
+    source_record_ids = _source_record_ids(plan)
+    return {
+        "prediction_time": prediction.isoformat(),
+        "source_cutoff": source.isoformat() if source else None,
+        "max_feature_available_time": feature.isoformat() if feature else None,
+        "pit_eligible": _row_pit_eligible(
+            source_cutoff=source,
+            max_feature_available_time=feature,
+            decision_id=normalized_decision_id,
+            input_context_id=input_context_id,
+            source_record_ids=source_record_ids,
+        ),
+        "pit_contract": DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": normalized_decision_id or None,
+        "mode": mode,
+        "producer": producer,
+        "producer_version": producer_version,
+        "input_context_id": input_context_id,
+        "source_record_ids": source_record_ids,
+    }
 
 
 # 期待値ガード反実仮想の対象ゲート。このゲート「だけ」で見送りになった行を
@@ -111,40 +267,35 @@ def append_plans(
     *,
     source_cutoff: datetime | None = None,
     max_feature_available_time: datetime | None = None,
+    decision_ids: Sequence[str] | None = None,
 ) -> None:
     """今回の判断をJSONLへ追記する(1プラン1行)。
 
-    source_cutoff と max_feature_available_time の両方がある行だけをGBDTの
+    時刻順序、decision ID、input context、source record IDが全てある行だけを
     PIT適格行として記録する。旧呼出しは互換のため記録できるが、学習対象外になる。
     """
-    now = _aware_utc(now or datetime.now(UTC), "prediction_time")
-    pit_eligible = source_cutoff is not None and max_feature_available_time is not None
-    source_utc: datetime | None = None
-    feature_utc: datetime | None = None
-    if pit_eligible:
-        assert source_cutoff is not None
-        assert max_feature_available_time is not None
-        source_utc = _aware_utc(source_cutoff, "source_cutoff")
-        feature_utc = _aware_utc(max_feature_available_time, "max_feature_available_time")
-        if not source_utc <= feature_utc <= now:
-            raise PointInTimeError(
-                "PIT ordering must satisfy source_cutoff <= "
-                "max_feature_available_time <= prediction_time"
-            )
+    now, source_utc, feature_utc = _pit_times(now, source_cutoff, max_feature_available_time)
+    if decision_ids is not None and len(decision_ids) != len(plans):
+        raise PointInTimeError("decision_ids must contain exactly one ID per plan")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        for plan in plans:
+        for index, plan in enumerate(plans):
+            decision_id = _decision_id_at(decision_ids, index)
+            pit_metadata = pit_metadata_for_plan(
+                plan,
+                prediction_time=now,
+                source_cutoff=source_utc,
+                max_feature_available_time=feature_utc,
+                decision_id=decision_id,
+                mode="fusion",
+            )
+            input_context_id = str(pit_metadata["input_context_id"])
             handle.write(
                 json.dumps(
                     {
                         "ts": now.isoformat(),
-                        "prediction_time": now.isoformat(),
-                        "source_cutoff": source_utc.isoformat() if source_utc else None,
-                        "max_feature_available_time": (
-                            feature_utc.isoformat() if feature_utc else None
-                        ),
-                        "pit_eligible": pit_eligible,
+                        **pit_metadata,
                         "symbol": plan.symbol,
                         "direction": plan.direction,
                         "analysis_direction": plan.analysis_direction,
@@ -188,7 +339,7 @@ def append_plans(
                         "learning_dimensions": plan.learning_dimensions,
                         "gate_trace": plan.gate_trace,
                         "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": plan.input_context_id,
+                        "input_context_id": input_context_id,
                         "input_features": plan.input_features,
                         "input_feature_masks": plan.input_feature_masks,
                         "input_context_schema_version": plan.input_context.get(
@@ -202,7 +353,13 @@ def append_plans(
 
 
 def append_timeframe_plans(
-    path: str | Path, plans: Sequence[TimeframePlan], now: datetime | None = None
+    path: str | Path,
+    plans: Sequence[TimeframePlan],
+    now: datetime | None = None,
+    *,
+    source_cutoff: datetime | None = None,
+    max_feature_available_time: datetime | None = None,
+    decision_ids: Sequence[str] | None = None,
 ) -> None:
     """時間足別の判断をJSONLへ追記する(1プラン1行)。
 
@@ -214,15 +371,28 @@ def append_timeframe_plans(
     エントリが追記されるので、その close 列が「過去判断から見た将来価格」に
     なる(price_history.build_close_series が (symbol, timeframe) 別に組む)。
     """
-    now = now or datetime.now(UTC)
+    now, source_utc, feature_utc = _pit_times(now, source_cutoff, max_feature_available_time)
+    if decision_ids is not None and len(decision_ids) != len(plans):
+        raise PointInTimeError("decision_ids must contain exactly one ID per plan")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        for plan in plans:
+        for index, plan in enumerate(plans):
+            decision_id = _decision_id_at(decision_ids, index)
+            pit_metadata = pit_metadata_for_plan(
+                plan,
+                prediction_time=now,
+                source_cutoff=source_utc,
+                max_feature_available_time=feature_utc,
+                decision_id=decision_id,
+                mode="per_timeframe",
+            )
+            input_context_id = str(pit_metadata["input_context_id"])
             handle.write(
                 json.dumps(
                     {
                         "ts": now.isoformat(),
+                        **pit_metadata,
                         "symbol": plan.symbol,
                         # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
                         # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
@@ -270,7 +440,7 @@ def append_timeframe_plans(
                         "learning_dimensions": plan.learning_dimensions,
                         "gate_trace": plan.gate_trace,
                         "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": plan.input_context_id,
+                        "input_context_id": input_context_id,
                         "input_features": plan.input_features,
                         "input_feature_masks": plan.input_feature_masks,
                         "input_context_schema_version": plan.input_context.get(
