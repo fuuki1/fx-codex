@@ -62,7 +62,15 @@ from .technicals import PairTechnicals
 from .evaluation_labels import (
     DEFAULT_COMMISSION_R,
     DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_COMMISSION_MODEL_ID,
     DEFAULT_SLIPPAGE_R,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    DIAGNOSTIC_COST_MODEL_ID,
+    DIAGNOSTIC_COST_STATUS,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
 )
 from .shadow_learning import build_shadow_predictions, prediction_draft
 from . import input_context as decision_inputs
@@ -157,9 +165,20 @@ class TimeframePlan:
     entry_bid: float | None = None
     entry_ask: float | None = None
     quote_observed_at: str | None = None
-    cost_model_id: str = DEFAULT_COST_MODEL_ID
+    quote_available_at: str | None = None
+    quote_source: str = ""
+    quote_source_record_id: str = ""
+    planned_risk_distance: float | None = None
+    label_version: str = NET_LABEL_VERSION
+    label_provenance: str = NET_LABEL_PROVENANCE
+    cost_model_id: str = DIAGNOSTIC_COST_MODEL_ID
+    cost_model_version: str = DEFAULT_COST_MODEL_VERSION
+    cost_status: str = DIAGNOSTIC_COST_STATUS
+    slippage_model_id: str = DEFAULT_SLIPPAGE_MODEL_ID
+    commission_model_id: str = DEFAULT_COMMISSION_MODEL_ID
     slippage_r: float = DEFAULT_SLIPPAGE_R
     commission_r: float = DEFAULT_COMMISSION_R
+    financing_r: float = 0.0
     direction_threshold: float = DIRECTION_THRESHOLD
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0
@@ -459,13 +478,32 @@ def build_timeframe_plan(
     entry_bid = view.bid if view else None
     entry_ask = view.ask if view else None
     quote_observed_at = now.isoformat() if entry_bid is not None and entry_ask is not None else None
+    quote_available_at = quote_observed_at
+    quote_source = "tradingview_oanda_scanner" if quote_observed_at else ""
+    quote_source_record_id = ""
+    cost_model_id = DIAGNOSTIC_COST_MODEL_ID
+    cost_status = DIAGNOSTIC_COST_STATUS
     context_bid, context_ask, context_quote_at = decision_inputs.decision_quote_from_mapping(
         serialized_context
     )
+    quote_contract = decision_inputs.decision_quote_contract_from_mapping(serialized_context)
     if context_bid is not None and context_ask is not None:
         entry_bid, entry_ask, quote_observed_at = context_bid, context_ask, context_quote_at
+        quote_available_at = str(quote_contract.get("available_time") or "") or None
+        quote_source = str(quote_contract.get("source") or "")
+        quote_source_record_id = str(quote_contract.get("source_record_id") or "")
+        if (
+            quote_observed_at
+            and quote_available_at
+            and quote_source
+            and quote_source_record_id
+            and quote_contract.get("quality_status") == "measured"
+        ):
+            cost_model_id = DEFAULT_COST_MODEL_ID
+            cost_status = DEFAULT_COST_STATUS
 
     stop = target1 = target2 = None
+    planned_risk_distance = None
     target_policy: dict[str, object] = {}
     if direction in ("long", "short") and (atr is None or atr <= 0):
         gate_reasons.append("missing_atr")
@@ -475,6 +513,7 @@ def build_timeframe_plan(
         )
     if close is not None and atr is not None and atr > 0 and direction in ("long", "short"):
         risk_distance = atr * atr_multiple
+        planned_risk_distance = risk_distance
         sign = 1.0 if direction == "long" else -1.0
         target1_r = 1.0
         target2_r = 2.0
@@ -518,7 +557,7 @@ def build_timeframe_plan(
         entry_bid=entry_bid,
         entry_ask=entry_ask,
         quote_observed_at=quote_observed_at,
-        cost_model_id=DEFAULT_COST_MODEL_ID,
+        cost_model_id=cost_model_id,
         slippage_r=DEFAULT_SLIPPAGE_R,
         commission_r=DEFAULT_COMMISSION_R,
         atr_multiple=atr_multiple,
@@ -566,6 +605,12 @@ def build_timeframe_plan(
         entry_bid=entry_bid,
         entry_ask=entry_ask,
         quote_observed_at=quote_observed_at,
+        quote_available_at=quote_available_at,
+        quote_source=quote_source,
+        quote_source_record_id=quote_source_record_id,
+        planned_risk_distance=planned_risk_distance,
+        cost_model_id=cost_model_id,
+        cost_status=cost_status,
         direction_threshold=direction_threshold,
         risk_pct=risk_pct,
         data_quality=quality,

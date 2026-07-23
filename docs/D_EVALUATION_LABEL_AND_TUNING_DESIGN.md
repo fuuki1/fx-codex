@@ -113,7 +113,7 @@ TP/SL の同一足先着が不明な場合は現行どおり SL 優先とし、�
   "execution_cost_r": 0.05,
   "realized_net_r": 0.77,
   "cost_status": "quote_measured_modelled_execution",
-  "cost_model_id": "oanda-paper-v1",
+  "cost_model_id": "executable-quotes-zero-slippage-v1",
   "path_quality": 0.96,
   "quality_flags": []
 }
@@ -219,7 +219,7 @@ active -> auto_paused -> approved（再承認時のみ）
 - Discord 分析結果から broker/executor へ注文を送る
 
 既存の `risk_pct` は説明用の固定値として残せるが、D の候補レジストリには含めない。
-将来発注を再導入する場合は、D とは別のリスク設計・paper 運用・人間承認を必須とする。
+broker 発注と口座リスク変更は、このリポジトリでは恒久的に対象外とする。
 
 ## 6. 実装境界
 
@@ -303,7 +303,13 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   terminal exitを同じ `planned_risk_distance` で決定論的に採点する。
 - 同一 `decision_id + label_version` の同値再採点は許可し、異なる結果は
   `CanonicalOutcomeConflict` としてhard errorにする。
+- fusion / timeframe の判断producerは `label_version`、`label_provenance`、
+  `planned_risk_distance`、quoteの観測時刻・利用可能時刻・source・source record ID、
+  cost modelのversion/statusと追加コストmodel IDを判断ログへ保存する。
+- TradingView scanner由来のproxy quoteは
+  `scanner-proxy-mid-diagnostic-v1 / diagnostic_only` のままとし、
+  lineage付きのmeasured decision quoteだけを executable cost modelとして記録する。
 
-この状態はD1完了ではない。判断producerから正準scorerへの入力配線、outcome keyの
-永続層一意性、label metadataの保存、MLのdecision ID joinが完了するまで、
+この状態はD1完了ではない。保存済み判断から正準scorerを自動実行する接続、outcome keyの
+永続層一意性、MLのdecision ID joinが完了するまで、
 正準net label coverageは不足または0としてfail-closedに扱う。

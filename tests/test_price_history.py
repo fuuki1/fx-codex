@@ -47,6 +47,26 @@ def test_append_timeframe_plans_writes_timeframe_and_horizon(tmp_path) -> None:
     assert row["close"] == 150.0
 
 
+def test_append_timeframe_plans_persists_canonical_label_metadata(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    plan = _plan("1h", 1.0, "long", 156.0)
+    plan.planned_risk_distance = 0.25
+    plan.quote_available_at = "2026-06-29T08:59:59+00:00"
+    plan.quote_source = "fixture_quotes"
+    plan.quote_source_record_id = "quote-123"
+
+    append_timeframe_plans(path, [plan], now=T0)
+
+    row = next(read_entries(path))
+    assert row["label_version"] == plan.label_version
+    assert row["label_provenance"] == plan.label_provenance
+    assert row["planned_risk_distance"] == 0.25
+    assert row["quote_available_at"] == plan.quote_available_at
+    assert row["quote_source"] == "fixture_quotes"
+    assert row["quote_source_record_id"] == "quote-123"
+    assert row["cost_status"] == plan.cost_status
+
+
 def test_append_timeframe_plans_appends(tmp_path) -> None:
     path = tmp_path / "journal.jsonl"
     append_timeframe_plans(path, [_plan("1h", 1.0, "long", 156.0)], now=T0)

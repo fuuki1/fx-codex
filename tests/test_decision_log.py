@@ -63,6 +63,13 @@ def _plan() -> TimeframePlan:
         stop=149.5,
         target1=150.5,
         target2=151.0,
+        entry_bid=149.99,
+        entry_ask=150.01,
+        quote_observed_at="2026-07-08T07:59:57+00:00",
+        quote_available_at="2026-07-08T07:59:59+00:00",
+        quote_source="fixture_quotes",
+        quote_source_record_id="quote-123",
+        planned_risk_distance=0.5,
         data_quality=0.9,
         features={"rsi_1h": 55.0, "news_count": 2.0},
         components=[{"key": "tech", "score": 0.5, "weight": 0.55}],
@@ -135,6 +142,11 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
     event = events[0]
     assert event["decision_id"]
     assert event["decision"]["target2"] == 151.0
+    assert event["decision"]["label_version"] == _plan().label_version
+    assert event["decision"]["label_provenance"] == _plan().label_provenance
+    assert event["decision"]["planned_risk_distance"] == 0.5
+    assert event["decision"]["quote_available_at"] == "2026-07-08T07:59:59+00:00"
+    assert event["decision"]["quote_source_record_id"] == "quote-123"
     assert event["audit"]["scoring_ready"] is True
     assert event["technical_context"]["views"]["1h"]["atr"] == 0.2
     assert event["market_context"]["currency_sentiment"]["USD"]["score"] == 0.3

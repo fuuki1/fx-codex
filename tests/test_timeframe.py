@@ -7,6 +7,14 @@ from datetime import datetime, timedelta, UTC
 import pytest
 
 from fx_intel.calendar import EconomicEvent, risk_windows
+from fx_intel.evaluation_labels import (
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_STATUS,
+    DIAGNOSTIC_COST_MODEL_ID,
+    DIAGNOSTIC_COST_STATUS,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import (
     AUXILIARY_HORIZON_HOURS,
@@ -76,6 +84,56 @@ def test_each_timeframe_carries_own_close_and_indicators() -> None:
     assert plans["4h"].close == 156.30
     assert plans["4h"].adx == 35.0
     assert plans["1d"].atr == 0.80
+
+
+def test_scanner_quote_remains_diagnostic_only() -> None:
+    plan = build_timeframe_plan("USDJPY", "1h", _all_up_tech(), {}, [], [], now=OPEN_NOW)
+
+    assert plan.cost_model_id == DIAGNOSTIC_COST_MODEL_ID
+    assert plan.cost_status == DIAGNOSTIC_COST_STATUS
+    assert plan.label_version == NET_LABEL_VERSION
+    assert plan.label_provenance == NET_LABEL_PROVENANCE
+    assert plan.planned_risk_distance == pytest.approx(0.15 * 2.5)
+
+
+def test_measured_decision_quote_carries_executable_cost_metadata() -> None:
+    context = {
+        "context_id": "ctx-quote",
+        "liquidity": {
+            "quote": {
+                "bid": 156.24,
+                "ask": 156.26,
+                "observed_at": "2026-06-29T08:59:57+00:00",
+                "available_time": "2026-06-29T08:59:59+00:00",
+                "source": "fixture_quotes",
+                "role": "decision_quote",
+                "source_record_id": "quote-123",
+                "content_hash": "a" * 64,
+                "quality_status": "measured",
+                "quality_flags": [],
+            }
+        },
+    }
+
+    plan = build_timeframe_plan(
+        "USDJPY",
+        "1h",
+        _all_up_tech(),
+        {},
+        [],
+        [],
+        now=OPEN_NOW,
+        input_context=context,
+    )
+
+    assert plan.entry_bid == 156.24
+    assert plan.entry_ask == 156.26
+    assert plan.quote_observed_at == "2026-06-29T08:59:57+00:00"
+    assert plan.quote_available_at == "2026-06-29T08:59:59+00:00"
+    assert plan.quote_source == "fixture_quotes"
+    assert plan.quote_source_record_id == "quote-123"
+    assert plan.cost_model_id == DEFAULT_COST_MODEL_ID
+    assert plan.cost_status == DEFAULT_COST_STATUS
 
 
 # ------------------------------------------------- 独立した方向判断
