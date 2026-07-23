@@ -36,7 +36,7 @@ import os
 from pathlib import Path
 import socket
 
-from .market import WEEKEND_CLOSURE, open_hours_between
+from .market import WEEKEND_CLOSURE, WeekendOpenHours
 
 # 源B(外部履歴OHLC)の注入契約。
 # (symbol, timeframe, target_time, tolerance_hours) -> 将来終値 or None
@@ -100,12 +100,13 @@ def future_close_from_series(
     # [ホライズン下限, ホライズン上限 + 週末クローズ1回分] に限られる
     window_lower = recorded_at + timedelta(hours=horizon_hours - tolerance_hours)
     window_upper = recorded_at + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
+    open_hours = WeekendOpenHours(recorded_at, window_upper)
     best: tuple[float, float] | None = None  # (|経過-ホライズン|, 将来終値)
     for index in range(bisect_left(times, window_lower), len(series)):
         point_ts, point_close = series[index]
         if point_ts > window_upper:
             break
-        age = open_hours_between(recorded_at, point_ts)
+        age = open_hours.age(point_ts)
         if not (horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours):
             continue
         gap = abs(age - horizon_hours)

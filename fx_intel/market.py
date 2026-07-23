@@ -44,17 +44,74 @@ def _closure_start_on_or_before(moment: datetime) -> datetime:
     return anchor
 
 
+def _weekend_closure_starts(start_utc: datetime, end_utc: datetime) -> list[datetime]:
+    """[start_utc, end_utc] に重なり得る週末クローズ開始時刻を昇順で返す。
+
+    列挙は open_hours_between の while ループと完全に同一(end 側から
+    _closure_start_on_or_before で1つ取り、cursor + WEEKEND_CLOSURE > start_utc の
+    間だけ7日ずつ遡る)。呼び出し側が早期 break できるよう昇順にして返す。
+    """
+    starts: list[datetime] = []
+    cursor = _closure_start_on_or_before(end_utc)
+    while cursor + WEEKEND_CLOSURE > start_utc:
+        starts.append(cursor)
+        cursor -= timedelta(days=7)
+    starts.reverse()
+    return starts
+
+
+def _closed_hours(
+    start_utc: datetime, end_utc: datetime, closure_starts: list[datetime]
+) -> timedelta:
+    """closure_starts(昇順)と [start_utc, end_utc] の重なり合計。"""
+    closed = timedelta()
+    for cursor in closure_starts:
+        if cursor >= end_utc:
+            break  # 昇順なので以降の窓は区間外
+        overlap = min(cursor + WEEKEND_CLOSURE, end_utc) - max(cursor, start_utc)
+        if overlap > timedelta():
+            closed += overlap
+    return closed
+
+
 def open_hours_between(start: datetime, end: datetime) -> float:
     """start→endの経過時間から週末クローズ分を除いた「市場オープン時間」。"""
     if end <= start:
         return 0.0
     start_utc = start.astimezone(UTC)
     end_utc = end.astimezone(UTC)
-    closed = timedelta()
-    cursor = _closure_start_on_or_before(end_utc)
-    while cursor + WEEKEND_CLOSURE > start_utc:
-        overlap = min(cursor + WEEKEND_CLOSURE, end_utc) - max(cursor, start_utc)
-        if overlap > timedelta():
-            closed += overlap
-        cursor -= timedelta(days=7)
+    closed = _closed_hours(start_utc, end_utc, _weekend_closure_starts(start_utc, end_utc))
     return (end_utc - start_utc - closed).total_seconds() / 3600.0
+
+
+class WeekendOpenHours:
+    """固定 start から増加する end への open_hours を O(窓数) で繰り返し計算する。
+
+    採点ループ(将来価格探索)は「固定した判断時刻 ts」と「価格系列を進む point.ts」
+    の組で open_hours_between を系列長ぶん呼ぶため、そのままだと判断数×価格点数の
+    二乗になる。この補助オブジェクトは start 固定で週末クローズ開始時刻を一度だけ
+    列挙し、以降の各 end 呼び出しを窓の総和(通常1〜2個)+昇順早期 break にする。
+    値は open_hours_between とビット単位で一致する。
+
+    max_end は列挙する窓の上限を決めるための保守的な壁時計上限(将来探索窓の
+    window_upper を渡す)。max_end を超える end を渡しても open_hours_between に
+    フォールバックするため結果は正しい(高速路を外れるだけ)。
+    """
+
+    __slots__ = ("_start_utc", "_max_end_utc", "_closure_starts")
+
+    def __init__(self, start: datetime, max_end: datetime) -> None:
+        self._start_utc = start.astimezone(UTC)
+        self._max_end_utc = max_end.astimezone(UTC)
+        self._closure_starts = _weekend_closure_starts(self._start_utc, self._max_end_utc)
+
+    def age(self, end: datetime) -> float:
+        """start→end の市場オープン時間(open_hours_between(start, end) と同値)。"""
+        end_utc = end.astimezone(UTC)
+        if end_utc <= self._start_utc:
+            return 0.0
+        if end_utc > self._max_end_utc:
+            # 事前列挙した窓の範囲外。素の実装にフォールバックする。
+            return open_hours_between(self._start_utc, end_utc)
+        closed = _closed_hours(self._start_utc, end_utc, self._closure_starts)
+        return (end_utc - self._start_utc - closed).total_seconds() / 3600.0
