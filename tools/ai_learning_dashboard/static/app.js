@@ -1436,7 +1436,7 @@ function renderDecisionMonitor(data) {
   );
   setText(
     "decisionNetCoverage",
-    `net label ${canonicalNet.net_label_samples || 0} / gross ${canonicalNet.gross_samples || 0} (${pct(num(canonicalNet.net_label_coverage))}) / version ${(canonicalNet.label_versions || []).join(", ") || "--"} / cost ${(canonicalNet.cost_model_ids || []).join(", ") || "--"}`,
+    `net label ${canonicalNet.net_label_samples || 0} / gross ${canonicalNet.gross_samples || 0} (${pct(num(canonicalNet.net_label_coverage))}) / raw ${canonicalNet.raw_samples || 0} → effective ${canonicalNet.effective_samples || 0} / overlap ${pct(num(canonicalNet.overlap_ratio))} / ${canonicalNet.sample_ok ? "sample OK" : "sample不足"} / version ${(canonicalNet.label_versions || []).join(", ") || "--"} / cost ${(canonicalNet.cost_model_ids || []).join(", ") || "--"}`,
   );
 
   const actions = $("decisionActionList");

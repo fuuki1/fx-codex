@@ -18,6 +18,7 @@ from fx_intel.trade_outcome import (
     CanonicalOutcomeConflict,
     CanonicalTradeRequest,
     ExecutableQuoteBar,
+    aggregate_canonical_expectancy,
     assert_canonical_outcome_idempotent,
     score_canonical_outcome,
 )
@@ -139,6 +140,8 @@ def _request(
 def test_long_uses_ask_entry_and_bid_exit_without_spread_double_subtraction() -> None:
     outcome = score_canonical_outcome(_request())
 
+    assert outcome.prediction_time == NOW.isoformat()
+    assert outcome.holding_end_time == (NOW + timedelta(minutes=60)).isoformat()
     assert outcome.first_touch == "tp1"
     assert outcome.entry_executable == 100.1
     assert outcome.exit_executable == 101.1
@@ -150,6 +153,30 @@ def test_long_uses_ask_entry_and_bid_exit_without_spread_double_subtraction() ->
         outcome.gross_realized_r - outcome.realized_net_r
     )
     assert outcome.net_label_eligible is True
+
+
+def test_canonical_aggregate_gates_on_effective_not_raw_samples() -> None:
+    base = score_canonical_outcome(_request())
+    outcomes = []
+    for batch in range(5):
+        batch_start = NOW + timedelta(hours=batch * 2)
+        for offset in range(4):
+            prediction = batch_start + timedelta(minutes=offset * 5)
+            outcomes.append(
+                replace(
+                    base,
+                    decision_id=f"d-{batch}-{offset}",
+                    prediction_time=prediction.isoformat(),
+                    holding_end_time=(prediction + timedelta(hours=1)).isoformat(),
+                )
+            )
+
+    summary = aggregate_canonical_expectancy(outcomes, min_samples=6)
+
+    assert summary["raw_samples"] == 20
+    assert summary["effective_samples"] == 5
+    assert summary["net_label_samples"] == 20
+    assert summary["sample_ok"] is False
 
 
 def test_short_uses_bid_entry_and_ask_exit() -> None:

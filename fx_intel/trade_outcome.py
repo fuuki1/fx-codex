@@ -18,6 +18,10 @@ import json
 import math
 from pathlib import Path
 
+from .effective_samples import (
+    DEFAULT_MIN_EFFECTIVE_SAMPLES,
+    summarize_effective_samples,
+)
 from .evaluation_labels import (
     DEFAULT_COST_STATUS,
     KNOWN_EXECUTABLE_COST_MODEL_IDS,
@@ -36,7 +40,7 @@ from .market import WEEKEND_CLOSURE, WeekendOpenHours, open_hours_between
 MIN_PATH_POINTS = 3
 MIN_PATH_COVERAGE = 0.50
 MIN_PATH_QUALITY = 0.35
-MIN_EXPECTANCY_SAMPLES = 20
+MIN_EXPECTANCY_SAMPLES = DEFAULT_MIN_EFFECTIVE_SAMPLES
 MIN_GROUP_EXPECTANCY_SAMPLES = 12
 CLOSE_ONLY_QUALITY_CAP = 0.70
 PARTIAL_OHLC_QUALITY_CAP = 0.85
@@ -151,6 +155,8 @@ class CanonicalTradeOutcome:
     timeframe: str
     horizon_hours: float
     direction: str
+    prediction_time: str | None = None
+    holding_end_time: str | None = None
     first_touch: str = "unavailable"
     first_touch_ts: str | None = None
     entry_executable: float | None = None
@@ -188,6 +194,8 @@ class CanonicalTradeOutcome:
             "timeframe": self.timeframe,
             "horizon_hours": self.horizon_hours,
             "direction": self.direction,
+            "prediction_time": self.prediction_time,
+            "holding_end_time": self.holding_end_time,
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
             "entry_executable": self.entry_executable,
@@ -283,6 +291,8 @@ def score_canonical_outcome(request: CanonicalTradeRequest) -> CanonicalTradeOut
         timeframe=request.timeframe,
         horizon_hours=request.horizon_hours,
         direction=request.direction,
+        prediction_time=request.prediction_time.astimezone(UTC).isoformat(),
+        holding_end_time=touch_bar.ts.astimezone(UTC).isoformat(),
         first_touch=touch,
         first_touch_ts=touch_bar.ts.astimezone(UTC).isoformat(),
         entry_executable=entry_executable,
@@ -305,6 +315,51 @@ def score_canonical_outcome(request: CanonicalTradeRequest) -> CanonicalTradeOut
         path_quality=_canonical_round(path_quality),
         quality_flags=all_flags,
     )
+
+
+def aggregate_canonical_expectancy(
+    outcomes: Sequence[CanonicalTradeOutcome],
+    *,
+    min_samples: int = MIN_EXPECTANCY_SAMPLES,
+) -> dict[str, object]:
+    """Aggregate canonical gross/net R while gating on effective net samples."""
+
+    gross_values = [
+        float(outcome.gross_realized_r)
+        for outcome in outcomes
+        if outcome.gross_realized_r is not None
+    ]
+    net_outcomes = [
+        outcome
+        for outcome in outcomes
+        if outcome.net_label_eligible and outcome.realized_net_r is not None
+    ]
+    net_values = [
+        float(outcome.realized_net_r)
+        for outcome in net_outcomes
+        if outcome.realized_net_r is not None
+    ]
+    effective = summarize_effective_samples(net_outcomes, min_samples=min_samples)
+    return {
+        **effective.to_dict(),
+        "raw_samples": len(outcomes),
+        "effective_input_samples": effective.raw_samples,
+        "gross_samples": len(gross_values),
+        "net_label_samples": len(net_values),
+        "net_label_coverage": (len(net_values) / len(gross_values) if gross_values else None),
+        "gross_expectancy_r": _canonical_round(_mean(gross_values)),
+        "net_expectancy_r": _canonical_round(_mean(net_values)),
+        "gross_profit_factor": _canonical_profit_factor(gross_values),
+        "net_profit_factor": _canonical_profit_factor(net_values),
+    }
+
+
+def _canonical_profit_factor(values: Sequence[float]) -> float | None:
+    gains = sum(value for value in values if value > 0)
+    losses = abs(sum(value for value in values if value < 0))
+    if losses > 0:
+        return _canonical_round(gains / losses)
+    return None if gains <= 0 else float("inf")
 
 
 def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
@@ -393,6 +448,11 @@ def _unavailable_canonical_outcome(
         timeframe=request.timeframe,
         horizon_hours=request.horizon_hours,
         direction=request.direction,
+        prediction_time=(
+            request.prediction_time.astimezone(UTC).isoformat()
+            if _aware_datetime(request.prediction_time)
+            else None
+        ),
         slippage_r=(cost.slippage_r if cost is not None else None),
         commission_r=(cost.commission_r if cost is not None else None),
         financing_r=(cost.financing_r if cost is not None else None),

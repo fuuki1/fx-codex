@@ -15,6 +15,7 @@ import math
 import mimetypes
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,15 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 REPO_ROOT = APP_DIR.parents[1]
 DEFAULT_LOG_DIR = REPO_ROOT / "logs"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from fx_intel.effective_samples import summarize_effective_samples  # noqa: E402
+from fx_intel.evaluation_labels import (  # noqa: E402
+    KNOWN_EXECUTABLE_COST_MODEL_IDS,
+    KNOWN_NET_LABEL_PROVENANCES,
+    KNOWN_NET_LABEL_VERSIONS,
+)
 
 JOURNAL_FILE = "briefing_journal.jsonl"
 LEARNING_FILE = "briefing_learning.json"
@@ -1561,25 +1571,27 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
     raw_outcomes = payload.get("outcomes")
     outcomes = raw_outcomes if isinstance(raw_outcomes, list) else []
-    scored = [
-        row
-        for row in outcomes
-        if isinstance(row, dict) and _number(row.get("realized_r")) is not None
-    ]
+
+    def gross_value(row: dict[str, Any]) -> float | None:
+        canonical_gross = _number(row.get("gross_realized_r"))
+        return canonical_gross if canonical_gross is not None else _number(row.get("realized_r"))
+
+    scored = [row for row in outcomes if isinstance(row, dict) and gross_value(row) is not None]
 
     def canonical(row: dict[str, Any]) -> bool:
         return (
             _number(row.get("realized_net_r")) is not None
             and row.get("net_label_eligible") is True
             and bool(str(row.get("decision_id") or "").strip())
-            and bool(str(row.get("label_version") or "").strip())
-            and bool(str(row.get("label_provenance") or "").strip())
-            and bool(str(row.get("cost_model_id") or "").strip())
+            and row.get("label_version") in KNOWN_NET_LABEL_VERSIONS
+            and row.get("label_provenance") in KNOWN_NET_LABEL_PROVENANCES
+            and row.get("cost_model_id") in KNOWN_EXECUTABLE_COST_MODEL_IDS
         )
 
     labeled = [row for row in scored if canonical(row)]
     values = [float(row["realized_net_r"]) for row in labeled]
-    gross_values = [float(row["realized_r"]) for row in scored]
+    gross_values = [value for row in scored if (value := gross_value(row)) is not None]
+    effective = summarize_effective_samples(labeled)
 
     def profit_factor(samples: list[float]) -> float | None:
         gains = sum(value for value in samples if value > 0)
@@ -1619,6 +1631,16 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "labels": len(labeled),
         "gross_samples": len(gross_values),
         "net_label_samples": len(labeled),
+        "raw_samples": len(scored),
+        "effective_input_samples": effective.raw_samples,
+        "effective_samples": effective.effective_samples,
+        "overlap_ratio": effective.overlap_ratio,
+        "cluster_count": effective.cluster_count,
+        "market_days": effective.market_days,
+        "invalid_effective_samples": effective.invalid_samples,
+        "effective_sample_invalid_reasons": effective.invalid_reasons,
+        "minimum_effective_samples": effective.min_samples,
+        "sample_ok": effective.sample_ok,
         "net_label_coverage": len(labeled) / len(scored) if scored else None,
         "gross_expectancy_r": (sum(gross_values) / len(gross_values) if gross_values else None),
         "net_expectancy_r": sum(values) / len(values) if values else None,

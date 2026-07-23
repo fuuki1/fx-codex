@@ -309,6 +309,12 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
 - TradingView scanner由来のproxy quoteは
   `scanner-proxy-mid-diagnostic-v1 / diagnostic_only` のままとし、
   lineage付きのmeasured decision quoteだけを executable cost modelとして記録する。
+- canonical outcomeは `prediction_time` と `holding_end_time` を保存する。
+  `effective_samples.summarize_effective_samples()` は5分の最小間隔、保有区間の重複、
+  同一symbol、同じ符号の共通通貨エクスポージャー、FX市場日を使い、
+  raw/effective/overlap/cluster/market-day件数を決定論的に返す。
+- canonical gross/net集計の `sample_ok` はraw件数ではなくeffective件数で判定し、
+  時刻欠損・naive時刻・競合duplicateがある場合はfail-closedにする。
 
 この状態はD1完了ではない。保存済み判断から正準scorerを自動実行する接続、outcome keyの
 永続層一意性、MLのdecision ID joinが完了するまで、

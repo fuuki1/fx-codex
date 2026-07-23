@@ -306,25 +306,37 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
             "outcomes": [
                 {
                     "ts": "2026-07-01T00:00:00+00:00",
+                    "prediction_time": "2026-07-01T00:00:00+00:00",
+                    "holding_end_time": "2026-07-01T01:00:00+00:00",
                     "decision_id": "d1",
+                    "symbol": "USDJPY",
+                    "direction": "long",
+                    "timeframe": "1h",
+                    "horizon_hours": 1.0,
                     "realized_r": 1.0,
                     "realized_net_r": 0.8,
                     "tradable": True,
                     "net_label_eligible": True,
                     "label_version": "net-r-v1",
-                    "label_provenance": "fixture_executable_quotes",
-                    "cost_model_id": "quotes-v1",
+                    "label_provenance": "paper_quote_model",
+                    "cost_model_id": "executable-quotes-zero-slippage-v1",
                 },
                 {
                     "ts": "2026-07-02T00:00:00+00:00",
+                    "prediction_time": "2026-07-02T00:00:00+00:00",
+                    "holding_end_time": "2026-07-02T01:00:00+00:00",
                     "decision_id": "d2",
+                    "symbol": "USDJPY",
+                    "direction": "long",
+                    "timeframe": "1h",
+                    "horizon_hours": 1.0,
                     "realized_r": -1.0,
                     "realized_net_r": -1.2,
                     "tradable": True,
                     "net_label_eligible": True,
                     "label_version": "net-r-v1",
-                    "label_provenance": "fixture_executable_quotes",
-                    "cost_model_id": "quotes-v1",
+                    "label_provenance": "paper_quote_model",
+                    "cost_model_id": "executable-quotes-zero-slippage-v1",
                 },
                 {
                     "ts": "2026-07-03T00:00:00+00:00",
@@ -348,14 +360,20 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
 
     assert result["labels"] == 2
     assert result["scored"] == 4
+    assert result["raw_samples"] == 4
+    assert result["effective_input_samples"] == 2
+    assert result["effective_samples"] == 2
+    assert result["overlap_ratio"] == 0.0
+    assert result["market_days"] == 2
+    assert result["sample_ok"] is False
     assert result["net_label_coverage"] == pytest.approx(1 / 2)
     assert result["net_expectancy_r"] == pytest.approx(-0.2)
     assert result["cumulative_net_r"] == pytest.approx(-0.4)
     assert result["curve"][-1]["cumulative_net_r"] == pytest.approx(-0.4)
     assert result["gross_expectancy_r"] == pytest.approx(0.15)
     assert result["label_versions"] == ["net-r-v1"]
-    assert result["label_provenances"] == ["fixture_executable_quotes"]
-    assert result["cost_model_ids"] == ["quotes-v1"]
+    assert result["label_provenances"] == ["paper_quote_model"]
+    assert result["cost_model_ids"] == ["executable-quotes-zero-slippage-v1"]
     assert result["missing_reasons"] == {
         "missing_net_label_entry_quote": 1,
         "noncanonical_net_label": 1,
