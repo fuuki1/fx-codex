@@ -51,9 +51,10 @@ def test_raw_twenty_can_be_only_five_effective_samples() -> None:
     assert summary.effective_samples == 5
     assert summary.overlap_ratio == pytest.approx(0.75)
     assert summary.sample_ok is False
-    assert summarize_effective_samples(
-        list(reversed(rows)), min_samples=6
-    ).selected_keys == summary.selected_keys
+    assert (
+        summarize_effective_samples(list(reversed(rows)), min_samples=6).selected_keys
+        == summary.selected_keys
+    )
 
 
 def test_five_minute_predictions_with_one_hour_horizon_are_not_twelve_samples() -> None:
