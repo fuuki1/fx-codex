@@ -792,9 +792,15 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _recent_outcomes_by_timeframe(
-    outcomes: list[dict[str, Any]], per_timeframe: int = 12
+    outcomes: list[dict[str, Any]], per_timeframe: int = 300
 ) -> dict[str, list[dict[str, Any]]]:
-    """満期採点済みの結果を時間足ごとに直近per_timeframe件ずつ返す。"""
+    """満期採点済みの結果を時間足ごとに直近per_timeframe件ずつ返す。
+
+    日付タブ(今日/昨日/…)で過去に遡って絞り込めるよう、UIが必要とする
+    直近数日分をカバーする件数を保持する。件数を増やしても表示側は日付・
+    時間足・銘柄で絞ってから20件区切りでページ送りするため、一度に全件を
+    描画することはない。
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in outcomes:
         timeframe = str(row.get("timeframe") or "")

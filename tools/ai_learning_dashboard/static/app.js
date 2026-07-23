@@ -836,9 +836,35 @@ const ANALYSIS_OUTCOME_LABEL = {
 let outcomeTabSelection = "all";
 // 選択中の銘柄タブ("all" or "USDJPY" 等)。時間足タブと同じく再描画で維持する。
 let outcomeSymbolSelection = "all";
+// 選択中の日付タブ("all" or "2026-07-23" 等の YYYY-MM-DD)。
+let outcomeDateSelection = "all";
 // 結果リストのページ番号(0始まり)。絞り込みを変えたら先頭に戻す。
 let outcomePage = 0;
 const OUTCOME_PAGE_SIZE = 20;
+
+// 行のtsから現地時間の日付キー(YYYY-MM-DD)を作る。日付タブの絞り込みと
+// 見出しラベル(今日/昨日/…)の両方で同じ基準を使う。
+function outcomeDateKey(row) {
+  const d = new Date(row.ts || 0);
+  if (Number.isNaN(d.getTime())) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// 日付キーを「今日 / 昨日 / 一昨日 / M/D」の見やすいラベルにする。
+function outcomeDateLabel(dateKey) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const target = new Date(y, m - 1, d);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const diffDays = Math.round((today - target) / 86400000);
+  if (diffDays === 0) return "今日";
+  if (diffDays === 1) return "昨日";
+  if (diffDays === 2) return "一昨日";
+  return `${m}/${d}`;
+}
 
 function outcomeRowElement(row) {
   const style = OUTCOME_STYLE[row.outcome] || { badge: row.outcome || "?", className: "flat" };
@@ -1021,11 +1047,13 @@ function renderRecentOutcomes(data) {
   if (!target) return;
   const tabs = $("outcomeTabs");
   const symbolTabs = $("outcomeSymbolTabs");
+  const dateTabs = $("outcomeDateTabs");
   const summary = $("outcomeSummary");
   const pager = $("outcomePager");
   target.replaceChildren();
   if (tabs) tabs.replaceChildren();
   if (symbolTabs) symbolTabs.replaceChildren();
+  if (dateTabs) dateTabs.replaceChildren();
   if (summary) summary.replaceChildren();
   if (pager) pager.replaceChildren();
 
@@ -1056,6 +1084,19 @@ function renderRecentOutcomes(data) {
     outcomeSymbolSelection = "all";
   }
 
+  // 日付フィルタ。時間足・銘柄で絞った後の行から、存在する日付を新しい順に集める。
+  const byDateFilter = (rows) =>
+    outcomeDateSelection === "all"
+      ? rows
+      : rows.filter((row) => outcomeDateKey(row) === outcomeDateSelection);
+  const tfSymFilteredRows = bySymbolFilter(tfFilteredRows);
+  const availableDates = Array.from(
+    new Set(tfSymFilteredRows.map((row) => outcomeDateKey(row)).filter(Boolean)),
+  ).sort((a, b) => (a < b ? 1 : -1));
+  if (outcomeDateSelection !== "all" && !availableDates.includes(outcomeDateSelection)) {
+    outcomeDateSelection = "all";
+  }
+
   // タブは「ラベル + 件数バッジ」で作る。件数バッジは総数だけを小さく添える
   // (以前は各タブに ✅/❌/他 を全部並べていて、時間足タブと銘柄タブの両方に
   // 出ると情報過多で読みにくかった)。
@@ -1084,6 +1125,7 @@ function renderRecentOutcomes(data) {
       button.addEventListener("click", () => {
         outcomeTabSelection = key;
         outcomeSymbolSelection = "all";
+        outcomeDateSelection = "all";
         outcomePage = 0;
         renderRecentOutcomes(data);
       });
@@ -1100,10 +1142,33 @@ function renderRecentOutcomes(data) {
       const button = makeTab(key, label, rows, outcomeSymbolSelection === key);
       button.addEventListener("click", () => {
         outcomeSymbolSelection = key;
+        outcomeDateSelection = "all";
         outcomePage = 0;
         renderRecentOutcomes(data);
       });
       symbolTabs.appendChild(button);
+    });
+  }
+
+  // 日付タブ(すべて / 今日 / 昨日 / 一昨日 / M/D …、新しい順)。
+  // 時間足・銘柄で絞った後に存在する日付だけを候補に出す。
+  if (dateTabs) {
+    const options = [
+      ["all", "すべて"],
+      ...availableDates.map((dateKey) => [dateKey, outcomeDateLabel(dateKey)]),
+    ];
+    options.forEach(([key, label]) => {
+      const rows =
+        key === "all"
+          ? tfSymFilteredRows
+          : tfSymFilteredRows.filter((row) => outcomeDateKey(row) === key);
+      const button = makeTab(key, label, rows, outcomeDateSelection === key);
+      button.addEventListener("click", () => {
+        outcomeDateSelection = key;
+        outcomePage = 0;
+        renderRecentOutcomes(data);
+      });
+      dateTabs.appendChild(button);
     });
   }
 
@@ -1113,13 +1178,16 @@ function renderRecentOutcomes(data) {
   const analysisByTimeframe = data.evaluation?.analysis?.by_timeframe || {};
   if (summary) {
     const tfsToShow = outcomeTabSelection === "all" ? availableTfs : [outcomeTabSelection];
+    // 通算的中率(by_timeframe)は全期間・全銘柄の集計なので、銘柄または日付で
+    // 絞り込んでいる間は分母がかみ合わない。そのチップは省いて誤読を防ぐ。
+    const showCumulative = outcomeSymbolSelection === "all" && outcomeDateSelection === "all";
     tfsToShow.forEach((tf) => {
       summary.appendChild(
         outcomeSummaryChip(
           tf,
-          bySymbolFilter(groups[tf] || []),
-          outcomeSymbolSelection === "all" ? byTimeframe : null,
-          outcomeSymbolSelection === "all" ? analysisByTimeframe : null,
+          byDateFilter(bySymbolFilter(groups[tf] || [])),
+          showCumulative ? byTimeframe : null,
+          showCumulative ? analysisByTimeframe : null,
         ),
       );
     });
@@ -1134,8 +1202,10 @@ function renderRecentOutcomes(data) {
   };
   const allRows =
     outcomeTabSelection === "all"
-      ? bySymbolFilter(Object.values(groups).flat()).sort((a, b) => parseTs(b) - parseTs(a))
-      : [...bySymbolFilter(groups[outcomeTabSelection] || [])].reverse();
+      ? byDateFilter(bySymbolFilter(Object.values(groups).flat())).sort(
+          (a, b) => parseTs(b) - parseTs(a),
+        )
+      : [...byDateFilter(bySymbolFilter(groups[outcomeTabSelection] || []))].reverse();
   if (!allRows.length) {
     target.appendChild(empty("この絞り込みに該当する判断はまだありません"));
     return;
