@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, UTC
 from collections.abc import Callable, Mapping, Sequence
+import math
 
 from .calendar import (
     EconomicEvent,
@@ -47,6 +48,7 @@ from .evaluation_labels import (
     DIAGNOSTIC_COST_STATUS,
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
+    has_executable_entry,
 )
 from .shadow_learning import build_shadow_predictions, prediction_draft
 from . import input_context as decision_inputs
@@ -182,6 +184,16 @@ class TradePlan:
     interval_summary: str = ""
     ma_note: str = ""
     target_policy: dict[str, object] = field(default_factory=dict)
+    # 期待値ガード直前の完全プラン。ガードがneutralへ変更した後にraw scoreから
+    # 再計算せず、反実仮想はこの判断時凍結値だけを使用する。
+    pre_guard_direction: str = "neutral"
+    pre_guard_conviction: int = 0
+    pre_guard_stop: float | None = None
+    pre_guard_target1: float | None = None
+    pre_guard_target2: float | None = None
+    pre_guard_target_policy: dict[str, object] = field(default_factory=dict)
+    pre_guard_execution_snapshot: dict[str, object] = field(default_factory=dict)
+    pre_guard_cost_model_id: str = ""
     # 発注前9段チェックリスト(decision_pipeline.build_checklist の結果)。
     # {"steps": [...], "net_expected_r": ..., "position_units": ...} の辞書。
     # 空なら未算出。表示・ジャーナル記録に使う(判断そのものには影響しない)。
@@ -202,6 +214,126 @@ class TradePlan:
     @property
     def emoji(self) -> str:
         return DIRECTION_EMOJI.get(self.direction, "⚪")
+
+
+@dataclass(frozen=True)
+class FrozenTargetPlan:
+    stop: float | None = None
+    target1: float | None = None
+    target2: float | None = None
+    planned_risk_distance: float | None = None
+    target_policy: dict[str, object] = field(default_factory=dict)
+    approved_reason: str = ""
+
+
+def freeze_target_plan(
+    symbol: str,
+    direction: str,
+    conviction: int,
+    *,
+    close: float | None,
+    atr: float | None,
+    atr_multiple: float,
+    target_r_adjuster: TargetRAdjuster | None,
+) -> FrozenTargetPlan:
+    """Freeze the exact target plan for a direction without mutating the recommendation."""
+
+    if (
+        direction not in ("long", "short")
+        or close is None
+        or atr is None
+        or not all(math.isfinite(value) for value in (close, atr, atr_multiple))
+        or atr <= 0
+        or atr_multiple <= 0
+    ):
+        return FrozenTargetPlan()
+    risk_distance = atr * atr_multiple
+    target1_r = DEFAULT_TARGET1_R
+    target2_r = DEFAULT_TARGET2_R
+    approved_reason = ""
+    target_policy: dict[str, object] = {
+        "policy_id": "default-atr-v1",
+        "target1_r": target1_r,
+        "target2_r": target2_r,
+    }
+    if target_r_adjuster is not None:
+        adjusted_targets = target_r_adjuster(symbol, direction, conviction)
+        if adjusted_targets is not None:
+            candidate_target1_r, candidate_target2_r, reason = adjusted_targets[:3]
+            if (
+                math.isfinite(candidate_target1_r)
+                and math.isfinite(candidate_target2_r)
+                and candidate_target1_r > 0
+                and candidate_target2_r > candidate_target1_r
+            ):
+                target1_r = candidate_target1_r
+                target2_r = candidate_target2_r
+                approved_reason = reason
+                if len(adjusted_targets) >= 4 and isinstance(adjusted_targets[3], Mapping):
+                    target_policy = dict(adjusted_targets[3])
+                else:
+                    target_policy = {
+                        "target1_r": target1_r,
+                        "target2_r": target2_r,
+                        "reason_ja": reason,
+                    }
+    sign = 1.0 if direction == "long" else -1.0
+    return FrozenTargetPlan(
+        stop=close - sign * risk_distance,
+        target1=close + sign * risk_distance * target1_r,
+        target2=close + sign * risk_distance * target2_r,
+        planned_risk_distance=risk_distance,
+        target_policy=target_policy,
+        approved_reason=approved_reason,
+    )
+
+
+def freeze_pre_guard_execution(
+    *,
+    entry_bid: float | None,
+    entry_ask: float | None,
+    quote_observed_at: str | None,
+    quote_available_at: str | None,
+    quote_source: str,
+    quote_source_record_id: str,
+    planned_risk_distance: float | None,
+    cost_model_id: str,
+    cost_status: str,
+) -> dict[str, object]:
+    """Freeze canonical net-label inputs without claiming that an outcome exists."""
+
+    input_ready = (
+        has_executable_entry(entry_bid, entry_ask)
+        and bool(quote_observed_at)
+        and bool(quote_available_at)
+        and bool(quote_source)
+        and bool(quote_source_record_id)
+        and planned_risk_distance is not None
+        and planned_risk_distance > 0
+        and cost_model_id == DEFAULT_COST_MODEL_ID
+        and cost_status == DEFAULT_COST_STATUS
+    )
+    return {
+        "entry_bid": entry_bid,
+        "entry_ask": entry_ask,
+        "quote_observed_at": quote_observed_at,
+        "quote_available_at": quote_available_at,
+        "quote_source": quote_source,
+        "quote_source_record_id": quote_source_record_id,
+        "planned_risk_distance": planned_risk_distance,
+        "label_version": NET_LABEL_VERSION,
+        "label_provenance": NET_LABEL_PROVENANCE,
+        "cost_model_id": cost_model_id,
+        "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+        "cost_status": cost_status,
+        "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
+        "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
+        "slippage_r": DEFAULT_SLIPPAGE_R,
+        "commission_r": DEFAULT_COMMISSION_R,
+        "financing_r": 0.0,
+        "canonical_net_label_input_eligible": input_ready,
+        "canonical_net_label_status": "input_ready" if input_ready else "ineligible",
+    }
 
 
 def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -530,6 +662,9 @@ def build_trade_plan(
             conviction = round(conviction * condition_factor)
             warnings.append(f"📉 学習調整: {condition_reason}")
 
+    pre_guard_direction = direction
+    pre_guard_conviction = conviction
+
     # 期待値ガード: 方向的中ではなく、過去のTP/SL込み期待Rで新規判断を制御する
     if expectancy_adjuster is not None and direction in ("long", "short"):
         expectancy_factor, expectancy_reason, expectancy_block = expectancy_adjuster(
@@ -574,9 +709,35 @@ def build_trade_plan(
         ):
             cost_model_id = DEFAULT_COST_MODEL_ID
             cost_status = DEFAULT_COST_STATUS
-    stop = target1 = target2 = None
-    planned_risk_distance = None
-    target_policy: dict[str, object] = {}
+    pre_guard_targets = freeze_target_plan(
+        symbol,
+        pre_guard_direction,
+        pre_guard_conviction,
+        close=close,
+        atr=atr,
+        atr_multiple=atr_multiple,
+        target_r_adjuster=target_r_adjuster,
+    )
+    final_targets = (
+        pre_guard_targets
+        if (direction, conviction) == (pre_guard_direction, pre_guard_conviction)
+        else freeze_target_plan(
+            symbol,
+            direction,
+            conviction,
+            close=close,
+            atr=atr,
+            atr_multiple=atr_multiple,
+            target_r_adjuster=target_r_adjuster,
+        )
+    )
+    stop = final_targets.stop
+    target1 = final_targets.target1
+    target2 = final_targets.target2
+    planned_risk_distance = final_targets.planned_risk_distance
+    target_policy: dict[str, object] = (
+        dict(final_targets.target_policy) if final_targets.approved_reason else {}
+    )
     if direction in ("long", "short") and (atr is None or atr <= 0):
         gate_reasons.append("missing_atr")
         # ATRが無い方向判断は、SL/TPを提示できないだけでなく学習側の
@@ -584,32 +745,20 @@ def build_trade_plan(
         warnings.append(
             "⚠️ ATR(1h)取得失敗 — SL/TPを算出できず、学習の小動き判定・期待値計算も無効"
         )
-    if close is not None and atr is not None and atr > 0 and direction in ("long", "short"):
-        risk_distance = atr * atr_multiple
-        planned_risk_distance = risk_distance
-        sign = 1.0 if direction == "long" else -1.0
-        target1_r = DEFAULT_TARGET1_R
-        target2_r = DEFAULT_TARGET2_R
-        if target_r_adjuster is not None:
-            adjusted_targets = target_r_adjuster(symbol, direction, conviction)
-            if adjusted_targets is not None:
-                candidate_target1_r, candidate_target2_r, reason = adjusted_targets[:3]
-                if candidate_target1_r > 0 and candidate_target2_r > candidate_target1_r:
-                    target1_r = candidate_target1_r
-                    target2_r = candidate_target2_r
-                    if len(adjusted_targets) >= 4 and isinstance(adjusted_targets[3], Mapping):
-                        target_policy = dict(adjusted_targets[3])
-                    else:
-                        target_policy = {
-                            "target1_r": target1_r,
-                            "target2_r": target2_r,
-                            "reason_ja": reason,
-                        }
-                    if reason:
-                        warnings.append(f"✅ 承認済みTP/SL: {reason}")
-        stop = close - sign * risk_distance
-        target1 = close + sign * risk_distance * target1_r
-        target2 = close + sign * risk_distance * target2_r
+    if final_targets.approved_reason:
+        warnings.append(f"✅ 承認済みTP/SL: {final_targets.approved_reason}")
+
+    pre_guard_execution_snapshot = freeze_pre_guard_execution(
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        quote_available_at=quote_available_at,
+        quote_source=quote_source,
+        quote_source_record_id=quote_source_record_id,
+        planned_risk_distance=pre_guard_targets.planned_risk_distance,
+        cost_model_id=cost_model_id,
+        cost_status=cost_status,
+    )
 
     dimensions = dict(learning_dimensions or {})
     shadow_predictions = build_shadow_predictions(
@@ -682,6 +831,14 @@ def build_trade_plan(
         interval_summary=_interval_summary(tech),
         ma_note=ma_note,
         target_policy=target_policy,
+        pre_guard_direction=pre_guard_direction,
+        pre_guard_conviction=pre_guard_conviction,
+        pre_guard_stop=pre_guard_targets.stop,
+        pre_guard_target1=pre_guard_targets.target1,
+        pre_guard_target2=pre_guard_targets.target2,
+        pre_guard_target_policy=dict(pre_guard_targets.target_policy),
+        pre_guard_execution_snapshot=pre_guard_execution_snapshot,
+        pre_guard_cost_model_id=cost_model_id,
         learning_dimensions=dimensions,
         gate_trace=gate_trace,
         shadow_predictions=shadow_predictions,

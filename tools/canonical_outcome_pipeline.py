@@ -36,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--store", required=True, type=Path)
     parser.add_argument("--export", type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--no-guard-counterfactuals",
+        action="store_true",
+        help="Do not expand PIT-eligible expectancy-guard pre-guard snapshots.",
+    )
     return parser
 
 
@@ -43,7 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     decisions = _read_jsonl(args.decisions)
     prices = _read_jsonl(args.prices)
-    result = score_and_store_decision_events(decisions, prices, args.store)
+    result = score_and_store_decision_events(
+        decisions,
+        prices,
+        args.store,
+        include_guard_counterfactuals=not args.no_guard_counterfactuals,
+    )
     payload = result.to_dict()
     if args.store.exists():
         audit = verify_canonical_outcome_store(args.store)

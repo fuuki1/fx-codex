@@ -7,7 +7,9 @@ USD全面高の日にEURUSD/GBPUSDのlongが全敗した。
 
 from __future__ import annotations
 
-from fx_intel import usd_coherence
+from datetime import UTC, datetime, timedelta
+
+from fx_intel import journal, usd_coherence
 from fx_intel.journal import (
     COUNTERFACTUAL_ENTRY_KEY,
     blocked_gate_names,
@@ -145,12 +147,37 @@ def test_observed_trace_does_not_break_guard_counterfactual_eligibility() -> Non
     report = usd_coherence.audit_usd_coherence([_entry("GBPUSD", "neutral", 0, "long", 24)])
     usd_trace = usd_coherence.plan_trace(report, "GBPUSD")
     assert usd_trace is not None
+    ts = datetime(2026, 7, 16, 8, 0, tzinfo=UTC)
     entry = {
+        "ts": ts.isoformat(),
+        "prediction_time": ts.isoformat(),
+        "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+        "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+        "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": "decision-gbpusd",
+        "mode": "fusion",
+        "producer": journal.FUSION_PRODUCER,
+        "producer_version": journal.FUSION_PRODUCER_VERSION,
+        "input_context_id": "context-gbpusd",
+        "source_record_ids": ["source-gbpusd"],
         "symbol": "GBPUSD",
         "direction": "neutral",
         "conviction": 0,
         "analysis_direction": "long",
         "analysis_conviction": 24,
+        "pre_guard_direction": "long",
+        "pre_guard_conviction": 24,
+        "pre_guard_stop": 1.335,
+        "pre_guard_target1": 1.355,
+        "pre_guard_target2": 1.365,
+        "pre_guard_target_policy": {
+            "policy_id": "default-atr-v1",
+            "target1_r": 1.0,
+            "target2_r": 2.0,
+        },
+        "pre_guard_cost_model_id": "scanner-proxy-mid-diagnostic-v1",
+        "pre_guard_execution_snapshot": {"cost_model_id": "scanner-proxy-mid-diagnostic-v1"},
         "close": 1.345,
         "atr": 0.004,
         "gate_trace": [

@@ -854,6 +854,7 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "reason": getattr(plan, "reason", ""),
         "warnings": list(getattr(plan, "warnings", []) or []),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
+        **_pre_guard_snapshot(plan),
         "auxiliary_horizons": list(getattr(plan, "auxiliary_horizons", ()) or ()),
         "learning_dimensions": dict(getattr(plan, "learning_dimensions", {}) or {}),
         "input_context_id": str(getattr(plan, "input_context_id", "") or ""),
@@ -887,6 +888,21 @@ def _execution_snapshot(plan: object) -> dict[str, object]:
         "net_expected_r": _number_or_none(checklist.get("net_expected_r")),
         "expectancy_source": str(checklist.get("expectancy_source") or ""),
         "probability_calibrated": bool(checklist.get("probability_calibrated", False)),
+    }
+
+
+def _pre_guard_snapshot(plan: object) -> dict[str, object]:
+    return {
+        "pre_guard_direction": str(getattr(plan, "pre_guard_direction", "") or ""),
+        "pre_guard_conviction": _int_or_none(getattr(plan, "pre_guard_conviction", None)),
+        "pre_guard_stop": _number_or_none(getattr(plan, "pre_guard_stop", None)),
+        "pre_guard_target1": _number_or_none(getattr(plan, "pre_guard_target1", None)),
+        "pre_guard_target2": _number_or_none(getattr(plan, "pre_guard_target2", None)),
+        "pre_guard_target_policy": dict(getattr(plan, "pre_guard_target_policy", {}) or {}),
+        "pre_guard_execution_snapshot": dict(
+            getattr(plan, "pre_guard_execution_snapshot", {}) or {}
+        ),
+        "pre_guard_cost_model_id": str(getattr(plan, "pre_guard_cost_model_id", "") or ""),
     }
 
 
@@ -934,6 +950,7 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "interval_summary": getattr(plan, "interval_summary", ""),
         "ma_note": getattr(plan, "ma_note", ""),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
+        **_pre_guard_snapshot(plan),
         "learning_dimensions": dict(getattr(plan, "learning_dimensions", {}) or {}),
         "input_context_id": str(getattr(plan, "input_context_id", "") or ""),
         "input_features": dict(getattr(plan, "input_features", {}) or {}),

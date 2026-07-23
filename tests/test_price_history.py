@@ -78,6 +78,8 @@ def test_append_timeframe_plans_persists_canonical_label_metadata(tmp_path) -> N
     assert row["quote_source"] == "fixture_quotes"
     assert row["quote_source_record_id"] == "quote-123"
     assert row["cost_status"] == plan.cost_status
+    assert row["pre_guard_direction"] == plan.pre_guard_direction
+    assert row["pre_guard_execution_snapshot"] == plan.pre_guard_execution_snapshot
 
 
 def test_append_timeframe_plans_appends(tmp_path) -> None:

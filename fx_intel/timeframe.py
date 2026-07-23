@@ -52,6 +52,8 @@ from .briefing import (
     TECH_WEIGHT,
     _clip,
     _event_warnings,
+    freeze_pre_guard_execution,
+    freeze_target_plan,
     NEWS_FULL_COVERAGE_COUNT,
 )
 from .calendar import RiskWindow, active_and_next_window, symbol_currencies
@@ -191,6 +193,14 @@ class TimeframePlan:
     reason: str = ""  # 判断根拠の一文(Discord表示・監査用)
     warnings: list[str] = field(default_factory=list)
     target_policy: dict[str, object] = field(default_factory=dict)
+    pre_guard_direction: str = "neutral"
+    pre_guard_conviction: int = 0
+    pre_guard_stop: float | None = None
+    pre_guard_target1: float | None = None
+    pre_guard_target2: float | None = None
+    pre_guard_target_policy: dict[str, object] = field(default_factory=dict)
+    pre_guard_execution_snapshot: dict[str, object] = field(default_factory=dict)
+    pre_guard_cost_model_id: str = ""
     # 補助ホライズン(観測専用)。{ホライズン時間: ラベル} の順序付き情報
     auxiliary_horizons: tuple[float, ...] = ()
     learning_dimensions: dict[str, object] = field(default_factory=dict)
@@ -455,6 +465,9 @@ def build_timeframe_plan(
             conviction = round(conviction * condition_factor)
             warnings.append(f"📉 学習調整: {condition_reason}")
 
+    pre_guard_direction = direction
+    pre_guard_conviction = conviction
+
     if expectancy_adjuster is not None and direction in ("long", "short"):
         expectancy_factor, expectancy_reason, expectancy_block = expectancy_adjuster(
             symbol, direction, conviction
@@ -502,41 +515,55 @@ def build_timeframe_plan(
             cost_model_id = DEFAULT_COST_MODEL_ID
             cost_status = DEFAULT_COST_STATUS
 
-    stop = target1 = target2 = None
-    planned_risk_distance = None
-    target_policy: dict[str, object] = {}
+    pre_guard_targets = freeze_target_plan(
+        symbol,
+        pre_guard_direction,
+        pre_guard_conviction,
+        close=close,
+        atr=atr,
+        atr_multiple=atr_multiple,
+        target_r_adjuster=target_r_adjuster,
+    )
+    final_targets = (
+        pre_guard_targets
+        if (direction, conviction) == (pre_guard_direction, pre_guard_conviction)
+        else freeze_target_plan(
+            symbol,
+            direction,
+            conviction,
+            close=close,
+            atr=atr,
+            atr_multiple=atr_multiple,
+            target_r_adjuster=target_r_adjuster,
+        )
+    )
+    stop = final_targets.stop
+    target1 = final_targets.target1
+    target2 = final_targets.target2
+    planned_risk_distance = final_targets.planned_risk_distance
+    target_policy: dict[str, object] = (
+        dict(final_targets.target_policy) if final_targets.approved_reason else {}
+    )
     if direction in ("long", "short") and (atr is None or atr <= 0):
         gate_reasons.append("missing_atr")
         warnings.append(
             f"⚠️ ATR({timeframe})取得失敗 — SL/TPを算出できず、"
             "学習の小動き判定・期待値計算も無効"
         )
-    if close is not None and atr is not None and atr > 0 and direction in ("long", "short"):
-        risk_distance = atr * atr_multiple
-        planned_risk_distance = risk_distance
-        sign = 1.0 if direction == "long" else -1.0
-        target1_r = 1.0
-        target2_r = 2.0
-        if target_r_adjuster is not None:
-            adjusted_targets = target_r_adjuster(symbol, direction, conviction)
-            if adjusted_targets is not None:
-                candidate_target1_r, candidate_target2_r, reason = adjusted_targets[:3]
-                if candidate_target1_r > 0 and candidate_target2_r > candidate_target1_r:
-                    target1_r = candidate_target1_r
-                    target2_r = candidate_target2_r
-                    if len(adjusted_targets) >= 4 and isinstance(adjusted_targets[3], Mapping):
-                        target_policy = dict(adjusted_targets[3])
-                    else:
-                        target_policy = {
-                            "target1_r": target1_r,
-                            "target2_r": target2_r,
-                            "reason_ja": reason,
-                        }
-                    if reason:
-                        warnings.append(f"✅ 承認済みTP/SL: {reason}")
-        stop = close - sign * risk_distance
-        target1 = close + sign * risk_distance * target1_r
-        target2 = close + sign * risk_distance * target2_r
+    if final_targets.approved_reason:
+        warnings.append(f"✅ 承認済みTP/SL: {final_targets.approved_reason}")
+
+    pre_guard_execution_snapshot = freeze_pre_guard_execution(
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        quote_available_at=quote_available_at,
+        quote_source=quote_source,
+        quote_source_record_id=quote_source_record_id,
+        planned_risk_distance=pre_guard_targets.planned_risk_distance,
+        cost_model_id=cost_model_id,
+        cost_status=cost_status,
+    )
 
     dimensions = dict(learning_dimensions or {})
     shadow_drafts = [prediction_draft("timeframe_raw", composite)]
@@ -621,6 +648,14 @@ def build_timeframe_plan(
         reason=tf_reason,
         warnings=warnings,
         target_policy=target_policy,
+        pre_guard_direction=pre_guard_direction,
+        pre_guard_conviction=pre_guard_conviction,
+        pre_guard_stop=pre_guard_targets.stop,
+        pre_guard_target1=pre_guard_targets.target1,
+        pre_guard_target2=pre_guard_targets.target2,
+        pre_guard_target_policy=dict(pre_guard_targets.target_policy),
+        pre_guard_execution_snapshot=pre_guard_execution_snapshot,
+        pre_guard_cost_model_id=cost_model_id,
         auxiliary_horizons=AUXILIARY_HORIZON_HOURS.get(timeframe, ()),
         learning_dimensions=dimensions,
         gate_trace=gate_trace,

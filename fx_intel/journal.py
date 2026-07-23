@@ -26,6 +26,7 @@ JSONLへ追記し、次回以降の実行で過去の方向判断が的中して
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -239,7 +240,6 @@ def pit_metadata_for_plan(
 # データ・リスク由来の見送りは、ガードが無くても見送っていた行なので含めない
 # (含めると反実仮想の根拠が汚染される)。
 GUARD_COUNTERFACTUAL_GATE = "expectancy_guard"
-SHADOW_FUSION_PRODUCER = "fusion_raw"
 # 合成行に立てるマーカー。採点側(learning / trade_outcome)はこのキーで
 # 「実際の推奨」と「ガード見送り中のシャドー計画」を区別して集計に注記する。
 COUNTERFACTUAL_ENTRY_KEY = "counterfactual_guard"
@@ -328,6 +328,7 @@ def append_plans(
                         "financing_r": plan.financing_r,
                         "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
+                        **_pre_guard_plan(plan),
                         "data_quality": plan.data_quality,
                         # チャート状態の特徴量(learning.pyの状態別学習に使う)
                         "features": plan.features,
@@ -433,6 +434,7 @@ def append_timeframe_plans(
                         "financing_r": plan.financing_r,
                         "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
+                        **_pre_guard_plan(plan),
                         "data_quality": plan.data_quality,
                         "features": plan.features,
                         "components": plan.components,
@@ -468,6 +470,21 @@ def _plan_execution(plan: object) -> dict[str, object]:
     return {
         "execution_cost_r": float(cost) if isinstance(cost, (int, float)) else None,
         "net_expected_r": float(net) if isinstance(net, (int, float)) else None,
+    }
+
+
+def _pre_guard_plan(plan: object) -> dict[str, object]:
+    return {
+        "pre_guard_direction": str(getattr(plan, "pre_guard_direction", "") or ""),
+        "pre_guard_conviction": getattr(plan, "pre_guard_conviction", None),
+        "pre_guard_stop": getattr(plan, "pre_guard_stop", None),
+        "pre_guard_target1": getattr(plan, "pre_guard_target1", None),
+        "pre_guard_target2": getattr(plan, "pre_guard_target2", None),
+        "pre_guard_target_policy": dict(getattr(plan, "pre_guard_target_policy", {}) or {}),
+        "pre_guard_execution_snapshot": dict(
+            getattr(plan, "pre_guard_execution_snapshot", {}) or {}
+        ),
+        "pre_guard_cost_model_id": str(getattr(plan, "pre_guard_cost_model_id", "") or ""),
     }
 
 
@@ -510,70 +527,91 @@ def counterfactual_guard_entries(
 
     期待値ガードは自分がブロックした判断の結果を観測できないため、放置すると
     根拠サンプルが増えず永久ブロックに陥る(学習飢餓)。この関数は、ゲート前の
-    分析方向(analysis_direction)と判断時に凍結記録済みのシャドーSL/TP
-    (shadow_predictionsのfusion_raw)から「ガードが無ければ推奨していた計画」を
-    合成し、既存の採点エンジンへそのまま流せる行として返す。
+    producer側が判断時に凍結したpre_guard_*から「ガードが無ければ推奨していた
+    完全プラン」を合成し、既存の診断採点エンジンへ流せる行として返す。
 
-    PIT安全性: 合成に使う値はすべて判断時点で記録済みのもの(分析方向・
-    分析確信度・凍結SL/TP)に限る。事後の再計算・推定は行わず、必要な記録が
-    欠けた行は黙って除外する(fail-closed)。
+    PIT安全性: modeと明示producerが現行PIT契約に一致し、凍結方向・確信度・
+    SL/TP・target policy・execution snapshotが揃う行だけを受け入れる。
+    正準bid/ask outcomeが未生成のため、ここでrealized_net_rは作らない。
     """
     output: list[dict[str, object]] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
             continue
+        if not is_pit_eligible_entry(entry):
+            continue
         if blocked_gate_names(entry) != {GUARD_COUNTERFACTUAL_GATE}:
             continue
-        direction = entry.get("analysis_direction")
+        direction = entry.get("pre_guard_direction")
         if direction not in ("long", "short"):
             continue
-        prediction = _fusion_shadow_prediction(entry)
-        if prediction is None:
+        conviction = entry.get("pre_guard_conviction")
+        if isinstance(conviction, bool) or not isinstance(conviction, (int, float)):
             continue
-        if prediction.get("direction") != direction:
-            # 凍結スコアと分析方向の不整合は記録欠陥として採点しない
+        if not math.isfinite(float(conviction)) or not 0 <= float(conviction) <= 100:
             continue
-        stop = _level(prediction.get("stop"))
-        target1 = _level(prediction.get("target1"))
-        target2 = _level(prediction.get("target2"))
+        stop = _level(entry.get("pre_guard_stop"))
+        target1 = _level(entry.get("pre_guard_target1"))
+        target2 = _level(entry.get("pre_guard_target2"))
         if stop is None or target1 is None or target2 is None:
             continue
-        conviction = entry.get("analysis_conviction")
-        target_policy = prediction.get("target_policy")
+        target_policy = entry.get("pre_guard_target_policy")
+        execution = entry.get("pre_guard_execution_snapshot")
+        cost_model_id = str(entry.get("pre_guard_cost_model_id") or "").strip()
+        if not isinstance(target_policy, Mapping) or not target_policy:
+            continue
+        if not isinstance(execution, Mapping) or not execution or not cost_model_id:
+            continue
+        if str(execution.get("cost_model_id") or "") != cost_model_id:
+            continue
+        original_decision_id = str(entry.get("decision_id") or "").strip()
         synthesized: dict[str, object] = dict(entry)
         synthesized["direction"] = str(direction)
-        synthesized["conviction"] = int(conviction) if isinstance(conviction, (int, float)) else 0
+        synthesized["conviction"] = int(conviction)
         synthesized["stop"] = stop
         synthesized["target1"] = target1
         synthesized["target2"] = target2
-        synthesized["target_policy"] = (
-            dict(target_policy)
-            if isinstance(target_policy, Mapping)
-            else {"policy_id": "shadow-default-atr-v1"}
+        synthesized["target_policy"] = dict(target_policy)
+        for key in (
+            "entry_bid",
+            "entry_ask",
+            "quote_observed_at",
+            "quote_available_at",
+            "quote_source",
+            "quote_source_record_id",
+            "planned_risk_distance",
+            "label_version",
+            "label_provenance",
+            "cost_model_id",
+            "cost_model_version",
+            "cost_status",
+            "slippage_model_id",
+            "commission_model_id",
+            "slippage_r",
+            "commission_r",
+            "financing_r",
+        ):
+            synthesized[key] = execution.get(key)
+        synthesized["parent_decision_id"] = original_decision_id
+        synthesized["decision_id"] = f"{original_decision_id}:pre-guard"
+        # Legacy diagnostic scoring may produce gross realized_r, but a net label
+        # must come from the canonical executable-quote scorer and verified store.
+        synthesized["execution_cost_r"] = None
+        synthesized["net_expected_r"] = None
+        synthesized["canonical_net_label_input_eligible"] = bool(
+            execution.get("canonical_net_label_input_eligible")
         )
+        synthesized["canonical_net_label_status"] = "pending_canonical_outcome"
         synthesized[COUNTERFACTUAL_ENTRY_KEY] = True
         output.append(synthesized)
     return output
 
 
-def _fusion_shadow_prediction(entry: Mapping[str, object]) -> Mapping[str, object] | None:
-    predictions = entry.get("shadow_predictions")
-    if not isinstance(predictions, (list, tuple)):
-        return None
-    for row in predictions:
-        if (
-            isinstance(row, Mapping)
-            and str(row.get("producer", "")) == SHADOW_FUSION_PRODUCER
-            and row.get("eligible_for_scoring") is True
-        ):
-            return row
-    return None
-
-
 def _level(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def evaluate_directional_accuracy(

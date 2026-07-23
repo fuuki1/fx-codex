@@ -75,6 +75,21 @@ def _plan() -> TimeframePlan:
         components=[{"key": "tech", "score": 0.5, "weight": 0.55}],
         reason="1hレーティング 買い",
         warnings=["📈 期待値ガード: テスト"],
+        pre_guard_direction="long",
+        pre_guard_conviction=72,
+        pre_guard_stop=149.5,
+        pre_guard_target1=150.5,
+        pre_guard_target2=151.0,
+        pre_guard_target_policy={
+            "policy_id": "default-atr-v1",
+            "target1_r": 1.0,
+            "target2_r": 2.0,
+        },
+        pre_guard_execution_snapshot={
+            "cost_model_id": "executable-quotes-zero-slippage-v1",
+            "canonical_net_label_input_eligible": True,
+        },
+        pre_guard_cost_model_id="executable-quotes-zero-slippage-v1",
     )
 
 
@@ -147,6 +162,12 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
     assert event["decision"]["planned_risk_distance"] == 0.5
     assert event["decision"]["quote_available_at"] == "2026-07-08T07:59:59+00:00"
     assert event["decision"]["quote_source_record_id"] == "quote-123"
+    assert event["decision"]["pre_guard_direction"] == "long"
+    assert event["decision"]["pre_guard_target_policy"]["policy_id"] == "default-atr-v1"
+    assert (
+        event["decision"]["pre_guard_execution_snapshot"]["canonical_net_label_input_eligible"]
+        is True
+    )
     assert event["audit"]["scoring_ready"] is True
     assert event["technical_context"]["views"]["1h"]["atr"] == 0.2
     assert event["market_context"]["currency_sentiment"]["USD"]["score"] == 0.3

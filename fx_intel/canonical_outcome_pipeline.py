@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 
+from . import journal
 from .canonical_outcome_store import append_canonical_outcomes
 from .evaluation_labels import CostModelResult
 from .market import open_hours_between
@@ -53,6 +54,8 @@ class CanonicalOutcomePipelineError(RuntimeError):
 
 @dataclass(frozen=True)
 class CanonicalPipelineReport:
+    input_events: int
+    counterfactual_events: int
     events: int
     scored: int
     eligible: int
@@ -64,6 +67,8 @@ class CanonicalPipelineReport:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "input_events": self.input_events,
+            "counterfactual_events": self.counterfactual_events,
             "events": self.events,
             "scored": self.scored,
             "eligible": self.eligible,
@@ -79,18 +84,26 @@ def score_and_store_decision_events(
     events: Sequence[Mapping[str, object]],
     price_rows: Sequence[Mapping[str, object]],
     store_path: str | Path,
+    *,
+    include_guard_counterfactuals: bool = True,
 ) -> CanonicalPipelineReport:
     """Score an immutable event batch and idempotently persist every outcome."""
 
+    counterfactuals = (
+        guard_counterfactual_decision_events(events) if include_guard_counterfactuals else ()
+    )
+    scoring_events = (*events, *counterfactuals)
     outcomes = tuple(
         score_canonical_outcome(build_canonical_trade_request(event, price_rows))
-        for event in events
+        for event in scoring_events
     )
     persistable = tuple(outcome for outcome in outcomes if not _retryable_path_outcome(outcome))
     appended = append_canonical_outcomes(store_path, persistable) if persistable else 0
     eligible = sum(outcome.net_label_eligible for outcome in outcomes)
     return CanonicalPipelineReport(
-        events=len(events),
+        input_events=len(events),
+        counterfactual_events=len(counterfactuals),
+        events=len(scoring_events),
         scored=len(outcomes),
         eligible=eligible,
         ineligible=len(outcomes) - eligible,
@@ -99,6 +112,89 @@ def score_and_store_decision_events(
         appended=appended,
         outcomes=outcomes,
     )
+
+
+def guard_counterfactual_decision_events(
+    events: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Materialize guard-only pre-guard plans as immutable canonical child events.
+
+    The compact journal owns the eligibility rules. Complete decision events are
+    flattened only for that validation, then restored to the canonical pipeline's
+    nested event schema. No raw score or shadow prediction is consulted.
+    """
+
+    output: list[dict[str, object]] = []
+    event_envelope_keys = (
+        "ts",
+        "prediction_time",
+        "source_cutoff",
+        "max_feature_available_time",
+        "pit_eligible",
+        "pit_contract",
+        "decision_id",
+        "run_id",
+        "mode",
+        "producer",
+        "producer_version",
+        "input_context_id",
+        "source_record_ids",
+        "symbol",
+        "timeframe",
+        "horizon_hours",
+    )
+    decision_fields = (
+        "direction",
+        "conviction",
+        "stop",
+        "target1",
+        "target2",
+        "target_policy",
+        "entry_bid",
+        "entry_ask",
+        "quote_observed_at",
+        "quote_available_at",
+        "quote_source",
+        "quote_source_record_id",
+        "planned_risk_distance",
+        "label_version",
+        "label_provenance",
+        "cost_model_id",
+        "cost_model_version",
+        "cost_status",
+        "slippage_model_id",
+        "commission_model_id",
+        "slippage_r",
+        "commission_r",
+        "financing_r",
+        "canonical_net_label_input_eligible",
+        "canonical_net_label_status",
+    )
+    for event in events:
+        decision = event.get("decision")
+        if not isinstance(decision, Mapping):
+            continue
+        flat = dict(decision)
+        for key in event_envelope_keys:
+            flat[key] = event.get(key)
+        synthesized = journal.counterfactual_guard_entries((flat,))
+        if not synthesized:
+            continue
+        restored = synthesized[0]
+        child_decision = dict(decision)
+        for key in decision_fields:
+            child_decision[key] = restored.get(key)
+        child_event = dict(event)
+        child_event.update(
+            {
+                "decision_id": restored["decision_id"],
+                "parent_decision_id": restored["parent_decision_id"],
+                journal.COUNTERFACTUAL_ENTRY_KEY: True,
+                "decision": child_decision,
+            }
+        )
+        output.append(child_event)
+    return tuple(output)
 
 
 def build_canonical_trade_request(

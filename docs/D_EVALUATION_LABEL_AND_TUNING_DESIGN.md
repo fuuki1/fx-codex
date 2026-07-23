@@ -327,6 +327,12 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   full horizon、source record一意性を確認して同じcanonical scorer/storeへ接続する。
   forming足、hash欠損、内部gap、満期前など再取得可能なpath不備はpendingとして
   final storeへ入れず、満期後の決定論的再実行を妨げない。
+  expectancy guard単独で見送ったPIT適格decisionは、producerが判断時に凍結した
+  `pre_guard_*`完全プランから決定論的な子decisionを作る。明示mode/producerが
+  現行契約と一致し、target policyとexecution snapshotがそろう場合だけ対象とし、
+  raw scoreや別producerのshadow predictionから復元しない。子decisionも同じ
+  canonical scorer/storeで採点し、executable quote、cost model、完了bid/ask pathの
+  条件を満たさなければ`realized_net_r`を生成しない。
   CLIは明示されたローカルJSONLだけを読み、broker接続や注文面を持たない。
 
 この状態はD1の会計・永続化実装済み、runtime配備前である。MLのdecision ID joinと

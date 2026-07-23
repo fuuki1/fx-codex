@@ -734,6 +734,14 @@ def test_journal_records_score_breakdown_and_levels(tmp_path) -> None:
     assert entry["stop"] == plan.stop
     assert entry["target1"] == plan.target1
     assert entry["target2"] == plan.target2
+    assert entry["pre_guard_direction"] == plan.pre_guard_direction
+    assert entry["pre_guard_conviction"] == plan.pre_guard_conviction
+    assert entry["pre_guard_stop"] == plan.pre_guard_stop
+    assert entry["pre_guard_target1"] == plan.pre_guard_target1
+    assert entry["pre_guard_target2"] == plan.pre_guard_target2
+    assert entry["pre_guard_target_policy"] == plan.pre_guard_target_policy
+    assert entry["pre_guard_execution_snapshot"] == plan.pre_guard_execution_snapshot
+    assert entry["pre_guard_cost_model_id"] == plan.pre_guard_cost_model_id
     assert entry["pit_eligible"] is False
 
 

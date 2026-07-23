@@ -255,10 +255,27 @@ def test_expectancy_guard_can_block_timeframe_plan() -> None:
         [],
         now=OPEN_NOW,
         expectancy_adjuster=guard,
+        target_r_adjuster=lambda _symbol, _direction, _conviction: (
+            0.75,
+            1.5,
+            "承認済み候補",
+            {
+                "candidate_id": "approved-overall-tp",
+                "target1_r": 0.75,
+                "target2_r": 1.5,
+            },
+        ),
     )
     assert plan.direction == "neutral"
     assert plan.conviction == 0
     assert plan.stop is None
+    assert plan.pre_guard_direction == "long"
+    assert plan.pre_guard_conviction > 0
+    assert plan.pre_guard_stop is not None
+    assert plan.pre_guard_target_policy["candidate_id"] == "approved-overall-tp"
+    assert plan.pre_guard_target1 == pytest.approx(156.25 + 0.15 * 2.5 * 0.75)
+    assert plan.pre_guard_target2 == pytest.approx(156.25 + 0.15 * 2.5 * 1.5)
+    assert plan.pre_guard_execution_snapshot["canonical_net_label_status"] == "ineligible"
     assert any("期待値ガード" in warning for warning in plan.warnings)
 
 

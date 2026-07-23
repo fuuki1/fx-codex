@@ -12,9 +12,11 @@ from tools import canonical_outcome_pipeline as pipeline_cli
 from fx_intel.canonical_outcome_pipeline import (
     CanonicalOutcomePipelineError,
     build_canonical_trade_request,
+    guard_counterfactual_decision_events,
     score_and_store_decision_events,
 )
 from fx_intel.canonical_outcome_store import load_canonical_outcomes
+from fx_intel import journal
 from fx_intel.evaluation_labels import (
     DEFAULT_COMMISSION_MODEL_ID,
     DEFAULT_COST_MODEL_ID,
@@ -64,6 +66,80 @@ def _event(**decision_overrides: object) -> dict[str, object]:
         "horizon_hours": 1.0,
         "decision": decision,
     }
+
+
+def _guard_event(**event_overrides: object) -> dict[str, object]:
+    event = _event(
+        direction="neutral",
+        stop=None,
+        target1=None,
+        target2=None,
+        planned_risk_distance=None,
+    )
+    decision = dict(event["decision"])
+    execution = {
+        key: value
+        for key, value in _event()["decision"].items()
+        if key
+        in {
+            "entry_bid",
+            "entry_ask",
+            "quote_observed_at",
+            "quote_available_at",
+            "quote_source",
+            "quote_source_record_id",
+            "planned_risk_distance",
+            "label_version",
+            "label_provenance",
+            "cost_model_id",
+            "cost_model_version",
+            "cost_status",
+            "slippage_model_id",
+            "commission_model_id",
+            "slippage_r",
+            "commission_r",
+            "financing_r",
+        }
+    }
+    execution.update(
+        {
+            "canonical_net_label_input_eligible": True,
+            "canonical_net_label_status": "input_ready",
+        }
+    )
+    decision.update(
+        {
+            "pre_guard_direction": "long",
+            "pre_guard_conviction": 60,
+            "pre_guard_stop": 99.1,
+            "pre_guard_target1": 101.1,
+            "pre_guard_target2": 102.1,
+            "pre_guard_target_policy": {
+                "candidate_id": "approved-overall-tp",
+                "target1_r": 1.0,
+                "target2_r": 2.0,
+            },
+            "pre_guard_execution_snapshot": execution,
+            "pre_guard_cost_model_id": DEFAULT_COST_MODEL_ID,
+            "gate_trace": [{"gate": "expectancy_guard", "status": "blocked"}],
+        }
+    )
+    event["decision"] = decision
+    event.update(
+        {
+            "prediction_time": NOW.isoformat(),
+            "source_cutoff": NOW.isoformat(),
+            "max_feature_available_time": NOW.isoformat(),
+            "pit_eligible": True,
+            "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+            "producer": journal.TIMEFRAME_PRODUCER,
+            "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+            "input_context_id": "context-1",
+            "source_record_ids": ["source-1"],
+        }
+    )
+    event.update(event_overrides)
+    return event
 
 
 def _bar(index: int, **overrides: object) -> dict[str, object]:
@@ -119,6 +195,75 @@ def test_complete_horizon_scores_and_persists_canonical_outcome(tmp_path) -> Non
 
     replay = score_and_store_decision_events([_event()], list(reversed(rows)), store)
     assert replay.appended == 0
+
+
+def test_guard_counterfactual_uses_canonical_scorer_and_store(tmp_path) -> None:
+    event = _guard_event()
+    children = guard_counterfactual_decision_events([event])
+
+    assert len(children) == 1
+    child = children[0]
+    assert child["decision_id"] == f"{event['decision_id']}:pre-guard"
+    assert child["parent_decision_id"] == event["decision_id"]
+    assert child["decision"]["direction"] == "long"
+    assert child["decision"]["target_policy"]["candidate_id"] == "approved-overall-tp"
+    assert event["decision"]["direction"] == "neutral"
+
+    store = tmp_path / "canonical.jsonl"
+    report = score_and_store_decision_events(
+        [event],
+        [_bar(index) for index in range(12)],
+        store,
+    )
+
+    assert report.input_events == 1
+    assert report.counterfactual_events == 1
+    assert report.events == 2
+    counterfactual = next(
+        outcome for outcome in report.outcomes if outcome.decision_id.endswith(":pre-guard")
+    )
+    assert counterfactual.net_label_eligible is True
+    assert counterfactual.realized_net_r == 0.4
+    assert counterfactual.cost_model_id == DEFAULT_COST_MODEL_ID
+    assert {outcome.decision_id for outcome in load_canonical_outcomes(store)} == {
+        event["decision_id"],
+        f"{event['decision_id']}:pre-guard",
+    }
+
+
+def test_guard_counterfactual_unknown_producer_and_missing_net_inputs_fail_closed() -> None:
+    fusion = _guard_event(
+        mode="fusion",
+        timeframe="fusion",
+        producer=journal.FUSION_PRODUCER,
+        producer_version=journal.FUSION_PRODUCER_VERSION,
+    )
+    fusion_child = guard_counterfactual_decision_events([fusion])[0]
+    assert fusion_child["mode"] == "fusion"
+    assert fusion_child["timeframe"] == "fusion"
+    assert fusion_child["decision"]["direction"] == "long"
+
+    unknown = _guard_event(producer="unknown")
+    assert guard_counterfactual_decision_events([unknown]) == ()
+
+    ineligible = _guard_event()
+    decision = dict(ineligible["decision"])
+    execution = dict(decision["pre_guard_execution_snapshot"])
+    execution["cost_model_id"] = "scanner-proxy-mid-diagnostic-v1"
+    execution["cost_status"] = "diagnostic_only"
+    execution["canonical_net_label_input_eligible"] = False
+    decision["pre_guard_execution_snapshot"] = execution
+    decision["pre_guard_cost_model_id"] = "scanner-proxy-mid-diagnostic-v1"
+    ineligible["decision"] = decision
+
+    child = guard_counterfactual_decision_events([ineligible])[0]
+    outcome = score_canonical_outcome(
+        build_canonical_trade_request(child, [_bar(index) for index in range(12)])
+    )
+
+    assert outcome.net_label_eligible is False
+    assert outcome.realized_net_r is None
+    assert "unknown_cost_model" in outcome.quality_flags
 
 
 def test_forming_or_unhashed_rows_do_not_become_executable_path(tmp_path) -> None:

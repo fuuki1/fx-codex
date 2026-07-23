@@ -297,6 +297,8 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
     )
     assert all(row["source_record_ids"] for row in rows)
     assert len({row["decision_id"] for row in rows}) == 4
+    assert all(row["pre_guard_direction"] in {"long", "short", "neutral"} for row in rows)
+    assert all("canonical_net_label_status" in row["pre_guard_execution_snapshot"] for row in rows)
     # 各行に主ホライズンが紐づく
     horizons = {row["timeframe"]: row["horizon_hours"] for row in rows}
     assert horizons == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
