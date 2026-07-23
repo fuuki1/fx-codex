@@ -19,14 +19,16 @@ from .evaluation_labels import (
     KNOWN_EXECUTABLE_COST_MODEL_IDS,
     KNOWN_NET_LABEL_PROVENANCES,
     KNOWN_NET_LABEL_VERSIONS,
+    CostModelResult,
+    cost_model_contract_flags,
 )
 from .trade_outcome import (
     CanonicalTradeOutcome,
     assert_canonical_outcome_idempotent,
 )
 
-STORE_SCHEMA_VERSION = 1
-EXPORT_SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
+EXPORT_SCHEMA_VERSION = 2
 
 
 class CanonicalOutcomeStoreCorruption(RuntimeError):
@@ -235,6 +237,9 @@ def _outcome_from_record(
     flags = prepared.get("quality_flags")
     if isinstance(flags, list):
         prepared["quality_flags"] = tuple(str(flag) for flag in flags)
+    cost_flags = prepared.get("cost_quality_flags")
+    if isinstance(cost_flags, list):
+        prepared["cost_quality_flags"] = tuple(str(flag) for flag in cost_flags)
     try:
         outcome = CanonicalTradeOutcome(**prepared)
     except (TypeError, ValueError) as error:
@@ -320,6 +325,9 @@ def _eligible_accounting_complete(outcome: CanonicalTradeOutcome) -> bool:
     required_values = (
         outcome.gross_realized_r,
         outcome.quote_realized_r,
+        outcome.entry_bid,
+        outcome.entry_ask,
+        outcome.planned_risk_distance,
         outcome.slippage_r,
         outcome.commission_r,
         outcome.financing_r,
@@ -350,8 +358,34 @@ def _eligible_accounting_complete(outcome: CanonicalTradeOutcome) -> bool:
     assert outcome.realized_net_r is not None
     assert outcome.gross_realized_r is not None
     assert outcome.execution_cost_r is not None
+    assert outcome.entry_bid is not None
+    assert outcome.entry_ask is not None
+    assert outcome.planned_risk_distance is not None
+    assert outcome.entry_spread_r is not None
+    cost = CostModelResult(
+        cost_model_id=outcome.cost_model_id,
+        cost_model_version=outcome.cost_model_version,
+        entry_quote_source=outcome.entry_quote_source,
+        spread_source=outcome.spread_source,
+        slippage_model_id=outcome.slippage_model_id,
+        commission_model_id=outcome.commission_model_id,
+        entry_spread_r=outcome.entry_spread_r,
+        slippage_r=outcome.slippage_r,
+        commission_r=outcome.commission_r,
+        financing_r=outcome.financing_r,
+        cost_status=outcome.cost_status,
+        quality_flags=outcome.cost_quality_flags,
+    )
     return (
-        math.isclose(
+        not cost_model_contract_flags(cost)
+        and 0 < outcome.entry_bid <= outcome.entry_ask
+        and outcome.planned_risk_distance > 0
+        and math.isclose(
+            outcome.entry_spread_r,
+            (outcome.entry_ask - outcome.entry_bid) / outcome.planned_risk_distance,
+            abs_tol=1e-8,
+        )
+        and math.isclose(
             outcome.additional_cost_r,
             outcome.slippage_r + outcome.commission_r + outcome.financing_r,
             abs_tol=1e-8,

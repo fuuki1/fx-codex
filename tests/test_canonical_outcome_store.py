@@ -43,6 +43,9 @@ def _outcome(index: int = 1) -> CanonicalTradeOutcome:
         holding_end_time=(prediction + timedelta(hours=1)).isoformat(),
         first_touch="terminal",
         first_touch_ts=(prediction + timedelta(hours=1)).isoformat(),
+        entry_bid=99.9,
+        entry_ask=100.1,
+        planned_risk_distance=1.0,
         gross_realized_r=0.5,
         quote_realized_r=0.4,
         planned_payoff_r=0.4,
@@ -56,6 +59,10 @@ def _outcome(index: int = 1) -> CanonicalTradeOutcome:
         cost_model_id=DEFAULT_COST_MODEL_ID,
         cost_model_version="1",
         cost_status=DEFAULT_COST_STATUS,
+        entry_quote_source="fixture",
+        spread_source="fixture",
+        slippage_model_id="zero-slippage-v1",
+        commission_model_id="zero-commission-v1",
         net_label_eligible=True,
         path_quality=1.0,
     )
@@ -70,6 +77,7 @@ def test_identical_replay_is_idempotent_and_loads_once(tmp_path) -> None:
 
     assert load_canonical_outcomes(path) == [outcome]
     assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_missing_store_is_unavailable_not_verified_empty(tmp_path) -> None:
@@ -82,7 +90,7 @@ def test_conflicting_same_key_is_hard_error(tmp_path) -> None:
     outcome = _outcome()
     append_canonical_outcomes(path, [outcome])
 
-    with pytest.raises(CanonicalOutcomeConflict, match="decision-1.*net-r-v1"):
+    with pytest.raises(CanonicalOutcomeConflict, match=f"decision-1.*{NET_LABEL_VERSION}"):
         append_canonical_outcomes(path, [replace(outcome, realized_net_r=-9.0)])
 
     assert load_canonical_outcomes(path) == [outcome]
@@ -108,6 +116,27 @@ def test_eligible_outcome_with_broken_accounting_identity_is_rejected(tmp_path) 
             path,
             [replace(_outcome(), realized_net_r=99.0)],
         )
+
+
+def test_store_rejects_zero_model_with_nonzero_cost_even_if_math_balances(tmp_path) -> None:
+    path = tmp_path / "canonical.jsonl"
+    mismatched = replace(
+        _outcome(),
+        slippage_r=0.1,
+        additional_cost_r=0.1,
+        realized_net_r=0.3,
+        execution_cost_r=0.2,
+    )
+
+    with pytest.raises(CanonicalOutcomeStoreCorruption, match="incomplete"):
+        append_canonical_outcomes(path, [mismatched])
+
+
+def test_store_recomputes_entry_spread_from_persisted_quote_and_risk(tmp_path) -> None:
+    path = tmp_path / "canonical.jsonl"
+
+    with pytest.raises(CanonicalOutcomeStoreCorruption, match="incomplete"):
+        append_canonical_outcomes(path, [replace(_outcome(), entry_spread_r=0.3)])
 
 
 @pytest.mark.parametrize(
@@ -149,6 +178,7 @@ def test_verified_export_hash_matches_store_audit(tmp_path) -> None:
     payload = json.loads(export_path.read_text(encoding="utf-8"))
 
     assert exported == audit
+    assert payload["schema_version"] == 2
     assert payload["canonical_outcomes_sha256"] == audit.canonical_export_sha256
     assert payload["entry_count"] == 2
     assert [row["decision_id"] for row in payload["outcomes"]] == [

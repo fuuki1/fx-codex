@@ -40,6 +40,7 @@ def _cost(
         spread_source="fixture",
         slippage_model_id="zero-slippage-v1",
         commission_model_id="zero-commission-v1",
+        entry_spread_r=0.2,
         slippage_r=slippage_r,
         commission_r=commission_r,
         financing_r=financing_r,
@@ -248,17 +249,60 @@ def test_planned_risk_distance_is_the_only_r_denominator() -> None:
     assert outcome.gross_realized_r == pytest.approx(0.5)
 
 
-def test_modelled_costs_are_subtracted_once_after_executable_quote_r() -> None:
+def test_zero_cost_model_rejects_nonzero_component_values() -> None:
     outcome = score_canonical_outcome(
         _request(cost_model=_cost(slippage_r=0.05, commission_r=0.02, financing_r=0.01))
     )
 
-    assert outcome.quote_realized_r == pytest.approx(1.0)
+    assert outcome.net_label_eligible is False
+    assert outcome.realized_net_r is None
     assert outcome.slippage_r == pytest.approx(0.05)
     assert outcome.commission_r == pytest.approx(0.02)
     assert outcome.financing_r == pytest.approx(0.01)
-    assert outcome.additional_cost_r == pytest.approx(0.08)
-    assert outcome.realized_net_r == pytest.approx(0.92)
+    assert "slippage_model_value_mismatch" in outcome.quality_flags
+    assert "commission_model_value_mismatch" in outcome.quality_flags
+    assert "financing_model_missing" in outcome.quality_flags
+
+
+def test_cost_model_is_bound_to_entry_and_spread_source() -> None:
+    mismatched = replace(
+        _cost(),
+        entry_quote_source="ibkr_paper_snapshot",
+        spread_source="ibkr_paper_snapshot",
+    )
+
+    outcome = score_canonical_outcome(_request(cost_model=mismatched))
+
+    assert outcome.net_label_eligible is False
+    assert outcome.realized_net_r is None
+    assert "cost_model_entry_source_mismatch" in outcome.quality_flags
+    assert "cost_model_spread_source_mismatch" in outcome.quality_flags
+    assert "entry_quote_source_mismatch" in outcome.quality_flags
+    assert "spread_source_mismatch" in outcome.quality_flags
+
+
+def test_cost_model_requires_auditable_entry_spread_r() -> None:
+    missing = replace(_cost(), entry_spread_r=None)
+    wrong = replace(_cost(), entry_spread_r=0.3)
+
+    missing_outcome = score_canonical_outcome(_request(cost_model=missing))
+    wrong_outcome = score_canonical_outcome(_request(cost_model=wrong))
+
+    assert missing_outcome.net_label_eligible is False
+    assert "missing_entry_spread_r" in missing_outcome.quality_flags
+    assert wrong_outcome.net_label_eligible is False
+    assert "entry_spread_r_mismatch" in wrong_outcome.quality_flags
+
+
+def test_declared_cost_quality_flags_veto_net_label() -> None:
+    flagged = replace(_cost(), quality_flags=("unverified_cost_input",))
+
+    outcome = score_canonical_outcome(_request(cost_model=flagged))
+
+    assert outcome.net_label_eligible is False
+    assert outcome.realized_net_r is None
+    assert outcome.cost_quality_flags == ("unverified_cost_input",)
+    assert "declared_cost_quality_flag" in outcome.quality_flags
 
 
 @pytest.mark.parametrize(
@@ -419,5 +463,5 @@ def test_scoring_is_deterministic_and_conflicting_same_key_is_hard_error() -> No
     assert_canonical_outcome_idempotent(first, replay)
 
     conflicting = replace(replay, realized_net_r=0.5)
-    with pytest.raises(CanonicalOutcomeConflict, match="decision-1.*net-r-v1"):
+    with pytest.raises(CanonicalOutcomeConflict, match=f"decision-1.*{NET_LABEL_VERSION}"):
         assert_canonical_outcome_idempotent(first, conflicting)

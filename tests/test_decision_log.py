@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from fx_intel import decision_log, journal, learning, maximization, tf_learning, tp_sl_learning
 from fx_intel.briefing import TradePlan
+from fx_intel.evaluation_labels import DEFAULT_COST_MODEL_ID
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import TimeframePlan
@@ -86,10 +87,10 @@ def _plan() -> TimeframePlan:
             "target2_r": 2.0,
         },
         pre_guard_execution_snapshot={
-            "cost_model_id": "executable-quotes-zero-slippage-v1",
+            "cost_model_id": DEFAULT_COST_MODEL_ID,
             "canonical_net_label_input_eligible": True,
         },
-        pre_guard_cost_model_id="executable-quotes-zero-slippage-v1",
+        pre_guard_cost_model_id=DEFAULT_COST_MODEL_ID,
     )
 
 
@@ -357,10 +358,8 @@ def test_score_decision_events_classifies_failure_reasons() -> None:
     assert report["failure_reason_summary"][0]["key"] == "sl_first"
 
 
-def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
-    """判断時に確定した執行コスト(R換算)と期待R予測を判断ログへ保存し、
-
-    採点スキーマへ引き継ぐ。realized_net_r 生成の入力になる。"""
+def test_fusion_decision_keeps_checklist_cost_diagnostic_only() -> None:
+    """Checklist estimate must not become a canonical net-label input."""
     plan = TradePlan(
         symbol="USDJPY",
         direction="long",
@@ -376,6 +375,10 @@ def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
         "expected_r": 0.55,
         "expectancy_source": "test",
         "probability_calibrated": True,
+        "diagnostic_cost_model": {
+            "cost_model_id": "spread-plus-modelled-slippage-diagnostic-v1",
+            "cost_status": "diagnostic_only",
+        },
     }
     events = decision_log.build_fusion_decision_events(
         [plan],
@@ -384,14 +387,19 @@ def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
         tech_map={"USDJPY": _tech()},
     )
     execution = events[0]["decision"]["execution"]
-    assert execution["execution_cost_r"] == 0.13
-    assert execution["net_expected_r"] == 0.42
+    assert execution["execution_cost_r"] is None
+    assert execution["net_expected_r"] is None
+    assert execution["diagnostic_execution_cost_r"] == 0.13
+    assert execution["diagnostic_net_expected_r"] == 0.42
+    assert execution["diagnostic_cost_model"]["cost_status"] == "diagnostic_only"
     assert execution["expected_r"] == 0.55
 
     scoring = decision_log.decision_event_to_scoring_entry(events[0])
     assert scoring is not None
-    assert scoring["execution_cost_r"] == 0.13
-    assert scoring["net_expected_r"] == 0.42
+    assert scoring["execution_cost_r"] is None
+    assert scoring["net_expected_r"] is None
+    assert scoring["diagnostic_execution_cost_r"] == 0.13
+    assert scoring["diagnostic_net_expected_r"] == 0.42
 
 
 def test_fusion_decision_persists_null_execution_without_checklist() -> None:
@@ -413,3 +421,5 @@ def test_fusion_decision_persists_null_execution_without_checklist() -> None:
     execution = events[0]["decision"]["execution"]
     assert execution["execution_cost_r"] is None
     assert execution["net_expected_r"] is None
+    assert execution["diagnostic_execution_cost_r"] is None
+    assert execution["diagnostic_cost_model"] == {}

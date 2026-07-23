@@ -10,6 +10,7 @@ from fx_intel.effective_samples import (
     EffectiveSampleConflict,
     summarize_effective_samples,
 )
+from fx_intel.evaluation_labels import NET_LABEL_VERSION
 
 START = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 
@@ -25,7 +26,7 @@ def _row(
 ) -> dict[str, object]:
     return {
         "decision_id": f"d-{index}",
-        "label_version": "net-r-v1",
+        "label_version": NET_LABEL_VERSION,
         "symbol": symbol,
         "direction": direction,
         "timeframe": timeframe,
@@ -125,5 +126,5 @@ def test_identical_replay_is_deduplicated_but_conflict_is_hard_error() -> None:
 
     conflicting = dict(row)
     conflicting["holding_end_time"] = (START + timedelta(hours=2)).isoformat()
-    with pytest.raises(EffectiveSampleConflict, match="d-1.*net-r-v1"):
+    with pytest.raises(EffectiveSampleConflict, match=f"d-1.*{NET_LABEL_VERSION}"):
         summarize_effective_samples([row, conflicting], min_samples=1)

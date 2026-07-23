@@ -38,7 +38,6 @@ from .sentiment import CurrencySentiment, MarketAnalysis, pair_bias
 from .technicals import PairTechnicals
 from .evaluation_labels import (
     DEFAULT_COMMISSION_R,
-    DEFAULT_COST_MODEL_ID,
     DEFAULT_COST_MODEL_VERSION,
     DEFAULT_COST_STATUS,
     DEFAULT_COMMISSION_MODEL_ID,
@@ -46,8 +45,14 @@ from .evaluation_labels import (
     DEFAULT_SLIPPAGE_MODEL_ID,
     DIAGNOSTIC_COST_MODEL_ID,
     DIAGNOSTIC_COST_STATUS,
+    KNOWN_EXECUTABLE_COST_MODEL_IDS,
+    MISSING_COST_MODEL_ID,
+    MISSING_COST_STATUS,
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
+    CostModelResult,
+    cost_model_contract_flags,
+    executable_cost_model_id_for_source,
     has_executable_entry,
 )
 from .shadow_learning import build_shadow_predictions, prediction_draft
@@ -167,6 +172,7 @@ class TradePlan:
     slippage_r: float = DEFAULT_SLIPPAGE_R
     commission_r: float = DEFAULT_COMMISSION_R
     financing_r: float = 0.0
+    cost_quality_flags: tuple[str, ...] = ()
     direction_threshold: float = DIRECTION_THRESHOLD
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0  # 0.0〜1.0。判断の根拠データがどれだけ揃っていたか
@@ -298,10 +304,40 @@ def freeze_pre_guard_execution(
     quote_source_record_id: str,
     planned_risk_distance: float | None,
     cost_model_id: str,
+    cost_model_version: str,
     cost_status: str,
+    slippage_model_id: str,
+    commission_model_id: str,
+    slippage_r: float,
+    commission_r: float,
+    financing_r: float,
+    cost_quality_flags: tuple[str, ...],
 ) -> dict[str, object]:
     """Freeze canonical net-label inputs without claiming that an outcome exists."""
 
+    entry_spread_r = (
+        (entry_ask - entry_bid) / planned_risk_distance
+        if has_executable_entry(entry_bid, entry_ask)
+        and entry_bid is not None
+        and entry_ask is not None
+        and planned_risk_distance is not None
+        and planned_risk_distance > 0
+        else None
+    )
+    frozen_cost = CostModelResult(
+        cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
+        entry_quote_source=quote_source,
+        spread_source=quote_source,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        entry_spread_r=entry_spread_r,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_status=cost_status,
+        quality_flags=cost_quality_flags,
+    )
     input_ready = (
         has_executable_entry(entry_bid, entry_ask)
         and bool(quote_observed_at)
@@ -309,9 +345,12 @@ def freeze_pre_guard_execution(
         and bool(quote_source)
         and bool(quote_source_record_id)
         and planned_risk_distance is not None
+        and math.isfinite(planned_risk_distance)
         and planned_risk_distance > 0
-        and cost_model_id == DEFAULT_COST_MODEL_ID
+        and cost_model_id in KNOWN_EXECUTABLE_COST_MODEL_IDS
         and cost_status == DEFAULT_COST_STATUS
+        and entry_spread_r is not None
+        and not cost_model_contract_flags(frozen_cost)
     )
     return {
         "entry_bid": entry_bid,
@@ -324,13 +363,15 @@ def freeze_pre_guard_execution(
         "label_version": NET_LABEL_VERSION,
         "label_provenance": NET_LABEL_PROVENANCE,
         "cost_model_id": cost_model_id,
-        "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+        "cost_model_version": cost_model_version,
         "cost_status": cost_status,
-        "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
-        "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
-        "slippage_r": DEFAULT_SLIPPAGE_R,
-        "commission_r": DEFAULT_COMMISSION_R,
-        "financing_r": 0.0,
+        "slippage_model_id": slippage_model_id,
+        "commission_model_id": commission_model_id,
+        "slippage_r": slippage_r,
+        "commission_r": commission_r,
+        "financing_r": financing_r,
+        "cost_quality_flags": list(cost_quality_flags),
+        "entry_spread_r": entry_spread_r,
         "canonical_net_label_input_eligible": input_ready,
         "canonical_net_label_status": "input_ready" if input_ready else "ineligible",
     }
@@ -690,7 +731,14 @@ def build_trade_plan(
     quote_source = "tradingview_oanda_scanner" if quote_observed_at else ""
     quote_source_record_id = ""
     cost_model_id = DIAGNOSTIC_COST_MODEL_ID
+    cost_model_version = DEFAULT_COST_MODEL_VERSION
     cost_status = DIAGNOSTIC_COST_STATUS
+    slippage_model_id = DEFAULT_SLIPPAGE_MODEL_ID
+    commission_model_id = DEFAULT_COMMISSION_MODEL_ID
+    slippage_r = DEFAULT_SLIPPAGE_R
+    commission_r = DEFAULT_COMMISSION_R
+    financing_r = 0.0
+    cost_quality_flags: tuple[str, ...] = ("diagnostic_only",)
     context_bid, context_ask, context_quote_at = decision_inputs.decision_quote_from_mapping(
         serialized_context
     )
@@ -707,8 +755,19 @@ def build_trade_plan(
             and quote_source_record_id
             and quote_contract.get("quality_status") == "measured"
         ):
-            cost_model_id = DEFAULT_COST_MODEL_ID
-            cost_status = DEFAULT_COST_STATUS
+            resolved_cost_model = executable_cost_model_id_for_source(quote_source)
+            if resolved_cost_model is not None:
+                cost_model_id = resolved_cost_model
+                cost_status = DEFAULT_COST_STATUS
+            else:
+                cost_model_id = MISSING_COST_MODEL_ID
+                cost_model_version = ""
+                cost_status = MISSING_COST_STATUS
+                slippage_model_id = ""
+                commission_model_id = ""
+                cost_quality_flags = ("unsupported_cost_source",)
+            if resolved_cost_model is not None:
+                cost_quality_flags = ()
     pre_guard_targets = freeze_target_plan(
         symbol,
         pre_guard_direction,
@@ -757,7 +816,14 @@ def build_trade_plan(
         quote_source_record_id=quote_source_record_id,
         planned_risk_distance=pre_guard_targets.planned_risk_distance,
         cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
         cost_status=cost_status,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_quality_flags=cost_quality_flags,
     )
 
     dimensions = dict(learning_dimensions or {})
@@ -817,7 +883,14 @@ def build_trade_plan(
         quote_source_record_id=quote_source_record_id,
         planned_risk_distance=planned_risk_distance,
         cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
         cost_status=cost_status,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_quality_flags=cost_quality_flags,
         direction_threshold=direction_threshold,
         risk_pct=risk_pct,
         data_quality=quality,

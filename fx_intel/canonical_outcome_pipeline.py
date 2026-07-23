@@ -157,6 +157,7 @@ def guard_counterfactual_decision_events(
         "quote_source",
         "quote_source_record_id",
         "planned_risk_distance",
+        "entry_spread_r",
         "label_version",
         "label_provenance",
         "cost_model_id",
@@ -167,6 +168,7 @@ def guard_counterfactual_decision_events(
         "slippage_r",
         "commission_r",
         "financing_r",
+        "cost_quality_flags",
         "canonical_net_label_input_eligible",
         "canonical_net_label_status",
     )
@@ -246,7 +248,13 @@ def build_canonical_trade_request(
         target2=_number(decision.get("target2")),
         planned_risk_distance=_number(decision.get("planned_risk_distance")),
         path=path,
-        cost_model=_cost_model(decision, quote_source),
+        cost_model=_cost_model(
+            decision,
+            quote_source,
+            entry_bid=entry_bid,
+            entry_ask=entry_ask,
+            planned_risk_distance=_number(decision.get("planned_risk_distance")),
+        ),
         quality_flags=path_flags,
     )
 
@@ -402,23 +410,56 @@ def _quote_bar(
 def _cost_model(
     decision: Mapping[str, object],
     quote_source: str,
+    *,
+    entry_bid: float | None,
+    entry_ask: float | None,
+    planned_risk_distance: float | None,
 ) -> CostModelResult | None:
     slippage = _number(decision.get("slippage_r"))
     commission = _number(decision.get("commission_r"))
     financing = _number(decision.get("financing_r"))
     if slippage is None or commission is None or financing is None:
         return None
+    calculated_entry_spread_r = (
+        (entry_ask - entry_bid) / planned_risk_distance
+        if entry_bid is not None
+        and entry_ask is not None
+        and planned_risk_distance is not None
+        and planned_risk_distance > 0
+        else None
+    )
+    entry_spread_r = (
+        _number(decision.get("entry_spread_r"))
+        if "entry_spread_r" in decision
+        else calculated_entry_spread_r
+    )
+    raw_cost_quality_flags = decision.get("cost_quality_flags")
+    cost_quality_flags = (
+        tuple(str(value) for value in raw_cost_quality_flags)
+        if isinstance(raw_cost_quality_flags, (list, tuple))
+        else (() if raw_cost_quality_flags is None else ("invalid_cost_quality_flags",))
+    )
     return CostModelResult(
         cost_model_id=str(decision.get("cost_model_id") or ""),
         cost_model_version=str(decision.get("cost_model_version") or ""),
-        entry_quote_source=quote_source,
-        spread_source=quote_source,
+        entry_quote_source=(
+            str(decision.get("entry_quote_source") or "")
+            if "entry_quote_source" in decision
+            else quote_source
+        ),
+        spread_source=(
+            str(decision.get("spread_source") or "")
+            if "spread_source" in decision
+            else quote_source
+        ),
         slippage_model_id=str(decision.get("slippage_model_id") or ""),
         commission_model_id=str(decision.get("commission_model_id") or ""),
+        entry_spread_r=entry_spread_r,
         slippage_r=slippage,
         commission_r=commission,
         financing_r=financing,
         cost_status=str(decision.get("cost_status") or ""),
+        quality_flags=cost_quality_flags,
     )
 
 

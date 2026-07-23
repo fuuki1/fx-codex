@@ -1134,8 +1134,8 @@ def test_check_trade_outcome_health_cli_returns_failure_for_negative_expectancy(
     assert check_trade_outcome_health_cli(journal_path) == 1
 
 
-def test_realized_net_r_subtracts_execution_cost() -> None:
-    """収益ラベル: 判断時の execution_cost_r をグロスRから引いて realized_net_r を作る。"""
+def test_legacy_cost_estimate_does_not_create_a_net_label() -> None:
+    """close-only path and checklist costs remain diagnostic, never canonical net R."""
     rows = [
         _entry(
             NOW,
@@ -1157,9 +1157,12 @@ def test_realized_net_r_subtracts_execution_cost() -> None:
     assert len(scored) == 1
     outcome = scored[0]
     assert outcome.realized_r == 2.0  # グロスは従来通り
-    assert outcome.execution_cost_r == 0.15
-    assert outcome.realized_net_r == 1.85  # 2.0 - 0.15
-    assert outcome.net_expected_r == 0.30  # 判断時の予測は比較対象として保持
+    assert outcome.execution_cost_r is None
+    assert outcome.realized_net_r is None
+    assert outcome.net_expected_r is None
+    assert outcome.diagnostic_execution_cost_r == 0.15
+    assert outcome.diagnostic_net_expected_r == 0.30
+    assert to.NONCANONICAL_COST_QUALITY_FLAG in outcome.quality_flags
 
 
 def test_realized_net_r_is_none_without_cost() -> None:
@@ -1185,3 +1188,4 @@ def test_realized_net_r_is_none_without_cost() -> None:
     assert outcome.realized_r == 2.0
     assert outcome.realized_net_r is None
     assert outcome.execution_cost_r is None
+    assert outcome.diagnostic_execution_cost_r is None

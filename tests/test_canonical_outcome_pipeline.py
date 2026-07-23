@@ -23,6 +23,7 @@ from fx_intel.evaluation_labels import (
     DEFAULT_COST_MODEL_VERSION,
     DEFAULT_COST_STATUS,
     DEFAULT_SLIPPAGE_MODEL_ID,
+    IBKR_PAPER_COST_MODEL_ID,
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
 )
@@ -55,6 +56,7 @@ def _event(**decision_overrides: object) -> dict[str, object]:
         "slippage_r": 0.0,
         "commission_r": 0.0,
         "financing_r": 0.0,
+        "cost_quality_flags": [],
     }
     decision.update(decision_overrides)
     return {
@@ -99,10 +101,12 @@ def _guard_event(**event_overrides: object) -> dict[str, object]:
             "slippage_r",
             "commission_r",
             "financing_r",
+            "cost_quality_flags",
         }
     }
     execution.update(
         {
+            "entry_spread_r": 0.2,
             "canonical_net_label_input_eligible": True,
             "canonical_net_label_status": "input_ready",
         }
@@ -355,6 +359,58 @@ def test_future_entry_quote_and_path_source_mismatch_are_rejected() -> None:
     assert outcome.net_label_eligible is False
     assert "future_entry_quote" in outcome.quality_flags
     assert "path_source_mismatch" in outcome.quality_flags
+
+
+def test_ibkr_source_uses_its_own_zero_cost_contract() -> None:
+    request = build_canonical_trade_request(
+        _event(
+            quote_source="ibkr_paper_snapshot",
+            cost_model_id=IBKR_PAPER_COST_MODEL_ID,
+        ),
+        [_bar(index, source="ibkr_paper_snapshot") for index in range(12)],
+    )
+
+    outcome = score_canonical_outcome(request)
+
+    assert outcome.net_label_eligible is True
+    assert outcome.cost_model_id == IBKR_PAPER_COST_MODEL_ID
+    assert outcome.entry_quote_source == "ibkr_paper_snapshot"
+    assert outcome.spread_source == "ibkr_paper_snapshot"
+
+
+def test_explicit_cost_source_mismatch_is_auditable() -> None:
+    request = build_canonical_trade_request(
+        _event(entry_quote_source="ibkr_paper_snapshot", spread_source="fixture_quotes"),
+        [_bar(index) for index in range(12)],
+    )
+
+    outcome = score_canonical_outcome(request)
+
+    assert outcome.net_label_eligible is False
+    assert "cost_model_entry_source_mismatch" in outcome.quality_flags
+    assert "entry_quote_source_mismatch" in outcome.quality_flags
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_flag"),
+    [
+        ({"entry_quote_source": ""}, "cost_model_entry_source_mismatch"),
+        ({"cost_quality_flags": "not-a-list"}, "declared_cost_quality_flag"),
+    ],
+)
+def test_malformed_cost_provenance_does_not_fall_back(
+    override: dict[str, object],
+    expected_flag: str,
+) -> None:
+    request = build_canonical_trade_request(
+        _event(**override),
+        [_bar(index) for index in range(12)],
+    )
+
+    outcome = score_canonical_outcome(request)
+
+    assert outcome.net_label_eligible is False
+    assert expected_flag in outcome.quality_flags
 
 
 def test_offline_cli_writes_verified_store_export_and_report(tmp_path) -> None:

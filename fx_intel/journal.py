@@ -326,6 +326,7 @@ def append_plans(
                         "slippage_r": plan.slippage_r,
                         "commission_r": plan.commission_r,
                         "financing_r": plan.financing_r,
+                        "cost_quality_flags": list(plan.cost_quality_flags),
                         "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
                         **_pre_guard_plan(plan),
@@ -432,6 +433,7 @@ def append_timeframe_plans(
                         "slippage_r": plan.slippage_r,
                         "commission_r": plan.commission_r,
                         "financing_r": plan.financing_r,
+                        "cost_quality_flags": list(plan.cost_quality_flags),
                         "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
                         **_pre_guard_plan(plan),
@@ -456,20 +458,29 @@ def append_timeframe_plans(
 
 
 def _plan_execution(plan: object) -> dict[str, object]:
-    """plan.checklist から執行コスト系の値を採点・学習用に取り出す。
+    """Persist checklist costs as diagnostics, never as canonical net-label inputs.
 
-    値は build_checklist が判断時の実測 spread から既に計算済み。realized_net_r
-    (コスト控除後の実現R=収益ラベル)を trade_outcome が作るのに使う。checklist を
-    持たない plan(時間足別など)は None。欠損は採点側が欠損として扱う。
+    The checklist estimate includes spread even though executable bid/ask accounting
+    already embeds spread. Keeping it under the old canonical keys would double count.
     """
     checklist = getattr(plan, "checklist", None)
     if not isinstance(checklist, Mapping):
-        return {"execution_cost_r": None, "net_expected_r": None}
+        return {
+            "execution_cost_r": None,
+            "net_expected_r": None,
+            "diagnostic_execution_cost_r": None,
+            "diagnostic_net_expected_r": None,
+            "diagnostic_cost_model": {},
+        }
     cost = checklist.get("execution_cost_r")
     net = checklist.get("net_expected_r")
+    cost_model = checklist.get("diagnostic_cost_model")
     return {
-        "execution_cost_r": float(cost) if isinstance(cost, (int, float)) else None,
-        "net_expected_r": float(net) if isinstance(net, (int, float)) else None,
+        "execution_cost_r": None,
+        "net_expected_r": None,
+        "diagnostic_execution_cost_r": (float(cost) if isinstance(cost, (int, float)) else None),
+        "diagnostic_net_expected_r": (float(net) if isinstance(net, (int, float)) else None),
+        "diagnostic_cost_model": (dict(cost_model) if isinstance(cost_model, Mapping) else {}),
     }
 
 
@@ -580,6 +591,7 @@ def counterfactual_guard_entries(
             "quote_source",
             "quote_source_record_id",
             "planned_risk_distance",
+            "entry_spread_r",
             "label_version",
             "label_provenance",
             "cost_model_id",
@@ -590,6 +602,7 @@ def counterfactual_guard_entries(
             "slippage_r",
             "commission_r",
             "financing_r",
+            "cost_quality_flags",
         ):
             synthesized[key] = execution.get(key)
         synthesized["parent_decision_id"] = original_decision_id

@@ -378,6 +378,7 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "slippage_r": decision.get("slippage_r"),
         "commission_r": decision.get("commission_r"),
         "financing_r": decision.get("financing_r"),
+        "cost_quality_flags": decision.get("cost_quality_flags", []),
         "direction_threshold": decision.get("direction_threshold"),
         "target_policy": decision.get("target_policy", {}),
         "data_quality": decision.get("data_quality"),
@@ -386,12 +387,14 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "learning_context": event.get("learning_context", {}),
         "learning_dimensions": decision.get("learning_dimensions", {}),
     }
-    # 執行コスト(R換算)と判断時点の期待R予測を採点スキーマへ引き継ぐ。
-    # 採点側は execution_cost_r から realized_net_r を作り、net_expected_r と対比する。
+    # Checklist cost is a spread-based diagnostic, not a canonical net-label input.
     execution = decision.get("execution")
     if isinstance(execution, Mapping):
-        entry["execution_cost_r"] = execution.get("execution_cost_r")
-        entry["net_expected_r"] = execution.get("net_expected_r")
+        entry["execution_cost_r"] = None
+        entry["net_expected_r"] = None
+        entry["diagnostic_execution_cost_r"] = execution.get("diagnostic_execution_cost_r")
+        entry["diagnostic_net_expected_r"] = execution.get("diagnostic_net_expected_r")
+        entry["diagnostic_cost_model"] = execution.get("diagnostic_cost_model", {})
         entry["expected_r"] = execution.get("expected_r")
     return _json_ready_dict(entry)
 
@@ -461,6 +464,7 @@ def decision_event_to_shadow_entries(
                     "slippage_r": raw.get("slippage_r"),
                     "commission_r": raw.get("commission_r"),
                     "financing_r": decision.get("financing_r"),
+                    "cost_quality_flags": decision.get("cost_quality_flags", []),
                     "target_policy": raw.get("target_policy", {}),
                     "data_quality": decision.get("data_quality"),
                     "features": decision.get("features", {}),
@@ -844,6 +848,7 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "slippage_r": _number_or_none(getattr(plan, "slippage_r", None)),
         "commission_r": _number_or_none(getattr(plan, "commission_r", None)),
         "financing_r": _number_or_none(getattr(plan, "financing_r", None)),
+        "cost_quality_flags": list(getattr(plan, "cost_quality_flags", ()) or ()),
         "direction_threshold": _number_or_none(getattr(plan, "direction_threshold", None)),
         "risk_pct": _number_or_none(getattr(plan, "risk_pct", None)),
         "data_quality": _number_or_none(getattr(plan, "data_quality", None)),
@@ -868,24 +873,20 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
 
 
 def _execution_snapshot(plan: object) -> dict[str, object]:
-    """発注前チェックリストが確定した執行コスト系の値を採点用に保存する。
-
-    trade_outcome の採点は「market が返した実現R」から realized_net_r を作るとき
-    このコスト(R換算)を差し引く。値は build_checklist が判断時点の実測 spread から
-    既に計算済み(decision_pipeline.execution_cost_in_r)なので、ここでは取り出して
-    載せるだけ(再計算しない)。net_expected_r は「判断時点の予測」として残し、
-    採点側で実測 realized_net_r と対比できるようにする。
-
-    checklist を持たない plan(時間足別=較正・コスト・サイズを通さない方向分析)は
-    全て None を保存する。採点側はコスト不明を欠損として扱う。
-    """
+    """Persist checklist cost estimates under an explicit diagnostic namespace."""
     checklist = getattr(plan, "checklist", None)
     if not isinstance(checklist, Mapping):
         checklist = {}
+    diagnostic_cost_model = checklist.get("diagnostic_cost_model")
     return {
-        "execution_cost_r": _number_or_none(checklist.get("execution_cost_r")),
+        "execution_cost_r": None,
         "expected_r": _number_or_none(checklist.get("expected_r")),
-        "net_expected_r": _number_or_none(checklist.get("net_expected_r")),
+        "net_expected_r": None,
+        "diagnostic_execution_cost_r": _number_or_none(checklist.get("execution_cost_r")),
+        "diagnostic_net_expected_r": _number_or_none(checklist.get("net_expected_r")),
+        "diagnostic_cost_model": (
+            dict(diagnostic_cost_model) if isinstance(diagnostic_cost_model, Mapping) else {}
+        ),
         "expectancy_source": str(checklist.get("expectancy_source") or ""),
         "probability_calibrated": bool(checklist.get("probability_calibrated", False)),
     }
@@ -937,6 +938,7 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "slippage_r": _number_or_none(getattr(plan, "slippage_r", None)),
         "commission_r": _number_or_none(getattr(plan, "commission_r", None)),
         "financing_r": _number_or_none(getattr(plan, "financing_r", None)),
+        "cost_quality_flags": list(getattr(plan, "cost_quality_flags", ()) or ()),
         "direction_threshold": _number_or_none(getattr(plan, "direction_threshold", None)),
         "risk_pct": _number_or_none(getattr(plan, "risk_pct", None)),
         "data_quality": _number_or_none(getattr(plan, "data_quality", None)),

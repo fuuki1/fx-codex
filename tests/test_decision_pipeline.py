@@ -16,6 +16,10 @@ from fx_intel.decision_pipeline import (
     position_units,
     run_pipeline,
 )
+from fx_intel.evaluation_labels import (
+    DIAGNOSTIC_COST_STATUS,
+    DIAGNOSTIC_EXECUTION_COST_MODEL_ID,
+)
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import IntervalView, PairTechnicals
 
@@ -179,6 +183,20 @@ def test_wide_spread_makes_net_expectancy_negative_or_blocks() -> None:
     # 前段(spread)でblock済み。コストR自体も大きい。
     assert checklist.execution_cost_r is not None
     assert checklist.execution_cost_r > 0.2
+    model = checklist.diagnostic_cost_model
+    assert model["cost_model_id"] == DIAGNOSTIC_EXECUTION_COST_MODEL_ID
+    assert model["cost_status"] == DIAGNOSTIC_COST_STATUS
+    assert model["entry_spread_r"] > 0
+    assert model["slippage_r"] > 0
+    assert model["diagnostic_total_cost_r"] == checklist.execution_cost_r
+    assert round(model["entry_spread_r"] + model["slippage_r"], 4) == (checklist.execution_cost_r)
+
+
+def test_invalid_cost_inputs_fail_closed_without_negative_or_nan_cost() -> None:
+    assert execution_cost_in_r(-0.1, 1.0) is None
+    assert execution_cost_in_r(0.1, float("nan")) is None
+    assert execution_cost_in_r(0.1, 1.0, float("nan")) is None
+    assert execution_cost_in_r(0.1, 1.0, -1.0) is None
 
 
 def test_no_balance_still_ok_at_sizing() -> None:

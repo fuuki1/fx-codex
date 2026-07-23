@@ -6,6 +6,7 @@ import json
 import pytest
 
 from fx_intel import direction_threshold as dt
+from fx_intel.evaluation_labels import DEFAULT_COST_MODEL_ID, NET_LABEL_VERSION
 
 NOW = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
 
@@ -27,8 +28,8 @@ def _outcomes(count: int = 300, *, losing: bool = False) -> list[dict[str, objec
                 "realized_net_r": net_r + (index % 5) * 0.01,
                 "tradable": True,
                 "net_label_eligible": True,
-                "label_version": "net-r-v1",
-                "cost_model_id": "quotes-v1",
+                "label_version": NET_LABEL_VERSION,
+                "cost_model_id": DEFAULT_COST_MODEL_ID,
             }
         )
     return rows
@@ -90,6 +91,6 @@ def test_active_policy_auto_pauses_when_recent_net_r_lcb_is_nonpositive() -> Non
 
 def test_mixed_label_accounting_is_rejected() -> None:
     rows = _outcomes()
-    rows[-1]["label_version"] = "net-r-v2"
+    rows[-1]["label_version"] = "legacy-net-label"
     with pytest.raises(ValueError, match="混在"):
         dt.evaluate_threshold_candidates(rows, now=NOW)

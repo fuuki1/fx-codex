@@ -103,7 +103,7 @@ TP/SL の同一足先着が不明な場合は現行どおり SL 優先とし、�
 
 ```json
 {
-  "label_version": "net-r-v1",
+  "label_version": "net-r-v2",
   "label_provenance": "paper_quote_model",
   "decision_id": "...",
   "gross_realized_r": 0.82,
@@ -113,7 +113,7 @@ TP/SL の同一足先着が不明な場合は現行どおり SL 優先とし、�
   "execution_cost_r": 0.05,
   "realized_net_r": 0.77,
   "cost_status": "quote_measured_modelled_execution",
-  "cost_model_id": "executable-quotes-zero-slippage-v1",
+  "cost_model_id": "fixture-executable-quotes-zero-slippage-v1",
   "path_quality": 0.96,
   "quality_flags": []
 }
@@ -192,8 +192,8 @@ active -> auto_paused -> approved（再承認時のみ）
   "threshold": 0.2,
   "fallback_threshold": 0.15,
   "scope": "overall",
-  "label_version": "net-r-v1",
-  "cost_model_id": "oanda-paper-v1",
+  "label_version": "net-r-v2",
+  "cost_model_id": "ibkr-paper-executable-quotes-zero-slippage-v1",
   "dataset_hash": "...",
   "train_end": "...",
   "test_end": "...",
@@ -309,6 +309,18 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
 - TradingView scanner由来のproxy quoteは
   `scanner-proxy-mid-diagnostic-v1 / diagnostic_only` のままとし、
   lineage付きのmeasured decision quoteだけを executable cost modelとして記録する。
+- executable cost modelはquote sourceへ固定し、fixtureは
+  `fixture-executable-quotes-zero-slippage-v1`、IBKR paper snapshotは
+  `ibkr-paper-executable-quotes-zero-slippage-v1`を使う。未知sourceは`missing`として
+  net label不可にする。zero-slippage / zero-commission IDで非ゼロ値を保存した行、
+  financing modelなしの非ゼロfinancing、entry/spread source不一致、
+  entry spread R不一致もfail-closedにする。
+  これらのcomponent model/sourceをoutcomeへ保存するstore/export schemaはv2とし、
+  v1を暗黙に新契約へ読み替えない。
+- 9段checklistのspread＋modelled slippage見積りは
+  `spread-plus-modelled-slippage-diagnostic-v1 / diagnostic_only`として分離し、
+  legacy close/OHLC採点から`realized_net_r`を生成しない。正準net Rは完了bid/ask
+  pathを使うcanonical scorerだけが生成する。
 - canonical outcomeは `prediction_time` と `holding_end_time` を保存する。
   `effective_samples.summarize_effective_samples()` は5分の最小間隔、保有区間の重複、
   同一symbol、同じ符号の共通通貨エクスポージャー、FX市場日を使い、

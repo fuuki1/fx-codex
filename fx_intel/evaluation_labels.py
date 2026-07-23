@@ -10,10 +10,14 @@ change must use a new model id and label version.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
-NET_LABEL_VERSION = "net-r-v1"
+NET_LABEL_VERSION = "net-r-v2"
 NET_LABEL_PROVENANCE = "paper_quote_model"
-DEFAULT_COST_MODEL_ID = "executable-quotes-zero-slippage-v1"
+FIXTURE_COST_MODEL_ID = "fixture-executable-quotes-zero-slippage-v1"
+IBKR_PAPER_COST_MODEL_ID = "ibkr-paper-executable-quotes-zero-slippage-v1"
+# Existing call sites use DEFAULT for deterministic fixtures.
+DEFAULT_COST_MODEL_ID = FIXTURE_COST_MODEL_ID
 DEFAULT_COST_STATUS = "quote_measured_modelled_execution"
 DEFAULT_SLIPPAGE_R = 0.0
 DEFAULT_COMMISSION_R = 0.0
@@ -22,9 +26,17 @@ DEFAULT_SLIPPAGE_MODEL_ID = "zero-slippage-v1"
 DEFAULT_COMMISSION_MODEL_ID = "zero-commission-v1"
 DIAGNOSTIC_COST_MODEL_ID = "scanner-proxy-mid-diagnostic-v1"
 DIAGNOSTIC_COST_STATUS = "diagnostic_only"
+DIAGNOSTIC_EXECUTION_COST_MODEL_ID = "spread-plus-modelled-slippage-diagnostic-v1"
+MISSING_COST_MODEL_ID = "missing"
+MISSING_COST_STATUS = "unavailable"
 KNOWN_NET_LABEL_VERSIONS = frozenset({NET_LABEL_VERSION})
 KNOWN_NET_LABEL_PROVENANCES = frozenset({NET_LABEL_PROVENANCE})
-KNOWN_EXECUTABLE_COST_MODEL_IDS = frozenset({DEFAULT_COST_MODEL_ID})
+KNOWN_EXECUTABLE_COST_MODEL_IDS = frozenset({FIXTURE_COST_MODEL_ID, IBKR_PAPER_COST_MODEL_ID})
+COST_MODEL_QUOTE_SOURCES = {
+    FIXTURE_COST_MODEL_ID: frozenset({"fixture", "fixture_quotes"}),
+    IBKR_PAPER_COST_MODEL_ID: frozenset({"ibkr_paper_snapshot"}),
+}
+ZERO_COST_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True)
@@ -71,13 +83,60 @@ class CostModelResult:
         }
 
 
+def executable_cost_model_id_for_source(source: str) -> str | None:
+    """Resolve an executable cost model only for explicitly supported quote sources."""
+
+    normalized = source.strip()
+    for cost_model_id, sources in COST_MODEL_QUOTE_SOURCES.items():
+        if normalized in sources:
+            return cost_model_id
+    return None
+
+
+def cost_model_contract_flags(cost: CostModelResult) -> tuple[str, ...]:
+    """Return deterministic provenance/value mismatches for a declared cost model."""
+
+    flags: list[str] = []
+    allowed_sources = COST_MODEL_QUOTE_SOURCES.get(cost.cost_model_id)
+    if allowed_sources is None:
+        flags.append("unknown_cost_model")
+    else:
+        if cost.entry_quote_source not in allowed_sources:
+            flags.append("cost_model_entry_source_mismatch")
+        if cost.spread_source not in allowed_sources:
+            flags.append("cost_model_spread_source_mismatch")
+        if cost.cost_model_version != DEFAULT_COST_MODEL_VERSION:
+            flags.append("cost_model_version_mismatch")
+        if cost.cost_status != DEFAULT_COST_STATUS:
+            flags.append("cost_status_mismatch")
+        if cost.slippage_model_id != DEFAULT_SLIPPAGE_MODEL_ID:
+            flags.append("slippage_model_mismatch")
+        if cost.commission_model_id != DEFAULT_COMMISSION_MODEL_ID:
+            flags.append("commission_model_mismatch")
+        if not _is_zero(cost.slippage_r):
+            flags.append("slippage_model_value_mismatch")
+        if not _is_zero(cost.commission_r):
+            flags.append("commission_model_value_mismatch")
+        if not _is_zero(cost.financing_r):
+            flags.append("financing_model_missing")
+        if cost.quality_flags:
+            flags.append("declared_cost_quality_flag")
+    return tuple(flags)
+
+
 def has_executable_entry(entry_bid: float | None, entry_ask: float | None) -> bool:
     """Return whether a valid, ordered decision-time quote is available."""
 
     return (
         entry_bid is not None
         and entry_ask is not None
+        and math.isfinite(entry_bid)
+        and math.isfinite(entry_ask)
         and entry_bid > 0
         and entry_ask > 0
         and entry_ask >= entry_bid
     )
+
+
+def _is_zero(value: float) -> bool:
+    return math.isfinite(value) and abs(value) <= ZERO_COST_TOLERANCE

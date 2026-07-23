@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from fx_intel import journal
+from fx_intel.evaluation_labels import DEFAULT_COST_MODEL_ID, NET_LABEL_VERSION
 
 _SERVER_PATH = Path(__file__).resolve().parents[1] / "tools" / "ai_learning_dashboard" / "server.py"
 
@@ -315,13 +316,30 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
                     "direction": "long",
                     "timeframe": "1h",
                     "horizon_hours": 1.0,
-                    "realized_r": 1.0,
+                    "gross_realized_r": 1.0,
+                    "quote_realized_r": 0.8,
                     "realized_net_r": 0.8,
+                    "entry_bid": 1.0,
+                    "entry_ask": 1.002,
+                    "planned_risk_distance": 0.01,
+                    "entry_spread_r": 0.2,
+                    "slippage_r": 0.0,
+                    "commission_r": 0.0,
+                    "financing_r": 0.0,
+                    "additional_cost_r": 0.0,
+                    "execution_cost_r": 0.2,
                     "tradable": True,
                     "net_label_eligible": True,
-                    "label_version": "net-r-v1",
+                    "label_version": NET_LABEL_VERSION,
                     "label_provenance": "paper_quote_model",
-                    "cost_model_id": "executable-quotes-zero-slippage-v1",
+                    "cost_model_id": DEFAULT_COST_MODEL_ID,
+                    "cost_model_version": "1",
+                    "cost_status": "quote_measured_modelled_execution",
+                    "entry_quote_source": "fixture",
+                    "spread_source": "fixture",
+                    "slippage_model_id": "zero-slippage-v1",
+                    "commission_model_id": "zero-commission-v1",
+                    "cost_quality_flags": [],
                 },
                 {
                     "ts": "2026-07-02T00:00:00+00:00",
@@ -332,13 +350,30 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
                     "direction": "long",
                     "timeframe": "1h",
                     "horizon_hours": 1.0,
-                    "realized_r": -1.0,
+                    "gross_realized_r": -1.0,
+                    "quote_realized_r": -1.2,
                     "realized_net_r": -1.2,
+                    "entry_bid": 1.0,
+                    "entry_ask": 1.002,
+                    "planned_risk_distance": 0.01,
+                    "entry_spread_r": 0.2,
+                    "slippage_r": 0.0,
+                    "commission_r": 0.0,
+                    "financing_r": 0.0,
+                    "additional_cost_r": 0.0,
+                    "execution_cost_r": 0.2,
                     "tradable": True,
                     "net_label_eligible": True,
-                    "label_version": "net-r-v1",
+                    "label_version": NET_LABEL_VERSION,
                     "label_provenance": "paper_quote_model",
-                    "cost_model_id": "executable-quotes-zero-slippage-v1",
+                    "cost_model_id": DEFAULT_COST_MODEL_ID,
+                    "cost_model_version": "1",
+                    "cost_status": "quote_measured_modelled_execution",
+                    "entry_quote_source": "fixture",
+                    "spread_source": "fixture",
+                    "slippage_model_id": "zero-slippage-v1",
+                    "commission_model_id": "zero-commission-v1",
+                    "cost_quality_flags": [],
                 },
                 {
                     "ts": "2026-07-03T00:00:00+00:00",
@@ -373,13 +408,56 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
     assert result["cumulative_net_r"] == pytest.approx(-0.4)
     assert result["curve"][-1]["cumulative_net_r"] == pytest.approx(-0.4)
     assert result["gross_expectancy_r"] == pytest.approx(0.15)
-    assert result["label_versions"] == ["net-r-v1"]
+    assert result["label_versions"] == [NET_LABEL_VERSION]
     assert result["label_provenances"] == ["paper_quote_model"]
-    assert result["cost_model_ids"] == ["executable-quotes-zero-slippage-v1"]
+    assert result["cost_model_ids"] == [DEFAULT_COST_MODEL_ID]
     assert result["missing_reasons"] == {
         "missing_net_label_entry_quote": 1,
         "noncanonical_net_label": 1,
     }
+
+
+def test_net_r_summary_rejects_cost_source_mismatch_with_known_id(server) -> None:
+    result = server._net_r_summary(
+        {
+            "outcomes": [
+                {
+                    "ts": "2026-07-01T00:00:00+00:00",
+                    "prediction_time": "2026-07-01T00:00:00+00:00",
+                    "holding_end_time": "2026-07-01T01:00:00+00:00",
+                    "decision_id": "mismatched-cost-source",
+                    "gross_realized_r": 0.9,
+                    "quote_realized_r": 0.8,
+                    "realized_net_r": 0.8,
+                    "entry_bid": 1.0,
+                    "entry_ask": 1.001,
+                    "planned_risk_distance": 0.01,
+                    "entry_spread_r": 0.1,
+                    "slippage_r": 0.0,
+                    "commission_r": 0.0,
+                    "financing_r": 0.0,
+                    "additional_cost_r": 0.0,
+                    "execution_cost_r": 0.1,
+                    "net_label_eligible": True,
+                    "label_version": NET_LABEL_VERSION,
+                    "label_provenance": "paper_quote_model",
+                    "cost_model_id": DEFAULT_COST_MODEL_ID,
+                    "cost_model_version": "1",
+                    "cost_status": "quote_measured_modelled_execution",
+                    "entry_quote_source": "fixture",
+                    "spread_source": "ibkr_paper_snapshot",
+                    "slippage_model_id": "zero-slippage-v1",
+                    "commission_model_id": "zero-commission-v1",
+                    "cost_quality_flags": [],
+                }
+            ]
+        }
+    )
+
+    assert result["scored"] == 1
+    assert result["labels"] == 0
+    assert result["net_expectancy_r"] is None
+    assert result["missing_reasons"] == {"noncanonical_net_label": 1}
 
 
 def test_input_context_summary_reports_coverage_and_status(server) -> None:

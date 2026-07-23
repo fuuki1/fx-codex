@@ -12,8 +12,12 @@ from fx_intel.evaluation_labels import (
     DEFAULT_COST_STATUS,
     DIAGNOSTIC_COST_MODEL_ID,
     DIAGNOSTIC_COST_STATUS,
+    IBKR_PAPER_COST_MODEL_ID,
+    MISSING_COST_MODEL_ID,
+    MISSING_COST_STATUS,
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
+    has_executable_entry,
 )
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import (
@@ -57,6 +61,26 @@ def _all_up_tech() -> PairTechnicals:
     return tech
 
 
+def _measured_quote_context(source: str = "fixture_quotes") -> dict[str, object]:
+    return {
+        "context_id": "ctx-quote",
+        "liquidity": {
+            "quote": {
+                "bid": 156.24,
+                "ask": 156.26,
+                "observed_at": "2026-06-29T08:59:57+00:00",
+                "available_time": "2026-06-29T08:59:59+00:00",
+                "source": source,
+                "role": "decision_quote",
+                "source_record_id": "quote-123",
+                "content_hash": "a" * 64,
+                "quality_status": "measured",
+                "quality_flags": [],
+            }
+        },
+    }
+
+
 # ------------------------------------------------- 基本構造
 
 
@@ -75,6 +99,18 @@ def test_primary_horizons_match_spec() -> None:
     assert PRIMARY_HORIZON_HOURS == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
 
 
+@pytest.mark.parametrize(
+    ("bid", "ask"),
+    [
+        (float("inf"), float("inf")),
+        (1.0, float("inf")),
+        (float("nan"), 1.0),
+    ],
+)
+def test_nonfinite_entry_quote_is_not_executable(bid: float, ask: float) -> None:
+    assert has_executable_entry(bid, ask) is False
+
+
 def test_each_timeframe_carries_own_close_and_indicators() -> None:
     plans = {
         p.timeframe: p
@@ -91,30 +127,13 @@ def test_scanner_quote_remains_diagnostic_only() -> None:
 
     assert plan.cost_model_id == DIAGNOSTIC_COST_MODEL_ID
     assert plan.cost_status == DIAGNOSTIC_COST_STATUS
+    assert plan.cost_quality_flags == ("diagnostic_only",)
     assert plan.label_version == NET_LABEL_VERSION
     assert plan.label_provenance == NET_LABEL_PROVENANCE
     assert plan.planned_risk_distance == pytest.approx(0.15 * 2.5)
 
 
 def test_measured_decision_quote_carries_executable_cost_metadata() -> None:
-    context = {
-        "context_id": "ctx-quote",
-        "liquidity": {
-            "quote": {
-                "bid": 156.24,
-                "ask": 156.26,
-                "observed_at": "2026-06-29T08:59:57+00:00",
-                "available_time": "2026-06-29T08:59:59+00:00",
-                "source": "fixture_quotes",
-                "role": "decision_quote",
-                "source_record_id": "quote-123",
-                "content_hash": "a" * 64,
-                "quality_status": "measured",
-                "quality_flags": [],
-            }
-        },
-    }
-
     plan = build_timeframe_plan(
         "USDJPY",
         "1h",
@@ -123,7 +142,7 @@ def test_measured_decision_quote_carries_executable_cost_metadata() -> None:
         [],
         [],
         now=OPEN_NOW,
-        input_context=context,
+        input_context=_measured_quote_context(),
     )
 
     assert plan.entry_bid == 156.24
@@ -134,6 +153,41 @@ def test_measured_decision_quote_carries_executable_cost_metadata() -> None:
     assert plan.quote_source_record_id == "quote-123"
     assert plan.cost_model_id == DEFAULT_COST_MODEL_ID
     assert plan.cost_status == DEFAULT_COST_STATUS
+    assert plan.cost_quality_flags == ()
+    assert plan.pre_guard_execution_snapshot["entry_spread_r"] == pytest.approx(
+        0.02 / plan.pre_guard_execution_snapshot["planned_risk_distance"]
+    )
+
+
+def test_measured_cost_model_is_bound_to_supported_quote_source() -> None:
+    ibkr = build_timeframe_plan(
+        "USDJPY",
+        "1h",
+        _all_up_tech(),
+        {},
+        [],
+        [],
+        now=OPEN_NOW,
+        input_context=_measured_quote_context("ibkr_paper_snapshot"),
+    )
+    unknown = build_timeframe_plan(
+        "USDJPY",
+        "1h",
+        _all_up_tech(),
+        {},
+        [],
+        [],
+        now=OPEN_NOW,
+        input_context=_measured_quote_context("oanda_v20_pricing"),
+    )
+
+    assert ibkr.cost_model_id == IBKR_PAPER_COST_MODEL_ID
+    assert ibkr.cost_status == DEFAULT_COST_STATUS
+    assert ibkr.pre_guard_execution_snapshot["canonical_net_label_input_eligible"] is True
+    assert unknown.cost_model_id == MISSING_COST_MODEL_ID
+    assert unknown.cost_status == MISSING_COST_STATUS
+    assert unknown.cost_quality_flags == ("unsupported_cost_source",)
+    assert unknown.pre_guard_execution_snapshot["canonical_net_label_input_eligible"] is False
 
 
 # ------------------------------------------------- 独立した方向判断

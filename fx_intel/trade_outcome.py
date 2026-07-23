@@ -24,10 +24,10 @@ from .effective_samples import (
 )
 from .evaluation_labels import (
     DEFAULT_COST_STATUS,
-    KNOWN_EXECUTABLE_COST_MODEL_IDS,
     KNOWN_NET_LABEL_PROVENANCES,
     KNOWN_NET_LABEL_VERSIONS,
     CostModelResult,
+    cost_model_contract_flags,
 )
 from .journal import (
     COUNTERFACTUAL_ENTRY_KEY,
@@ -53,6 +53,7 @@ EXPECTANCY_WEAK_FACTOR = 0.75
 # ガード見送り中のシャドー計画を採点した反実仮想アウトカムに付く品質フラグ。
 # quality_summary の flags 集計にそのまま現れ、根拠に占める反実仮想の量を監査できる
 COUNTERFACTUAL_QUALITY_FLAG = "expectancy_guard_counterfactual"
+NONCANONICAL_COST_QUALITY_FLAG = "noncanonical_cost_estimate_ignored"
 MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R = 0.05
 DEFAULT_TP1_R_CANDIDATES = (0.75, 1.0, 1.25)
 DEFAULT_TP2_R_CANDIDATES = (1.5, 2.0, 2.5)
@@ -160,7 +161,10 @@ class CanonicalTradeOutcome:
     holding_end_time: str | None = None
     first_touch: str = "unavailable"
     first_touch_ts: str | None = None
+    entry_bid: float | None = None
+    entry_ask: float | None = None
     entry_executable: float | None = None
+    planned_risk_distance: float | None = None
     exit_executable: float | None = None
     exit_mid: float | None = None
     gross_realized_r: float | None = None
@@ -176,6 +180,11 @@ class CanonicalTradeOutcome:
     cost_model_id: str = "missing"
     cost_model_version: str = ""
     cost_status: str = "missing"
+    entry_quote_source: str = ""
+    spread_source: str = ""
+    slippage_model_id: str = ""
+    commission_model_id: str = ""
+    cost_quality_flags: tuple[str, ...] = field(default_factory=tuple)
     net_label_eligible: bool = False
     path_quality: float | None = None
     path_source: str = "executable_bid_ask"
@@ -199,7 +208,10 @@ class CanonicalTradeOutcome:
             "holding_end_time": self.holding_end_time,
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
+            "entry_bid": self.entry_bid,
+            "entry_ask": self.entry_ask,
             "entry_executable": self.entry_executable,
+            "planned_risk_distance": self.planned_risk_distance,
             "exit_executable": self.exit_executable,
             "exit_mid": self.exit_mid,
             "gross_realized_r": self.gross_realized_r,
@@ -215,6 +227,11 @@ class CanonicalTradeOutcome:
             "cost_model_id": self.cost_model_id,
             "cost_model_version": self.cost_model_version,
             "cost_status": self.cost_status,
+            "entry_quote_source": self.entry_quote_source,
+            "spread_source": self.spread_source,
+            "slippage_model_id": self.slippage_model_id,
+            "commission_model_id": self.commission_model_id,
+            "cost_quality_flags": list(self.cost_quality_flags),
             "net_label_eligible": self.net_label_eligible,
             "path_quality": self.path_quality,
             "path_source": self.path_source,
@@ -296,7 +313,10 @@ def score_canonical_outcome(request: CanonicalTradeRequest) -> CanonicalTradeOut
         holding_end_time=touch_bar.ts.astimezone(UTC).isoformat(),
         first_touch=touch,
         first_touch_ts=touch_bar.ts.astimezone(UTC).isoformat(),
+        entry_bid=request.entry_bid,
+        entry_ask=request.entry_ask,
         entry_executable=entry_executable,
+        planned_risk_distance=request.planned_risk_distance,
         exit_executable=exit_executable,
         exit_mid=exit_mid,
         gross_realized_r=_canonical_round(gross_realized_r),
@@ -312,6 +332,11 @@ def score_canonical_outcome(request: CanonicalTradeRequest) -> CanonicalTradeOut
         cost_model_id=request.cost_model.cost_model_id,
         cost_model_version=request.cost_model.cost_model_version,
         cost_status=request.cost_model.cost_status,
+        entry_quote_source=request.cost_model.entry_quote_source,
+        spread_source=request.cost_model.spread_source,
+        slippage_model_id=request.cost_model.slippage_model_id,
+        commission_model_id=request.cost_model.commission_model_id,
+        cost_quality_flags=request.cost_model.quality_flags,
         net_label_eligible=True,
         path_quality=_canonical_round(path_quality),
         quality_flags=all_flags,
@@ -414,8 +439,7 @@ def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
     if cost is None:
         flags.append("missing_cost_model")
     else:
-        if cost.cost_model_id not in KNOWN_EXECUTABLE_COST_MODEL_IDS:
-            flags.append("unknown_cost_model")
+        flags.extend(cost_model_contract_flags(cost))
         if (
             not cost.cost_model_version.strip()
             or not cost.slippage_model_id.strip()
@@ -427,6 +451,28 @@ def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
             flags.append("entry_quote_source_mismatch")
         if cost.spread_source != request.quote_source:
             flags.append("spread_source_mismatch")
+        planned_risk = request.planned_risk_distance
+        expected_entry_spread_r = (
+            (request.entry_ask - request.entry_bid) / planned_risk
+            if request.entry_bid is not None
+            and request.entry_ask is not None
+            and planned_risk is not None
+            and _finite_positive(planned_risk)
+            else None
+        )
+        if cost.entry_spread_r is None:
+            flags.append("missing_entry_spread_r")
+        elif (
+            expected_entry_spread_r is None
+            or not math.isfinite(cost.entry_spread_r)
+            or not math.isclose(
+                cost.entry_spread_r,
+                expected_entry_spread_r,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            flags.append("entry_spread_r_mismatch")
         if any(
             not _finite_nonnegative(value)
             for value in (cost.slippage_r, cost.commission_r, cost.financing_r)
@@ -454,12 +500,20 @@ def _unavailable_canonical_outcome(
             if _aware_datetime(request.prediction_time)
             else None
         ),
+        entry_bid=request.entry_bid,
+        entry_ask=request.entry_ask,
+        planned_risk_distance=request.planned_risk_distance,
         slippage_r=(cost.slippage_r if cost is not None else None),
         commission_r=(cost.commission_r if cost is not None else None),
         financing_r=(cost.financing_r if cost is not None else None),
         cost_model_id=(cost.cost_model_id if cost is not None else "missing"),
         cost_model_version=(cost.cost_model_version if cost is not None else ""),
         cost_status=(cost.cost_status if cost is not None else "missing"),
+        entry_quote_source=(cost.entry_quote_source if cost is not None else ""),
+        spread_source=(cost.spread_source if cost is not None else ""),
+        slippage_model_id=(cost.slippage_model_id if cost is not None else ""),
+        commission_model_id=(cost.commission_model_id if cost is not None else ""),
+        cost_quality_flags=(cost.quality_flags if cost is not None else ()),
         net_label_eligible=False,
         quality_flags=tuple(dict.fromkeys(flags)),
     )
@@ -728,11 +782,12 @@ class TradeOutcome:
     first_touch: str = "none"
     first_touch_ts: str | None = None
     realized_r: float | None = None  # 執行コスト控除前(グロス)の実現R
-    # 執行コスト控除後の実現R。realized_r から execution_cost_r を引いた「市場が返した
-    # 正解ラベル」。コスト不明(spread未取得等)なら None。MLの収益ラベルはこれを使う。
+    # close/OHLC-only legacy scorerはcanonical net labelを生成しない。
     realized_net_r: float | None = None
-    execution_cost_r: float | None = None  # 差し引いた執行コスト(R換算)。判断時の実測値
-    net_expected_r: float | None = None  # 判断時点の予測(比較対象)。実測 realized_net_r と対比
+    execution_cost_r: float | None = None
+    net_expected_r: float | None = None
+    diagnostic_execution_cost_r: float | None = None
+    diagnostic_net_expected_r: float | None = None
     path_points: int = 0
     path_start: str | None = None
     path_end: str | None = None
@@ -778,6 +833,8 @@ class TradeOutcome:
             "decision_id": self.decision_id,
             "execution_cost_r": self.execution_cost_r,
             "net_expected_r": self.net_expected_r,
+            "diagnostic_execution_cost_r": self.diagnostic_execution_cost_r,
+            "diagnostic_net_expected_r": self.diagnostic_net_expected_r,
             "path_points": self.path_points,
             "path_start": self.path_start,
             "path_end": self.path_end,
@@ -1129,18 +1186,19 @@ def evaluate_trade_outcomes(
         mae = max(0.0, max(_adverse_move(direction, entry_price, point) for point in active_path))
 
         realized_r = _realized_r(first_touch, terminal_r, tp1_r_value, tp2_r_value)
-        # 収益ラベル: 判断時に保存した執行コスト(R換算)をグロスRから差し引き、
-        # 「市場が返したコスト控除後の実現R」を作る。コスト不明(None)なら差し引かず
-        # realized_net_r も None(採点側=MLは欠損として扱う)。net_expected_r は
-        # 判断時点の予測をそのまま持ち、実測 realized_net_r と対比できるようにする。
-        execution_cost_r = _float(entry.get("execution_cost_r"))
-        net_expected_r = _float(entry.get("net_expected_r"))
+        # close/OHLC-only pathとchecklist cost estimateはcanonical会計ではない。
+        # 旧キーも診断値として保持するが、realized_net_rは必ずNoneにする。
+        diagnostic_execution_cost_r = _float(
+            entry.get("diagnostic_execution_cost_r", entry.get("execution_cost_r"))
+        )
+        diagnostic_net_expected_r = _float(
+            entry.get("diagnostic_net_expected_r", entry.get("net_expected_r"))
+        )
         raw_decision_id = str(entry.get("decision_id", "")).strip()
         decision_id = raw_decision_id or None
-        realized_net_r = (
-            round(realized_r - execution_cost_r, 4) if execution_cost_r is not None else None
-        )
         quality, flags, path_source = _path_quality(ts, future, horizon_hours, min_path_points)
+        if diagnostic_execution_cost_r is not None or diagnostic_net_expected_r is not None:
+            flags = tuple(dict.fromkeys((*flags, NONCANONICAL_COST_QUALITY_FLAG)))
         if ambiguous_intrabar:
             flags = tuple(dict.fromkeys((*flags, "ambiguous_intrabar_touch")))
         if counterfactual:
@@ -1174,9 +1232,11 @@ def evaluate_trade_outcomes(
                 first_touch=first_touch,
                 first_touch_ts=first_touch_ts,
                 realized_r=round(realized_r, 4),
-                realized_net_r=realized_net_r,
-                execution_cost_r=execution_cost_r,
-                net_expected_r=net_expected_r,
+                realized_net_r=None,
+                execution_cost_r=None,
+                net_expected_r=None,
+                diagnostic_execution_cost_r=diagnostic_execution_cost_r,
+                diagnostic_net_expected_r=diagnostic_net_expected_r,
                 decision_id=decision_id,
                 path_points=len(future),
                 path_start=future[0].ts.isoformat(),

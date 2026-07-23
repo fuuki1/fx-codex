@@ -63,7 +63,6 @@ from .sentiment import CurrencySentiment, pair_bias
 from .technicals import PairTechnicals
 from .evaluation_labels import (
     DEFAULT_COMMISSION_R,
-    DEFAULT_COST_MODEL_ID,
     DEFAULT_COST_MODEL_VERSION,
     DEFAULT_COST_STATUS,
     DEFAULT_COMMISSION_MODEL_ID,
@@ -71,8 +70,11 @@ from .evaluation_labels import (
     DEFAULT_SLIPPAGE_MODEL_ID,
     DIAGNOSTIC_COST_MODEL_ID,
     DIAGNOSTIC_COST_STATUS,
+    MISSING_COST_MODEL_ID,
+    MISSING_COST_STATUS,
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
+    executable_cost_model_id_for_source,
 )
 from .shadow_learning import build_shadow_predictions, prediction_draft
 from . import input_context as decision_inputs
@@ -181,6 +183,7 @@ class TimeframePlan:
     slippage_r: float = DEFAULT_SLIPPAGE_R
     commission_r: float = DEFAULT_COMMISSION_R
     financing_r: float = 0.0
+    cost_quality_flags: tuple[str, ...] = ()
     direction_threshold: float = DIRECTION_THRESHOLD
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0
@@ -495,7 +498,14 @@ def build_timeframe_plan(
     quote_source = "tradingview_oanda_scanner" if quote_observed_at else ""
     quote_source_record_id = ""
     cost_model_id = DIAGNOSTIC_COST_MODEL_ID
+    cost_model_version = DEFAULT_COST_MODEL_VERSION
     cost_status = DIAGNOSTIC_COST_STATUS
+    slippage_model_id = DEFAULT_SLIPPAGE_MODEL_ID
+    commission_model_id = DEFAULT_COMMISSION_MODEL_ID
+    slippage_r = DEFAULT_SLIPPAGE_R
+    commission_r = DEFAULT_COMMISSION_R
+    financing_r = 0.0
+    cost_quality_flags: tuple[str, ...] = ("diagnostic_only",)
     context_bid, context_ask, context_quote_at = decision_inputs.decision_quote_from_mapping(
         serialized_context
     )
@@ -512,8 +522,19 @@ def build_timeframe_plan(
             and quote_source_record_id
             and quote_contract.get("quality_status") == "measured"
         ):
-            cost_model_id = DEFAULT_COST_MODEL_ID
-            cost_status = DEFAULT_COST_STATUS
+            resolved_cost_model = executable_cost_model_id_for_source(quote_source)
+            if resolved_cost_model is not None:
+                cost_model_id = resolved_cost_model
+                cost_status = DEFAULT_COST_STATUS
+            else:
+                cost_model_id = MISSING_COST_MODEL_ID
+                cost_model_version = ""
+                cost_status = MISSING_COST_STATUS
+                slippage_model_id = ""
+                commission_model_id = ""
+                cost_quality_flags = ("unsupported_cost_source",)
+            if resolved_cost_model is not None:
+                cost_quality_flags = ()
 
     pre_guard_targets = freeze_target_plan(
         symbol,
@@ -562,7 +583,14 @@ def build_timeframe_plan(
         quote_source_record_id=quote_source_record_id,
         planned_risk_distance=pre_guard_targets.planned_risk_distance,
         cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
         cost_status=cost_status,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_quality_flags=cost_quality_flags,
     )
 
     dimensions = dict(learning_dimensions or {})
@@ -637,7 +665,14 @@ def build_timeframe_plan(
         quote_source_record_id=quote_source_record_id,
         planned_risk_distance=planned_risk_distance,
         cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
         cost_status=cost_status,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_quality_flags=cost_quality_flags,
         direction_threshold=direction_threshold,
         risk_pct=risk_pct,
         data_quality=quality,
