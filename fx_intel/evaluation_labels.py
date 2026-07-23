@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, UTC
 import math
 
 NET_LABEL_VERSION = "net-r-v2"
@@ -137,6 +138,30 @@ def canonical_net_label_contract_flags(record: Mapping[str, object]) -> tuple[st
         flags.append("unknown_label_version")
     if record.get("label_provenance") not in KNOWN_NET_LABEL_PROVENANCES:
         flags.append("unknown_label_provenance")
+    symbol = str(record.get("symbol") or "").upper()
+    for separator in ("/", "_", "-"):
+        symbol = symbol.replace(separator, "")
+    if len(symbol) != 6 or not symbol.isalpha():
+        flags.append("invalid_symbol")
+    if str(record.get("direction") or "").lower() not in {"long", "short"}:
+        flags.append("invalid_direction")
+    if not str(record.get("timeframe") or "").strip():
+        flags.append("missing_timeframe")
+    horizon_hours = _number(record.get("horizon_hours"))
+    if horizon_hours is None or horizon_hours <= 0:
+        flags.append("invalid_horizon_hours")
+    prediction_time = _aware_time(record.get("prediction_time"))
+    holding_end_time = _aware_time(record.get("holding_end_time"))
+    if prediction_time is None:
+        flags.append("invalid_prediction_time")
+    if holding_end_time is None:
+        flags.append("invalid_holding_end_time")
+    if (
+        prediction_time is not None
+        and holding_end_time is not None
+        and holding_end_time <= prediction_time
+    ):
+        flags.append("invalid_holding_interval")
 
     required = {
         name: _number(record.get(name))
@@ -153,6 +178,7 @@ def canonical_net_label_contract_flags(record: Mapping[str, object]) -> tuple[st
             "additional_cost_r",
             "execution_cost_r",
             "realized_net_r",
+            "path_quality",
         )
     }
     for name, value in required.items():
@@ -203,6 +229,8 @@ def canonical_net_label_contract_flags(record: Mapping[str, object]) -> tuple[st
     entry_bid = numeric["entry_bid"]
     entry_ask = numeric["entry_ask"]
     planned_risk = numeric["planned_risk_distance"]
+    if not 0.0 < numeric["path_quality"] <= 1.0:
+        flags.append("invalid_path_quality")
     if not (0 < entry_bid <= entry_ask):
         flags.append("invalid_entry_quote")
     if planned_risk <= 0:
@@ -257,3 +285,16 @@ def _number(value: object) -> float | None:
         return None
     numeric = float(value)
     return numeric if math.isfinite(numeric) else None
+
+
+def _aware_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)

@@ -17,6 +17,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .effective_samples import select_effective_samples
 from .evaluation_labels import canonical_net_label_contract_flags
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .tp_sl_learning import MVP_SYMBOLS, MVP_TIMEFRAMES
@@ -562,13 +563,14 @@ def _advanced_metrics(
     brier: float | None,
     brier_base: float | None,
 ) -> dict[str, float | None]:
-    tradable = [
+    valid_net = [
         outcome
         for outcome in outcomes
         if outcome.tradable
         and outcome.realized_net_r is not None
         and not canonical_net_label_contract_flags(outcome.to_dict())
     ]
+    tradable, _effective = select_effective_samples(valid_net, min_samples=1)
     r_values = [
         float(outcome.realized_net_r) for outcome in tradable if outcome.realized_net_r is not None
     ]
@@ -742,13 +744,14 @@ def _policy(
 
 
 def _brier_stats(outcomes: Sequence[TradeOutcome]) -> tuple[float | None, float | None]:
-    tradable = [
+    valid_net = [
         outcome
         for outcome in outcomes
         if outcome.tradable
         and outcome.realized_net_r is not None
         and not canonical_net_label_contract_flags(outcome.to_dict())
     ]
+    tradable, _effective = select_effective_samples(valid_net, min_samples=1)
     if not tradable:
         return None, None
     labels = [1.0 if float(outcome.realized_net_r or 0.0) > 0 else 0.0 for outcome in tradable]

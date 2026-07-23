@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
+from .effective_samples import summarize_effective_samples
 from .evaluation_labels import canonical_net_label_contract_flags
 from .market import WEEKEND_CLOSURE, WeekendOpenHours
 from .ml import THIN_MIN_GAP_HOURS
@@ -69,7 +70,11 @@ class MemberPerformance:
     # legacy evaluate_memberはATR分母のmove_atrとstop-distance分母のcostを混ぜず、
     # 常にNoneにする。evaluate_shadow_memberだけが正準ラベルを読み取れる。
     net_expectancy_r: float | None = None
-    net_r_samples: int = 0  # net_expectancy_r の分母(realized_net_r が付いた採点数)
+    net_r_raw_samples: int = 0
+    net_r_samples: int = 0  # net_expectancy_r の分母(non-overlapping effective samples)
+    net_r_overlap_ratio: float | None = None
+    net_r_cluster_count: int = 0
+    net_r_market_days: int = 0
     producer_version: str = ""
 
     @property
@@ -109,7 +114,11 @@ class MemberPerformance:
             "expectancy_atr": self.expectancy_atr,
             "p_value": self.p_value,
             "net_expectancy_r": self.net_expectancy_r,
+            "net_r_raw_samples": self.net_r_raw_samples,
             "net_r_samples": self.net_r_samples,
+            "net_r_overlap_ratio": self.net_r_overlap_ratio,
+            "net_r_cluster_count": self.net_r_cluster_count,
+            "net_r_market_days": self.net_r_market_days,
             "producer_version": self.producer_version,
         }
 
@@ -131,7 +140,11 @@ class MemberPerformance:
                 if payload.get("net_expectancy_r") is not None
                 else _float(payload.get("expectancy_net_r"))
             ),
+            net_r_raw_samples=_int(payload.get("net_r_raw_samples")),
             net_r_samples=_int(payload.get("net_r_samples")),
+            net_r_overlap_ratio=_float(payload.get("net_r_overlap_ratio")),
+            net_r_cluster_count=_int(payload.get("net_r_cluster_count")),
+            net_r_market_days=_int(payload.get("net_r_market_days")),
             producer_version=str(payload.get("producer_version", "")),
         )
 
@@ -272,31 +285,43 @@ def evaluate_shadow_member(
         if ts is not None:
             parsed.append((ts, row))
     last: dict[str, datetime] = {}
-    effective: list[Mapping[str, object]] = []
+    legacy_effective: list[Mapping[str, object]] = []
     for ts, row in sorted(parsed, key=lambda item: item[0]):
         symbol = str(row.get("symbol", ""))
         previous = last.get(symbol)
         if previous is not None and ts - previous < timedelta(hours=THIN_MIN_GAP_HOURS):
             continue
         last[symbol] = ts
-        effective.append(row)
-    if not effective:
+        legacy_effective.append(row)
+    if not legacy_effective:
         return MemberPerformance(member=member)
-    hits = sum(1 for row in effective if row.get("direction_outcome") == "hit")
+    valid_net_records = [row for _ts, row in parsed if not canonical_net_label_contract_flags(row)]
+    net_effective = summarize_effective_samples(valid_net_records, min_samples=1)
+    selected_keys = set(net_effective.selected_keys)
+    effective_net_records = [
+        row
+        for row in valid_net_records
+        if f"{row['decision_id']}+{row['label_version']}" in selected_keys
+    ]
     net_values = [
         value
-        for row in effective
-        if not canonical_net_label_contract_flags(row)
-        and (value := _float(row.get("realized_net_r"))) is not None
+        for row in effective_net_records
+        if (value := _float(row.get("realized_net_r"))) is not None
     ]
+    decision_evidence = effective_net_records or legacy_effective
+    hits = sum(1 for row in decision_evidence if row.get("direction_outcome") == "hit")
     net_expectancy_r = sum(net_values) / len(net_values) if net_values else None
     return MemberPerformance(
         member=member,
-        evaluated=len(effective),
+        evaluated=len(decision_evidence),
         hits=hits,
         net_expectancy_r=(round(net_expectancy_r, 4) if net_expectancy_r is not None else None),
+        net_r_raw_samples=net_effective.raw_samples,
         net_r_samples=len(net_values),
-        p_value=round(_one_sided_binomial_pvalue(hits, len(effective)), 4),
+        net_r_overlap_ratio=net_effective.overlap_ratio,
+        net_r_cluster_count=net_effective.cluster_count,
+        net_r_market_days=net_effective.market_days,
+        p_value=round(_one_sided_binomial_pvalue(hits, len(decision_evidence)), 4),
         producer_version=active_version,
     )
 

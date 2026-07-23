@@ -25,12 +25,17 @@ def _outcomes(count: int = 300, *, losing: bool = False) -> list[dict[str, objec
         strong = index % 2 == 0
         composite = 0.28 if strong else 0.18
         net_r = (-0.4 if losing else 0.55) if strong else -0.35
+        prediction_time = NOW - timedelta(hours=8 * (count - index))
         rows.append(
             {
-                "ts": (NOW - timedelta(hours=8 * (count - index))).isoformat(),
+                "ts": prediction_time.isoformat(),
+                "prediction_time": prediction_time.isoformat(),
+                "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
                 "decision_id": f"decision-{index}",
                 "symbol": "USDJPY",
                 "direction": "long",
+                "timeframe": "1h",
+                "horizon_hours": 1.0,
                 "composite": composite,
                 "realized_r": net_r + 0.1,
                 "realized_net_r": net_r + (index % 5) * 0.01,
@@ -57,6 +62,7 @@ def _outcomes(count: int = 300, *, losing: bool = False) -> list[dict[str, objec
                 "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
                 "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
                 "cost_quality_flags": [],
+                "path_quality": 1.0,
             }
         )
     return rows
@@ -69,6 +75,9 @@ def test_candidate_evaluation_only_promotes_stricter_profitable_threshold() -> N
     assert policy.stage == "ready_for_review"
     assert policy.oos_net_r_lcb is not None and policy.oos_net_r_lcb > 0
     assert policy.effective_samples >= dt.DEFAULT_MIN_TEST_SAMPLES
+    assert policy.raw_samples == 300
+    assert policy.effective_input_samples == 300
+    assert policy.overlap_ratio == 0.0
 
 
 def test_policy_requires_human_approval_and_activation(tmp_path) -> None:
@@ -95,7 +104,7 @@ def test_policy_load_and_validation_fail_closed(tmp_path) -> None:
     path.write_text(
         json.dumps(
             {
-                "schema": 1,
+                "schema": dt.SCHEMA_VERSION,
                 "policy_id": "unsafe",
                 "stage": "active",
                 "threshold": 0.05,
@@ -119,5 +128,31 @@ def test_active_policy_auto_pauses_when_recent_net_r_lcb_is_nonpositive() -> Non
 def test_invalid_label_accounting_is_rejected() -> None:
     rows = _outcomes()
     rows[-1]["label_version"] = "legacy-net-label"
+    with pytest.raises(ValueError, match="invalid canonical net label"):
+        dt.evaluate_threshold_candidates(rows, now=NOW)
+
+
+def test_overlapping_rows_do_not_satisfy_threshold_oos_sample_gate() -> None:
+    rows = _outcomes()
+    start = NOW - timedelta(hours=30)
+    for index, row in enumerate(rows):
+        prediction_time = start + timedelta(minutes=5 * index)
+        row["ts"] = prediction_time.isoformat()
+        row["prediction_time"] = prediction_time.isoformat()
+        row["holding_end_time"] = (prediction_time + timedelta(hours=1)).isoformat()
+
+    policy = dt.evaluate_threshold_candidates(rows, now=NOW)
+
+    assert policy.stage == "shadow"
+    assert policy.effective_samples < dt.DEFAULT_MIN_TEST_SAMPLES
+    assert policy.raw_samples == 300
+    assert policy.effective_input_samples < policy.raw_samples
+    assert policy.overlap_ratio is not None and policy.overlap_ratio > 0
+
+
+def test_missing_holding_interval_is_rejected_before_threshold_statistics() -> None:
+    rows = _outcomes()
+    rows[-1].pop("holding_end_time")
+
     with pytest.raises(ValueError, match="invalid canonical net label"):
         dt.evaluate_threshold_candidates(rows, now=NOW)

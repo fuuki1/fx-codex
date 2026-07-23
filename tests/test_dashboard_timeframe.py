@@ -340,11 +340,12 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
                     "slippage_model_id": "zero-slippage-v1",
                     "commission_model_id": "zero-commission-v1",
                     "cost_quality_flags": [],
+                    "path_quality": 1.0,
                 },
                 {
-                    "ts": "2026-07-02T00:00:00+00:00",
-                    "prediction_time": "2026-07-02T00:00:00+00:00",
-                    "holding_end_time": "2026-07-02T01:00:00+00:00",
+                    "ts": "2026-07-01T00:05:00+00:00",
+                    "prediction_time": "2026-07-01T00:05:00+00:00",
+                    "holding_end_time": "2026-07-01T01:05:00+00:00",
                     "decision_id": "d2",
                     "symbol": "USDJPY",
                     "direction": "long",
@@ -374,6 +375,7 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
                     "slippage_model_id": "zero-slippage-v1",
                     "commission_model_id": "zero-commission-v1",
                     "cost_quality_flags": [],
+                    "path_quality": 1.0,
                 },
                 {
                     "ts": "2026-07-03T00:00:00+00:00",
@@ -399,14 +401,14 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
     assert result["scored"] == 4
     assert result["raw_samples"] == 4
     assert result["effective_input_samples"] == 2
-    assert result["effective_samples"] == 2
-    assert result["overlap_ratio"] == 0.0
-    assert result["market_days"] == 2
+    assert result["effective_samples"] == 1
+    assert result["overlap_ratio"] == 0.5
+    assert result["market_days"] == 1
     assert result["sample_ok"] is False
     assert result["net_label_coverage"] == pytest.approx(1 / 2)
-    assert result["net_expectancy_r"] == pytest.approx(-0.2)
-    assert result["cumulative_net_r"] == pytest.approx(-0.4)
-    assert result["curve"][-1]["cumulative_net_r"] == pytest.approx(-0.4)
+    assert result["net_expectancy_r"] == pytest.approx(0.8)
+    assert result["cumulative_net_r"] == pytest.approx(0.8)
+    assert result["curve"][-1]["cumulative_net_r"] == pytest.approx(0.8)
     assert result["gross_expectancy_r"] == pytest.approx(0.15)
     assert result["label_versions"] == [NET_LABEL_VERSION]
     assert result["label_provenances"] == ["paper_quote_model"]

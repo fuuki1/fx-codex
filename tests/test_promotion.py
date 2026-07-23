@@ -236,11 +236,17 @@ def test_member_net_expectancy_r_roundtrips_and_gates_expectancy() -> None:
         expectancy_atr=0.3,
         p_value=0.01,
         net_expectancy_r=0.22,
+        net_r_raw_samples=100,
         net_r_samples=90,
+        net_r_overlap_ratio=0.1,
+        net_r_cluster_count=90,
+        net_r_market_days=50,
     )
     restored = MemberPerformance.from_mapping("ml", perf.to_dict())
     assert restored.net_expectancy_r == 0.22
+    assert restored.net_r_raw_samples == 100
     assert restored.net_r_samples == 90
+    assert restored.net_r_overlap_ratio == 0.1
     # 純Rが正(閾値超)なら参考判定を満たす
     ok_positive, _ = perf.meets_reference_thresholds()
     assert ok_positive

@@ -334,6 +334,12 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   raw/effective/overlap/cluster/market-day件数を決定論的に返す。
 - canonical gross/net集計の `sample_ok` はraw件数ではなくeffective件数で判定し、
   時刻欠損・naive時刻・競合duplicateがある場合はfail-closedにする。
+- direction thresholdのtune/test・片側LCB・DSR・auto-pause、ML return headの
+  train/test・t検定・PBO/DSR、shadow dimension集計、promotion参考統計、
+  dashboardのnet期待値/PF/累積曲線も同じeffective subsetを使う。threshold policyは
+  schema 2、GBDT artifactはschema 5としてraw/effective/overlap/cluster/market-day
+  来歴を保存し、旧schemaを暗黙に有効化しない。過学習検定が実行不能ならML収益ヘッドを
+  採用しない。
 - canonical outcome storeは `decision_id + label_version` を自然キーにし、
   `flock`、`fsync`、record hashで追記する。同値replayは追記せず、
   競合値、partial JSON、hash不一致、既存duplicateをhard errorにする。

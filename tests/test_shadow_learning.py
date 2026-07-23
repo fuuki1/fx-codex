@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, UTC
 
+import pytest
+
 from fx_intel import decision_log, promotion
 from fx_intel.evaluation_labels import (
     DEFAULT_COMMISSION_MODEL_ID,
@@ -26,8 +28,15 @@ DIMENSIONS = {"session_bucket": "london", "regime": "risk_off"}
 
 
 def _canonical_net_fields(index: int, *, gross_r: float, net_r: float) -> dict[str, object]:
+    prediction_time = NOW + timedelta(hours=5 * index)
     return {
         "decision_id": f"canonical-{index}",
+        "symbol": "USDJPY",
+        "direction": "long",
+        "timeframe": "1h",
+        "horizon_hours": 1.0,
+        "prediction_time": prediction_time.isoformat(),
+        "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
         "net_label_eligible": True,
         "label_version": NET_LABEL_VERSION,
         "label_provenance": NET_LABEL_PROVENANCE,
@@ -51,6 +60,7 @@ def _canonical_net_fields(index: int, *, gross_r: float, net_r: float) -> dict[s
         "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
         "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
         "cost_quality_flags": [],
+        "path_quality": 1.0,
     }
 
 
@@ -212,6 +222,41 @@ def test_shadow_summary_and_promotion_use_separate_producer_stream() -> None:
     assert perf.net_expectancy_r is not None and perf.net_expectancy_r > 0
 
 
+def test_shadow_promotion_deduplicates_simultaneous_same_usd_factor() -> None:
+    outcomes = []
+    symbols_and_directions = (
+        ("EURUSD", "long"),
+        ("GBPUSD", "long"),
+        ("USDJPY", "short"),
+    )
+    for batch in range(50):
+        prediction_time = NOW + timedelta(hours=5 * batch)
+        for offset, (symbol, direction) in enumerate(symbols_and_directions):
+            index = batch * len(symbols_and_directions) + offset
+            row = {
+                "ts": prediction_time.isoformat(),
+                "producer": "ml_direction",
+                "direction_outcome": "hit",
+                **_canonical_net_fields(index, gross_r=0.3, net_r=0.2),
+            }
+            row.update(
+                {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "prediction_time": prediction_time.isoformat(),
+                    "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
+                }
+            )
+            outcomes.append(row)
+
+    perf = promotion.evaluate_shadow_member("ml", outcomes)
+
+    assert perf.net_r_raw_samples == 150
+    assert perf.net_r_samples == 50
+    assert perf.evaluated == 50
+    assert perf.net_r_overlap_ratio == pytest.approx(2 / 3)
+
+
 def test_final_outcomes_aggregate_net_r_by_regime() -> None:
     outcomes = [
         {
@@ -231,7 +276,30 @@ def test_final_outcomes_aggregate_net_r_by_regime() -> None:
     summary = summarize_outcome_dimensions(outcomes)
     cell = summary["regime"]["risk_off"]["long"]
     assert cell["net_labels"] == 2
+    assert cell["effective_net_labels"] == 2
     assert cell["net_expectancy_r"] == 0.0
+
+
+def test_dimension_net_expectancy_uses_non_overlapping_effective_subset() -> None:
+    outcomes = []
+    for index, net_r in enumerate((0.4, -4.0)):
+        prediction_time = NOW + timedelta(minutes=5 * index)
+        row = {
+            "ts": prediction_time.isoformat(),
+            "realized_r": net_r,
+            **_canonical_net_fields(index, gross_r=net_r, net_r=net_r),
+            "learning_dimensions": DIMENSIONS,
+        }
+        row["prediction_time"] = prediction_time.isoformat()
+        row["holding_end_time"] = (prediction_time + timedelta(hours=1)).isoformat()
+        outcomes.append(row)
+
+    cell = summarize_outcome_dimensions(outcomes)["regime"]["risk_off"]["long"]
+
+    assert cell["net_labels"] == 2
+    assert cell["effective_net_labels"] == 1
+    assert cell["net_overlap_ratio"] == 0.5
+    assert cell["net_expectancy_r"] == 0.4
 
 
 def test_shadow_promotion_does_not_mix_producer_versions_and_resets_stage() -> None:

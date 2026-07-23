@@ -1618,9 +1618,13 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     labeled = [row for row in scored if canonical(row)]
-    values = [float(row["realized_net_r"]) for row in labeled]
     gross_values = [value for row in scored if (value := gross_value(row)) is not None]
     effective = summarize_effective_samples(labeled)
+    selected_keys = set(effective.selected_keys)
+    effective_labeled = [
+        row for row in labeled if f"{row['decision_id']}+{row['label_version']}" in selected_keys
+    ]
+    values = [float(row["realized_net_r"]) for row in effective_labeled]
 
     def profit_factor(samples: list[float]) -> float | None:
         gains = sum(value for value in samples if value > 0)
@@ -1631,11 +1635,14 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
     cumulative = 0.0
     curve: list[dict[str, Any]] = []
-    for row, value in sorted(zip(labeled, values), key=lambda item: str(item[0].get("ts", ""))):
+    for row, value in sorted(
+        zip(effective_labeled, values),
+        key=lambda item: str(item[0].get("prediction_time", "")),
+    ):
         cumulative += value
         curve.append(
             {
-                "ts": row.get("ts"),
+                "ts": row.get("prediction_time"),
                 "decision_id": row.get("decision_id"),
                 "realized_net_r": round(value, 4),
                 "cumulative_net_r": round(cumulative, 4),

@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, UTC
 import math
+from typing import TypeVar
 from zoneinfo import ZoneInfo
 
 from .evaluation_labels import KNOWN_NET_LABEL_VERSIONS
@@ -14,6 +15,7 @@ DEFAULT_MINIMUM_GAP = timedelta(minutes=5)
 DEFAULT_MIN_EFFECTIVE_SAMPLES = 20
 FX_SESSION_TIMEZONE = ZoneInfo("America/New_York")
 FX_SESSION_ROLLOVER = time(17, 0)
+T = TypeVar("T")
 
 
 class EffectiveSampleConflict(ValueError):
@@ -166,6 +168,28 @@ def summarize_effective_samples(
         invalid_reasons=dict(sorted(invalid_reasons.items())),
         selected_keys=tuple(row.key_text for row in selected),
     )
+
+
+def select_effective_samples(
+    records: Sequence[T],
+    *,
+    min_samples: int = DEFAULT_MIN_EFFECTIVE_SAMPLES,
+    minimum_gap: timedelta = DEFAULT_MINIMUM_GAP,
+) -> tuple[list[T], EffectiveSampleSummary]:
+    """Return the deterministic effective subset and its full audit summary."""
+
+    summary = summarize_effective_samples(
+        records,
+        min_samples=min_samples,
+        minimum_gap=minimum_gap,
+    )
+    selected_keys = set(summary.selected_keys)
+    first_by_key: dict[str, T] = {}
+    for record in records:
+        key = f"{_get(record, 'decision_id')}+{_get(record, 'label_version')}"
+        if key in selected_keys and key not in first_by_key:
+            first_by_key[key] = record
+    return [first_by_key[key] for key in summary.selected_keys], summary
 
 
 def _observation(record: object) -> tuple[_Observation | None, str | None]:

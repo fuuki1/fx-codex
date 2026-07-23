@@ -8,6 +8,7 @@ import pytest
 
 from fx_intel.effective_samples import (
     EffectiveSampleConflict,
+    select_effective_samples,
     summarize_effective_samples,
 )
 from fx_intel.evaluation_labels import NET_LABEL_VERSION
@@ -128,3 +129,14 @@ def test_identical_replay_is_deduplicated_but_conflict_is_hard_error() -> None:
     conflicting["holding_end_time"] = (START + timedelta(hours=2)).isoformat()
     with pytest.raises(EffectiveSampleConflict, match=f"d-1.*{NET_LABEL_VERSION}"):
         summarize_effective_samples([row, conflicting], min_samples=1)
+
+
+def test_selector_returns_the_same_deterministic_subset_as_summary_keys() -> None:
+    rows = [_row(index, START + timedelta(minutes=5 * index)) for index in range(12)]
+
+    selected, summary = select_effective_samples(list(reversed(rows)), min_samples=2)
+
+    assert len(selected) == summary.effective_samples == 1
+    assert [f"{row['decision_id']}+{row['label_version']}" for row in selected] == list(
+        summary.selected_keys
+    )

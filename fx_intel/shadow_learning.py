@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, UTC
 
+from .effective_samples import summarize_effective_samples
 from .evaluation_labels import canonical_net_label_contract_flags
 
 SHADOW_SCHEMA_VERSION = 1
@@ -186,20 +187,17 @@ def summarize_shadow_outcomes(
             for row in all_producer_predictions
             if str(row.get("producer_version", "unknown") or "unknown") == active_version
         ]
-        thinned = _thin(producer_outcomes)
         by_producer[producer] = {
-            **_stats(thinned, predictions=producer_predictions),
+            **_stats(producer_outcomes, predictions=producer_predictions),
             "active_version": active_version,
             "producer_versions": versions,
             "by_version": {
                 version: _stats(
-                    _thin(
-                        [
-                            row
-                            for row in all_producer_outcomes
-                            if str(row.get("producer_version", "unknown") or "unknown") == version
-                        ]
-                    ),
+                    [
+                        row
+                        for row in all_producer_outcomes
+                        if str(row.get("producer_version", "unknown") or "unknown") == version
+                    ],
                     predictions=[
                         row
                         for row in all_producer_predictions
@@ -208,9 +206,9 @@ def summarize_shadow_outcomes(
                 )
                 for version in versions
             },
-            "by_timeframe": _group_field_stats(thinned, "timeframe"),
-            "by_session": _group_stats(thinned, "session_bucket"),
-            "by_regime": _group_stats(thinned, "regime"),
+            "by_timeframe": _group_field_stats(producer_outcomes, "timeframe"),
+            "by_session": _group_stats(producer_outcomes, "session_bucket"),
+            "by_regime": _group_stats(producer_outcomes, "regime"),
         }
     return {
         "schema": 1,
@@ -264,7 +262,7 @@ def summarize_outcome_dimensions(
             grouped.setdefault((bucket, direction), []).append(row)
         dimension_result: dict[str, object] = {}
         for (bucket, direction), rows in sorted(grouped.items()):
-            dimension_result.setdefault(bucket, {})[direction] = _stats(_thin(rows))  # type: ignore[index]
+            dimension_result.setdefault(bucket, {})[direction] = _stats(rows)  # type: ignore[index]
         result[dimension] = dimension_result
     return result
 
@@ -294,17 +292,30 @@ def _stats(
     *,
     predictions: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
-    directional = [row for row in rows if row.get("direction_outcome") in ("hit", "miss")]
+    directional_rows = _thin(rows)
+    directional = [
+        row for row in directional_rows if row.get("direction_outcome") in ("hit", "miss")
+    ]
     if directional:
         hits = sum(1 for row in directional if row.get("direction_outcome") == "hit")
     else:
-        directional = [row for row in rows if _number(row.get("realized_r")) is not None]
+        directional = [
+            row for row in directional_rows if _number(row.get("realized_r")) is not None
+        ]
         hits = sum(1 for row in directional if (_number(row.get("realized_r")) or 0.0) > 0)
+    valid_net_rows = [
+        row
+        for row in rows
+        if _number(row.get("realized_net_r")) is not None
+        and not canonical_net_label_contract_flags(row)
+    ]
+    effective_net = summarize_effective_samples(valid_net_rows, min_samples=1)
+    selected_keys = set(effective_net.selected_keys)
     net_values = [
         value
-        for row in rows
-        if (value := _number(row.get("realized_net_r"))) is not None
-        and not canonical_net_label_contract_flags(row)
+        for row in valid_net_rows
+        if f"{row['decision_id']}+{row['label_version']}" in selected_keys
+        and (value := _number(row.get("realized_net_r"))) is not None
     ]
     abstained = sum(1 for row in predictions if bool(row.get("abstained", False)))
     return {
@@ -312,8 +323,10 @@ def _stats(
         "effective": len(directional),
         "hits": hits,
         "hit_rate": round(hits / len(directional), 4) if directional else None,
-        "net_labels": len(net_values),
-        "net_label_coverage": round(len(net_values) / len(rows), 4) if rows else 0.0,
+        "net_labels": len(valid_net_rows),
+        "effective_net_labels": effective_net.effective_samples,
+        "net_overlap_ratio": effective_net.overlap_ratio,
+        "net_label_coverage": round(len(valid_net_rows) / len(rows), 4) if rows else 0.0,
         "net_expectancy_r": round(sum(net_values) / len(net_values), 4) if net_values else None,
         "cumulative_net_r": round(sum(net_values), 4) if net_values else None,
         "predictions": len(predictions),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 
 from fx_intel import decision_feedback
 from fx_intel.evaluation_labels import (
@@ -45,11 +45,15 @@ def _outcome(
             }
         )
     realized_net_r = realized_r - 0.2 if realized_r is not None else None
+    prediction_time = NOW + timedelta(hours=2 * index)
     return {
         "symbol": symbol,
         "timeframe": timeframe,
         "mode": "per_timeframe" if timeframe != "fusion" else "fusion",
         "direction": direction,
+        "prediction_time": prediction_time.isoformat(),
+        "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
+        "horizon_hours": 1.0,
         "realized_r": realized_r,
         "gross_realized_r": realized_r,
         "quote_realized_r": realized_net_r,
@@ -108,6 +112,30 @@ def test_decision_feedback_blocks_repeated_negative_sl_cell() -> None:
     assert factor == decision_feedback.BLOCK_FACTOR
     assert block is True
     assert "見送り優先" in reason
+
+
+def test_overlapping_negative_rows_do_not_trigger_feedback_block() -> None:
+    rows = [_outcome(-1.0, index=index) for index in range(20)]
+    for index, row in enumerate(rows):
+        prediction_time = NOW + timedelta(minutes=5 * index)
+        row["prediction_time"] = prediction_time.isoformat()
+        row["holding_end_time"] = (prediction_time + timedelta(hours=1)).isoformat()
+
+    profile = decision_feedback.derive_decision_feedback({"outcomes": rows}, now=NOW)
+    cell = profile.cell_for("USDJPY", "1h", "long")
+
+    assert cell is not None
+    assert cell.net_label_samples == 20
+    assert cell.effective_samples == 2
+    assert cell.sample_ok is False
+    assert cell.block is False
+    assert cell.action == "quality_guard"
+
+    adjuster = profile.expectancy_lookup("USDJPY", "1h")
+    assert adjuster is not None
+    factor, _reason, block = adjuster("USDJPY", "long", 80)
+    assert factor == 1.0
+    assert block is False
 
 
 def test_decision_feedback_dampens_tp_too_far_without_blocking() -> None:

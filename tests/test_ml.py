@@ -70,6 +70,12 @@ def _make_calls(
             net_label_metadata = (
                 {
                     "decision_id": f"decision-{symbol}-{i}",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "timeframe": "1h",
+                    "horizon_hours": 1.0,
+                    "prediction_time": ts.isoformat(),
+                    "holding_end_time": (ts + timedelta(hours=1)).isoformat(),
                     "net_label_eligible": True,
                     "label_version": NET_LABEL_VERSION,
                     "label_provenance": NET_LABEL_PROVENANCE,
@@ -92,6 +98,7 @@ def _make_calls(
                     "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
                     "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
                     "cost_quality_flags": [],
+                    "path_quality": 1.0,
                 }
                 if realized_net_r is not None
                 else {}
@@ -296,8 +303,21 @@ def test_build_dataset_returns_aligned_return_labels() -> None:
     calls = _make_calls(20, gap_hours=8.0, seed=2, net_r_mean=0.3)
     rows, labels, stamps, r_labels = build_dataset(calls)
     assert len(rows) == len(labels) == len(stamps) == len(r_labels)
-    # net_r_mean 指定時は全行に収益ラベルが付く
-    assert all(r is not None for r in r_labels)
+    # 同時刻・同一USD因子の行はeffective subsetだけが収益ラベルに残る。
+    selected = sum(r is not None for r in r_labels)
+    assert 0 < selected < len(r_labels)
+
+
+def test_build_dataset_does_not_count_overlapping_net_labels_as_independent() -> None:
+    calls = [
+        call
+        for call in _make_calls(12, gap_hours=5 / 60, seed=2, net_r_mean=0.3)
+        if call.symbol == "USDJPY"
+    ]
+
+    _rows, _labels, _stamps, r_labels = build_dataset(calls)
+
+    assert sum(value is not None for value in r_labels) == 1
 
 
 def test_build_dataset_return_labels_none_without_cost() -> None:
@@ -314,6 +334,8 @@ def test_return_heads_train_and_quantiles_are_ordered() -> None:
     assert art.return_model is not None
     assert set(art.quantile_models) == {"p10", "p50", "p90"}
     assert art.n_return_train > 0 and art.n_return_test > 0
+    assert 0 < art.return_effective_samples <= art.return_raw_samples
+    assert art.return_overlap_ratio is not None
     assert art.return_val_rmse is not None
     chart = {"rsi_1h": 65.0, "adx_1h": 25.0, "atr_pct": 0.15, "tf_agreement": 0.8, "news_count": 3}
     interval = art.net_r_interval("long", 0.5, 0.2, chart, 0.9)
@@ -346,6 +368,11 @@ def test_return_heads_survive_save_load_roundtrip(tmp_path) -> None:
     save_artifact(art, path)
     loaded = load_artifact(path)
     assert loaded.return_usable == art.return_usable
+    assert loaded.return_raw_samples == art.return_raw_samples
+    assert loaded.return_effective_samples == art.return_effective_samples
+    assert loaded.return_overlap_ratio == art.return_overlap_ratio
+    assert loaded.return_cluster_count == art.return_cluster_count
+    assert loaded.return_market_days == art.return_market_days
     assert set(loaded.quantile_models) == set(art.quantile_models)
     chart = {"rsi_1h": 65.0, "adx_1h": 25.0, "atr_pct": 0.15, "tf_agreement": 0.8, "news_count": 3}
     assert loaded.expected_net_r("long", 0.5, 0.2, chart, 0.9) == art.expected_net_r(
@@ -383,7 +410,7 @@ def test_return_head_skips_overfitting_gate_with_few_observations() -> None:
     """OOS共有時刻が32件未満だと過学習検定はskip(PBO/DSRは未計算=None)。
 
     採点済みが最低件数(MIN_RETURN_TRAIN/TEST)は満たすが、共有時刻が
-    PBO_MIN_OBSERVATIONS 未満のケース。ゲートはt検定のみで判定する。
+    PBO_MIN_OBSERVATIONS 未満のケース。検定不能なので収益ヘッドはfail closedする。
     """
     # 同一時刻に多数ペアを詰めて test区間のユニーク時刻を32未満に抑える
     from fx_intel.ml import PBO_MIN_OBSERVATIONS
@@ -394,6 +421,7 @@ def test_return_head_skips_overfitting_gate_with_few_observations() -> None:
         # 学習は走るが、共有時刻が閾値未満なら過学習検定はskip
         if art.return_n_trials > 0 and art.return_pbo is None:
             assert any("過学習検定skip" in r for r in art.return_reasons)
+            assert not art.return_usable
     # いずれにせよ PBO_MIN_OBSERVATIONS は正の定数
     assert PBO_MIN_OBSERVATIONS > 0
 

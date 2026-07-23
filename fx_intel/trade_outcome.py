@@ -765,6 +765,7 @@ class TradeOutcome:
     horizon_hours: float
     conviction: int
     data_quality: float | None
+    mode: str = "fusion"
     timeframe: str = "fusion"
     # 判断ログ行の識別子(shadow予測の満期照合キー)。無い行は None。
     decision_id: str | None = None
@@ -826,10 +827,19 @@ class TradeOutcome:
     def tradable(self) -> bool:
         return self.realized_r is not None and self.path_quality >= MIN_PATH_QUALITY
 
+    @property
+    def prediction_time(self) -> str:
+        return self.ts
+
+    @property
+    def holding_end_time(self) -> str | None:
+        return self.path_end
+
     def to_dict(self) -> dict:
         return {
             "symbol": self.symbol,
             "direction": self.direction,
+            "mode": self.mode,
             "timeframe": self.timeframe,
             "ts": self.ts,
             "prediction_time": self.ts,

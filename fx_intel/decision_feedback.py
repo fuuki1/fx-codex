@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from .effective_samples import select_effective_samples
 from .evaluation_labels import canonical_net_label_contract_flags
 from .market import open_hours_between
 from .trade_outcome import json_safe
@@ -112,7 +113,12 @@ class DecisionFeedbackCell:
     low_quality: int = 0
     gross_samples: int = 0
     net_label_samples: int = 0
+    effective_samples: int = 0
     net_label_coverage: float | None = None
+    overlap_ratio: float | None = None
+    cluster_count: int = 0
+    market_days: int = 0
+    sample_ok: bool = False
     hit_rate: float | None = None
     gross_expectancy_r: float | None = None
     net_expectancy_r: float | None = None
@@ -141,7 +147,12 @@ class DecisionFeedbackCell:
             "low_quality": self.low_quality,
             "gross_samples": self.gross_samples,
             "net_label_samples": self.net_label_samples,
+            "effective_samples": self.effective_samples,
             "net_label_coverage": self.net_label_coverage,
+            "overlap_ratio": self.overlap_ratio,
+            "cluster_count": self.cluster_count,
+            "market_days": self.market_days,
+            "sample_ok": self.sample_ok,
             "hit_rate": self.hit_rate,
             "gross_expectancy_r": self.gross_expectancy_r,
             "net_expectancy_r": self.net_expectancy_r,
@@ -537,7 +548,11 @@ def _derive_cell(
         for row in rows
         if bool(row.get("tradable")) and _float(row.get("realized_r")) is not None
     ]
-    tradable_rows = [row for row in gross_rows if not canonical_net_label_contract_flags(row)]
+    valid_net_rows = [row for row in gross_rows if not canonical_net_label_contract_flags(row)]
+    tradable_rows, effective = select_effective_samples(
+        valid_net_rows,
+        min_samples=MIN_FEEDBACK_SAMPLES,
+    )
     r_values = [
         value
         for value in (_float(row.get("realized_net_r")) for row in tradable_rows)
@@ -564,8 +579,10 @@ def _derive_cell(
     ]
     sl_count = sum(1 for row in tradable_rows if row.get("first_touch") == "sl")
     tp_count = sum(1 for row in tradable_rows if row.get("first_touch") in {"tp1", "tp2"})
-    reason_stats = _reason_stats(rows)
-    high_severity_hits = sum(1 for row in rows if _row_has_any_reason(row, HIGH_SEVERITY_REASONS))
+    reason_stats = _reason_stats(tradable_rows)
+    high_severity_hits = sum(
+        1 for row in tradable_rows if _row_has_any_reason(row, HIGH_SEVERITY_REASONS)
+    )
     tradable = len(tradable_rows)
     hit_rate = wins / tradable if tradable else None
     expectancy = _mean(r_values)
@@ -573,7 +590,7 @@ def _derive_cell(
     avg_mae = _mean(mae_values)
     sl_rate = sl_count / tradable if tradable else None
     tp_rate = tp_count / tradable if tradable else None
-    high_severity_rate = high_severity_hits / evaluated if evaluated else 0.0
+    high_severity_rate = high_severity_hits / tradable if tradable else 0.0
     action, factor, block, reason = _policy(
         symbol=symbol,
         timeframe=timeframe,
@@ -600,8 +617,13 @@ def _derive_cell(
         unscored=unscored,
         low_quality=low_quality,
         gross_samples=len(gross_rows),
-        net_label_samples=tradable,
-        net_label_coverage=(tradable / len(gross_rows) if gross_rows else None),
+        net_label_samples=len(valid_net_rows),
+        effective_samples=effective.effective_samples,
+        net_label_coverage=(len(valid_net_rows) / len(gross_rows) if gross_rows else None),
+        overlap_ratio=effective.overlap_ratio,
+        cluster_count=effective.cluster_count,
+        market_days=effective.market_days,
+        sample_ok=effective.sample_ok,
         hit_rate=_round(hit_rate),
         gross_expectancy_r=_round(_mean(gross_values)),
         net_expectancy_r=_round(expectancy),
@@ -929,11 +951,12 @@ def _performance_summary(report: Mapping[str, object]) -> dict[str, object]:
     mfe_values = [_float(row.get("mfe_r")) for row in tradable]
     mae_values = [_float(row.get("mae_r")) for row in tradable]
     r_numbers = [value for value in r_values if value is not None]
+    valid_net_rows = [row for row in tradable if not canonical_net_label_contract_flags(row)]
+    effective_net_rows, effective = select_effective_samples(valid_net_rows, min_samples=1)
     net_numbers = [
         value
-        for row in tradable
-        if not canonical_net_label_contract_flags(row)
-        and (value := _float(row.get("realized_net_r"))) is not None
+        for row in effective_net_rows
+        if (value := _float(row.get("realized_net_r"))) is not None
     ]
     mfe_numbers = [value for value in mfe_values if value is not None]
     mae_numbers = [value for value in mae_values if value is not None]
@@ -944,8 +967,12 @@ def _performance_summary(report: Mapping[str, object]) -> dict[str, object]:
         "gross_expected_R": _round(_mean(r_numbers)),
         "net_R": _round(sum(net_numbers)) if net_numbers else None,
         "net_expected_R": _round(_mean(net_numbers)),
-        "net_label_samples": len(net_numbers),
-        "net_label_coverage": len(net_numbers) / len(r_numbers) if r_numbers else None,
+        "net_label_samples": len(valid_net_rows),
+        "effective_samples": effective.effective_samples,
+        "overlap_ratio": effective.overlap_ratio,
+        "cluster_count": effective.cluster_count,
+        "market_days": effective.market_days,
+        "net_label_coverage": len(valid_net_rows) / len(r_numbers) if r_numbers else None,
         "avg_mfe_R": _round(_mean(mfe_numbers)),
         "avg_mae_R": _round(_mean(mae_numbers)),
     }
@@ -953,14 +980,17 @@ def _performance_summary(report: Mapping[str, object]) -> dict[str, object]:
 
 def _model_expectancy_delta(report: Mapping[str, object]) -> dict[str, object]:
     buckets: dict[str, list[float]] = {"baseline_model": [], "learning_model": []}
-    for row in _iter_outcomes(report):
+    eligible = [
+        row
+        for row in _iter_outcomes(report)
+        if bool(row.get("tradable"))
+        and _float(row.get("realized_net_r")) is not None
+        and not canonical_net_label_contract_flags(row)
+    ]
+    effective_rows, _effective = select_effective_samples(eligible, min_samples=1)
+    for row in effective_rows:
         realized = _float(row.get("realized_net_r"))
-        if (
-            realized is None
-            or not bool(row.get("tradable"))
-            or canonical_net_label_contract_flags(row)
-        ):
-            continue
+        assert realized is not None
         bucket = (
             "learning_model"
             if _has_learning_context(row.get("learning_context"))
