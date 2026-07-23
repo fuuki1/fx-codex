@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
-from .market import open_hours_between, WEEKEND_CLOSURE
+from .market import WEEKEND_CLOSURE, WeekendOpenHours
 from .ml import THIN_MIN_GAP_HOURS
 
 STAGES = ("shadow",)
@@ -316,13 +316,14 @@ def _future_close(
     """ts から市場オープン時間換算で horizon±tolerance に最も近い将来終値。"""
     window_lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
     window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
+    open_hours = WeekendOpenHours(ts, window_upper)
     best: tuple[float, float] | None = None
     for point_ts, point_close in series:
         if point_ts < window_lower:
             continue
         if point_ts > window_upper:
             break
-        age = open_hours_between(ts, point_ts)
+        age = open_hours.age(point_ts)
         if not (horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours):
             continue
         gap = abs(age - horizon_hours)

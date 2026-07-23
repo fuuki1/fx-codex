@@ -24,7 +24,7 @@ from .journal import (
     DEFAULT_TOLERANCE_HOURS,
     counterfactual_guard_entries,
 )
-from .market import WEEKEND_CLOSURE, open_hours_between
+from .market import WEEKEND_CLOSURE, WeekendOpenHours, open_hours_between
 
 MIN_PATH_POINTS = 3
 MIN_PATH_COVERAGE = 0.50
@@ -2239,6 +2239,7 @@ def _future_path(
     tolerance_hours: float,
 ) -> list[PricePathPoint]:
     upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
+    open_hours = WeekendOpenHours(ts, upper)
     future: list[PricePathPoint] = []
     for index in range(bisect_left(times, ts), len(series)):
         point = series[index]
@@ -2246,7 +2247,7 @@ def _future_path(
             continue
         if point.ts > upper:
             break
-        age = open_hours_between(ts, point.ts)
+        age = open_hours.age(point.ts)
         if 0.0 < age <= horizon_hours + tolerance_hours:
             future.append(point)
     return future

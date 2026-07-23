@@ -73,7 +73,7 @@ from .journal import (
     counterfactual_guard_entries,
     is_pit_eligible_entry,
 )
-from .market import WEEKEND_CLOSURE, open_hours_between
+from .market import WEEKEND_CLOSURE, WeekendOpenHours
 from .market_session import dimensions_from_mapping
 
 # 学習サンプルの間引き幅。5分周期の高相関な判断を1時間単位へ間引き、
@@ -517,12 +517,13 @@ def evaluate_history(
         # [ホライズン下限, ホライズン上限+週末クローズ1回分] の範囲に限られる
         window_lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
         window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
+        open_hours = WeekendOpenHours(ts, window_upper)
         best: tuple[float, float] | None = None  # (|経過-ホライズン|, 将来終値)
         for index in range(bisect_left(times, window_lower), len(series)):
             point_ts, point_close = series[index]
             if point_ts > window_upper:
                 break
-            age = open_hours_between(ts, point_ts)
+            age = open_hours.age(point_ts)
             if not (horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours):
                 continue
             gap = abs(age - horizon_hours)

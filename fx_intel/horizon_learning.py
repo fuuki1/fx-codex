@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .horizon_journal import HORIZON_PIT_CONTRACT, is_pit_eligible_horizon_entry
 from .horizons import HORIZON_BY_LABEL, HORIZON_SPECS, PRIOR_WEIGHTS, HorizonSpec
-from .market import WEEKEND_CLOSURE, open_hours_between
+from .market import WEEKEND_CLOSURE, WeekendOpenHours, open_hours_between
 
 SCHEMA_VERSION = 1
 MODEL_DATA_CONTRACT = HORIZON_PIT_CONTRACT
@@ -143,10 +143,11 @@ def _future_point_and_path(
     upper = ts + timedelta(hours=spec.hours + spec.tolerance_hours) + WEEKEND_CLOSURE
     best: tuple[float, PricePoint] | None = None
     start_index = bisect_left(stamps, ts)
+    open_hours = WeekendOpenHours(ts, upper)
     for point in points[bisect_left(stamps, lower) :]:
         if point.ts > upper:
             break
-        age = open_hours_between(ts, point.ts)
+        age = open_hours.age(point.ts)
         if spec.hours - spec.tolerance_hours <= age <= spec.hours + spec.tolerance_hours:
             gap = abs(age - spec.hours)
             if best is None or gap < best[0]:
