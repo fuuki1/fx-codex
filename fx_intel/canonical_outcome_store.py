@@ -320,7 +320,6 @@ def _eligible_accounting_complete(outcome: CanonicalTradeOutcome) -> bool:
     required_values = (
         outcome.gross_realized_r,
         outcome.quote_realized_r,
-        outcome.planned_payoff_r,
         outcome.slippage_r,
         outcome.commission_r,
         outcome.financing_r,
@@ -335,6 +334,12 @@ def _eligible_accounting_complete(outcome: CanonicalTradeOutcome) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(float(value))
         for value in required_values
+    ):
+        return False
+    if outcome.planned_payoff_r is not None and (
+        isinstance(outcome.planned_payoff_r, bool)
+        or not isinstance(outcome.planned_payoff_r, (int, float))
+        or not math.isfinite(float(outcome.planned_payoff_r))
     ):
         return False
     assert outcome.slippage_r is not None

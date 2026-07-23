@@ -322,7 +322,13 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   gross/quote/net/cost恒等式をstore境界でも再検証し、store欠損はunavailableとする。
   verified exportには並べ替え済みoutcomeのcanonical SHA-256を記録し、
   store監査値との一致を検証する。
+- provider-neutral offline pipelineは保存済みdecision eventと
+  `completed_bid_ask_bar`だけを読み、row hash、aware bar時刻、連続した保有経路、
+  full horizon、source record一意性を確認して同じcanonical scorer/storeへ接続する。
+  forming足、hash欠損、内部gap、満期前など再取得可能なpath不備はpendingとして
+  final storeへ入れず、満期後の決定論的再実行を妨げない。
+  CLIは明示されたローカルJSONLだけを読み、broker接続や注文面を持たない。
 
-この状態はD1完了ではない。保存済み判断から正準scorerを自動実行する接続と、
-MLのdecision ID joinが完了するまで、
+この状態はD1の会計・永続化実装済み、runtime配備前である。MLのdecision ID joinと
+consumer移行が完了するまで、
 正準net label coverageは不足または0としてfail-closedに扱う。

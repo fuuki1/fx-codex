@@ -141,6 +141,7 @@ class CanonicalTradeRequest:
     path: tuple[ExecutableQuoteBar, ...]
     cost_model: CostModelResult | None
     max_entry_quote_age_seconds: float = 300.0
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -363,7 +364,7 @@ def _canonical_profit_factor(values: Sequence[float]) -> float | None:
 
 
 def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
-    flags: list[str] = []
+    flags: list[str] = list(request.quality_flags)
     if not request.decision_id.strip():
         flags.append("missing_decision_id")
     if request.label_version not in KNOWN_NET_LABEL_VERSIONS:
