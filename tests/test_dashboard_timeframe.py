@@ -887,9 +887,13 @@ def test_ml_summary_rejects_pre_pit_artifact(server) -> None:
 
 
 def test_recent_outcomes_grouped_per_timeframe_with_cap(server) -> None:
-    """時間足タブ用: 時間足ごとに直近12件ずつ返し、全体20件制限に潰されない。"""
+    """時間足タブ用: 時間足ごとにまとめ、全体20件制限に潰されない。
+
+    日付タブ(今日/昨日/…)で過去に遡れるよう保持件数の上限は 300 に引き上げた。
+    上限より少ない件数はそのまま全件返り、時系列順(最後が最新)であること。
+    """
     entries = []
-    # 15mの判断を15件(12件制限を超えさせる)+ 1hの判断を2件
+    # 15mの判断を15件 + 1hの判断を2件
     for index in range(15):
         base = START + timedelta(minutes=20 * index)
         entries.append(_row(base, "15m", 0.25, "long", 150.0 + index, atr=0.05))
@@ -901,11 +905,25 @@ def test_recent_outcomes_grouped_per_timeframe_with_cap(server) -> None:
     result = server._evaluate_journal(entries)
     grouped = result["recent_outcomes_by_timeframe"]
     assert set(grouped) == {"15m", "1h"}
-    assert len(grouped["15m"]) == 12  # 直近12件に丸める
+    # 上限300未満なので、採点された15m行は丸められず全件残る(12件に潰されない)
+    assert len(grouped["15m"]) > 12
     assert all(row["timeframe"] == "15m" for row in grouped["15m"])
     # 旧UI互換のフラットな直近20件も残す
     assert len(result["recent_outcomes"]) <= 20
     # グループ内は時系列順(最後が最新)
+    assert grouped["15m"][-1]["ts"] > grouped["15m"][0]["ts"]
+
+
+def test_recent_outcomes_respects_300_cap(server) -> None:
+    """保持上限(300)を超える件数は直近300件に丸める。"""
+    entries = []
+    for index in range(305):
+        base = START + timedelta(minutes=20 * index)
+        entries.append(_row(base, "15m", 0.25, "long", 150.0, atr=0.05))
+        entries.append(_row(base + timedelta(minutes=15), "15m", 0.25, "long", 150.5, atr=0.05))
+    result = server._evaluate_journal(entries)
+    grouped = result["recent_outcomes_by_timeframe"]
+    assert len(grouped["15m"]) == 300
     assert grouped["15m"][-1]["ts"] > grouped["15m"][0]["ts"]
 
 
