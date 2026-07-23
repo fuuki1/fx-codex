@@ -298,7 +298,12 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
 - legacy学習曲線は `cum_move_atr` / `move_atr_points` として表示し、純Rと呼ばない。
 - ダッシュボードの正準net集計は `decision_id`、`label_version`、
   `label_provenance`、`cost_model_id`、`net_label_eligible=true` がそろう保存済み行だけを読む。
+- `trade_outcome.score_canonical_outcome()` はprovider-neutralな完了bid/ask足から、
+  longのask entry/bid exit、shortのbid entry/ask exit、gap、同一足SL優先、
+  terminal exitを同じ `planned_risk_distance` で決定論的に採点する。
+- 同一 `decision_id + label_version` の同値再採点は許可し、異なる結果は
+  `CanonicalOutcomeConflict` としてhard errorにする。
 
-この状態はD1完了ではない。executable bid/ask pathを使う正準scorer、outcome keyの
-一意性、label metadataの永続化、MLのdecision ID joinが完了するまで、
+この状態はD1完了ではない。判断producerから正準scorerへの入力配線、outcome keyの
+永続層一意性、label metadataの保存、MLのdecision ID joinが完了するまで、
 正準net label coverageは不足または0としてfail-closedに扱う。

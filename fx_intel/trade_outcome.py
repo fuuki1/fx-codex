@@ -18,6 +18,13 @@ import json
 import math
 from pathlib import Path
 
+from .evaluation_labels import (
+    DEFAULT_COST_STATUS,
+    KNOWN_EXECUTABLE_COST_MODEL_IDS,
+    KNOWN_NET_LABEL_PROVENANCES,
+    KNOWN_NET_LABEL_VERSIONS,
+    CostModelResult,
+)
 from .journal import (
     COUNTERFACTUAL_ENTRY_KEY,
     DEFAULT_HORIZON_HOURS,
@@ -79,6 +86,552 @@ class PricePathPoint:
     @property
     def has_range(self) -> bool:
         return self.high is not None and self.low is not None
+
+
+@dataclass(frozen=True)
+class ExecutableQuoteBar:
+    """One completed provider-neutral executable bid/ask bar."""
+
+    ts: datetime
+    bid_open: float
+    bid_high: float
+    bid_low: float
+    bid_close: float
+    ask_open: float
+    ask_high: float
+    ask_low: float
+    ask_close: float
+    quote_source: str
+    source_record_id: str
+    path_quality: float
+    bar_start: datetime | None = None
+    available_time: datetime | None = None
+    closed: bool = True
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class CanonicalTradeRequest:
+    """All point-in-time inputs required to create a canonical net-R label."""
+
+    decision_id: str
+    label_version: str
+    label_provenance: str
+    symbol: str
+    mode: str
+    timeframe: str
+    horizon_hours: float
+    direction: str
+    prediction_time: datetime
+    entry_mid: float | None
+    entry_bid: float | None
+    entry_ask: float | None
+    quote_observed_at: datetime
+    quote_available_at: datetime
+    quote_source: str
+    source_record_id: str
+    stop: float | None
+    target1: float | None
+    target2: float | None
+    planned_risk_distance: float | None
+    path: tuple[ExecutableQuoteBar, ...]
+    cost_model: CostModelResult | None
+    max_entry_quote_age_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
+class CanonicalTradeOutcome:
+    """Deterministic result keyed by ``decision_id + label_version``."""
+
+    decision_id: str
+    label_version: str
+    label_provenance: str
+    symbol: str
+    mode: str
+    timeframe: str
+    horizon_hours: float
+    direction: str
+    first_touch: str = "unavailable"
+    first_touch_ts: str | None = None
+    entry_executable: float | None = None
+    exit_executable: float | None = None
+    exit_mid: float | None = None
+    gross_realized_r: float | None = None
+    quote_realized_r: float | None = None
+    planned_payoff_r: float | None = None
+    slippage_r: float | None = None
+    commission_r: float | None = None
+    financing_r: float | None = None
+    entry_spread_r: float | None = None
+    additional_cost_r: float | None = None
+    execution_cost_r: float | None = None
+    realized_net_r: float | None = None
+    cost_model_id: str = "missing"
+    cost_model_version: str = ""
+    cost_status: str = "missing"
+    net_label_eligible: bool = False
+    path_quality: float | None = None
+    path_source: str = "executable_bid_ask"
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def outcome_key(self) -> tuple[str, str]:
+        return self.decision_id, self.label_version
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "decision_id": self.decision_id,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "symbol": self.symbol,
+            "mode": self.mode,
+            "timeframe": self.timeframe,
+            "horizon_hours": self.horizon_hours,
+            "direction": self.direction,
+            "first_touch": self.first_touch,
+            "first_touch_ts": self.first_touch_ts,
+            "entry_executable": self.entry_executable,
+            "exit_executable": self.exit_executable,
+            "exit_mid": self.exit_mid,
+            "gross_realized_r": self.gross_realized_r,
+            "quote_realized_r": self.quote_realized_r,
+            "planned_payoff_r": self.planned_payoff_r,
+            "slippage_r": self.slippage_r,
+            "commission_r": self.commission_r,
+            "financing_r": self.financing_r,
+            "entry_spread_r": self.entry_spread_r,
+            "additional_cost_r": self.additional_cost_r,
+            "execution_cost_r": self.execution_cost_r,
+            "realized_net_r": self.realized_net_r,
+            "cost_model_id": self.cost_model_id,
+            "cost_model_version": self.cost_model_version,
+            "cost_status": self.cost_status,
+            "net_label_eligible": self.net_label_eligible,
+            "path_quality": self.path_quality,
+            "path_source": self.path_source,
+            "quality_flags": list(self.quality_flags),
+        }
+
+
+class CanonicalOutcomeConflict(ValueError):
+    """Raised when the same canonical key has different scored values."""
+
+
+def assert_canonical_outcome_idempotent(
+    existing: CanonicalTradeOutcome,
+    candidate: CanonicalTradeOutcome,
+) -> None:
+    """Accept identical replay and hard-fail a conflicting canonical key."""
+
+    if existing.outcome_key != candidate.outcome_key:
+        return
+    if existing != candidate:
+        decision_id, label_version = existing.outcome_key
+        raise CanonicalOutcomeConflict(
+            f"conflicting canonical outcome for {decision_id} + {label_version}"
+        )
+
+
+def score_canonical_outcome(request: CanonicalTradeRequest) -> CanonicalTradeOutcome:
+    """Score executable quotes using one planned-risk denominator.
+
+    Long uses ask entry/bid exit and short uses bid entry/ask exit. Spread is
+    therefore embedded in ``quote_realized_r`` and is never deducted again.
+    Invalid or incomplete inputs return an ineligible outcome rather than a
+    fabricated zero.
+    """
+
+    flags = _canonical_request_flags(request)
+    if flags:
+        return _unavailable_canonical_outcome(request, flags)
+
+    assert request.entry_mid is not None
+    assert request.entry_bid is not None
+    assert request.entry_ask is not None
+    assert request.stop is not None
+    assert request.target1 is not None
+    assert request.target2 is not None
+    assert request.planned_risk_distance is not None
+    assert request.cost_model is not None
+
+    entry_executable = request.entry_ask if request.direction == "long" else request.entry_bid
+    touch, touch_bar, exit_executable, exit_mid, touch_flags = _canonical_exit(request)
+    risk = request.planned_risk_distance
+    quote_realized_r = _signed_move(request.direction, entry_executable, exit_executable) / risk
+    gross_realized_r = _signed_move(request.direction, request.entry_mid, exit_mid) / risk
+    planned_payoff_r = _canonical_planned_payoff(request, touch, entry_executable)
+    additional_cost_r = request.cost_model.total_cost_r
+    entry_spread_r = (request.entry_ask - request.entry_bid) / risk
+    realized_net_r = quote_realized_r - additional_cost_r
+    execution_cost_r = gross_realized_r - realized_net_r
+    path_quality = min(bar.path_quality for bar in request.path)
+    all_flags = tuple(
+        dict.fromkeys(
+            (
+                *request.cost_model.quality_flags,
+                *(flag for bar in request.path for flag in bar.quality_flags),
+                *touch_flags,
+            )
+        )
+    )
+    return CanonicalTradeOutcome(
+        decision_id=request.decision_id,
+        label_version=request.label_version,
+        label_provenance=request.label_provenance,
+        symbol=request.symbol,
+        mode=request.mode,
+        timeframe=request.timeframe,
+        horizon_hours=request.horizon_hours,
+        direction=request.direction,
+        first_touch=touch,
+        first_touch_ts=touch_bar.ts.astimezone(UTC).isoformat(),
+        entry_executable=entry_executable,
+        exit_executable=exit_executable,
+        exit_mid=exit_mid,
+        gross_realized_r=_canonical_round(gross_realized_r),
+        quote_realized_r=_canonical_round(quote_realized_r),
+        planned_payoff_r=_canonical_round(planned_payoff_r),
+        slippage_r=_canonical_round(request.cost_model.slippage_r),
+        commission_r=_canonical_round(request.cost_model.commission_r),
+        financing_r=_canonical_round(request.cost_model.financing_r),
+        entry_spread_r=_canonical_round(entry_spread_r),
+        additional_cost_r=_canonical_round(additional_cost_r),
+        execution_cost_r=_canonical_round(execution_cost_r),
+        realized_net_r=_canonical_round(realized_net_r),
+        cost_model_id=request.cost_model.cost_model_id,
+        cost_model_version=request.cost_model.cost_model_version,
+        cost_status=request.cost_model.cost_status,
+        net_label_eligible=True,
+        path_quality=_canonical_round(path_quality),
+        quality_flags=all_flags,
+    )
+
+
+def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
+    flags: list[str] = []
+    if not request.decision_id.strip():
+        flags.append("missing_decision_id")
+    if request.label_version not in KNOWN_NET_LABEL_VERSIONS:
+        flags.append("unknown_label_version")
+    if request.label_provenance not in KNOWN_NET_LABEL_PROVENANCES:
+        flags.append("unknown_label_provenance")
+    if request.direction not in {"long", "short"}:
+        flags.append("invalid_direction")
+    if not request.symbol.strip() or not request.mode.strip() or not request.timeframe.strip():
+        flags.append("missing_decision_context")
+    if not _aware_datetime(request.prediction_time):
+        flags.append("invalid_prediction_time")
+    if not _aware_datetime(request.quote_observed_at):
+        flags.append("invalid_quote_time")
+    if not _aware_datetime(request.quote_available_at):
+        flags.append("invalid_quote_available_time")
+    elif _aware_datetime(request.prediction_time) and _aware_datetime(request.quote_observed_at):
+        observed = request.quote_observed_at.astimezone(UTC)
+        available = request.quote_available_at.astimezone(UTC)
+        prediction = request.prediction_time.astimezone(UTC)
+        if not observed <= available <= prediction:
+            flags.append("future_entry_quote")
+        elif (prediction - available).total_seconds() > request.max_entry_quote_age_seconds:
+            flags.append("stale_entry_quote")
+    if request.entry_bid is None or request.entry_ask is None:
+        flags.append("missing_entry_quote")
+    elif not _valid_book(request.entry_bid, request.entry_ask):
+        flags.append("invalid_entry_quote")
+    if not _finite_positive(request.entry_mid) or (
+        request.entry_bid is not None
+        and request.entry_ask is not None
+        and request.entry_mid is not None
+        and not request.entry_bid <= request.entry_mid <= request.entry_ask
+    ):
+        flags.append("invalid_entry_mid")
+    if not request.quote_source.strip() or not request.source_record_id.strip():
+        flags.append("missing_entry_provenance")
+    if not _finite_positive(request.planned_risk_distance):
+        flags.append("invalid_planned_risk_distance")
+    if not _canonical_levels_valid(request):
+        flags.append("invalid_risk_levels")
+    if not request.path:
+        flags.append("missing_executable_path")
+    else:
+        flags.extend(_canonical_path_flags(request))
+    cost = request.cost_model
+    if cost is None:
+        flags.append("missing_cost_model")
+    else:
+        if cost.cost_model_id not in KNOWN_EXECUTABLE_COST_MODEL_IDS:
+            flags.append("unknown_cost_model")
+        if (
+            not cost.cost_model_version.strip()
+            or not cost.slippage_model_id.strip()
+            or not cost.commission_model_id.strip()
+            or cost.cost_status != DEFAULT_COST_STATUS
+        ):
+            flags.append("invalid_cost_model")
+        if cost.entry_quote_source != request.quote_source:
+            flags.append("entry_quote_source_mismatch")
+        if cost.spread_source != request.quote_source:
+            flags.append("spread_source_mismatch")
+        if any(
+            not _finite_nonnegative(value)
+            for value in (cost.slippage_r, cost.commission_r, cost.financing_r)
+        ):
+            flags.append("invalid_cost_value")
+    return tuple(dict.fromkeys(flags))
+
+
+def _unavailable_canonical_outcome(
+    request: CanonicalTradeRequest,
+    flags: Sequence[str],
+) -> CanonicalTradeOutcome:
+    cost = request.cost_model
+    return CanonicalTradeOutcome(
+        decision_id=request.decision_id,
+        label_version=request.label_version,
+        label_provenance=request.label_provenance,
+        symbol=request.symbol,
+        mode=request.mode,
+        timeframe=request.timeframe,
+        horizon_hours=request.horizon_hours,
+        direction=request.direction,
+        slippage_r=(cost.slippage_r if cost is not None else None),
+        commission_r=(cost.commission_r if cost is not None else None),
+        financing_r=(cost.financing_r if cost is not None else None),
+        cost_model_id=(cost.cost_model_id if cost is not None else "missing"),
+        cost_model_version=(cost.cost_model_version if cost is not None else ""),
+        cost_status=(cost.cost_status if cost is not None else "missing"),
+        net_label_eligible=False,
+        quality_flags=tuple(dict.fromkeys(flags)),
+    )
+
+
+def _canonical_exit(
+    request: CanonicalTradeRequest,
+) -> tuple[str, ExecutableQuoteBar, float, float, tuple[str, ...]]:
+    assert request.stop is not None
+    assert request.target1 is not None
+    assert request.target2 is not None
+    for bar in request.path:
+        if request.direction == "long":
+            open_price = bar.bid_open
+            high = bar.bid_high
+            low = bar.bid_low
+            stop_gap = open_price <= request.stop
+            target2_gap = open_price >= request.target2
+            target1_gap = open_price >= request.target1
+            stop_hit = low <= request.stop
+            target2_hit = high >= request.target2
+            target1_hit = high >= request.target1
+        else:
+            open_price = bar.ask_open
+            high = bar.ask_high
+            low = bar.ask_low
+            stop_gap = open_price >= request.stop
+            target2_gap = open_price <= request.target2
+            target1_gap = open_price <= request.target1
+            stop_hit = high >= request.stop
+            target2_hit = low <= request.target2
+            target1_hit = low <= request.target1
+        if stop_gap:
+            return (
+                "sl_gap",
+                bar,
+                open_price,
+                (bar.bid_open + bar.ask_open) / 2.0,
+                ("gap_through_stop",),
+            )
+        if target2_gap:
+            return (
+                "tp2",
+                bar,
+                request.target2,
+                _canonical_trigger_mid(request.direction, request.target2, bar),
+                ("favorable_gap_target_capped",),
+            )
+        if target1_gap:
+            return (
+                "tp1",
+                bar,
+                request.target1,
+                _canonical_trigger_mid(request.direction, request.target1, bar),
+                ("favorable_gap_target_capped",),
+            )
+        if stop_hit and (target1_hit or target2_hit):
+            return (
+                "ambiguous_sl_tp",
+                bar,
+                request.stop,
+                _canonical_trigger_mid(request.direction, request.stop, bar),
+                ("same_bar_ambiguous_stop_first", "intrabar_mid_from_open_spread"),
+            )
+        if stop_hit:
+            return (
+                "sl",
+                bar,
+                request.stop,
+                _canonical_trigger_mid(request.direction, request.stop, bar),
+                ("intrabar_mid_from_open_spread",),
+            )
+        if target2_hit:
+            return (
+                "tp2",
+                bar,
+                request.target2,
+                _canonical_trigger_mid(request.direction, request.target2, bar),
+                ("intrabar_mid_from_open_spread",),
+            )
+        if target1_hit:
+            return (
+                "tp1",
+                bar,
+                request.target1,
+                _canonical_trigger_mid(request.direction, request.target1, bar),
+                ("intrabar_mid_from_open_spread",),
+            )
+    terminal = request.path[-1]
+    if request.direction == "long":
+        return (
+            "terminal",
+            terminal,
+            terminal.bid_close,
+            (terminal.bid_close + terminal.ask_close) / 2.0,
+            (),
+        )
+    return (
+        "terminal",
+        terminal,
+        terminal.ask_close,
+        (terminal.bid_close + terminal.ask_close) / 2.0,
+        (),
+    )
+
+
+def _canonical_trigger_mid(
+    direction: str,
+    executable_price: float,
+    bar: ExecutableQuoteBar,
+) -> float:
+    half_spread = (bar.ask_open - bar.bid_open) / 2.0
+    return executable_price + half_spread if direction == "long" else executable_price - half_spread
+
+
+def _canonical_planned_payoff(
+    request: CanonicalTradeRequest,
+    touch: str,
+    entry_executable: float,
+) -> float | None:
+    assert request.planned_risk_distance is not None
+    if touch in {"sl", "sl_gap", "ambiguous_sl_tp"}:
+        return -1.0
+    if touch == "tp1":
+        assert request.target1 is not None
+        return (
+            _signed_move(request.direction, entry_executable, request.target1)
+            / request.planned_risk_distance
+        )
+    if touch == "tp2":
+        assert request.target2 is not None
+        return (
+            _signed_move(request.direction, entry_executable, request.target2)
+            / request.planned_risk_distance
+        )
+    return None
+
+
+def _canonical_levels_valid(request: CanonicalTradeRequest) -> bool:
+    if not all(
+        _finite_positive(value) for value in (request.stop, request.target1, request.target2)
+    ):
+        return False
+    if request.entry_bid is None or request.entry_ask is None:
+        return False
+    assert request.stop is not None
+    assert request.target1 is not None
+    assert request.target2 is not None
+    if request.direction == "long":
+        return request.stop < request.entry_ask < request.target1 < request.target2
+    if request.direction == "short":
+        return request.stop > request.entry_bid > request.target1 > request.target2
+    return False
+
+
+def _canonical_path_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
+    flags: list[str] = []
+    previous: datetime | None = None
+    for bar in request.path:
+        if not _aware_datetime(bar.ts) or not bar.closed:
+            flags.append("invalid_path_time")
+            continue
+        current = bar.ts.astimezone(UTC)
+        if not _aware_datetime(bar.bar_start) or not _aware_datetime(bar.available_time):
+            flags.append("missing_path_availability")
+            continue
+        assert bar.bar_start is not None
+        assert bar.available_time is not None
+        start = bar.bar_start.astimezone(UTC)
+        available = bar.available_time.astimezone(UTC)
+        if current <= request.prediction_time.astimezone(UTC):
+            flags.append("invalid_path_time")
+        if start < request.prediction_time.astimezone(UTC):
+            flags.append("forming_bar_path")
+        if not start < current <= available:
+            flags.append("invalid_path_availability")
+        if previous is not None and current <= previous:
+            flags.append("out_of_order_path")
+        previous = current
+        if not bar.quote_source.strip() or not bar.source_record_id.strip():
+            flags.append("missing_path_provenance")
+        if bar.quote_source != request.quote_source:
+            flags.append("path_source_mismatch")
+        if not 0.0 < bar.path_quality <= 1.0:
+            flags.append("invalid_path_quality")
+        bid = (bar.bid_open, bar.bid_high, bar.bid_low, bar.bid_close)
+        ask = (bar.ask_open, bar.ask_high, bar.ask_low, bar.ask_close)
+        if not all(_finite_positive(value) for value in (*bid, *ask)):
+            flags.append("invalid_path_quote")
+            continue
+        if not all(ask_value >= bid_value for bid_value, ask_value in zip(bid, ask)):
+            flags.append("invalid_path_quote")
+        if bar.bid_high < max(bar.bid_open, bar.bid_low, bar.bid_close):
+            flags.append("invalid_path_ohlc")
+        if bar.bid_low > min(bar.bid_open, bar.bid_high, bar.bid_close):
+            flags.append("invalid_path_ohlc")
+        if bar.ask_high < max(bar.ask_open, bar.ask_low, bar.ask_close):
+            flags.append("invalid_path_ohlc")
+        if bar.ask_low > min(bar.ask_open, bar.ask_high, bar.ask_close):
+            flags.append("invalid_path_ohlc")
+    return tuple(dict.fromkeys(flags))
+
+
+def _valid_book(bid: float, ask: float) -> bool:
+    return _finite_positive(bid) and _finite_positive(ask) and ask >= bid
+
+
+def _finite_positive(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
+
+
+def _finite_nonnegative(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
+def _aware_datetime(value: object) -> bool:
+    return (
+        isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
+    )
+
+
+def _canonical_round(value: float | None) -> float | None:
+    return round(value, 8) if value is not None else None
 
 
 @dataclass(frozen=True)
