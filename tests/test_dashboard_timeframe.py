@@ -312,6 +312,7 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
                     "tradable": True,
                     "net_label_eligible": True,
                     "label_version": "net-r-v1",
+                    "label_provenance": "fixture_executable_quotes",
                     "cost_model_id": "quotes-v1",
                 },
                 {
@@ -322,26 +323,43 @@ def test_net_r_summary_reads_canonical_labels_without_recalculation(server) -> N
                     "tradable": True,
                     "net_label_eligible": True,
                     "label_version": "net-r-v1",
+                    "label_provenance": "fixture_executable_quotes",
                     "cost_model_id": "quotes-v1",
                 },
                 {
                     "ts": "2026-07-03T00:00:00+00:00",
+                    "decision_id": "d3",
                     "realized_r": 0.2,
                     "realized_net_r": None,
                     "tradable": True,
                     "quality_flags": ["missing_net_label_entry_quote"],
+                },
+                {
+                    "ts": "2026-07-04T00:00:00+00:00",
+                    "decision_id": "legacy-d4",
+                    "realized_r": 0.4,
+                    "realized_net_r": 99.0,
+                    "tradable": True,
+                    "net_label_eligible": True,
                 },
             ]
         }
     )
 
     assert result["labels"] == 2
-    assert result["scored"] == 3
-    assert result["coverage"] == pytest.approx(2 / 3)
-    assert result["expectancy_r"] == pytest.approx(-0.2)
+    assert result["scored"] == 4
+    assert result["net_label_coverage"] == pytest.approx(1 / 2)
+    assert result["net_expectancy_r"] == pytest.approx(-0.2)
     assert result["cumulative_net_r"] == pytest.approx(-0.4)
     assert result["curve"][-1]["cumulative_net_r"] == pytest.approx(-0.4)
-    assert result["missing_reasons"] == {"missing_net_label_entry_quote": 1}
+    assert result["gross_expectancy_r"] == pytest.approx(0.15)
+    assert result["label_versions"] == ["net-r-v1"]
+    assert result["label_provenances"] == ["fixture_executable_quotes"]
+    assert result["cost_model_ids"] == ["quotes-v1"]
+    assert result["missing_reasons"] == {
+        "missing_net_label_entry_quote": 1,
+        "noncanonical_net_label": 1,
+    }
 
 
 def test_input_context_summary_reports_coverage_and_status(server) -> None:
@@ -571,9 +589,10 @@ def test_learning_curve_excludes_flat(server) -> None:
     assert result["curve"] == []
 
 
-def test_learning_curve_accumulates_net_r_from_execution_cost(server) -> None:
-    """execution_cost_r 付きの判断から、curve に累積純R(コスト控除後)が乗る。"""
-    # long判断 close=100 atr=1.0 cost=0.15、1h後 close=101(+1R方向)→ 純R +0.85R
+def test_learning_curve_accumulates_move_atr_without_mixed_unit_cost(server) -> None:
+    """legacy曲線はATR換算値幅を表示し、stop-Rコストを引いて純Rと呼ばない。"""
+    # long判断 close=100 atr=1.0、1h後 close=101 → move_atr +1.0。
+    # execution_cost_rは分母が異なるため、この診断曲線では使用しない。
     entries = [
         {
             "ts": START.isoformat(),
@@ -593,22 +612,23 @@ def test_learning_curve_accumulates_net_r_from_execution_cost(server) -> None:
     curve = result["curve"]
     assert curve, "採点済みが1件以上あるはず"
     last = curve[-1]
-    # cum_net_r = move_atr(+1.0) - cost(0.15) = 0.85
-    assert last["net_r_points"] >= 1
-    assert last["cum_net_r"] == pytest.approx(0.85, abs=1e-4)
+    assert last["move_atr_points"] == 1
+    assert last["cum_move_atr"] == pytest.approx(1.0, abs=1e-4)
+    assert "cum_net_r" not in last
+    assert "net_r_points" not in last
 
 
-def test_learning_curve_net_r_absent_without_cost(server) -> None:
-    """execution_cost_r が無い判断は純Rを算出しない(cum_net_r=0, net_r_points=0)。"""
+def test_learning_curve_move_atr_absent_without_atr(server) -> None:
+    """ATR欠損時はmove_atrを0埋めせず、件数0のままにする。"""
     entries = [
-        _row(START, "1h", 1.0, "long", 100.0, atr=1.0),
-        _row(START + timedelta(hours=1), "1h", 1.0, "long", 101.0, atr=1.0),
+        _row(START, "1h", 1.0, "long", 100.0, atr=None),
+        _row(START + timedelta(hours=1), "1h", 1.0, "long", 101.0, atr=None),
     ]
     result = server._evaluate_journal(entries)
     curve = result["curve"]
     assert curve
-    assert curve[-1]["net_r_points"] == 0
-    assert curve[-1]["cum_net_r"] == 0.0
+    assert curve[-1]["move_atr_points"] == 0
+    assert curve[-1]["cum_move_atr"] is None
 
 
 def test_build_state_exposes_horizon_matrix_and_promotion_metrics(server, tmp_path) -> None:

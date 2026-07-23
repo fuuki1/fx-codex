@@ -723,14 +723,9 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         move = future - close
         signed = move if direction == "long" else -move
         threshold = (atr or 0.0) * 0.1
-        # 収益R: 判断方向の値動きをATR換算(=learning.move_atr相当)し、判断時に保存した
-        # 執行コスト(R換算)を引いてコスト控除後の実現Rにする。atr・コストが揃う時だけ。
-        net_r: float | None = None
-        if atr and atr > 0:
-            realized_r_atr = signed / atr
-            cost_r = _number(entry.get("execution_cost_r"))
-            if cost_r is not None:
-                net_r = round(realized_r_atr - cost_r, 4)
+        # legacy判断ログから得られるのはATR換算値幅だけ。execution_cost_rは
+        # planned stop distance分母なので、ここで引いて「純R」とは呼ばない。
+        move_atr = round(signed / atr, 4) if atr is not None and atr > 0 else None
         # flat も内訳(by_symbol/by_timeframe)に計上する。的中率の分母は
         # evaluated のままなので、flat を数えても hit_rate は変わらない。
         stat = by_symbol.setdefault(symbol, {"evaluated": 0, "hits": 0, "flat": 0})
@@ -761,7 +756,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             **display_base,
             "outcome": outcome,
             "move": round(move, 6),
-            "net_r": net_r,
+            "move_atr": move_atr,
         }
         outcomes.append(outcome_row)
         display_decisions.append(outcome_row)
@@ -852,10 +847,9 @@ def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     その判断までの累積で、flat(小動き)は的中率の分母から除く(hits/evaluated と同義)。
     データが1日分でも点が増えるほど曲線が伸び、的中率が基準に収束していく様子が見える。
 
-    的中率(方向)に加え、コスト控除後の累積純R(cum_net_r)も持つ。的中率が高くても
-    薄利でコスト負けしていないか=「儲かっているか」を同じ時間軸で見るため。net_r は
-    execution_cost_r が保存された判断でだけ算出されるので、cum_net_r は net_r を持つ
-    採点のみを累積し、net_r_points にその件数を持たせる(欠損時は前値を据え置き)。
+    的中率(方向)に加え、legacy終値照合のATR換算値幅(cum_move_atr)を持つ。
+    これはterminal-price proxyであり、正準のgross/net Rではない。ATR欠損行は
+    0埋めせず、move_atr_pointsにも数えない。
     """
     scored = sorted(
         (o for o in outcomes if o.get("outcome") in {"hit", "miss"}),
@@ -863,22 +857,22 @@ def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     curve: list[dict[str, Any]] = []
     cumulative_hits = 0
-    cumulative_net_r = 0.0
-    net_r_points = 0
+    cumulative_move_atr = 0.0
+    move_atr_points = 0
     for index, outcome in enumerate(scored, start=1):
         cumulative_hits += int(outcome.get("outcome") == "hit")
-        net_r = outcome.get("net_r")
-        if isinstance(net_r, (int, float)):
-            cumulative_net_r += float(net_r)
-            net_r_points += 1
+        move_atr = outcome.get("move_atr")
+        if isinstance(move_atr, (int, float)):
+            cumulative_move_atr += float(move_atr)
+            move_atr_points += 1
         curve.append(
             {
                 "ts": outcome.get("ts"),
                 "scored": index,
                 "hits": cumulative_hits,
                 "hit_rate": round(cumulative_hits / index, 4),
-                "cum_net_r": round(cumulative_net_r, 4),
-                "net_r_points": net_r_points,
+                "cum_move_atr": (round(cumulative_move_atr, 4) if move_atr_points else None),
+                "move_atr_points": move_atr_points,
             }
         )
     return curve
@@ -1572,13 +1566,28 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
         for row in outcomes
         if isinstance(row, dict) and _number(row.get("realized_r")) is not None
     ]
-    labeled = [
-        row
-        for row in scored
-        if _number(row.get("realized_net_r")) is not None
-        and bool(row.get("net_label_eligible", row.get("tradable", False)))
-    ]
+
+    def canonical(row: dict[str, Any]) -> bool:
+        return (
+            _number(row.get("realized_net_r")) is not None
+            and row.get("net_label_eligible") is True
+            and bool(str(row.get("decision_id") or "").strip())
+            and bool(str(row.get("label_version") or "").strip())
+            and bool(str(row.get("label_provenance") or "").strip())
+            and bool(str(row.get("cost_model_id") or "").strip())
+        )
+
+    labeled = [row for row in scored if canonical(row)]
     values = [float(row["realized_net_r"]) for row in labeled]
+    gross_values = [float(row["realized_r"]) for row in scored]
+
+    def profit_factor(samples: list[float]) -> float | None:
+        gains = sum(value for value in samples if value > 0)
+        losses = abs(sum(value for value in samples if value < 0))
+        if losses <= 0:
+            return None
+        return gains / losses
+
     cumulative = 0.0
     curve: list[dict[str, Any]] = []
     for row, value in sorted(zip(labeled, values), key=lambda item: str(item[0].get("ts", ""))):
@@ -1593,7 +1602,10 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
         )
     missing: dict[str, int] = {}
     for row in scored:
+        if canonical(row):
+            continue
         if _number(row.get("realized_net_r")) is not None:
+            missing["noncanonical_net_label"] = missing.get("noncanonical_net_label", 0) + 1
             continue
         flags = row.get("quality_flags")
         if not isinstance(flags, list):
@@ -1605,11 +1617,17 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "scored": len(scored),
         "labels": len(labeled),
-        "coverage": len(labeled) / len(scored) if scored else 0.0,
-        "expectancy_r": sum(values) / len(values) if values else None,
+        "gross_samples": len(gross_values),
+        "net_label_samples": len(labeled),
+        "net_label_coverage": len(labeled) / len(scored) if scored else None,
+        "gross_expectancy_r": (sum(gross_values) / len(gross_values) if gross_values else None),
+        "net_expectancy_r": sum(values) / len(values) if values else None,
+        "gross_profit_factor": profit_factor(gross_values),
+        "net_profit_factor": profit_factor(values),
         "cumulative_net_r": sum(values) if values else None,
-        "label_versions": sorted({str(row.get("label_version")) for row in labeled}),
-        "cost_model_ids": sorted({str(row.get("cost_model_id")) for row in labeled}),
+        "label_versions": sorted({str(row["label_version"]) for row in labeled}),
+        "label_provenances": sorted({str(row["label_provenance"]) for row in labeled}),
+        "cost_model_ids": sorted({str(row["cost_model_id"]) for row in labeled}),
         "missing_reasons": dict(sorted(missing.items())),
         "curve": curve,
     }

@@ -199,19 +199,17 @@ def test_evaluation_rejects_naive_now_and_ignores_naive_or_future_rows() -> None
         evaluate_member("ml", entries, now=NOW.replace(tzinfo=None))
 
 
-def test_member_net_expectancy_r_is_computed_from_cost() -> None:
-    """execution_cost_r が保存された意見からコスト控除後の純R診断を算出する。"""
+def test_member_legacy_diagnostic_does_not_mix_atr_move_with_stop_r_cost() -> None:
+    """legacy journalはATR換算診断だけを返し、異なる分母から純Rを捏造しない。"""
     entries = _journal_with_signal(60, hit_prob=0.62, seed=3)
     for entry in entries:
         if entry.get("features", {}).get("ml_edge") is not None:
             entry["execution_cost_r"] = 0.1
     perf = evaluate_member("ml", entries, now=NOW)
     assert perf.evaluated > 0
-    assert perf.net_r_samples > 0
-    assert perf.net_expectancy_r is not None
     assert perf.expectancy_atr is not None
-    # 純R = ATR換算期待値 - コスト。コスト分だけ expectancy_atr より小さい
-    assert perf.net_expectancy_r < perf.expectancy_atr
+    assert perf.net_r_samples == 0
+    assert perf.net_expectancy_r is None
 
 
 def test_member_net_expectancy_r_none_without_cost() -> None:

@@ -64,11 +64,9 @@ class MemberPerformance:
     hits: int = 0
     expectancy_atr: float | None = None  # 意見方向のATR正規化期待値
     p_value: float | None = None  # 的中率が偶然50%超である確率(片側)
-    # コスト控除後の実測純R(realized_net_r)の平均。shadow診断のみで昇格権限は持たない
-    # (expectancy_atr がATR換算の値幅なのに対し、こちらは執行コストまで引いた「儲け」)。
-    # 通常採点(evaluate_member)は保存済み execution_cost_r から、shadow採点
-    # (evaluate_shadow_member)は net_label_eligible な realized_net_r から算出する。
-    # 両経路は排他的に呼ばれるため同一フィールドを共有する。無ければ None。
+    # 正準outcome scorerが生成し、net_label_eligibleなrealized_net_rの平均。
+    # legacy evaluate_memberはATR分母のmove_atrとstop-distance分母のcostを混ぜず、
+    # 常にNoneにする。evaluate_shadow_memberだけが正準ラベルを読み取れる。
     net_expectancy_r: float | None = None
     net_r_samples: int = 0  # net_expectancy_r の分母(realized_net_r が付いた採点数)
     producer_version: str = ""
@@ -190,8 +188,8 @@ def evaluate_member(
 
     # ペアごとの価格系列(将来価格の突き合わせ用)
     prices: dict[str, list[tuple[datetime, float]]] = {}
-    # (ts, symbol, close, atr, opinion, execution_cost_r)
-    parsed: list[tuple[datetime, str, float, float | None, float, float | None]] = []
+    # (ts, symbol, close, atr, opinion)
+    parsed: list[tuple[datetime, str, float, float | None, float]] = []
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
         if ts is None or ts > now:
@@ -206,15 +204,14 @@ def evaluate_member(
         atr_value = _finite_float(entry.get("atr"))
         if atr_value is not None and atr_value <= 0:
             atr_value = None
-        cost_r = _finite_float(entry.get("execution_cost_r"))
         if opinion_value is not None and close_value is not None:
-            parsed.append((ts, symbol, close_value, atr_value, opinion_value, cost_r))
+            parsed.append((ts, symbol, close_value, atr_value, opinion_value))
     for series in prices.values():
         series.sort(key=lambda point: point[0])
 
-    # (ts, hit(1/0), move_atr, net_r or None)。net_rはコスト控除後の実測R(診断用)
-    scored: list[tuple[datetime, int, float, float | None]] = []
-    for ts, symbol, entry_close, atr_value, opinion, cost_r in parsed:
+    # legacy経路は方向とATR換算値幅だけを診断する。
+    scored: list[tuple[datetime, int, float]] = []
+    for ts, symbol, entry_close, atr_value, opinion in parsed:
         if abs(opinion) < OPINION_ACTIVE_THRESHOLD:
             continue  # 中立票は方向判断していないので採点しない
         future_close = _future_close(prices.get(symbol, []), ts, horizon_hours, tolerance_hours)
@@ -227,10 +224,7 @@ def evaluate_member(
             continue  # 小動きは判定除外
         hit = 1 if signed_move > 0 else 0
         move_atr = signed_move / atr_value if atr_value is not None else 0.0
-        # コスト控除後の純R: move_atr(実測R相当)から執行コスト(R換算)を引く。
-        # atr・costが揃う時だけ算出(shadow診断)。
-        net_r = move_atr - cost_r if (atr_value is not None and cost_r is not None) else None
-        scored.append((ts, hit, move_atr, net_r))
+        scored.append((ts, hit, move_atr))
 
     if not scored:
         return MemberPerformance(member=member)
@@ -238,19 +232,17 @@ def evaluate_member(
     kept = _thin_indices([s[0] for s in scored], THIN_MIN_GAP_HOURS)
     effective = [scored[i] for i in kept]
     evaluated = len(effective)
-    hits = sum(hit for _, hit, _, _ in effective)
-    expectancy = sum(move for _, _, move, _ in effective) / evaluated if evaluated else None
+    hits = sum(hit for _, hit, _ in effective)
+    expectancy = sum(move for _, _, move in effective) / evaluated if evaluated else None
     p_value = _one_sided_binomial_pvalue(hits, evaluated)
-    net_values = [net for _, _, _, net in effective if net is not None]
-    net_expectancy_r = sum(net_values) / len(net_values) if net_values else None
     return MemberPerformance(
         member=member,
         evaluated=evaluated,
         hits=hits,
         expectancy_atr=round(expectancy, 4) if expectancy is not None else None,
         p_value=round(p_value, 4),
-        net_expectancy_r=round(net_expectancy_r, 4) if net_expectancy_r is not None else None,
-        net_r_samples=len(net_values),
+        net_expectancy_r=None,
+        net_r_samples=0,
     )
 
 

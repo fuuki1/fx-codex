@@ -237,9 +237,9 @@ class EvaluatedCall:
     # ml.py(確率モデルの教師)と promotion.py(期待値計算)が使う
     move_atr: float | None = None
     data_quality: float | None = None  # 記録時のデータ品質(0.0〜1.0)
-    # 収益ラベル(MLの回帰/分位点ヘッドの教師): コスト控除後の実現R。
-    # move_atr(この採点器の実現R相当)から判断時の execution_cost_r を引いた値。
-    # コスト不明(spread未取得など)なら None。net_expected_r は判断時点の予測(比較対象)。
+    # 収益ラベル(MLの回帰/分位点ヘッドの教師)。正準outcome scorerから
+    # decision_id + label_versionでjoinされた値だけを許可する。legacyの終値照合は
+    # move_atrとexecution_cost_rの分母が異なるため、このフィールドを生成しない。
     realized_net_r: float | None = None
     net_expected_r: float | None = None
     dimensions: Mapping[str, object] = field(default_factory=dict)
@@ -555,15 +555,6 @@ def evaluate_history(
             if isinstance(raw_features, dict)
             else {}
         )
-        # 収益ラベル: この採点器の実現R相当(move_atr)から判断時の執行コスト(R換算)を
-        # 引いてコスト控除後の実現Rにする。コスト・move_atr のいずれか不明なら None。
-        raw_cost = entry.get("execution_cost_r")
-        execution_cost_r = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
-        realized_net_r = (
-            round(move_atr - execution_cost_r, 4)
-            if move_atr is not None and execution_cost_r is not None
-            else None
-        )
         raw_net_expected = entry.get("net_expected_r")
         net_expected_r = (
             float(raw_net_expected) if isinstance(raw_net_expected, (int, float)) else None
@@ -580,7 +571,9 @@ def evaluate_history(
                 features=features,
                 move_atr=move_atr,
                 data_quality=data_quality,
-                realized_net_r=realized_net_r,
+                # legacy journalの固定ホライズン終値照合は方向診断専用。
+                # canonical outcome joinはML収益ヘッド接続PRで別経路として行う。
+                realized_net_r=None,
                 net_expected_r=net_expected_r,
                 dimensions=dimensions_from_mapping(
                     entry.get("learning_dimensions"), fallback_ts=ts

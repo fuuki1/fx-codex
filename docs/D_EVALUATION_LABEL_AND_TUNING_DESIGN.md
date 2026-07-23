@@ -287,3 +287,18 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
 - threshold challenger が OOS、DSR、stress、承認、rollback を通る
 - `0.15` fallback と全安全ゲートの拒否権がテストで固定される
 - リスク量と発注が学習・昇格経路から構造的に切り離されている
+
+## 10. 実装状態
+
+2026-07-23時点では、D1完了前の安全措置として次を実装済みとする。
+
+- `learning.evaluate_history()` は `move_atr` だけを作り、
+  `move_atr - execution_cost_r` を `realized_net_r` として生成しない。
+- `promotion.evaluate_member()` のlegacy journal診断はATR換算値幅だけを返す。
+- legacy学習曲線は `cum_move_atr` / `move_atr_points` として表示し、純Rと呼ばない。
+- ダッシュボードの正準net集計は `decision_id`、`label_version`、
+  `label_provenance`、`cost_model_id`、`net_label_eligible=true` がそろう保存済み行だけを読む。
+
+この状態はD1完了ではない。executable bid/ask pathを使う正準scorer、outcome keyの
+一意性、label metadataの永続化、MLのdecision ID joinが完了するまで、
+正準net label coverageは不足または0としてfail-closedに扱う。

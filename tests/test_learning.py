@@ -128,6 +128,22 @@ def test_evaluate_history_scores_hits_misses_and_flat() -> None:
     assert outcomes == {"USDJPY": "hit", "EURUSD": "miss", "GBPJPY": "flat"}
 
 
+def test_evaluate_history_never_builds_net_r_from_atr_move_and_stop_r_cost() -> None:
+    """分母が異なるlegacy値を引かず、正準outcome未接続なら純Rを欠損にする。"""
+    decision = entry(NOW, direction="long", close=100.0, atr=2.0)
+    decision["execution_cost_r"] = 0.25
+    rows = [
+        decision,
+        entry(NOW + DAY, direction="neutral", close=102.0, atr=2.0),
+    ]
+
+    calls = learning.evaluate_history(rows)
+
+    assert len(calls) == 1
+    assert calls[0].move_atr == 1.0
+    assert calls[0].realized_net_r is None
+
+
 def test_evaluate_history_picks_price_closest_to_horizon() -> None:
     entries = [
         entry(NOW, direction="long", close=100.0),
