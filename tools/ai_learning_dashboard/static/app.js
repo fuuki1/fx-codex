@@ -889,6 +889,11 @@ function outcomeRowElement(row) {
   move.className = "outcome-move";
   const moveValue = num(row.move ?? row.analysis_move);
   move.textContent = moveValue === null ? "--" : `${moveValue > 0 ? "+" : ""}${moveValue}`;
+  // 値動きの符号で色を付ける(上昇=緑 / 下落=赤)。判断方向の当否ではなく
+  // 「その後どちらへ動いたか」を示すので、行の左枠(結果色)とは独立。
+  if (moveValue !== null && moveValue !== 0) {
+    move.classList.add(moveValue > 0 ? "up" : "down");
+  }
   const ts = document.createElement("span");
   ts.className = "outcome-ts subtle";
   ts.textContent = shortDate(row.ts);
@@ -931,31 +936,84 @@ function outcomeSummaryChip(tf, rows, byTimeframe, analysisByTimeframe) {
   const chip = document.createElement("div");
   chip.className = "outcome-chip";
   const counts = outcomeCounts(rows);
+
+  // 見出し行(時間足名 + 主ホライズン)
+  const head = document.createElement("div");
+  head.className = "outcome-chip-head";
   const label = document.createElement("strong");
-  label.textContent = `${TIMEFRAME_LABEL[tf] || tf}(${TIMEFRAME_HORIZON[tf] || "?"})`;
-  const recent = document.createElement("span");
+  label.textContent = TIMEFRAME_LABEL[tf] || tf;
+  const horizon = document.createElement("span");
+  horizon.className = "subtle";
+  horizon.textContent = TIMEFRAME_HORIZON[tf] || "";
+  head.append(label, horizon);
+
+  // 直近の内訳を「絵文字 + 件数」の小さなタグの並びにする。0件のものは省いて
+  // 情報量を絞る(以前は 1行に全カテゴリを詰め込んでいて読みにくかった)。
+  const recent = document.createElement("div");
   recent.className = "outcome-chip-recent";
-  recent.textContent = `直近: ✅${counts.hit} ❌${counts.miss} ○${counts.flat} ⏳${counts.pending} 中立${counts.neutral} 見送り${counts.standby} 休場${counts.closed}`;
-  chip.append(label, recent);
+  const parts = [
+    ["✅", counts.hit],
+    ["❌", counts.miss],
+    ["○", counts.flat],
+    ["⏳", counts.pending],
+    ["中立", counts.neutral],
+    ["見送り", counts.standby],
+    ["休場", counts.closed],
+  ];
+  parts
+    .filter(([, n]) => n > 0)
+    .forEach(([sym, n]) => {
+      const tag = document.createElement("span");
+      tag.className = "outcome-chip-tag";
+      tag.textContent = `${sym}${n}`;
+      recent.appendChild(tag);
+    });
+  if (!recent.childElementCount) {
+    const tag = document.createElement("span");
+    tag.className = "outcome-chip-tag subtle";
+    tag.textContent = "該当なし";
+    recent.appendChild(tag);
+  }
+
+  chip.append(head, recent);
+
+  // 通算的中率・分析仮説は別々の行にして、割合を強調する
   const total = byTimeframe?.[tf];
   if (total && Number(total.evaluated)) {
     const evaluated = Number(total.evaluated);
     const hits = Number(total.hits || 0);
-    const rate = document.createElement("span");
-    rate.className = "subtle";
-    rate.textContent = `通算的中 ${pct(hits / evaluated)} (${hits}/${evaluated})`;
-    chip.append(rate);
+    chip.appendChild(outcomeChipRate("通算的中", pct(hits / evaluated), `${hits}/${evaluated}`));
   }
   const analysis = analysisByTimeframe?.[tf];
   if (analysis && (Number(analysis.evaluated) || Number(analysis.pending))) {
     const evaluated = Number(analysis.evaluated || 0);
     const hits = Number(analysis.hits || 0);
-    const analysisRate = document.createElement("span");
-    analysisRate.className = "subtle";
-    analysisRate.textContent = `分析仮説 ${evaluated ? pct(hits / evaluated) : "--"} (${hits}/${evaluated}) / 未採点${Number(analysis.pending || 0)}`;
-    chip.append(analysisRate);
+    const pending = Number(analysis.pending || 0);
+    chip.appendChild(
+      outcomeChipRate(
+        "分析仮説",
+        evaluated ? pct(hits / evaluated) : "--",
+        `${hits}/${evaluated}${pending ? ` ・未採点${pending}` : ""}`,
+      ),
+    );
   }
   return chip;
+}
+
+// 集計チップの中の1行「ラベル: 割合 (内訳)」を作る。
+function outcomeChipRate(label, rate, detail) {
+  const row = document.createElement("div");
+  row.className = "outcome-chip-rate";
+  const name = document.createElement("span");
+  name.className = "subtle";
+  name.textContent = label;
+  const value = document.createElement("strong");
+  value.textContent = rate;
+  const sub = document.createElement("span");
+  sub.className = "subtle";
+  sub.textContent = detail;
+  row.append(name, value, sub);
+  return row;
 }
 
 function renderRecentOutcomes(data) {
@@ -998,18 +1056,31 @@ function renderRecentOutcomes(data) {
     outcomeSymbolSelection = "all";
   }
 
+  // タブは「ラベル + 件数バッジ」で作る。件数バッジは総数だけを小さく添える
+  // (以前は各タブに ✅/❌/他 を全部並べていて、時間足タブと銘柄タブの両方に
+  // 出ると情報過多で読みにくかった)。
+  const makeTab = (key, label, rows, selected) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `outcome-tab${selected ? " active" : ""}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", selected ? "true" : "false");
+    const name = document.createElement("span");
+    name.className = "outcome-tab-label";
+    name.textContent = label;
+    const badge = document.createElement("span");
+    badge.className = "outcome-tab-count";
+    badge.textContent = String(rows.length);
+    button.append(name, badge);
+    return button;
+  };
+
   // 時間足タブ(すべて / 15分足 / 1時間足 / 4時間足 / 日足)
   if (tabs) {
     const options = [["all", "すべて"], ...availableTfs.map((tf) => [tf, TIMEFRAME_LABEL[tf] || tf])];
     options.forEach(([key, label]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `outcome-tab${outcomeTabSelection === key ? " active" : ""}`;
-      button.setAttribute("role", "tab");
-      button.setAttribute("aria-selected", outcomeTabSelection === key ? "true" : "false");
       const rows = key === "all" ? Object.values(groups).flat() : groups[key] || [];
-      const counts = outcomeCounts(rows);
-      button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
+      const button = makeTab(key, label, rows, outcomeTabSelection === key);
       button.addEventListener("click", () => {
         outcomeTabSelection = key;
         outcomeSymbolSelection = "all";
@@ -1024,15 +1095,9 @@ function renderRecentOutcomes(data) {
   if (symbolTabs) {
     const options = [["all", "すべて"], ...availableSymbols.map((sym) => [sym, sym])];
     options.forEach(([key, label]) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = `outcome-tab${outcomeSymbolSelection === key ? " active" : ""}`;
-      button.setAttribute("role", "tab");
-      button.setAttribute("aria-selected", outcomeSymbolSelection === key ? "true" : "false");
       const rows =
         key === "all" ? tfFilteredRows : tfFilteredRows.filter((row) => row.symbol === key);
-      const counts = outcomeCounts(rows);
-      button.textContent = `${label} ✅${counts.hit}/❌${counts.miss}/他${nonScoredCount(counts) + counts.flat}`;
+      const button = makeTab(key, label, rows, outcomeSymbolSelection === key);
       button.addEventListener("click", () => {
         outcomeSymbolSelection = key;
         outcomePage = 0;
