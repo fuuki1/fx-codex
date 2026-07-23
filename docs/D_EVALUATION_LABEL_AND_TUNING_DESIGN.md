@@ -315,7 +315,14 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   raw/effective/overlap/cluster/market-day件数を決定論的に返す。
 - canonical gross/net集計の `sample_ok` はraw件数ではなくeffective件数で判定し、
   時刻欠損・naive時刻・競合duplicateがある場合はfail-closedにする。
+- canonical outcome storeは `decision_id + label_version` を自然キーにし、
+  `flock`、`fsync`、record hashで追記する。同値replayは追記せず、
+  競合値、partial JSON、hash不一致、既存duplicateをhard errorにする。
+  eligible行は既知label/provenance/cost、awareな保有区間、有限な会計内訳と
+  gross/quote/net/cost恒等式をstore境界でも再検証し、store欠損はunavailableとする。
+  verified exportには並べ替え済みoutcomeのcanonical SHA-256を記録し、
+  store監査値との一致を検証する。
 
-この状態はD1完了ではない。保存済み判断から正準scorerを自動実行する接続、outcome keyの
-永続層一意性、MLのdecision ID joinが完了するまで、
+この状態はD1完了ではない。保存済み判断から正準scorerを自動実行する接続と、
+MLのdecision ID joinが完了するまで、
 正準net label coverageは不足または0としてfail-closedに扱う。
