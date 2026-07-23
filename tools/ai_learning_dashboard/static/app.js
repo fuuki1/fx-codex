@@ -1349,16 +1349,19 @@ function renderTradeMonitor(data) {
 
   const actions = $("tradeActionList");
   actions.replaceChildren();
-  const paperReady = trade.paper_ready || [];
+  const readyForReview = trade.ready_for_review || [];
   const paused = trade.auto_paused || [];
-  if (!paperReady.length && !paused.length) {
+  if (!readyForReview.length && !paused.length) {
     actions.appendChild(empty("承認待ち・自動停止中の改善候補はありません"));
   }
-  paperReady.slice(0, 5).forEach((row) => {
+  readyForReview.slice(0, 5).forEach((row) => {
+    const metrics = row.prospective_metrics || {};
     actions.appendChild(
       tradeItem(
         `承認待ち ${row.priority || ""}`,
-        `${row.title_ja || row.candidate_id || "--"} / seen ${row.seen_count || 0}`,
+        `${row.title_ja || row.candidate_id || "--"} / prospective effective ${
+          metrics.effective_samples || 0
+        } / expiry ${shortDate(row.prospective_end)}`,
         "amber-text",
       ),
     );

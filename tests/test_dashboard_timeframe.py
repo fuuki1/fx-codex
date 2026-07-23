@@ -120,10 +120,12 @@ def test_build_state_includes_trade_outcome_monitor(server, tmp_path) -> None:
             "cand-ready": {
                 "candidate_id": "cand-ready",
                 "status": "active",
-                "stage": "paper_ready",
+                "stage": "ready_for_review",
                 "priority": "high",
                 "title_ja": "承認待ち候補",
                 "seen_count": 2,
+                "prospective_end": (START + timedelta(days=30)).isoformat(),
+                "prospective_metrics": {"effective_samples": 20},
             },
             "cand-paused": {
                 "candidate_id": "cand-paused",
@@ -151,7 +153,7 @@ def test_build_state_includes_trade_outcome_monitor(server, tmp_path) -> None:
         "exit_code": 1,
         "registry": {
             "active_count": 2,
-            "paper_ready_count": 1,
+            "ready_for_review_count": 1,
             "approved_count": 0,
             "auto_paused_count": 1,
             "rejected_count": 0,
@@ -181,9 +183,9 @@ def test_build_state_includes_trade_outcome_monitor(server, tmp_path) -> None:
     trade = state["trade_monitor"]
 
     assert trade["status"] == "fail"
-    assert trade["counts"]["paper_ready"] == 1
+    assert trade["counts"]["ready_for_review"] == 1
     assert trade["counts"]["auto_paused"] == 1
-    assert trade["paper_ready"][0]["candidate_id"] == "cand-ready"
+    assert trade["ready_for_review"][0]["candidate_id"] == "cand-ready"
     assert trade["approved_policy_stats"][0]["candidate_id"] == "cand-paused"
     assert trade["recent_events"][0]["event_type"] == "auto_paused"
 

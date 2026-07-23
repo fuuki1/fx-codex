@@ -18,6 +18,7 @@ from fx_intel.evaluation_labels import (
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel import trade_outcome as to
+from tests.support.prospective_registry import mark_candidate_ready_for_review
 
 
 def _pit_timeframe_row(row: dict[str, object]) -> dict[str, object]:
@@ -119,6 +120,8 @@ def _approved_tp_registry(path) -> None:
             "candidate_net_expectancy_r": 0.75,
             "delta_net_expectancy_r": 1.75,
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+            "trial_count": 1,
+            "trial_sharpes": [0.0],
         },
         "paper",
         "approval",
@@ -129,11 +132,10 @@ def _approved_tp_registry(path) -> None:
         now=datetime(2026, 7, 1, tzinfo=UTC),
         data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
     )
-    registry = to.update_improvement_registry(
+    registry = mark_candidate_ready_for_review(
         registry,
-        [candidate],
-        now=datetime(2026, 7, 1, 1, tzinfo=UTC),
-        data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
+        candidate.candidate_id,
+        evaluated_at=datetime(2026, 7, 1, 1, tzinfo=UTC),
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,

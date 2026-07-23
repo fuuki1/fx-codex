@@ -67,6 +67,7 @@ def run_trade_outcome_monitor(
             managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
             now=generated_at,
             data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+            prospective_outcomes=outcomes,
         )
         registry_updated = True
 
@@ -84,6 +85,7 @@ def run_trade_outcome_monitor(
                 managed_action_types=trade_outcome.VARIANT_CANDIDATE_ACTION_TYPES,
                 now=generated_at,
                 data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+                prospective_outcomes=outcomes,
             )
             registry_updated = True
 
@@ -246,7 +248,7 @@ def _print_summary(result: Mapping[str, Any]) -> None:
         f"status={monitor.get('status')} exit={monitor.get('exit_code')} "
         f"outcomes={run.get('outcome_count', 0)} "
         f"findings={run.get('finding_count', 0)} "
-        f"paper_ready={counts.get('paper_ready_count', 0)} "
+        f"ready_for_review={counts.get('ready_for_review_count', 0)} "
         f"approved={counts.get('approved_count', 0)} "
         f"auto_paused={counts.get('auto_paused_count', 0)}"
     )

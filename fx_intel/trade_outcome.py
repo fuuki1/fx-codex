@@ -14,12 +14,15 @@ from bisect import bisect_left
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
+import hashlib
 import json
 import math
 from pathlib import Path
 
 from .effective_samples import (
     DEFAULT_MIN_EFFECTIVE_SAMPLES,
+    EffectiveSampleConflict,
+    select_effective_samples,
     summarize_effective_samples,
 )
 from .evaluation_labels import (
@@ -59,7 +62,15 @@ NONCANONICAL_COST_QUALITY_FLAG = "noncanonical_cost_estimate_ignored"
 MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R = 0.05
 DEFAULT_TP1_R_CANDIDATES = (0.75, 1.0, 1.25)
 DEFAULT_TP2_R_CANDIDATES = (1.5, 2.0, 2.5)
-IMPROVEMENT_REGISTRY_SCHEMA = 1
+IMPROVEMENT_REGISTRY_SCHEMA = 2
+PROSPECTIVE_EVIDENCE_SCHEMA = 1
+PROSPECTIVE_VALID_DAYS = 90
+PROSPECTIVE_MIN_EFFECTIVE_SAMPLES = MIN_EXPECTANCY_SAMPLES
+PROSPECTIVE_MIN_NET_COVERAGE = 0.95
+PROSPECTIVE_MIN_DSR = 0.95
+PROSPECTIVE_MAX_DRAWDOWN_R = 5.0
+PROSPECTIVE_COST_STRESS_R = 0.05
+PROSPECTIVE_MAX_CONCENTRATION = 0.75
 EXPECTANCY_CANDIDATE_ACTION_TYPES = {
     "collect_samples",
     "improve_path_quality",
@@ -72,8 +83,7 @@ STATUS_OK = "ok"
 STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
 CONFIDENCE_BINS = ((0, 25), (25, 50), (50, 75), (75, 101))
-READY_SEEN_BY_PRIORITY = {"high": 2, "medium": 3, "low": 5}
-APPROVAL_PRESERVED_STAGES = {"approved", "rejected", "auto_paused"}
+APPROVAL_PRESERVED_STAGES = {"approved", "rejected", "auto_paused", "expired"}
 TRUSTED_POST_PREDICTION_OHLC_SCOPES = {
     "closed_bar_after_prediction",
     "lower_timeframe_closed_bar",
@@ -921,8 +931,12 @@ class ExpectancyStats:
     market_days: int = 0
     gross_expectancy_r: float | None = None
     net_expectancy_r: float | None = None
+    net_sharpe_per_period: float | None = None
     gross_profit_factor_r: float | None = None
     net_profit_factor_r: float | None = None
+    label_version: str = ""
+    label_provenance: str = ""
+    cost_model_id: str = ""
     wins: int = 0
     losses: int = 0
     win_rate: float | None = None
@@ -954,8 +968,12 @@ class ExpectancyStats:
             "market_days": self.market_days,
             "gross_expectancy_r": self.gross_expectancy_r,
             "net_expectancy_r": self.net_expectancy_r,
+            "net_sharpe_per_period": self.net_sharpe_per_period,
             "gross_profit_factor_r": self.gross_profit_factor_r,
             "net_profit_factor_r": self.net_profit_factor_r,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "cost_model_id": self.cost_model_id,
             "wins": self.wins,
             "losses": self.losses,
             "win_rate": self.win_rate,
@@ -1082,7 +1100,18 @@ class TradeVariantScore:
     tradable: int
     sample_ok: bool
     expectancy_r: float | None
+    net_sharpe_per_period: float | None
     profit_factor_r: float | None
+    gross_expectancy_r: float | None
+    net_expectancy_r: float | None
+    gross_profit_factor_r: float | None
+    net_profit_factor_r: float | None
+    net_label_samples: int
+    net_label_coverage: float | None
+    effective_samples: int
+    label_version: str
+    label_provenance: str
+    cost_model_id: str
     tp1_rate: float | None
     tp2_rate: float | None
     sl_rate: float | None
@@ -1102,7 +1131,18 @@ class TradeVariantScore:
             "tradable": self.tradable,
             "sample_ok": self.sample_ok,
             "expectancy_r": self.expectancy_r,
+            "net_sharpe_per_period": self.net_sharpe_per_period,
             "profit_factor_r": self.profit_factor_r,
+            "gross_expectancy_r": self.gross_expectancy_r,
+            "net_expectancy_r": self.net_expectancy_r,
+            "gross_profit_factor_r": self.gross_profit_factor_r,
+            "net_profit_factor_r": self.net_profit_factor_r,
+            "net_label_samples": self.net_label_samples,
+            "net_label_coverage": self.net_label_coverage,
+            "effective_samples": self.effective_samples,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "cost_model_id": self.cost_model_id,
             "tp1_rate": self.tp1_rate,
             "tp2_rate": self.tp2_rate,
             "sl_rate": self.sl_rate,
@@ -1110,6 +1150,7 @@ class TradeVariantScore:
             "avg_mae_r": self.avg_mae_r,
             "avg_path_quality": self.avg_path_quality,
             "delta_expectancy_r": self.delta_expectancy_r,
+            "delta_net_expectancy_r": self.delta_expectancy_r,
             "delta_profit_factor_r": self.delta_profit_factor_r,
             "recommendation": self.recommendation,
             "reason_ja": self.reason_ja,
@@ -1422,8 +1463,12 @@ def aggregate_expectancy(
         market_days=effective.market_days,
         gross_expectancy_r=gross_expectancy,
         net_expectancy_r=net_expectancy,
+        net_sharpe_per_period=_round(_sample_sharpe(effective_net_values)),
         gross_profit_factor_r=gross_profit_factor,
         net_profit_factor_r=net_profit_factor,
+        label_version=_single_contract_value(valid_net_records, "label_version"),
+        label_provenance=_single_contract_value(valid_net_records, "label_provenance"),
+        cost_model_id=_single_contract_value(valid_net_records, "cost_model_id"),
         wins=sum(1 for value in effective_net_values if value > 0),
         losses=sum(1 for value in effective_net_values if value < 0),
         win_rate=(
@@ -1528,12 +1573,22 @@ def variant_improvement_candidates(
     baseline = variant_report.get("baseline")
     baseline_overall = baseline.get("overall") if isinstance(baseline, Mapping) else {}
     if isinstance(variants, Sequence):
-        for raw in [item for item in variants if isinstance(item, Mapping)]:
+        variant_rows = [item for item in variants if isinstance(item, Mapping)]
+        trial_sharpes = _variant_trial_sharpes(variant_rows)
+        for raw in variant_rows:
             if raw.get("recommendation") != "paper_test" or not _variant_has_canonical_net_evidence(
                 raw
             ):
                 continue
-            output.append(_candidate_from_variant(raw, baseline_overall, len(output) + 1))
+            output.append(
+                _candidate_from_variant(
+                    raw,
+                    baseline_overall,
+                    len(output) + 1,
+                    trial_sharpes=trial_sharpes,
+                    trial_count=len(variant_rows),
+                )
+            )
             if len(output) >= limit:
                 return output
     cells = variant_report.get("cells")
@@ -1548,7 +1603,9 @@ def variant_improvement_candidates(
                 cell_baseline = cell_report.get("baseline")
                 if not isinstance(cell_variants, Sequence):
                     continue
-                for raw in [item for item in cell_variants if isinstance(item, Mapping)]:
+                cell_variant_rows = [item for item in cell_variants if isinstance(item, Mapping)]
+                cell_trial_sharpes = _variant_trial_sharpes(cell_variant_rows)
+                for raw in cell_variant_rows:
                     if raw.get(
                         "recommendation"
                     ) != "paper_test" or not _variant_has_canonical_net_evidence(raw):
@@ -1560,6 +1617,8 @@ def variant_improvement_candidates(
                             len(output) + 1,
                             scope=str(scope),
                             key=str(key),
+                            trial_sharpes=cell_trial_sharpes,
+                            trial_count=len(cell_variant_rows),
                         )
                     )
                     if len(output) >= limit:
@@ -1707,33 +1766,49 @@ def update_improvement_registry(
     now: datetime | None = None,
     managed_action_types: set[str] | None = None,
     data_contract: str | None = None,
+    prospective_outcomes: Sequence[object] = (),
 ) -> dict:
-    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    generated_time = _utc(now or datetime.now(UTC))
+    generated_at = generated_time.isoformat()
+    if (
+        isinstance(previous, Mapping)
+        and _stat_int(previous, "schema") != IMPROVEMENT_REGISTRY_SCHEMA
+    ):
+        previous = None
     previous_records = _registry_records(previous)
     events = _registry_events(previous)
+    evidence_rows = _prospective_evidence_rows(prospective_outcomes)
     current_ids = {candidate.candidate_id for candidate in candidates}
     records: dict[str, dict] = {}
     for candidate in candidates:
         prior = previous_records.get(candidate.candidate_id, {})
         seen_count = _stat_int(prior, "seen_count") + 1
         prior_stage = str(prior.get("stage", ""))
+        first_seen = str(prior.get("first_seen") or generated_at)
+        if prior:
+            prospective_metadata = _preserved_prospective_metadata(prior)
+        else:
+            prospective_metadata = _initial_prospective_metadata(
+                candidate,
+                evidence_rows,
+                generated_time,
+            )
         stage = (
-            prior_stage
-            if prior_stage in APPROVAL_PRESERVED_STAGES
-            else _candidate_stage(candidate.priority, seen_count)
+            prior_stage if prior_stage in APPROVAL_PRESERVED_STAGES else "prospective_collecting"
         )
         record = {
             **candidate.to_dict(),
             "status": "active",
             "stage": stage,
-            "first_seen": str(prior.get("first_seen") or generated_at),
+            "first_seen": first_seen,
             "last_seen": generated_at,
             "resolved_at": None,
             "seen_count": seen_count,
-            "ready_seen_threshold": READY_SEEN_BY_PRIORITY.get(candidate.priority, 3),
+            **prospective_metadata,
         }
-        if data_contract:
-            record["data_contract"] = data_contract
+        record_data_contract = data_contract or str(prior.get("data_contract") or "")
+        if record_data_contract:
+            record["data_contract"] = record_data_contract
         for key in (
             "approved_at",
             "approved_by",
@@ -1749,6 +1824,9 @@ def update_improvement_registry(
         ):
             if key in prior:
                 record[key] = prior[key]
+        if stage not in APPROVAL_PRESERVED_STAGES:
+            record = _evaluate_prospective_candidate(record, evidence_rows, generated_time)
+            stage = str(record.get("stage", "prospective_collecting"))
         records[candidate.candidate_id] = record
         if not prior:
             _append_registry_event(
@@ -1757,7 +1835,16 @@ def update_improvement_registry(
                 candidate_id=candidate.candidate_id,
                 event_type="detected",
                 to_stage=stage,
-                details={"action_type": candidate.action_type, "priority": candidate.priority},
+                details={
+                    "action_type": candidate.action_type,
+                    "priority": candidate.priority,
+                    "candidate_created_at": record.get("candidate_created_at"),
+                    "training_data_end": record.get("training_data_end"),
+                    "prospective_start": record.get("prospective_start"),
+                    "prospective_end": record.get("prospective_end"),
+                    "lockbox_id": record.get("lockbox_id"),
+                    "dataset_hash": record.get("dataset_hash"),
+                },
             )
         elif str(prior.get("stage", "")) != stage:
             _append_registry_event(
@@ -1767,6 +1854,13 @@ def update_improvement_registry(
                 event_type="stage_changed",
                 from_stage=str(prior.get("stage", "")),
                 to_stage=stage,
+                details={
+                    "prospective_dataset_hash": record.get("prospective_dataset_hash"),
+                    "prospective_effective_dataset_hash": record.get(
+                        "prospective_effective_dataset_hash"
+                    ),
+                    "prospective_metrics": record.get("prospective_metrics"),
+                },
             )
     for candidate_id, prior in previous_records.items():
         if candidate_id in current_ids:
@@ -1797,12 +1891,460 @@ def update_improvement_registry(
     return payload
 
 
+def _prospective_evidence_rows(outcomes: Sequence[object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for outcome in outcomes:
+        if isinstance(outcome, Mapping):
+            rows.append({str(key): value for key, value in outcome.items()})
+            continue
+        to_dict = getattr(outcome, "to_dict", None)
+        if callable(to_dict):
+            raw = to_dict()
+            if isinstance(raw, Mapping):
+                rows.append({str(key): value for key, value in raw.items()})
+    return rows
+
+
+def _initial_prospective_metadata(
+    candidate: TradeImprovementCandidate,
+    evidence_rows: Sequence[Mapping[str, object]],
+    created_at: datetime,
+) -> dict[str, object]:
+    training_rows = [
+        row
+        for row in evidence_rows
+        if (holding_end := _parse_aware_iso(row.get("holding_end_time"))) is not None
+        and holding_end <= created_at
+    ]
+    training_end = max(
+        (
+            parsed
+            for row in training_rows
+            if (parsed := _parse_aware_iso(row.get("holding_end_time"))) is not None
+        ),
+        default=created_at,
+    )
+    prospective_start = max(created_at, training_end)
+    dataset_hash = _prospective_dataset_hash(training_rows)
+    lockbox_raw = (
+        f"{candidate.candidate_id}|{created_at.isoformat()}|"
+        f"{training_end.isoformat()}|{dataset_hash}"
+    )
+    lockbox_id = "prospective-" + hashlib.sha256(lockbox_raw.encode("utf-8")).hexdigest()[:20]
+    return {
+        "prospective_schema": PROSPECTIVE_EVIDENCE_SCHEMA,
+        "candidate_created_at": created_at.isoformat(),
+        "candidate_definition_hash": _candidate_definition_hash(candidate.to_dict()),
+        "training_data_end": training_end.isoformat(),
+        "prospective_start": prospective_start.isoformat(),
+        "prospective_end": (prospective_start + timedelta(days=PROSPECTIVE_VALID_DAYS)).isoformat(),
+        "lockbox_id": lockbox_id,
+        "dataset_hash": dataset_hash,
+        "prospective_dataset_hash": _prospective_dataset_hash(()),
+        "prospective_effective_dataset_hash": _prospective_dataset_hash(()),
+        "prospective_outcome_keys": [],
+        "prospective_metrics": _empty_prospective_metrics(),
+    }
+
+
+def _preserved_prospective_metadata(prior: Mapping[str, object]) -> dict[str, object]:
+    raw_outcome_keys = prior.get("prospective_outcome_keys")
+    raw_metrics = prior.get("prospective_metrics")
+    return {
+        "prospective_schema": prior.get("prospective_schema"),
+        "candidate_created_at": prior.get("candidate_created_at"),
+        "candidate_definition_hash": prior.get("candidate_definition_hash"),
+        "training_data_end": prior.get("training_data_end"),
+        "prospective_start": prior.get("prospective_start"),
+        "prospective_end": prior.get("prospective_end"),
+        "lockbox_id": prior.get("lockbox_id"),
+        "dataset_hash": prior.get("dataset_hash"),
+        "prospective_dataset_hash": prior.get("prospective_dataset_hash"),
+        "prospective_effective_dataset_hash": prior.get("prospective_effective_dataset_hash"),
+        "prospective_outcome_keys": (
+            list(raw_outcome_keys) if isinstance(raw_outcome_keys, list) else []
+        ),
+        "prospective_metrics": (
+            {str(key): value for key, value in raw_metrics.items()}
+            if isinstance(raw_metrics, Mapping)
+            else _empty_prospective_metrics()
+        ),
+        "prospective_last_evaluated_at": prior.get("prospective_last_evaluated_at"),
+    }
+
+
+def _evaluate_prospective_candidate(
+    record: dict[str, object],
+    evidence_rows: Sequence[Mapping[str, object]],
+    now: datetime,
+) -> dict[str, object]:
+    start = _parse_aware_iso(record.get("prospective_start"))
+    end = _parse_aware_iso(record.get("prospective_end"))
+    if start is None or end is None or end <= start:
+        record["stage"] = "expired"
+        record["prospective_metrics"] = {
+            **_empty_prospective_metrics(),
+            "blocking_reasons": ["invalid_prospective_window"],
+        }
+        return record
+    if record.get("candidate_definition_hash") != _candidate_definition_hash(record):
+        record["stage"] = "expired"
+        record["expired_at"] = record.get("expired_at") or now.isoformat()
+        record["prospective_metrics"] = {
+            **_empty_prospective_metrics(),
+            "blocking_reasons": ["candidate_definition_changed"],
+        }
+        return record
+
+    scoped_rows: list[Mapping[str, object]] = []
+    gross_rows: list[Mapping[str, object]] = []
+    valid_rows: list[Mapping[str, object]] = []
+    for row in evidence_rows:
+        prediction_time = _parse_aware_iso(row.get("prediction_time"))
+        holding_end_time = _parse_aware_iso(row.get("holding_end_time"))
+        if (
+            prediction_time is None
+            or holding_end_time is None
+            or prediction_time <= start
+            or holding_end_time <= start
+            or holding_end_time > now
+            or holding_end_time > end
+            or not _prospective_scope_match(record, row)
+        ):
+            continue
+        scoped_rows.append(row)
+        if _prospective_gross_value(row) is not None and row.get("tradable") is True:
+            gross_rows.append(row)
+        if row.get("tradable") is True and not canonical_net_label_contract_flags(row):
+            valid_rows.append(row)
+
+    try:
+        effective_rows, effective = select_effective_samples(valid_rows, min_samples=1)
+    except EffectiveSampleConflict:
+        record["stage"] = "expired"
+        record["expired_at"] = record.get("expired_at") or now.isoformat()
+        record["prospective_metrics"] = {
+            **_empty_prospective_metrics(),
+            "raw_samples": len(gross_rows),
+            "net_label_samples": len(valid_rows),
+            "blocking_reasons": ["effective_sample_conflict"],
+        }
+        return record
+    net_values = [
+        value for row in effective_rows if (value := _stat_float(row, "realized_net_r")) is not None
+    ]
+    versions = sorted({str(row.get("label_version", "")) for row in gross_rows})
+    provenances = sorted({str(row.get("label_provenance", "")) for row in gross_rows})
+    cost_models = sorted({str(row.get("cost_model_id", "")) for row in gross_rows})
+    proposed = record.get("proposed_change")
+    proposed_change = proposed if isinstance(proposed, Mapping) else {}
+    expected_version = str(proposed_change.get("label_version") or "")
+    expected_provenance = str(proposed_change.get("label_provenance") or "")
+    expected_cost_model = str(proposed_change.get("cost_model_id") or "")
+    contract_consistent = (
+        len(versions) <= 1
+        and len(provenances) <= 1
+        and len(cost_models) <= 1
+        and (not expected_version or versions == [expected_version])
+        and (not expected_provenance or provenances == [expected_provenance])
+        and (not expected_cost_model or cost_models == [expected_cost_model])
+    )
+    coverage = len(valid_rows) / len(gross_rows) if gross_rows else None
+    expectancy = _mean(net_values)
+    lcb = _prospective_lcb(net_values)
+    dsr, dsr_trials = _prospective_dsr(net_values, proposed_change)
+    max_drawdown = _prospective_max_drawdown(net_values)
+    stressed_expectancy = expectancy - PROSPECTIVE_COST_STRESS_R if expectancy is not None else None
+    concentration = _prospective_concentration(effective_rows)
+    scope = str(proposed_change.get("scope") or record.get("scope") or "")
+    concentration_ok = concentration is not None and (
+        scope in {"by_symbol", "by_symbol_direction", "通貨ペア", "通貨ペア×方向"}
+        or concentration <= PROSPECTIVE_MAX_CONCENTRATION
+    )
+    blocking_reasons: list[str] = []
+    if effective.effective_samples < PROSPECTIVE_MIN_EFFECTIVE_SAMPLES:
+        blocking_reasons.append("insufficient_effective_samples")
+    if coverage is None or coverage < PROSPECTIVE_MIN_NET_COVERAGE:
+        blocking_reasons.append("insufficient_net_label_coverage")
+    if lcb is None or lcb <= 0:
+        blocking_reasons.append("nonpositive_net_expectancy_lcb")
+    if dsr is None or dsr < PROSPECTIVE_MIN_DSR:
+        blocking_reasons.append("insufficient_dsr")
+    expected_trials = _stat_int(proposed_change, "trial_count")
+    if record.get("action_type") == "tp_sl_variant_paper_test" and (
+        expected_trials < 1 or dsr_trials != expected_trials
+    ):
+        blocking_reasons.append("incomplete_trial_sharpe_history")
+    if max_drawdown is None or max_drawdown < -PROSPECTIVE_MAX_DRAWDOWN_R:
+        blocking_reasons.append("max_drawdown_exceeded")
+    if stressed_expectancy is None or stressed_expectancy <= 0:
+        blocking_reasons.append("cost_stress_failed")
+    if not concentration_ok:
+        blocking_reasons.append("concentration_exceeded")
+    if not contract_consistent:
+        blocking_reasons.append("mixed_label_or_cost_contract")
+
+    metrics = {
+        "schema": PROSPECTIVE_EVIDENCE_SCHEMA,
+        "scoped_samples": len(scoped_rows),
+        "quality_excluded_samples": len(scoped_rows) - len(gross_rows),
+        "raw_samples": len(gross_rows),
+        "net_label_samples": len(valid_rows),
+        "effective_samples": effective.effective_samples,
+        "net_label_coverage": coverage,
+        "overlap_ratio": effective.overlap_ratio,
+        "cluster_count": effective.cluster_count,
+        "market_days": effective.market_days,
+        "net_expectancy_r": _round(expectancy),
+        "net_expectancy_lcb": _round(lcb),
+        "dsr": _round(dsr),
+        "dsr_trials": dsr_trials,
+        "max_drawdown_r": _round(max_drawdown),
+        "cost_stressed_expectancy_r": _round(stressed_expectancy),
+        "max_symbol_concentration": _round(concentration),
+        "label_versions": versions,
+        "label_provenances": provenances,
+        "cost_model_ids": cost_models,
+        "contract_consistent": contract_consistent,
+        "blocking_reasons": blocking_reasons,
+    }
+    record["prospective_metrics"] = metrics
+    record["prospective_dataset_hash"] = _prospective_dataset_hash(scoped_rows)
+    record["prospective_effective_dataset_hash"] = _prospective_dataset_hash(effective_rows)
+    record["prospective_outcome_keys"] = list(effective.selected_keys)
+    record["prospective_last_evaluated_at"] = now.isoformat()
+    if not blocking_reasons:
+        record["stage"] = "ready_for_review"
+        record["ready_for_review_at"] = record.get("ready_for_review_at") or now.isoformat()
+    elif now >= end:
+        record["stage"] = "expired"
+        record["expired_at"] = record.get("expired_at") or now.isoformat()
+    else:
+        record["stage"] = "prospective_collecting"
+    return record
+
+
+def _prospective_scope_match(
+    record: Mapping[str, object],
+    row: Mapping[str, object],
+) -> bool:
+    if record.get("action_type") == "tp_sl_variant_paper_test" and str(
+        row.get("target_policy_id") or ""
+    ) != str(record.get("candidate_id") or ""):
+        return False
+    proposed = record.get("proposed_change")
+    proposed_change = proposed if isinstance(proposed, Mapping) else {}
+    scope = str(proposed_change.get("scope") or record.get("scope") or "")
+    key = str(proposed_change.get("key") or record.get("key") or "")
+    symbol = str(row.get("symbol") or "").upper()
+    direction = str(row.get("direction") or "").lower()
+    if scope in {"overall", "全体", "データ品質", "TP/SL候補"}:
+        return True
+    if scope in {"by_symbol_direction", "通貨ペア×方向"}:
+        return key == f"{symbol}:{direction}"
+    if scope in {"by_symbol", "通貨ペア"}:
+        return key == symbol
+    if scope in {"by_direction", "方向"}:
+        return key == direction
+    if scope in {"by_confidence", "確信度"}:
+        return key == _confidence_label_from_int(_stat_int(row, "conviction"))
+    return False
+
+
+def _prospective_gross_value(row: Mapping[str, object]) -> float | None:
+    gross = _float(row.get("gross_realized_r"))
+    return gross if gross is not None else _float(row.get("realized_r"))
+
+
+def _prospective_dataset_hash(rows: Sequence[Mapping[str, object]]) -> str:
+    canonical = [
+        {
+            "decision_id": str(row.get("decision_id") or ""),
+            "label_version": str(row.get("label_version") or ""),
+            "label_provenance": str(row.get("label_provenance") or ""),
+            "prediction_time": row.get("prediction_time"),
+            "holding_end_time": row.get("holding_end_time"),
+            "symbol": row.get("symbol"),
+            "direction": row.get("direction"),
+            "timeframe": row.get("timeframe"),
+            "horizon_hours": _float(row.get("horizon_hours")),
+            "conviction": row.get("conviction"),
+            "tradable": row.get("tradable"),
+            "gross_realized_r": _prospective_gross_value(row),
+            "quote_realized_r": _float(row.get("quote_realized_r")),
+            "realized_net_r": _float(row.get("realized_net_r")),
+            "net_label_eligible": row.get("net_label_eligible"),
+            "entry_bid": _float(row.get("entry_bid")),
+            "entry_ask": _float(row.get("entry_ask")),
+            "planned_risk_distance": _float(row.get("planned_risk_distance")),
+            "entry_spread_r": _float(row.get("entry_spread_r")),
+            "slippage_r": _float(row.get("slippage_r")),
+            "commission_r": _float(row.get("commission_r")),
+            "financing_r": _float(row.get("financing_r")),
+            "additional_cost_r": _float(row.get("additional_cost_r")),
+            "execution_cost_r": _float(row.get("execution_cost_r")),
+            "cost_model_id": row.get("cost_model_id"),
+            "cost_model_version": row.get("cost_model_version"),
+            "cost_status": row.get("cost_status"),
+            "entry_quote_source": row.get("entry_quote_source"),
+            "spread_source": row.get("spread_source"),
+            "target_policy_id": row.get("target_policy_id"),
+        }
+        for row in rows
+    ]
+    canonical.sort(
+        key=lambda row: (
+            str(row["prediction_time"] or ""),
+            str(row["decision_id"]),
+            str(row["label_version"]),
+        )
+    )
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _candidate_definition_hash(candidate: Mapping[str, object]) -> str:
+    frozen = {
+        key: candidate.get(key)
+        for key in (
+            "candidate_id",
+            "scope",
+            "key",
+            "priority",
+            "action_type",
+            "proposed_change",
+            "validation_ja",
+            "guardrail_ja",
+        )
+    }
+    encoded = json.dumps(
+        json_safe(frozen),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prospective_lcb(values: Sequence[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return mean - 1.645 * math.sqrt(variance / len(values))
+
+
+def _prospective_dsr(
+    values: Sequence[float],
+    proposed_change: Mapping[str, object],
+) -> tuple[float | None, int]:
+    if len(values) < 3:
+        return None, 0
+    try:
+        import numpy as np
+
+        from fx_backtester.overfitting import deflated_sharpe_ratio, per_period_sharpe
+    except ImportError:
+        return None, 0
+    raw_trials = proposed_change.get("trial_sharpes")
+    trial_sharpes = (
+        [
+            float(value)
+            for value in raw_trials
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ]
+        if isinstance(raw_trials, Sequence) and not isinstance(raw_trials, str | bytes)
+        else []
+    )
+    selected = np.asarray(values, dtype=float)
+    if not trial_sharpes:
+        trial_sharpes = [per_period_sharpe(selected)]
+    try:
+        result = deflated_sharpe_ratio(selected, trial_sharpes)
+    except ValueError:
+        return None, len(trial_sharpes)
+    return float(result["dsr"]), len(trial_sharpes)
+
+
+def _prospective_max_drawdown(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    equity = 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for value in values:
+        equity += value
+        peak = max(peak, equity)
+        drawdown = min(drawdown, equity - peak)
+    return drawdown
+
+
+def _prospective_concentration(rows: Sequence[Mapping[str, object]]) -> float | None:
+    if not rows:
+        return None
+    counts: dict[str, int] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "unknown")
+        counts[symbol] = counts.get(symbol, 0) + 1
+    return max(counts.values()) / len(rows)
+
+
+def _empty_prospective_metrics() -> dict[str, object]:
+    return {
+        "schema": PROSPECTIVE_EVIDENCE_SCHEMA,
+        "scoped_samples": 0,
+        "quality_excluded_samples": 0,
+        "raw_samples": 0,
+        "net_label_samples": 0,
+        "effective_samples": 0,
+        "net_label_coverage": None,
+        "overlap_ratio": None,
+        "cluster_count": 0,
+        "market_days": 0,
+        "net_expectancy_r": None,
+        "net_expectancy_lcb": None,
+        "dsr": None,
+        "dsr_trials": 0,
+        "max_drawdown_r": None,
+        "cost_stressed_expectancy_r": None,
+        "max_symbol_concentration": None,
+        "label_versions": [],
+        "label_provenances": [],
+        "cost_model_ids": [],
+        "contract_consistent": False,
+        "blocking_reasons": ["insufficient_effective_samples"],
+    }
+
+
+def _parse_aware_iso(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 def load_improvement_registry(path: str | Path) -> dict:
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict) or raw.get("schema") != IMPROVEMENT_REGISTRY_SCHEMA:
+        return {}
+    return raw
 
 
 def save_improvement_registry(registry: Mapping[str, object], path: str | Path) -> None:
@@ -1825,10 +2367,11 @@ def set_improvement_candidate_approval(
 ) -> tuple[dict, dict]:
     """改善候補を人間承認/却下/再開する。
 
-    approved は paper_ready のみ、resumed は auto_paused のみ許可する。
+    approved は ready_for_review のみ、resumed は auto_paused のみ許可する。
     TP/SL候補は、期待Rが現行比で改善している証跡がある場合だけ昇格できる。
     """
-    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    generated_time = _utc(now or datetime.now(UTC))
+    generated_at = generated_time.isoformat()
     records = _registry_records(registry)
     events = _registry_events(registry)
     candidate_id = str(candidate_id)
@@ -1852,11 +2395,11 @@ def set_improvement_candidate_approval(
             }
         )
         return _registry_payload(records, generated_at), result
-    if decision == "approved" and stage != "paper_ready":
+    if decision == "approved" and stage != "ready_for_review":
         result.update(
             {
                 "status": "not_ready",
-                "message_ja": "paper_ready到達前のため承認できません",
+                "message_ja": "ready_for_review到達前のため承認できません",
             }
         )
         return _registry_payload(records, generated_at), result
@@ -1877,6 +2420,18 @@ def set_improvement_candidate_approval(
         )
         return _registry_payload(records, generated_at), result
     if decision in {"approved", "resumed"}:
+        prospective_ok, prospective_reason = _prospective_approval_gate(
+            record,
+            now=generated_time,
+        )
+        if not prospective_ok:
+            result.update(
+                {
+                    "status": "not_ready",
+                    "message_ja": prospective_reason,
+                }
+            )
+            return _registry_payload(records, generated_at), result
         improvement_ok, improvement_reason = _approval_improvement_gate(record)
         if not improvement_ok:
             result.update(
@@ -1949,7 +2504,7 @@ def build_monitoring_snapshot(
     health_report = health_report or check_expectancy_health(summary)
     records = _registry_records(registry)
     active = [record for record in records.values() if record.get("status") == "active"]
-    paper_ready = [record for record in active if record.get("stage") == "paper_ready"]
+    ready_for_review = [record for record in active if record.get("stage") == "ready_for_review"]
     approved = [record for record in active if record.get("stage") == "approved"]
     rejected = [record for record in active if record.get("stage") == "rejected"]
     auto_paused = [record for record in active if record.get("stage") == "auto_paused"]
@@ -1965,12 +2520,12 @@ def build_monitoring_snapshot(
     ]
     alerts.extend(
         {
-            "type": "paper_ready",
+            "type": "ready_for_review",
             "severity": "info",
             "candidate_id": str(record.get("candidate_id", "")),
             "message_ja": str(record.get("title_ja", "承認待ちの改善候補")),
         }
-        for record in paper_ready
+        for record in ready_for_review
     )
     alerts.extend(
         {
@@ -1982,7 +2537,7 @@ def build_monitoring_snapshot(
         for record in auto_paused
     )
     return {
-        "schema": 1,
+        "schema": 2,
         "generated_at": generated_at,
         "status": health_report.status,
         "exit_code": health_report.exit_code,
@@ -1990,14 +2545,14 @@ def build_monitoring_snapshot(
         "summary": summary,
         "registry": {
             "active_count": len(active),
-            "paper_ready_count": len(paper_ready),
+            "ready_for_review_count": len(ready_for_review),
             "approved_count": len(approved),
             "rejected_count": len(rejected),
             "auto_paused_count": len(auto_paused),
             "resolved_count": sum(
                 1 for record in records.values() if record.get("status") == "resolved"
             ),
-            "paper_ready": _monitor_records(paper_ready),
+            "ready_for_review": _monitor_records(ready_for_review),
             "approved": _monitor_records(approved),
             "rejected": _monitor_records(rejected),
             "auto_paused": _monitor_records(auto_paused),
@@ -2008,12 +2563,20 @@ def build_monitoring_snapshot(
     }
 
 
-def approved_target_policies(registry: Mapping[str, object] | None) -> list[ApprovedTargetPolicy]:
+def approved_target_policies(
+    registry: Mapping[str, object] | None,
+    *,
+    now: datetime | None = None,
+) -> list[ApprovedTargetPolicy]:
     policies: list[ApprovedTargetPolicy] = []
+    current_time = _utc(now or datetime.now(UTC))
     for record in _registry_records(registry).values():
         if record.get("status") != "active" or record.get("stage") != "approved":
             continue
         if record.get("action_type") != "tp_sl_variant_paper_test":
+            continue
+        prospective_ok, _ = _prospective_approval_gate(record, now=current_time)
+        if not prospective_ok:
             continue
         improvement_ok, _ = _approval_improvement_gate(record)
         if not improvement_ok:
@@ -2059,8 +2622,10 @@ def select_approved_target_policy(
     symbol: str,
     direction: str,
     conviction: int,
+    *,
+    now: datetime | None = None,
 ) -> ApprovedTargetPolicy | None:
-    for policy in approved_target_policies(registry):
+    for policy in approved_target_policies(registry, now=now):
         if _target_policy_matches(policy, symbol, direction, conviction):
             return policy
     return None
@@ -2107,7 +2672,8 @@ def auto_pause_underperforming_approved_policies(
     *,
     now: datetime | None = None,
 ) -> tuple[dict, list[dict]]:
-    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    generated_time = _utc(now or datetime.now(UTC))
+    generated_at = generated_time.isoformat()
     records = _registry_records(registry)
     events = _registry_events(registry)
     raw_by_policy = summary.get("by_target_policy")
@@ -2119,8 +2685,15 @@ def auto_pause_underperforming_approved_policies(
             continue
         if record.get("action_type") != "tp_sl_variant_paper_test":
             continue
+        prospective_ok, prospective_reason = _prospective_approval_gate(
+            record,
+            now=generated_time,
+        )
         stats = by_policy.get(candidate_id)
-        if not isinstance(stats, Mapping):
+        if not prospective_ok:
+            reason = prospective_reason
+            stats = stats if isinstance(stats, Mapping) else {}
+        elif not isinstance(stats, Mapping):
             reason = "承認済みTP/SLのcanonical純R証拠が取得不能"
             stats = {}
         elif not bool(stats.get("sample_ok")) or _stat_int(stats, "net_label_samples") <= 0:
@@ -2265,12 +2838,12 @@ def format_improvement_registry_ja(registry: Mapping[str, object], *, limit: int
     records = _registry_records(registry)
     active = [record for record in records.values() if record.get("status") == "active"]
     resolved = [record for record in records.values() if record.get("status") == "resolved"]
-    ready = [record for record in active if record.get("stage") == "paper_ready"]
+    ready = [record for record in active if record.get("stage") == "ready_for_review"]
     approved = [record for record in active if record.get("stage") == "approved"]
     rejected = [record for record in active if record.get("stage") == "rejected"]
     auto_paused = [record for record in active if record.get("stage") == "auto_paused"]
     lines = [
-        f"改善候補レジストリ: active={len(active)} / paper_ready={len(ready)}"
+        f"改善候補レジストリ: active={len(active)} / ready_for_review={len(ready)}"
         f" / approved={len(approved)} / auto_paused={len(auto_paused)}"
         f" / rejected={len(rejected)} / resolved={len(resolved)}"
     ]
@@ -2282,11 +2855,20 @@ def format_improvement_registry_ja(registry: Mapping[str, object], *, limit: int
             f"{len(events)}件 / latest={last.get('event_type')}:{last.get('candidate_id')}"
         )
     for record in sorted(
-        active, key=lambda item: (-_stat_int(item, "seen_count"), str(item.get("candidate_id", "")))
+        active,
+        key=lambda item: (
+            -_record_prospective_effective_samples(item),
+            str(item.get("candidate_id", "")),
+        ),
     )[:limit]:
+        metrics = record.get("prospective_metrics")
+        effective_samples = (
+            _stat_int(metrics, "effective_samples") if isinstance(metrics, Mapping) else 0
+        )
         lines.append(
             f"・{record.get('title_ja', record.get('candidate_id'))}"
-            f" (stage={record.get('stage')}, seen={_stat_int(record, 'seen_count')})"
+            f" (stage={record.get('stage')}, prospective effective={effective_samples}, "
+            f"expiry={record.get('prospective_end') or '—'})"
         )
     return "\n".join(lines)
 
@@ -2552,10 +3134,10 @@ def _variant_score(
     stats: Mapping[str, object],
     baseline: Mapping[str, object],
 ) -> TradeVariantScore:
-    expectancy = _stat_float(stats, "expectancy_r")
-    baseline_expectancy = _stat_float(baseline, "expectancy_r")
-    profit_factor = _stat_float(stats, "profit_factor_r")
-    baseline_pf = _stat_float(baseline, "profit_factor_r")
+    expectancy = _stat_float(stats, "net_expectancy_r")
+    baseline_expectancy = _stat_float(baseline, "net_expectancy_r")
+    profit_factor = _stat_float(stats, "net_profit_factor_r")
+    baseline_pf = _stat_float(baseline, "net_profit_factor_r")
     delta_expectancy = (
         _round(expectancy - baseline_expectancy)
         if expectancy is not None and baseline_expectancy is not None
@@ -2583,7 +3165,18 @@ def _variant_score(
         tradable=_stat_int(stats, "tradable"),
         sample_ok=sample_ok,
         expectancy_r=expectancy,
+        net_sharpe_per_period=_stat_float(stats, "net_sharpe_per_period"),
         profit_factor_r=profit_factor,
+        gross_expectancy_r=_stat_float(stats, "gross_expectancy_r"),
+        net_expectancy_r=expectancy,
+        gross_profit_factor_r=_stat_float(stats, "gross_profit_factor_r"),
+        net_profit_factor_r=profit_factor,
+        net_label_samples=_stat_int(stats, "net_label_samples"),
+        net_label_coverage=_stat_float(stats, "net_label_coverage"),
+        effective_samples=_stat_int(stats, "effective_samples"),
+        label_version=str(stats.get("label_version") or ""),
+        label_provenance=str(stats.get("label_provenance") or ""),
+        cost_model_id=str(stats.get("cost_model_id") or ""),
         tp1_rate=_stat_float(stats, "tp1_rate"),
         tp2_rate=_stat_float(stats, "tp2_rate"),
         sl_rate=_stat_float(stats, "sl_rate"),
@@ -2958,6 +3551,17 @@ def _candidate_from_finding(
     return None
 
 
+def _variant_trial_sharpes(
+    variants: Sequence[Mapping[str, object]],
+) -> list[float]:
+    return [
+        value
+        for variant in variants
+        if (value := _stat_float(variant, "net_sharpe_per_period")) is not None
+        and math.isfinite(value)
+    ]
+
+
 def _candidate_from_variant(
     variant: Mapping[str, object],
     baseline_overall: object,
@@ -2965,6 +3569,8 @@ def _candidate_from_variant(
     *,
     scope: str = "overall",
     key: str = "",
+    trial_sharpes: Sequence[float] = (),
+    trial_count: int = 0,
 ) -> TradeImprovementCandidate:
     baseline = baseline_overall if isinstance(baseline_overall, Mapping) else {}
     target1_r = _stat_float(variant, "target1_r")
@@ -3006,9 +3612,12 @@ def _candidate_from_variant(
             "scope": scope,
             "key": key,
             "min_expected_improvement_r": MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+            "trial_count": trial_count,
+            "trial_sharpes": list(trial_sharpes),
         },
         "paper期間で期待Rが現行比+0.05R以上、PF>=1.05、最低サンプル数を維持することを確認",
-        "live反映はpaper_ready後も即時採用せず、人間承認とデータ品質確認を必須にする",
+        "分析用policyへの反映はready_for_review後も即時採用せず、人間承認と"
+        "データ品質確認を必須にする",
         {"variant": dict(variant), "baseline_overall": dict(baseline), "scope": scope, "key": key},
     )
 
@@ -3244,8 +3853,99 @@ def _confidence_label_from_int(conviction: int) -> str:
     return "unknown"
 
 
-def _candidate_stage(priority: str, seen_count: int) -> str:
-    return "paper_ready" if seen_count >= READY_SEEN_BY_PRIORITY.get(priority, 3) else "watch"
+def _prospective_approval_gate(
+    record: Mapping[str, object],
+    *,
+    now: datetime,
+) -> tuple[bool, str]:
+    if _stat_int(record, "prospective_schema") != PROSPECTIVE_EVIDENCE_SCHEMA:
+        return False, "前向き検証schemaが不一致のため承認できません"
+    created_at = _parse_aware_iso(record.get("candidate_created_at"))
+    training_end = _parse_aware_iso(record.get("training_data_end"))
+    start = _parse_aware_iso(record.get("prospective_start"))
+    end = _parse_aware_iso(record.get("prospective_end"))
+    if (
+        created_at is None
+        or training_end is None
+        or start is None
+        or end is None
+        or created_at > start
+        or training_end > start
+        or end <= start
+    ):
+        return False, "前向き検証期間の来歴が不正なため承認できません"
+    if now > end:
+        return False, "前向き検証証拠が期限切れのため承認できません"
+    last_evaluated = _parse_aware_iso(record.get("prospective_last_evaluated_at"))
+    if last_evaluated is None or last_evaluated > now:
+        return False, "前向き検証の評価時刻が不正なため承認できません"
+    if record.get("candidate_definition_hash") != _candidate_definition_hash(record):
+        return False, "候補定義が登録後に変更されたため承認できません"
+    for key in (
+        "candidate_definition_hash",
+        "dataset_hash",
+        "prospective_dataset_hash",
+        "prospective_effective_dataset_hash",
+    ):
+        value = str(record.get(key) or "")
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            return False, f"{key}が不正なため承認できません"
+    if not str(record.get("lockbox_id") or "").startswith("prospective-"):
+        return False, "lockbox IDが不正なため承認できません"
+    metrics = record.get("prospective_metrics")
+    if not isinstance(metrics, Mapping):
+        return False, "前向き検証指標がないため承認できません"
+    if _stat_int(metrics, "schema") != PROSPECTIVE_EVIDENCE_SCHEMA:
+        return False, "前向き検証指標schemaが不一致のため承認できません"
+    effective_samples = _stat_int(metrics, "effective_samples")
+    outcome_keys = record.get("prospective_outcome_keys")
+    if (
+        not isinstance(outcome_keys, list)
+        or len(outcome_keys) != effective_samples
+        or effective_samples < PROSPECTIVE_MIN_EFFECTIVE_SAMPLES
+    ):
+        return False, "前向き検証のeffective sampleが不足しています"
+    coverage = _stat_float(metrics, "net_label_coverage")
+    if coverage is None or coverage < PROSPECTIVE_MIN_NET_COVERAGE:
+        return False, "前向き検証のcanonical net coverageが不足しています"
+    lcb = _stat_float(metrics, "net_expectancy_lcb")
+    if lcb is None or lcb <= 0:
+        return False, "前向き検証のnet期待R片側信頼下限が非正です"
+    dsr = _stat_float(metrics, "dsr")
+    if dsr is None or dsr < PROSPECTIVE_MIN_DSR:
+        return False, "前向き検証のDSRが基準未達です"
+    max_drawdown = _stat_float(metrics, "max_drawdown_r")
+    if max_drawdown is None or max_drawdown < -PROSPECTIVE_MAX_DRAWDOWN_R:
+        return False, "前向き検証の最大ドローダウンが基準超過です"
+    stressed = _stat_float(metrics, "cost_stressed_expectancy_r")
+    if stressed is None or stressed <= 0:
+        return False, "前向き検証のcost stress後期待Rが非正です"
+    concentration = _stat_float(metrics, "max_symbol_concentration")
+    proposed = record.get("proposed_change")
+    proposed_change = proposed if isinstance(proposed, Mapping) else {}
+    scope = str(proposed_change.get("scope") or record.get("scope") or "")
+    if concentration is None or (
+        scope not in {"by_symbol", "by_symbol_direction", "通貨ペア", "通貨ペア×方向"}
+        and concentration > PROSPECTIVE_MAX_CONCENTRATION
+    ):
+        return False, "前向き検証の集中度が基準超過です"
+    if metrics.get("contract_consistent") is not True:
+        return False, "前向き検証のlabel/cost契約が混在しています"
+    versions = metrics.get("label_versions")
+    provenances = metrics.get("label_provenances")
+    cost_models = metrics.get("cost_model_ids")
+    if (
+        versions != sorted(KNOWN_NET_LABEL_VERSIONS)
+        or provenances != sorted(KNOWN_NET_LABEL_PROVENANCES)
+        or not isinstance(cost_models, list)
+        or len(cost_models) != 1
+        or cost_models[0] not in KNOWN_EXECUTABLE_COST_MODEL_IDS
+    ):
+        return False, "前向き検証のcanonical label/cost schemaが不一致です"
+    blockers = metrics.get("blocking_reasons")
+    if not isinstance(blockers, list) or blockers:
+        return False, "前向き検証に未解決の昇格阻害理由があります"
+    return True, ""
 
 
 def _approval_improvement_gate(record: Mapping[str, object]) -> tuple[bool, str]:
@@ -3380,8 +4080,8 @@ def _registry_payload(
         "schema": IMPROVEMENT_REGISTRY_SCHEMA,
         "generated_at": generated_at,
         "active_count": sum(1 for record in records.values() if record.get("status") == "active"),
-        "paper_ready_count": sum(
-            1 for record in records.values() if record.get("stage") == "paper_ready"
+        "ready_for_review_count": sum(
+            1 for record in records.values() if record.get("stage") == "ready_for_review"
         ),
         "approved_count": sum(
             1 for record in records.values() if record.get("stage") == "approved"
@@ -3412,7 +4112,7 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
     sorted_records = sorted(
         records,
         key=lambda record: (
-            -_stat_int(record, "seen_count"),
+            -_record_prospective_effective_samples(record),
             str(record.get("priority", "")),
             str(record.get("candidate_id", "")),
         ),
@@ -3420,6 +4120,7 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
     output: list[dict] = []
     for record in sorted_records[: max(0, limit)]:
         proposed_change = record.get("proposed_change")
+        prospective_metrics = record.get("prospective_metrics")
         output.append(
             {
                 "candidate_id": str(record.get("candidate_id", "")),
@@ -3432,6 +4133,22 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
                 "seen_count": _stat_int(record, "seen_count"),
                 "first_seen": record.get("first_seen"),
                 "last_seen": record.get("last_seen"),
+                "candidate_created_at": record.get("candidate_created_at"),
+                "candidate_definition_hash": record.get("candidate_definition_hash"),
+                "training_data_end": record.get("training_data_end"),
+                "prospective_start": record.get("prospective_start"),
+                "prospective_end": record.get("prospective_end"),
+                "lockbox_id": record.get("lockbox_id"),
+                "dataset_hash": record.get("dataset_hash"),
+                "prospective_dataset_hash": record.get("prospective_dataset_hash"),
+                "prospective_effective_dataset_hash": record.get(
+                    "prospective_effective_dataset_hash"
+                ),
+                "prospective_metrics": (
+                    {str(key): value for key, value in prospective_metrics.items()}
+                    if isinstance(prospective_metrics, Mapping)
+                    else {}
+                ),
                 "approved_at": record.get("approved_at"),
                 "approved_by": record.get("approved_by"),
                 "auto_paused_at": record.get("auto_paused_at"),
@@ -3446,6 +4163,11 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
             }
         )
     return output
+
+
+def _record_prospective_effective_samples(record: Mapping[str, object]) -> int:
+    metrics = record.get("prospective_metrics")
+    return _stat_int(metrics, "effective_samples") if isinstance(metrics, Mapping) else 0
 
 
 def _policy_specificity(policy: ApprovedTargetPolicy) -> int:
@@ -3569,6 +4291,24 @@ def _float(value: object) -> float | None:
 
 def _mean(values: Sequence[float]) -> float | None:
     return sum(values) / len(values) if values else None
+
+
+def _sample_sharpe(values: Sequence[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    if variance <= 1e-24:
+        return None
+    return mean / math.sqrt(variance)
+
+
+def _single_contract_value(
+    records: Sequence[Mapping[str, object]],
+    key: str,
+) -> str:
+    values = {str(record.get(key) or "") for record in records}
+    return next(iter(values)) if len(values) == 1 else ""
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:

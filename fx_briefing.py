@@ -397,6 +397,7 @@ def score_trade_outcomes_cli(
             candidates,
             managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
             data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+            prospective_outcomes=outcomes,
         )
         registry, paused_policies = trade_outcome.auto_pause_underperforming_approved_policies(
             registry,
@@ -484,6 +485,7 @@ def approve_trade_candidate_cli(
     decision: str,
     actor: str = "manual",
     note: str = "",
+    now: datetime | None = None,
 ) -> int:
     registry = load_pit_improvement_registry(registry_path)
     updated, result = trade_outcome.set_improvement_candidate_approval(
@@ -492,6 +494,7 @@ def approve_trade_candidate_cli(
         decision,
         actor=actor,
         note=note,
+        now=now,
     )
     print(result["message_ja"])
     if result["status"] not in {"approved", "rejected", "resumed"}:
@@ -528,11 +531,13 @@ def retest_trade_variants_cli(
     evaluated = int(overall.get("evaluated", 0)) if isinstance(overall, dict) else 0
     if improvement_registry_path is not None and evaluated > 0:
         previous = load_pit_improvement_registry(improvement_registry_path)
+        outcomes = trade_outcome.evaluate_trade_outcomes(entries)
         registry = trade_outcome.update_improvement_registry(
             previous,
             candidates,
             managed_action_types=trade_outcome.VARIANT_CANDIDATE_ACTION_TYPES,
             data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+            prospective_outcomes=outcomes,
         )
         trade_outcome.save_improvement_registry(registry, improvement_registry_path)
 
@@ -1373,7 +1378,7 @@ def main(argv: list[str] | None = None) -> int:
         "--approve-trade-candidate",
         metavar="CANDIDATE_ID",
         default=None,
-        help="paper_readyの改善候補を人間承認し、stage=approvedとして記録する",
+        help="ready_for_reviewの改善候補を人間承認し、stage=approvedとして記録する",
     )
     parser.add_argument(
         "--reject-trade-candidate",
@@ -1732,6 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
                     now=now,
                     managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
                     data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+                    prospective_outcomes=trade_outcomes,
                 )
                 registry, paused_policies = (
                     trade_outcome.auto_pause_underperforming_approved_policies(

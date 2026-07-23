@@ -15,6 +15,7 @@ from fx_intel.evaluation_labels import (
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
 )
+from tests.support.prospective_registry import mark_candidate_ready_for_review
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "trade_outcome_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -135,7 +136,7 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
 
     assert first["exit_code"] == 1
     assert third["exit_code"] == 1
-    assert registry["paper_ready_count"] == 0
+    assert registry["ready_for_review_count"] == 0
     assert monitor_payload["runner"]["registry_updated"] is True
     assert monitor_payload["variant_retest"]["candidate_count"] == 0
     assert outcome_report["summary"]["overall"]["gross_expectancy_r"] == -1.0
@@ -198,6 +199,8 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
             "candidate_net_expectancy_r": 0.75,
             "delta_net_expectancy_r": 1.75,
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+            "trial_count": 1,
+            "trial_sharpes": [0.0],
         },
         "paper",
         "approval",
@@ -205,11 +208,10 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
     registry = to.update_improvement_registry(
         None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
     )
-    registry = to.update_improvement_registry(
+    registry = mark_candidate_ready_for_review(
         registry,
-        [candidate],
-        now=NOW + timedelta(hours=1),
-        data_contract=journal.FUSION_PIT_DATA_CONTRACT,
+        candidate.candidate_id,
+        evaluated_at=NOW + timedelta(hours=1),
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,

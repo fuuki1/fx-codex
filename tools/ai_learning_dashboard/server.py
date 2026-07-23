@@ -1492,9 +1492,9 @@ def _trade_monitor_summary(
             return value
         return sum(1 for record in active if record.get("stage") == stage)
 
-    paper_ready = _list_from_payload(monitor_registry, "paper_ready") or _registry_records_by_stage(
-        registry, "paper_ready"
-    )
+    ready_for_review = _list_from_payload(
+        monitor_registry, "ready_for_review"
+    ) or _registry_records_by_stage(registry, "ready_for_review")
     approved = _list_from_payload(monitor_registry, "approved") or _registry_records_by_stage(
         registry, "approved"
     )
@@ -1514,7 +1514,7 @@ def _trade_monitor_summary(
         "health": (monitor.get("health") if isinstance(monitor.get("health"), dict) else {}),
         "counts": {
             "active": int(monitor_registry.get("active_count", len(active)) or 0),
-            "paper_ready": _count("paper_ready"),
+            "ready_for_review": _count("ready_for_review"),
             "approved": _count("approved"),
             "auto_paused": _count("auto_paused"),
             "rejected": _count("rejected"),
@@ -1527,7 +1527,7 @@ def _trade_monitor_summary(
             ),
         },
         "alerts": _list_from_payload(monitor, "alerts")[:20],
-        "paper_ready": paper_ready[:10],
+        "ready_for_review": ready_for_review[:10],
         "approved": approved[:10],
         "auto_paused": auto_paused[:10],
         "rejected": rejected[:10],
