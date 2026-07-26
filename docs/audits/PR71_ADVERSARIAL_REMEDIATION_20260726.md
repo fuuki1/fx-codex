@@ -4,7 +4,8 @@ Review date: 2026-07-26 (Asia/Tokyo)
 
 Base: `bee7427ec0272fbb2fce85345a22e39e8ceb9cf7` (`origin/main`)
 
-Status: **LOCAL REMEDIATION PASSED; DRAFT PR; NOT DEPLOYED**
+Status: **LOCAL REMEDIATION AND MAC MINI ISOLATED FUNCTIONAL TEST PASSED;
+DEPLOYMENT PREFLIGHT BLOCKED; DRAFT PR; NOT DEPLOYED**
 
 The Mac mini canonical collector, materializer, and health topology remains
 stopped. This record covers repository changes and local synthetic evidence
@@ -76,6 +77,24 @@ Earlier capacity artifacts remain historical pre-remediation evidence; they
 must not be interpreted as post-review validation or production-daemon RSS
 evidence.
 
+## Mac mini isolated functional test
+
+The fixed PR head `122b04b62e8f3cf50c23a861107a85cefa3cdc47` was checked
+out detached into a new isolated Mac mini path. A fresh Python 3.12.13 venv was
+built from `requirements.lock` with `--require-hashes`; package build and
+`pip check` passed. Full pytest passed with 1,100 tests and one skip.
+
+Collector dry-run passed with a mode-`0600` dummy environment and no network
+collection output. The canonical topology dry-run then returned exit 78 and
+refused deployment because `/Users/fuuki/Desktop/fx-codex` still tracks
+prohibited legacy execution paths. No launchd plist, label or process was
+created. The active runtime SHA, branch and dirty-entry count remained
+unchanged.
+
+Mac mini synthetic soak, crash and archive/restore probes all passed. Exact
+host state, commands, limitations and artifact hashes are recorded in
+`MAC_MINI_PR71_ISOLATED_TEST_20260726.md`.
+
 ## Validation
 
 - Ruff: passed.
@@ -94,6 +113,8 @@ evidence.
 ## Remaining blockers
 
 - No approved clean deployment SHA has been installed on the Mac mini.
+- Two dirty legacy checkouts each still track 61 prohibited execution paths;
+  the canonical deployment preflight correctly refuses installation.
 - No provider-captured sizing, production-daemon RSS soak, target filesystem
   `ENOSPC` drill, full-size off-host archive, or independent restore has passed.
 - The independently governed prospective secondary source and typed daily
