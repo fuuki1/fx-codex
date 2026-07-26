@@ -66,34 +66,54 @@ class TestDaemonDryRun:
     def test_dry_run_without_credentials_is_ex_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        for name in ("FX_OANDA_API_TOKEN", "FX_OANDA_ACCOUNT_ID", "FX_OANDA_ENV"):
+        for name in (
+            "FX_TIINGO_API_TOKEN",
+            "FX_TIINGO_PLAN",
+            "FX_TIINGO_USAGE_SCOPE",
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        ):
             monkeypatch.delenv(name, raising=False)
         code = daemon_main(["--output-root", str(tmp_path), "--dry-run"])
         assert code == EX_CONFIG
         err = capsys.readouterr().err
-        assert "FX_OANDA_API_TOKEN" in err
+        assert "FX_TIINGO_API_TOKEN" in err
 
     def test_dry_run_with_credentials_masks_all_credential_values(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        monkeypatch.setenv("FX_OANDA_API_TOKEN", "SUPER-SECRET-TOKEN")
-        monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "001-001-1234567-001")
-        monkeypatch.setenv("FX_OANDA_ENV", "practice")
+        monkeypatch.setenv("FX_TIINGO_API_TOKEN", "SUPER-SECRET-TOKEN")
+        monkeypatch.setenv("FX_TIINGO_PLAN", "power")
+        monkeypatch.setenv(
+            "FX_TIINGO_USAGE_SCOPE",
+            "internal_nonredisplay_active_subscription",
+        )
+        monkeypatch.setenv(
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+            "tiingo-approval-2026-001",
+        )
         code = daemon_main(["--output-root", str(tmp_path), "--dry-run"])
         assert code == EX_OK
         out = capsys.readouterr().out
         assert "SUPER-SECRET-TOKEN" not in out
-        assert "001-001-1234567-001" not in out
+        assert "tiingo-approval-2026-001" not in out
         assert out.count("***masked***") == 2
         payload = json.loads(out)
         assert payload["dry_run"] is True
+        assert payload["config"].startswith("TiingoConfig(")
 
     def test_dry_run_makes_no_filesystem_changes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("FX_OANDA_API_TOKEN", "t")
-        monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "a")
-        monkeypatch.setenv("FX_OANDA_ENV", "practice")
+        monkeypatch.setenv("FX_TIINGO_API_TOKEN", "t")
+        monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+        monkeypatch.setenv(
+            "FX_TIINGO_USAGE_SCOPE",
+            "internal_nonredisplay_active_subscription",
+        )
+        monkeypatch.setenv(
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+            "tiingo-approval-2026-001",
+        )
         daemon_main(["--output-root", str(tmp_path / "never-created"), "--dry-run"])
         assert not (tmp_path / "never-created").exists()
 
@@ -103,13 +123,19 @@ class TestDaemonDryRun:
         marker = tmp_path / "must-not-exist"
         env_file = tmp_path / "collector.env"
         env_file.write_text(
-            f"FX_OANDA_API_TOKEN=$(touch {marker})\n"
-            "FX_OANDA_ACCOUNT_ID=account\n"
-            "FX_OANDA_ENV=practice\n",
+            f"FX_TIINGO_API_TOKEN=$(touch {marker})\n"
+            "FX_TIINGO_PLAN=free\n"
+            "FX_TIINGO_USAGE_SCOPE=internal_nonredisplay_active_subscription\n"
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF=tiingo-approval-2026-001\n",
             encoding="utf-8",
         )
         env_file.chmod(0o600)
-        for name in ("FX_OANDA_API_TOKEN", "FX_OANDA_ACCOUNT_ID", "FX_OANDA_ENV"):
+        for name in (
+            "FX_TIINGO_API_TOKEN",
+            "FX_TIINGO_PLAN",
+            "FX_TIINGO_USAGE_SCOPE",
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        ):
             monkeypatch.delenv(name, raising=False)
 
         code = daemon_main(
@@ -130,14 +156,20 @@ class TestDaemonDryRun:
     ) -> None:
         env_file = tmp_path / "collector.env"
         env_file.write_text(
-            "FX_OANDA_API_TOKEN=token\n"
-            "FX_OANDA_ACCOUNT_ID=account\n"
-            "FX_OANDA_ENV=practice\n"
+            "FX_TIINGO_API_TOKEN=token\n"
+            "FX_TIINGO_PLAN=free\n"
+            "FX_TIINGO_USAGE_SCOPE=internal_nonredisplay_active_subscription\n"
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF=tiingo-approval-2026-001\n"
             "UNRELATED_SECRET=do-not-load\n",
             encoding="utf-8",
         )
         env_file.chmod(0o600)
-        for name in ("FX_OANDA_API_TOKEN", "FX_OANDA_ACCOUNT_ID", "FX_OANDA_ENV"):
+        for name in (
+            "FX_TIINGO_API_TOKEN",
+            "FX_TIINGO_PLAN",
+            "FX_TIINGO_USAGE_SCOPE",
+            "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        ):
             monkeypatch.delenv(name, raising=False)
 
         code = daemon_main(

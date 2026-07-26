@@ -153,12 +153,12 @@ artifacts and run:
 ```bash
 REPORT_DATE=2026-07-14
 python -m tools.data_platform_daily_report \
-  --collection-root "$HOME/srv/fx-codex/collect" \
+  --collection-root "$HOME/srv/fx-codex/collect/tiingo-v1" \
   --date "$REPORT_DATE" \
-  --primary-evidence "$HOME/srv/fx-codex/collect/evidence/primary_$REPORT_DATE.json" \
-  --secondary-evidence "$HOME/srv/fx-codex/collect/evidence/secondary_$REPORT_DATE.json" \
-  --replay-evidence "$HOME/srv/fx-codex/collect/evidence/replay_$REPORT_DATE.json" \
-  --output-dir "$HOME/srv/fx-codex/collect/operations"
+  --primary-evidence "$HOME/srv/fx-codex/collect/tiingo-v1/evidence/primary_$REPORT_DATE.json" \
+  --secondary-evidence "$HOME/srv/fx-codex/collect/tiingo-v1/evidence/secondary_$REPORT_DATE.json" \
+  --replay-evidence "$HOME/srv/fx-codex/collect/tiingo-v1/evidence/replay_$REPORT_DATE.json" \
+  --output-dir "$HOME/srv/fx-codex/collect/tiingo-v1/operations"
 ```
 
 A qualifying day requires:
@@ -168,7 +168,7 @@ A qualifying day requires:
 - deterministic replay evidence for the same date
 - zero critical incidents
 - same-day primary-health evidence
-- actual live OANDA coverage for USDJPY, EURUSD and GBPUSD
+- actual Tiingo live-stream coverage for USDJPY, EURUSD, GBPUSD and AUDUSD
 - same-day independent secondary-source evidence
 
 The scorecard rejects filename/date mismatch and counts only explicit unique

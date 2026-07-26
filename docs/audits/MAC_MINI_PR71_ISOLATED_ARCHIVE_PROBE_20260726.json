@@ -1,0 +1,21 @@
+{
+  "evidence_class": "synthetic_archive_restore_probe",
+  "generated_at": "2026-07-26T05:28:26.673151+00:00",
+  "manifest_sha256": {
+    "capture-2026-01-05.sqlite3.manifest.json": "db842698093f1c44d50921cb56ad90b5249c97fdcdc881b1f754530bdef10fda",
+    "capture-2026-01-06.sqlite3.manifest.json": "59784909706a399ad6187c0ce81922edf3c497bfbb275d538ec5d053450b9df8"
+  },
+  "passed": true,
+  "restored_head_sequence": 4,
+  "restored_quote_count": 2,
+  "restored_quotes_match_source_prefix": true,
+  "restored_shard_dates": [
+    "2026-01-05",
+    "2026-01-06"
+  ],
+  "schema_version": 1,
+  "sealed_shards": 2,
+  "source_shards": 3,
+  "source_shards_preserved": true,
+  "verified_archives": 2
+}

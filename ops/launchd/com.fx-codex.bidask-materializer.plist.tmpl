@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fx-codex.bidask-materializer</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <!-- Shadow-only: COMMITTED journal rowsから完了済み1分足だけをmaterializeする。
+       既存briefing/snapshot経路は置換せず、判断入力への自動配線も行わない。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string>
+    <string>fx-bidask-materializer</string>
+    <string>--locks-dir</string>
+    <string>__ROOT__/logs/locks</string>
+    <string>--</string>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/tools/materialize_bid_ask_prices.py</string>
+    <string>--ingest-log-dir</string>
+    <string>__COLLECT_ROOT__/log</string>
+    <string>--output</string>
+    <string>__ROOT__/logs/briefing_tf_bidask_prices_tiingo_v1.sqlite3</string>
+    <string>--instruments</string>
+    <string>USDJPY</string>
+    <string>EURUSD</string>
+    <string>GBPUSD</string>
+    <string>AUDUSD</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__COLLECT_ROOT__/logs/materializer.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__COLLECT_ROOT__/logs/materializer.err.log</string>
+</dict>
+</plist>

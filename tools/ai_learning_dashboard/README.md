@@ -6,7 +6,7 @@
 ## 起動
 
 ```bash
-cd ~/trader/fx-codex
+cd ~/srv/fx-codex
 python3 tools/ai_learning_dashboard/server.py --host 127.0.0.1 --port 8765
 ```
 

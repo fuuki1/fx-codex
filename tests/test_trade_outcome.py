@@ -956,6 +956,39 @@ def test_forming_bar_ohlc_is_ignored_for_post_prediction_touch_labels() -> None:
     assert "untrusted_forming_ohlc_ignored" in outcome.quality_flags
 
 
+def test_decision_overlapping_closed_bar_range_is_ignored() -> None:
+    rows = [
+        _entry(
+            NOW,
+            "USDJPY",
+            100.0,
+            direction="long",
+            conviction=65,
+            stop=99.0,
+            target1=101.0,
+            target2=102.0,
+        ),
+        _entry(
+            NOW + timedelta(seconds=30),
+            "USDJPY",
+            100.2,
+            high=101.2,
+            low=100.1,
+            open_time=(NOW - timedelta(seconds=30)).isoformat(),
+            ohlc_scope="closed_bar_after_prediction",
+        ),
+        _entry(NOW + timedelta(hours=8), "USDJPY", 100.3),
+        _entry(NOW + timedelta(hours=16), "USDJPY", 100.4),
+        _entry(NOW + DAY, "USDJPY", 100.5),
+    ]
+
+    outcome = to.evaluate_trade_outcomes(rows)[0]
+
+    assert outcome.first_touch == "none"
+    assert outcome.path_source == "close"
+    assert "untrusted_forming_ohlc_ignored" in outcome.quality_flags
+
+
 def test_mfe_and_mae_stop_at_the_first_exit_touch() -> None:
     rows = [
         _entry(

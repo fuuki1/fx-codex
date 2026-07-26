@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, UTC
 import json
 import math
@@ -75,6 +75,7 @@ class PricePathPoint:
     low: float | None = None
     range_scope: str = ""
     rejected_range: bool = False
+    open_time: datetime | None = None
 
     @property
     def has_range(self) -> bool:
@@ -2211,14 +2212,28 @@ def _price_path_point(ts: datetime, entry: Mapping[str, object]) -> PricePathPoi
         return None
     high = _float(entry.get("high"))
     low = _float(entry.get("low"))
+    open_time = _parse_ts(entry.get("open_time"))
     if high is None or low is None:
-        return PricePathPoint(ts, close)
+        return PricePathPoint(ts, close, open_time=open_time)
     scope = str(entry.get("ohlc_scope", "")).strip()
     if scope not in TRUSTED_POST_PREDICTION_OHLC_SCOPES:
-        return PricePathPoint(ts, close, range_scope=scope, rejected_range=True)
+        return PricePathPoint(
+            ts,
+            close,
+            range_scope=scope,
+            rejected_range=True,
+            open_time=open_time,
+        )
     normalized_high = max(high, low, close)
     normalized_low = min(high, low, close)
-    return PricePathPoint(ts, close, normalized_high, normalized_low, range_scope=scope)
+    return PricePathPoint(
+        ts,
+        close,
+        normalized_high,
+        normalized_low,
+        range_scope=scope,
+        open_time=open_time,
+    )
 
 
 def _target_policy_meta(entry: Mapping[str, object]) -> tuple[str | None, str, str]:
@@ -2249,7 +2264,17 @@ def _future_path(
             break
         age = open_hours.age(point.ts)
         if 0.0 < age <= horizon_hours + tolerance_hours:
-            future.append(point)
+            if point.has_range and point.open_time is not None and point.open_time < ts:
+                future.append(
+                    replace(
+                        point,
+                        high=None,
+                        low=None,
+                        rejected_range=True,
+                    )
+                )
+            else:
+                future.append(point)
     return future
 
 

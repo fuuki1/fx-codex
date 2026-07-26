@@ -15,11 +15,15 @@ TMPL="$ROOT/ops/launchd/$LABEL.plist.tmpl"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 WRAPPER="$ROOT/scripts/run_quote_collector.sh"
 ENV_FILE="${FX_CODEX_COLLECTOR_ENV_FILE:-$HOME/.config/fx-codex/collector.env}"
-OUTPUT_ROOT="$HOME/srv/fx-codex/collect"
+OUTPUT_ROOT="${FX_CODEX_COLLECTOR_OUTPUT_ROOT:-$ROOT/collect/tiingo-v1}"
 CMD="${1:-status}"
 
 render_plist() {
-  sed -e "s|__ROOT__|$ROOT|g" -e "s|__HOME__|$HOME|g" "$TMPL"
+  sed \
+    -e "s|__ROOT__|$ROOT|g" \
+    -e "s|__HOME__|$HOME|g" \
+    -e "s|__COLLECT_ROOT__|$OUTPUT_ROOT|g" \
+    "$TMPL"
 }
 
 validate_files() {
@@ -44,6 +48,22 @@ validate_runtime() {
     /bin/sh "$WRAPPER" --output-root "$OUTPUT_ROOT" --dry-run >/dev/null
 }
 
+validate_approved_release() {
+  local approved_sha="${FX_CODEX_APPROVED_SHA:-}"
+  [[ "${#approved_sha}" == 40 ]] && [[ -z "${approved_sha//[0-9a-f]/}" ]] || {
+    echo "拒否: FX_CODEX_APPROVED_SHA にレビュー済み40桁commit SHAを指定してください" >&2
+    return 78
+  }
+  [[ "$(git -C "$ROOT" rev-parse HEAD)" == "$approved_sha" ]] || {
+    echo "拒否: runtime HEADがapproved SHAと一致しません" >&2
+    return 78
+  }
+  [[ -z "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]] || {
+    echo "拒否: dirty checkoutからcollectorを導入できません" >&2
+    return 78
+  }
+}
+
 write_plist_atomically() {
   mkdir -p "$AGENTS_DIR"
   local temporary="$PLIST.tmp.$$"
@@ -64,15 +84,24 @@ case "$CMD" in
     echo "== wrapper/config validation =="
     validate_files
     validate_runtime
+    validate_approved_release
     echo "dry-run passed: credentials were loaded without printing their values"
     ;;
   install)
     validate_files
     validate_runtime
+    validate_approved_release
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || [[ -e "$PLIST" ]]; then
+      echo "拒否: 既存collector label/plistを上書きしません。先に明示的にuninstallしてください" >&2
+      exit 78
+    fi
     mkdir -p "$OUTPUT_ROOT/logs"
     write_plist_atomically
-    launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST"; then
+      rm -f "$PLIST"
+      echo "導入失敗: collector plistをrollbackしました" >&2
+      exit 70
+    fi
     launchctl enable "gui/$(id -u)/$LABEL"
     launchctl print "gui/$(id -u)/$LABEL" >/dev/null
     echo "installed and verified: $LABEL"

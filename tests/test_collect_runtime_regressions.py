@@ -15,8 +15,15 @@ from types import SimpleNamespace
 import pytest
 
 import data_platform.collect.oanda as oanda
-from data_platform.collect.oanda import OandaConfig, requests_transport, stream_quotes
-from data_platform.collect.raw_first import QuoteLog, RawFirstError
+from data_platform.collect.capture_journal import CaptureJournal
+from data_platform.collect.oanda import (
+    CollectorConfigError,
+    OandaConfig,
+    requests_transport,
+    stream_quotes,
+)
+from data_platform.collect.raw_first import QuoteLog, RawFirstError, ingest_payload
+from data_platform.collect.reconnect import ConnectionState
 from data_platform.raw.immutable_store import ImmutableRawStore
 from tools.fx_quote_collector import (
     EX_SOFTWARE,
@@ -48,7 +55,7 @@ def _heartbeat_line() -> bytes:
 
 
 def _config() -> OandaConfig:
-    return OandaConfig(token="tok", account_id="acc", environment="practice")
+    return OandaConfig(token="tok", account_id="acc-001", environment="practice")
 
 
 def test_default_reconnect_path_calls_real_sleep(
@@ -163,6 +170,8 @@ def test_transport_timeout_is_classified_as_heartbeat_gap(tmp_path: Path) -> Non
 def test_requests_transport_closes_response(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeResponse:
         status_code = 200
+        is_redirect = False
+        is_permanent_redirect = False
 
         def __init__(self) -> None:
             self.closed = False
@@ -180,14 +189,66 @@ def test_requests_transport_closes_response(monkeypatch: pytest.MonkeyPatch) -> 
             yield b"line"
 
     response = FakeResponse()
+    observed_kwargs: dict[str, object] = {}
+
+    def fake_get(*_args: object, **kwargs: object) -> FakeResponse:
+        observed_kwargs.update(kwargs)
+        return response
+
     fake_requests = SimpleNamespace(
-        get=lambda *_args, **_kwargs: response,
+        get=fake_get,
         exceptions=SimpleNamespace(RequestException=RuntimeError),
     )
     monkeypatch.setitem(sys.modules, "requests", fake_requests)
 
-    assert list(requests_transport("https://example.invalid", "masked")) == [b"line"]
+    url = (
+        "https://stream-fxpractice.oanda.com/v3/accounts/acc-001/pricing/stream?instruments=USD_JPY"
+    )
+    assert list(requests_transport(url, "masked")) == [b"line"]
     assert response.closed is True
+    assert observed_kwargs["allow_redirects"] is False
+
+
+def test_requests_transport_rejects_non_oanda_destination_before_sending_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {"value": False}
+
+    def fake_get(*_args: object, **_kwargs: object) -> object:
+        called["value"] = True
+        raise AssertionError("must not send request")
+
+    fake_requests = SimpleNamespace(
+        get=fake_get,
+        exceptions=SimpleNamespace(RequestException=RuntimeError),
+    )
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    with pytest.raises(CollectorConfigError, match="refusing to send"):
+        list(requests_transport("https://example.invalid/pricing/stream", "masked"))
+    assert called["value"] is False
+
+
+def test_stream_can_count_without_retaining_per_message_results(tmp_path: Path) -> None:
+    log = QuoteLog(tmp_path / "log")
+    counts = {"accepted": 0}
+
+    state, results = stream_quotes(
+        _config(),
+        ["USD_JPY"],
+        store=None,
+        log=log,
+        transport=lambda _url, _token: iter([_price_line(), _price_line()]),
+        max_messages=2,
+        retain_results=False,
+        on_result=lambda result: counts.__setitem__(
+            "accepted", counts["accepted"] + result.accepted_count
+        ),
+    )
+
+    assert state.stopped_reason == "max_messages_reached"
+    assert results == []
+    assert counts == {"accepted": 2}
 
 
 def test_stop_predicate_stops_before_next_message(tmp_path: Path) -> None:
@@ -233,9 +294,16 @@ def test_log_bootstrap_fails_closed_on_malformed_row(tmp_path: Path) -> None:
 def test_duplicate_writer_creates_incident_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
-    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
-    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
     held = ExclusiveLock("quote-collector", locks_dir=tmp_path / "state")
     assert held.acquire() is True
     try:
@@ -257,9 +325,16 @@ def test_duplicate_writer_creates_incident_record(
 def test_unexpected_runtime_error_is_persisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
-    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
-    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
     monkeypatch.setattr(
         "tools.fx_quote_collector.stream_quotes",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
@@ -273,6 +348,47 @@ def test_unexpected_runtime_error_is_persisted(
     assert terminal["error_type"] == "RuntimeError"
     incidents = list((tmp_path / "state" / "incidents").glob("collector_runtime_failure_*.json"))
     assert len(incidents) == 1
+
+
+def test_production_startup_uses_tail_verification_not_full_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
+    seed = QuoteLog(tmp_path / "log", legacy_jsonl=False)
+    ingest_payload(
+        _price_line(),
+        parser=lambda raw: oanda.parse_price_line(
+            raw,
+            environment="practice",
+            connection_id="seed",
+            tradable_allowed=False,
+        ),
+        log=seed,
+    )
+    monkeypatch.setattr(
+        CaptureJournal,
+        "verify",
+        lambda _self: (_ for _ in ()).throw(AssertionError("unexpected full-history verify")),
+    )
+    state = ConnectionState(heartbeat_timeout_seconds=15.0)
+    state.stop("max_messages_reached")
+    monkeypatch.setattr(
+        "tools.fx_quote_collector.stream_quotes",
+        lambda *_args, **_kwargs: (state, []),
+    )
+
+    code = daemon_main(["--output-root", str(tmp_path)])
+
+    assert code == 0
 
 
 def test_launchd_wrapper_exit_mapping_and_env_loading(tmp_path: Path) -> None:
@@ -311,9 +427,10 @@ def test_launchd_wrapper_exit_mapping_and_env_loading(tmp_path: Path) -> None:
     env_dir.mkdir(parents=True)
     env_file = env_dir / "collector.env"
     env_file.write_text(
-        "FX_OANDA_API_TOKEN=TOP-SECRET\n"
-        "FX_OANDA_ACCOUNT_ID=ACCOUNT-SECRET\n"
-        "FX_OANDA_ENV=practice\n",
+        "FX_TIINGO_API_TOKEN=TOP-SECRET\n"
+        "FX_TIINGO_PLAN=free\n"
+        "FX_TIINGO_USAGE_SCOPE=internal_nonredisplay_active_subscription\n"
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF=tiingo-approval-2026-001\n",
         encoding="utf-8",
     )
     env_file.chmod(0o600)
@@ -331,5 +448,4 @@ def test_launchd_wrapper_exit_mapping_and_env_loading(tmp_path: Path) -> None:
     )
     assert configured.returncode == 0
     assert "TOP-SECRET" not in configured.stdout
-    assert "ACCOUNT-SECRET" not in configured.stdout
     assert "***masked***" in configured.stdout

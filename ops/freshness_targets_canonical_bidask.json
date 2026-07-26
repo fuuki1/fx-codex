@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "comment_ja": "canonical Tiingo bid/ask shadow収集経路専用。既存briefingの鮮度ゲートとは分離し、承認前の判断入力には使用しない。",
+  "cooldown_seconds": 21600,
+  "market_hours_only": true,
+  "targets": [
+    {
+      "name": "quote_capture_journal",
+      "path": "collect/tiingo-v1/log/capture_journal",
+      "kind": "capture_journal",
+      "expected_interval_seconds": 30,
+      "warn_after_seconds": 120,
+      "critical_after_seconds": 300,
+      "manual_action_ja": "quote collectorのlaunchd状態、collector.err.log、認証・接続incidentを確認"
+    },
+    {
+      "name": "canonical_bidask_prices",
+      "path": "logs/briefing_tf_bidask_prices_tiingo_v1.sqlite3",
+      "kind": "canonical_bidask_sqlite",
+      "required_schema_version": 4,
+      "required_fields": [
+        "ts",
+        "event_time",
+        "available_time",
+        "ingested_time",
+        "capture_slot",
+        "source",
+        "run_id",
+        "writer_id",
+        "content_hash",
+        "quote_provider",
+        "account_environment",
+        "collection_mode",
+        "source_endpoint_class",
+        "source_quality_states",
+        "all_quotes_tradable",
+        "quote_count",
+        "coverage_measurement",
+        "stale_seconds",
+        "source_lineage_sha256",
+        "source_journal_genesis_sha256"
+      ],
+      "aware_time_fields": [
+        "ts",
+        "event_time",
+        "available_time",
+        "ingested_time",
+        "capture_slot"
+      ],
+      "verify_content_hash": true,
+      "expected_interval_seconds": 60,
+      "warn_after_seconds": 180,
+      "critical_after_seconds": 600,
+      "required_symbols": ["USDJPY", "EURUSD", "GBPUSD", "AUDUSD"],
+      "required_timeframes": ["15m", "1h", "4h", "1d"],
+      "manual_action_ja": "quote collector、COMMITTED journal transaction、bridge checkpoint、materializer排他を確認"
+    }
+  ]
+}

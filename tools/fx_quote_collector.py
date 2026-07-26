@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Read-only FX quote collector daemon (launchd entrypoint).
+"""Read-only Tiingo FX quote collector daemon (launchd entrypoint).
 
-Runs the OANDA pricing stream through the raw-first ingest pipeline under a
-single-writer exclusive lock. This process is structurally incapable of
-trading: it imports only ``data_platform.collect`` (no executor, no order
-endpoint — enforced by tests) and its credentials are read-only pricing
-scope.
+Runs Tiingo's Forex top-of-book WebSocket through the raw-first ingest pipeline
+under a single-writer exclusive lock. This process is structurally incapable
+of trading: it imports only the market-data collector and has no account or
+broker API. The configured usage scope attests that storage is internal,
+non-display use under an active Tiingo subscription.
 
 Fail-closed rules:
 - missing credentials -> exit 78 (EX_CONFIG) without touching the quote log
@@ -37,19 +37,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_platform.collect.oanda import (  # noqa: E402
-    ENV_ACCOUNT,
-    ENV_ENVIRONMENT,
+from data_platform.collect.tiingo import (  # noqa: E402
+    ENV_DERIVED_DATA_APPROVAL,
+    ENV_PLAN,
     ENV_TOKEN,
+    ENV_USAGE_SCOPE,
+    SOURCE_ENDPOINT_CLASS,
     CollectorConfigError,
-    OandaConfig,
-    requests_transport,
+    TiingoConfig,
     stream_quotes,
+    websocket_transport,
 )
 from data_platform.collect.raw_first import QuoteLog  # noqa: E402
 from data_platform.collect.reconnect import ConnectionState  # noqa: E402
-from data_platform.raw.immutable_store import ImmutableRawStore  # noqa: E402
 from tools.run_exclusive import ExclusiveLock  # noqa: E402
+from fx_intel.universe import MVP_SYMBOLS, normalize_mvp_symbols  # noqa: E402
 
 EX_OK = 0
 EX_UNAVAILABLE = 69
@@ -59,7 +61,7 @@ EX_TEMPFAIL = 75
 EX_NOPERM = 77
 EX_CONFIG = 78
 
-DEFAULT_INSTRUMENTS = ("USD_JPY", "EUR_USD", "GBP_USD")
+DEFAULT_INSTRUMENTS = MVP_SYMBOLS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,14 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--instruments",
         nargs="+",
         default=list(DEFAULT_INSTRUMENTS),
-        help="OANDA instrument names, e.g. USD_JPY",
+        help="supported FX symbols, e.g. USDJPY",
     )
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument(
         "--env-file",
         type=Path,
         default=None,
-        help="optional mode-600 KEY=VALUE file containing only FX_OANDA_* credentials",
+        help="optional mode-600 KEY=VALUE file containing only FX_TIINGO_* settings",
     )
     parser.add_argument(
         "--dry-run",
@@ -101,7 +103,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
     if mode != 0o600:
         raise CollectorConfigError(f"collector env file must be mode 600, got {mode:o}: {path}")
 
-    allowed = {ENV_TOKEN, ENV_ACCOUNT, ENV_ENVIRONMENT}
+    allowed = {ENV_TOKEN, ENV_PLAN, ENV_USAGE_SCOPE, ENV_DERIVED_DATA_APPROVAL}
     values: dict[str, str] = {}
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -120,7 +122,8 @@ def _load_env_file(path: Path) -> dict[str, str]:
         value = raw_value.strip()
         if key not in allowed:
             raise CollectorConfigError(
-                f"unsupported key in collector env file at line {line_number}: {key}"
+                f"unsupported key in collector env file at line {line_number} "
+                "(key and value are not logged)"
             )
         if key in values:
             raise CollectorConfigError(f"duplicate key in collector env file: {key}")
@@ -224,12 +227,18 @@ def _record_incident(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        args.instruments = list(normalize_mvp_symbols(args.instruments))
+    except ValueError as error:
+        print(f"[collector] config error: {error}", file=sys.stderr)
+        return EX_CONFIG
+    try:
         environment = _load_env_file(args.env_file) if args.env_file is not None else None
-        config = OandaConfig.from_env(environment)
+        config = TiingoConfig.from_env(environment)
     except CollectorConfigError as error:
         print(f"[collector] config error: {error}", file=sys.stderr)
         print(
-            f"[collector] required env vars: {ENV_TOKEN}, {ENV_ACCOUNT}, {ENV_ENVIRONMENT}",
+            "[collector] required env vars: "
+            f"{ENV_TOKEN}, {ENV_PLAN}, {ENV_USAGE_SCOPE}, {ENV_DERIVED_DATA_APPROVAL}",
             file=sys.stderr,
         )
         return EX_CONFIG
@@ -238,7 +247,11 @@ def main(argv: list[str] | None = None) -> int:
         "config": repr(config),
         "instruments": list(args.instruments),
         "output_root": str(args.output_root),
-        "endpoint_class": "streaming_pricing (read-only)",
+        "endpoint_class": SOURCE_ENDPOINT_CLASS,
+        "storage_contract": "internal non-display use while Tiingo subscription is active",
+        "derived_data_contract": (
+            "written approval reference present and masked; operator attestation only"
+        ),
     }
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
@@ -274,11 +287,28 @@ def main(argv: list[str] | None = None) -> int:
         return EX_TEMPFAIL
 
     state: ConnectionState | None = None
-    results: list[Any] = []
+    counts = {"accepted": 0, "quarantined": 0}
     stop_requested = {"flag": False}
     try:
-        store = ImmutableRawStore(args.output_root / "raw")
-        log = QuoteLog(args.output_root / "log")
+        # The streaming path writes exact raw bytes and terminal rows into one
+        # daily SQLite shard.  Per-message raw files and compatibility JSONL
+        # are deliberately disabled to keep inode growth bounded.
+        log = QuoteLog(
+            args.output_root / "log",
+            legacy_jsonl=False,
+            verify_journal=False,
+        )
+        if log.journal.shard_paths():
+            log.journal.verify_tail()
+        recovered = log.journal.recover_incomplete(
+            occurred_at=datetime.now(UTC),
+            shard_limit=2,
+        )
+        if recovered:
+            print(
+                f"[collector] recovered {len(recovered)} incomplete capture(s) as unavailable",
+                file=sys.stderr,
+            )
 
         def _graceful(_signum: int, _frame: FrameType | None) -> None:
             stop_requested["flag"] = True
@@ -293,20 +323,29 @@ def main(argv: list[str] | None = None) -> int:
 
         signal.signal(signal.SIGTERM, _graceful)
         signal.signal(signal.SIGINT, _graceful)
-        state, results = stream_quotes(
+
+        def _count_result(result: Any) -> None:
+            counts["accepted"] += result.accepted_count
+            counts["quarantined"] += len(result.quarantined)
+
+        state, retained_results = stream_quotes(
             config,
             args.instruments,
-            store=store,
+            store=None,
             log=log,
-            transport=requests_transport,
+            transport=websocket_transport,
             max_messages=args.max_messages,
             sleeper=_sleep_interruptibly,
             should_stop=lambda: stop_requested["flag"],
-            source_endpoint_class="streaming_pricing",
+            source_endpoint_class=SOURCE_ENDPOINT_CLASS,
             collection_mode="live_stream",
+            retain_results=False,
+            on_result=_count_result,
         )
-        accepted = sum(result.accepted_count for result in results)
-        quarantined = sum(len(result.quarantined) for result in results)
+        if retained_results:
+            raise RuntimeError("production collector unexpectedly retained per-message results")
+        accepted = counts["accepted"]
+        quarantined = counts["quarantined"]
         stopped_reason = state.stopped_reason or "stream_returned"
         if "token_expired" in stopped_reason:
             exit_code = EX_NOPERM
@@ -343,8 +382,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return exit_code
     except OSError as error:
-        accepted = sum(result.accepted_count for result in results)
-        quarantined = sum(len(result.quarantined) for result in results)
+        accepted = counts["accepted"]
+        quarantined = counts["quarantined"]
         detail = f"{type(error).__name__}: {error}"
         try:
             _record_incident(
@@ -374,8 +413,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[collector] I/O failure: {type(error).__name__}", file=sys.stderr)
         return EX_IOERR
     except Exception as error:
-        accepted = sum(result.accepted_count for result in results)
-        quarantined = sum(len(result.quarantined) for result in results)
+        accepted = counts["accepted"]
+        quarantined = counts["quarantined"]
         detail = f"{type(error).__name__}: {error}"
         try:
             _record_incident(

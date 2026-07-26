@@ -25,6 +25,8 @@ research_pack/
 # 構成の説明(logs/README.md)だけをGit管理する。
 logs/*
 !logs/README.md
+# Canonical read-only quote collector runtime (SQLite journal, state, service logs).
+/collect/
 trade_log.csv
 trades.csv
 equity.csv

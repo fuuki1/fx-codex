@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,9 +33,24 @@ import sys
 import tempfile
 from collections.abc import Callable, Mapping
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from fx_intel.market import open_hours_between  # noqa: E402
+from data_platform.collect.capture_journal import (  # noqa: E402
+    CaptureJournal,
+    CaptureJournalError,
+)
+from data_platform.runtime.bid_ask_bridge import (  # noqa: E402
+    BidAskBridgeError,
+    read_latest_snapshot_slot,
+)
+
 DEFAULT_CONFIG_PATH = "ops/freshness_targets.json"
 DEFAULT_STATE_PATH = "logs/freshness_state.json"
 DEFAULT_REPORT_PATH = "logs/freshness_report.json"
+MAX_FUTURE_SKEW_SECONDS = 5.0
 DEFAULT_COOLDOWN_SECONDS = 6 * 3600
 
 STATUS_OK = "ok"
@@ -63,6 +79,11 @@ class TargetConfig:
     manual_action_ja: str = ""
     required_symbols: tuple[str, ...] = ()
     required_timeframes: tuple[str, ...] = ()
+    required_schema_version: int | None = None
+    required_fields: tuple[str, ...] = ()
+    aware_time_fields: tuple[str, ...] = ()
+    verify_content_hash: bool = False
+    market_hours_only: bool = False
 
 
 @dataclass
@@ -155,6 +176,7 @@ def _opt_int(value: object) -> int:
 def load_config(path: str | Path) -> tuple[list[TargetConfig], float]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     cooldown = float(payload.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS))
+    default_market_hours_only = bool(payload.get("market_hours_only", False))
     targets: list[TargetConfig] = []
     for row in payload.get("targets", []):
         critical_raw = row.get("critical_after_seconds")
@@ -171,6 +193,15 @@ def load_config(path: str | Path) -> tuple[list[TargetConfig], float]:
                 required_timeframes=tuple(
                     str(value) for value in row.get("required_timeframes", [])
                 ),
+                required_schema_version=(
+                    int(row["required_schema_version"])
+                    if row.get("required_schema_version") is not None
+                    else None
+                ),
+                required_fields=tuple(str(value) for value in row.get("required_fields", [])),
+                aware_time_fields=tuple(str(value) for value in row.get("aware_time_fields", [])),
+                verify_content_hash=bool(row.get("verify_content_hash", False)),
+                market_hours_only=bool(row.get("market_hours_only", default_market_hours_only)),
             )
         )
     return targets, cooldown
@@ -192,9 +223,49 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
         result.reason = "file_missing"
         return result
 
-    mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=UTC)
-    age = (now - mtime).total_seconds()
-    result.last_update = mtime.isoformat()
+    integrity_failure: str | None = None
+    activity_path = file_path
+    logical_update: datetime | None = None
+    if target.kind == "capture_journal":
+        shards = tuple(sorted(file_path.glob("capture-????-??-??.sqlite3")))
+        if not shards:
+            result.status = STATUS_CRITICAL
+            result.reason = "journal_shard_missing"
+            return result
+        active = shards[-1]
+        activity_path = active
+        try:
+            journal_tail = CaptureJournal(file_path, verify=False).verify_tail()
+            logical_update = journal_tail.occurred_at
+        except CaptureJournalError:
+            integrity_failure = "journal_integrity_failure"
+    elif target.kind == "canonical_bidask_sqlite":
+        try:
+            logical_update, latest_rows = read_latest_snapshot_slot(file_path)
+            for row in latest_rows:
+                contract_reason = _jsonl_contract_failure(row, target, now=now)
+                if contract_reason:
+                    raise BidAskBridgeError(contract_reason)
+            if target.required_symbols and target.required_timeframes:
+                _apply_snapshot_coverage(
+                    result,
+                    list(latest_rows),
+                    target,
+                    latest_slot=logical_update.isoformat(),
+                )
+        except BidAskBridgeError:
+            result.status = STATUS_CRITICAL
+            result.reason = "canonical_snapshot_integrity_failure"
+            return result
+
+    activity_time = logical_update or datetime.fromtimestamp(activity_path.stat().st_mtime, tz=UTC)
+    wall_age = (now - activity_time).total_seconds()
+    age = (
+        open_hours_between(activity_time, now) * 3600.0
+        if target.market_hours_only and wall_age > 0
+        else wall_age
+    )
+    result.last_update = activity_time.isoformat()
     result.age_seconds = round(age, 1)
 
     if target.critical_after_seconds is not None and age > target.critical_after_seconds:
@@ -203,6 +274,15 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
     elif age > target.warn_after_seconds:
         result.status = STATUS_WARNING
         result.reason = "stale_warning"
+    if wall_age < -MAX_FUTURE_SKEW_SECONDS:
+        result.status = STATUS_CRITICAL
+        result.reason = (
+            "canonical_timestamp_future" if logical_update is not None else "file_mtime_future"
+        )
+
+    if integrity_failure is not None:
+        result.status = STATUS_CRITICAL
+        result.reason = integrity_failure
 
     # JSONLの末尾行が壊れていたら書込み途中クラッシュや破損の兆候(鮮度より優先)
     if target.kind == "jsonl":
@@ -210,13 +290,62 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
         tail = recent_lines[-1] if recent_lines else None
         if tail is not None:
             try:
-                json.loads(tail)
+                tail_payload = json.loads(tail)
             except json.JSONDecodeError:
                 result.status = STATUS_CRITICAL
                 result.reason = "jsonl_corrupt_tail"
+            else:
+                contract_reason = _jsonl_contract_failure(tail_payload, target, now=now)
+                if contract_reason:
+                    result.status = STATUS_CRITICAL
+                    result.reason = contract_reason
         if target.required_symbols and target.required_timeframes:
             _apply_capture_coverage(result, recent_lines, target)
     return result
+
+
+def _jsonl_contract_failure(
+    payload: object,
+    target: TargetConfig,
+    *,
+    now: datetime,
+) -> str:
+    if not isinstance(payload, dict):
+        return "jsonl_tail_not_object"
+    if (
+        target.required_schema_version is not None
+        and payload.get("schema_version") != target.required_schema_version
+    ):
+        return "jsonl_schema_mismatch"
+    if any(payload.get(name) in (None, "") for name in target.required_fields):
+        return "jsonl_provenance_missing"
+    for name in target.aware_time_fields:
+        try:
+            parsed = datetime.fromisoformat(str(payload.get(name, "")))
+        except (TypeError, ValueError):
+            return "jsonl_timestamp_invalid"
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return "jsonl_timestamp_naive"
+        if parsed.astimezone(UTC) > now.astimezone(UTC) + timedelta(
+            seconds=MAX_FUTURE_SKEW_SECONDS
+        ):
+            return "jsonl_timestamp_future"
+    if target.verify_content_hash:
+        expected = payload.get("content_hash")
+        body = {str(key): value for key, value in payload.items() if key != "content_hash"}
+        try:
+            encoded = json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return "jsonl_hash_unverifiable"
+        if expected != hashlib.sha256(encoded).hexdigest():
+            return "jsonl_hash_mismatch"
+    return ""
 
 
 def _read_recent_nonempty_lines(path: Path, chunk: int = 65536) -> list[str]:
@@ -256,6 +385,18 @@ def _apply_capture_coverage(
         result.status = STATUS_CRITICAL
         result.reason = "coverage_metadata_missing"
         return
+    _apply_snapshot_coverage(result, parsed, target, latest_slot=latest_slot)
+
+
+def _apply_snapshot_coverage(
+    result: TargetResult,
+    parsed: list[dict[str, object]],
+    target: TargetConfig,
+    *,
+    latest_slot: str,
+) -> None:
+    """Validate the full natural-key coverage of one logical snapshot slot."""
+
     observed = {
         (str(row.get("symbol")), str(row.get("timeframe")))
         for row in parsed
@@ -556,7 +697,7 @@ def run_monitor(
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="学習データ鮮度監視")
     parser.add_argument("--root", default=".", help="fx-codexリポジトリのルート")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
@@ -567,6 +708,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="通知せず判定とレポートだけ更新する（通知状態は変更しない）",
     )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()

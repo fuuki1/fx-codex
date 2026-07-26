@@ -7,13 +7,15 @@
        credential values are never templated into this plist. -->
   <key>Label</key>
   <string>com.fx-codex.quote-collector</string>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
     <string>__ROOT__/scripts/run_quote_collector.sh</string>
     <string>--launchd</string>
     <string>--output-root</string>
-    <string>__HOME__/srv/fx-codex/collect</string>
+    <string>__COLLECT_ROOT__</string>
   </array>
   <key>WorkingDirectory</key>
   <string>__ROOT__</string>
@@ -29,9 +31,9 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>__HOME__/srv/fx-codex/collect/logs/collector.out.log</string>
+  <string>__COLLECT_ROOT__/logs/collector.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/srv/fx-codex/collect/logs/collector.err.log</string>
+  <string>__COLLECT_ROOT__/logs/collector.err.log</string>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>

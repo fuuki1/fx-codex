@@ -144,6 +144,16 @@ class TestMaterializeBars:
         bar = materialize_bars(quotes, "5s", expected_quote_interval=timedelta(seconds=1))[0]
         assert bar.source_coverage == pytest.approx(3 / 5)
 
+    def test_source_coverage_remains_unmeasured_without_expected_interval(self) -> None:
+        quotes = [
+            _quote(1, 145.10, 145.13, 0),
+            _quote(2, 145.11, 145.14, 1),
+        ]
+
+        bar = materialize_bars(quotes, "5s")[0]
+
+        assert bar.source_coverage is None
+
     def test_empty_quotes_yields_no_bars(self) -> None:
         assert materialize_bars([], "5s") == []
 
