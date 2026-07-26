@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 
@@ -139,6 +141,16 @@ def test_stale_warning_and_critical_thresholds(monitor, tmp_path):
     assert report["targets"][0]["reason"] == "stale_critical"
 
 
+def test_future_file_mtime_is_critical(monitor, tmp_path):
+    config = _write_config(tmp_path)
+    _touch_jsonl(tmp_path, age_seconds=-60)
+
+    report = _run(monitor, tmp_path, config, _Sender())
+
+    assert report["targets"][0]["status"] == "critical"
+    assert report["targets"][0]["reason"] == "file_mtime_future"
+
+
 def test_missing_file_is_critical(monitor, tmp_path):
     config = _write_config(tmp_path)
     sender = _Sender()
@@ -154,6 +166,115 @@ def test_corrupt_jsonl_tail_is_critical_even_if_fresh(monitor, tmp_path):
     report = _run(monitor, tmp_path, config, _Sender())
     assert report["targets"][0]["status"] == "critical"
     assert report["targets"][0]["reason"] == "jsonl_corrupt_tail"
+
+
+def test_market_hours_only_excludes_the_weekend_closure(monitor, tmp_path):
+    path = tmp_path / "logs" / "prices.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"ts": "2026-07-24T20:59:00+00:00"}\n', encoding="utf-8")
+    friday = datetime(2026, 7, 24, 20, 59, tzinfo=UTC)
+    os.utime(path, (friday.timestamp(), friday.timestamp()))
+    target = monitor.TargetConfig(
+        name="prices",
+        path="logs/prices.jsonl",
+        warn_after_seconds=120,
+        critical_after_seconds=300,
+        market_hours_only=True,
+    )
+
+    result = monitor.check_target(
+        target,
+        tmp_path,
+        datetime(2026, 7, 25, 12, 0, tzinfo=UTC),
+    )
+
+    assert result.status == "ok"
+    assert result.age_seconds == 60.0
+
+
+def test_jsonl_tail_provenance_and_content_hash_are_verified(monitor, tmp_path):
+    path = tmp_path / "logs" / "prices.jsonl"
+    path.parent.mkdir(parents=True)
+    row = {
+        "schema_version": 3,
+        "ts": "2026-07-10T02:59:00+00:00",
+        "available_time": "2026-07-10T02:59:30+00:00",
+        "capture_slot": "2026-07-10T02:59:00+00:00",
+        "symbol": "USDJPY",
+        "timeframe": "15m",
+    }
+    encoded = json.dumps(
+        row,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    row["content_hash"] = hashlib.sha256(encoded).hexdigest()
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+    target = monitor.TargetConfig(
+        name="prices",
+        path="logs/prices.jsonl",
+        warn_after_seconds=900,
+        critical_after_seconds=2700,
+        required_schema_version=3,
+        required_fields=("ts", "available_time", "capture_slot", "content_hash"),
+        aware_time_fields=("ts", "available_time", "capture_slot"),
+        verify_content_hash=True,
+    )
+
+    valid = monitor.check_target(target, tmp_path, NOW)
+    assert valid.status == "ok"
+
+    row["content_hash"] = "0" * 64
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    invalid = monitor.check_target(target, tmp_path, NOW)
+    assert invalid.status == "critical"
+    assert invalid.reason == "jsonl_hash_mismatch"
+
+    future = dict(row)
+    future["ts"] = (NOW + timedelta(minutes=1)).isoformat()
+    body = {key: value for key, value in future.items() if key != "content_hash"}
+    future["content_hash"] = hashlib.sha256(
+        json.dumps(
+            body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(json.dumps(future) + "\n", encoding="utf-8")
+    invalid_future = monitor.check_target(target, tmp_path, NOW)
+    assert invalid_future.status == "critical"
+    assert invalid_future.reason == "jsonl_timestamp_future"
+
+
+def test_capture_journal_target_checks_active_shard_integrity(monitor, tmp_path):
+    journal_root = tmp_path / "collect" / "log" / "capture_journal"
+    journal = monitor.CaptureJournal(journal_root)
+    journal.begin(b"raw-provider-message", occurred_at=NOW)
+    for path in journal_root.iterdir():
+        os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+    target = monitor.TargetConfig(
+        name="journal",
+        path="collect/log/capture_journal",
+        kind="capture_journal",
+        warn_after_seconds=900,
+        critical_after_seconds=2700,
+    )
+
+    valid = monitor.check_target(target, tmp_path, NOW + timedelta(seconds=1))
+    assert valid.status == "ok"
+
+    shard = journal.shard_paths()[0]
+    with sqlite3.connect(shard) as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.execute("UPDATE events SET raw_payload = ?", (b"tampered",))
+    invalid = monitor.check_target(target, tmp_path, NOW + timedelta(seconds=2))
+    assert invalid.status == "critical"
+    assert invalid.reason == "journal_integrity_failure"
 
 
 def test_latest_capture_slot_requires_complete_symbol_timeframe_coverage(monitor, tmp_path):

@@ -68,7 +68,7 @@ class BidAskBar:
     spread_max: float
     quote_count: int
     stale_seconds: float
-    source_coverage: float
+    source_coverage: float | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -117,9 +117,8 @@ def materialize_bars(
 
     ``expected_quote_interval`` (if given) sets the denominator for
     ``source_coverage`` — the fraction of the expected number of quotes actually
-    seen in the bar. Without it, coverage is reported as 1.0 for any bar that has
-    at least one quote (we cannot claim a coverage we cannot compute, so we do
-    not under-report either; callers that care must supply the expectation).
+    seen in the bar. Without an expected interval, coverage remains ``None``;
+    one observed quote must never be presented as 100% source coverage.
     """
 
     if interval not in BAR_INTERVALS:
@@ -167,7 +166,7 @@ def _bar_from_window(
         expected = max(1, int(span / expected_quote_interval))
         source_coverage = min(1.0, len(window) / expected)
     else:
-        source_coverage = 1.0
+        source_coverage = None
 
     return BidAskBar(
         instrument=window[0].instrument,

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fx-codex.bidask-health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string>
+    <string>fx-bidask-health</string>
+    <string>--locks-dir</string>
+    <string>__ROOT__/logs/locks</string>
+    <string>--timeout-seconds</string>
+    <string>50</string>
+    <string>--</string>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/tools/data_freshness_monitor.py</string>
+    <string>--root</string>
+    <string>__ROOT__</string>
+    <string>--config</string>
+    <string>ops/freshness_targets_canonical_bidask.json</string>
+    <string>--state</string>
+    <string>logs/canonical_bidask_freshness_state.json</string>
+    <string>--report</string>
+    <string>logs/canonical_bidask_freshness_report.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__ROOT__/collect/logs/bidask-health.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/collect/logs/bidask-health.err.log</string>
+</dict>
+</plist>
