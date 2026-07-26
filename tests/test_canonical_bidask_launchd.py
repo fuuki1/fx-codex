@@ -54,8 +54,9 @@ def test_materializer_reads_only_committed_ingest_and_uses_a_separate_shadow_lab
     assert arguments[arguments.index("--ingest-log-dir") + 1] == "/srv/fx-codex/collect/log"
     assert (
         arguments[arguments.index("--output") + 1]
-        == "/srv/fx-codex/logs/briefing_tf_bidask_prices.jsonl"
+        == "/srv/fx-codex/logs/briefing_tf_bidask_prices.sqlite3"
     )
+    assert "--state" not in arguments
     assert payload["StartInterval"] == 60
     assert "--timeout-seconds" not in arguments
 
@@ -85,6 +86,7 @@ def test_canonical_freshness_requires_hash_provenance_and_full_universe() -> Non
 
     assert prices["required_schema_version"] == 3
     assert prices["verify_content_hash"] is True
+    assert prices["kind"] == "canonical_bidask_sqlite"
     assert prices["required_symbols"] == ["USDJPY", "EURUSD", "GBPUSD", "AUDUSD"]
     assert prices["required_timeframes"] == ["15m", "1h", "4h", "1d"]
 

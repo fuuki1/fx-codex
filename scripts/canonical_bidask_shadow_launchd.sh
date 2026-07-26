@@ -88,10 +88,18 @@ validate_release() {
 import plistlib
 import sys
 from tools.run_exclusive import build_parser
+from tools.data_freshness_monitor import build_parser as freshness_parser
+from tools.materialize_bid_ask_prices import build_parser as materializer_parser
 
 arguments = plistlib.loads(sys.stdin.buffer.read())["ProgramArguments"]
 separator = arguments.index("--")
 build_parser().parse_args([*arguments[2:separator], "--", "/usr/bin/true"])
+inner = arguments[separator + 1:]
+parsers = {
+    "data_freshness_monitor.py": freshness_parser,
+    "materialize_bid_ask_prices.py": materializer_parser,
+}
+parsers[inner[1].rsplit("/", 1)[-1]]().parse_args(inner[2:])
 '
   done
 }

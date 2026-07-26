@@ -1,24 +1,25 @@
-"""Materialize committed bid/ask journal rows into completed one-minute bars.
+"""Materialize committed bid/ask journal rows into a transactional shadow store.
 
-Only hash-bound ``committed`` captures are visible. The checkpoint stores the
-first unconsumed ``(commit_sequence, row_index)``; the first still-open minute
-is replayed on the next invocation. Output is appended idempotently before the
-checkpoint advances, so a crash can replay data but cannot silently skip it.
-The legacy accepted JSONL and its byte offsets are never read here.
+Only hash-bound ``committed`` captures are visible. Canonical snapshot rows and
+the first unconsumed ``(commit_sequence, row_index)`` are committed together in
+one SQLite WAL transaction. A crash therefore exposes either both the rows and
+their checkpoint or neither. The legacy accepted JSONL and its byte offsets are
+never read here.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import socket
+import sqlite3
 from typing import Any
 
 from data_platform.collect.capture_journal import (
@@ -35,6 +36,7 @@ from fx_intel.universe import normalize_symbol
 
 BRIDGE_STATE_SCHEMA = 3
 SNAPSHOT_SCHEMA_VERSION = 3
+SNAPSHOT_STORE_SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_TIMEFRAMES = ("15m", "1h", "4h", "1d")
 _REPLAY_ROW_BITS = 32
 
@@ -103,46 +105,175 @@ class BridgeResult:
 @dataclass(frozen=True)
 class _LocatedQuote:
     position: ReplayPosition
+    capture_id: str
+    commit_entry_sha256: str
     collected: CollectedQuote
     market: MarketQuote
 
 
-def _load_state(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
+def _canonical_json(value: object) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise BidAskBridgeError("canonical snapshot contains non-JSON data") from error
+
+
+def _create_store_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(f"""
+        CREATE TABLE bridge_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            config_json TEXT NOT NULL,
+            next_commit_sequence INTEGER NOT NULL CHECK (next_commit_sequence >= 0),
+            next_row_index INTEGER NOT NULL CHECK (next_row_index >= 0),
+            checkpoint_commit_entry_sha256 TEXT,
+            last_materialized_close TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE snapshots (
+            event_time TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            capture_slot TEXT NOT NULL,
+            available_time TEXT NOT NULL,
+            ingested_time TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (event_time, symbol, timeframe)
+        );
+        CREATE INDEX snapshots_capture_slot_idx
+            ON snapshots(capture_slot, symbol, timeframe);
+        CREATE TRIGGER snapshots_no_update
+        BEFORE UPDATE ON snapshots BEGIN
+            SELECT RAISE(ABORT, 'append-only canonical snapshots');
+        END;
+        CREATE TRIGGER snapshots_no_delete
+        BEFORE DELETE ON snapshots BEGIN
+            SELECT RAISE(ABORT, 'append-only canonical snapshots');
+        END;
+        PRAGMA user_version={SNAPSHOT_STORE_SCHEMA_VERSION};
+        """)
+
+
+_REQUIRED_STORE_OBJECTS = {
+    ("table", "bridge_state"),
+    ("table", "snapshots"),
+    ("index", "snapshots_capture_slot_idx"),
+    ("trigger", "snapshots_no_update"),
+    ("trigger", "snapshots_no_delete"),
+}
+
+
+def _validate_store_schema(connection: sqlite3.Connection) -> None:
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version != SNAPSHOT_STORE_SCHEMA_VERSION:
+        raise BidAskBridgeError("canonical snapshot store schema version is invalid")
+    observed = {
+        (str(row["type"]), str(row["name"]))
+        for row in connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE name IN ('bridge_state', 'snapshots', 'snapshots_capture_slot_idx', "
+            "'snapshots_no_update', 'snapshots_no_delete')"
+        )
+    }
+    missing = sorted(_REQUIRED_STORE_OBJECTS - observed)
+    if missing:
+        raise BidAskBridgeError(f"canonical snapshot store schema objects are missing: {missing}")
+    integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+    if integrity != "ok":
+        raise BidAskBridgeError("canonical snapshot store quick_check failed")
+
+
+@contextmanager
+def _connect_store(
+    path: Path,
+    *,
+    readonly: bool,
+    create: bool = False,
+) -> Iterator[sqlite3.Connection]:
+    if readonly and not path.is_file():
+        raise BidAskBridgeError(f"canonical snapshot store is missing: {path}")
+    if path.is_symlink():
+        raise BidAskBridgeError(f"canonical snapshot store cannot be a symlink: {path}")
+    if not readonly:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    try:
+        connection = (
+            sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+            if readonly
+            else sqlite3.connect(path, timeout=30.0)
+        )
+    except sqlite3.Error as error:
+        raise BidAskBridgeError(f"cannot open canonical snapshot store: {error}") from error
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=30000")
+        if not readonly:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA wal_autocheckpoint=1000")
+        initialized = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshots'"
+        ).fetchone()
+        if initialized is None:
+            if readonly or existed or not create:
+                raise BidAskBridgeError("canonical snapshot store is uninitialized")
+            _create_store_schema(connection)
+            connection.commit()
+            os.chmod(path, 0o600)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        _validate_store_schema(connection)
+        yield connection
+    except sqlite3.Error as error:
+        raise BidAskBridgeError(f"canonical snapshot SQLite failure: {error}") from error
+    finally:
+        connection.close()
+
+
+def _state_from_connection(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute("SELECT * FROM bridge_state WHERE singleton = 1").fetchone()
+    if row is None:
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise BidAskBridgeError(f"cannot read bridge state {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise BidAskBridgeError(f"unsupported bridge state at {path}")
-    if value.get("schema_version") in (1, 2):
-        raise BidAskBridgeError(
-            "legacy bridge state requires explicit audited checkpoint migration"
-        )
-    if value.get("schema_version") != BRIDGE_STATE_SCHEMA:
-        raise BidAskBridgeError(f"unsupported bridge state at {path}")
+        config = json.loads(str(row["config_json"]))
+    except json.JSONDecodeError as error:
+        raise BidAskBridgeError("canonical snapshot bridge config is malformed") from error
+    if not isinstance(config, dict):
+        raise BidAskBridgeError("canonical snapshot bridge config is invalid")
+    value = {
+        "schema_version": int(row["schema_version"]),
+        **config,
+        "next_position": {
+            "commit_sequence": int(row["next_commit_sequence"]),
+            "row_index": int(row["next_row_index"]),
+        },
+        "checkpoint_commit_entry_sha256": row["checkpoint_commit_entry_sha256"],
+        "last_materialized_close": row["last_materialized_close"],
+        "updated_at": str(row["updated_at"]),
+    }
+    if value["schema_version"] != BRIDGE_STATE_SCHEMA:
+        raise BidAskBridgeError("canonical snapshot bridge state schema is invalid")
     return value
 
 
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+def _load_store_state(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with _connect_store(path, readonly=True) as connection:
+        return _state_from_connection(connection)
 
 
 def _validate_configuration(
@@ -208,7 +339,10 @@ def _checkpoint_commit_hash(
     return digest
 
 
-def _locate_quote(record: CommittedQuote) -> _LocatedQuote:
+def _locate_quote(
+    record: CommittedQuote,
+    commit_entry_hashes: Mapping[int, str],
+) -> _LocatedQuote:
     if record.row_index >= 1 << _REPLAY_ROW_BITS:
         raise BidAskBridgeError("committed capture exceeds durable replay row-index capacity")
     fallback_sequence = (record.commit_sequence << _REPLAY_ROW_BITS) | record.row_index
@@ -220,6 +354,8 @@ def _locate_quote(record: CommittedQuote) -> _LocatedQuote:
         ) from error
     return _LocatedQuote(
         position=ReplayPosition(record.commit_sequence, record.row_index),
+        capture_id=record.capture_id,
+        commit_entry_sha256=commit_entry_hashes[record.commit_sequence],
         collected=record.quote,
         market=market,
     )
@@ -253,6 +389,25 @@ def _bar_snapshot(bar: BidAskBar, located: Sequence[_LocatedQuote]) -> dict[str,
     collection_modes = sorted({item.collected.collection_mode for item in window})
     endpoint_classes = sorted({item.collected.source_endpoint_class for item in window})
     quality_states = sorted({str(item.collected.quality_state) for item in window})
+    if providers != ["oanda"]:
+        raise BidAskBridgeError("canonical bridge accepts only provider=oanda")
+    if collection_modes != ["live_stream"]:
+        raise BidAskBridgeError("canonical bridge accepts only collection_mode=live_stream")
+    if endpoint_classes != ["streaming_pricing"]:
+        raise BidAskBridgeError(
+            "canonical bridge accepts only source_endpoint_class=streaming_pricing"
+        )
+    lineage = [
+        {
+            "commit_sequence": item.position.commit_sequence,
+            "row_index": item.position.row_index,
+            "capture_id": item.capture_id,
+            "raw_payload_sha256": item.collected.raw_payload_sha256,
+            "commit_entry_sha256": item.commit_entry_sha256,
+        }
+        for item in window
+    ]
+    lineage_sha256 = hashlib.sha256(_canonical_json(lineage).encode("utf-8")).hexdigest()
 
     def single_or_mixed(values: list[str]) -> str:
         return values[0] if len(values) == 1 else "mixed"
@@ -291,10 +446,13 @@ def _bar_snapshot(bar: BidAskBar, located: Sequence[_LocatedQuote]) -> dict[str,
         "all_quotes_tradable": bool(window) and all(item.collected.tradable for item in window),
         "source_received_at_max": max(item.collected.received_at for item in window).isoformat(),
         "source_payload_count": len({item.collected.raw_payload_sha256 for item in window}),
+        "source_lineage_sha256": lineage_sha256,
+        "source_first_commit_sequence": min(item.position.commit_sequence for item in window),
+        "source_last_commit_sequence": max(item.position.commit_sequence for item in window),
         "open_time": bar.open_time.isoformat(),
         "event_time": bar.close_time.isoformat(),
         "source_record_id": (f"oanda-pricing:{bar.instrument}:1m:{bar.close_time.isoformat()}"),
-        "ohlc_scope": "closed_bar_after_prediction",
+        "ohlc_scope": "completed_bid_ask_bar",
         "data_quality_flags": list(dict.fromkeys(flags)),
     }
 
@@ -305,13 +463,7 @@ def _content_hash(row: Mapping[str, object]) -> str:
         for key, value in row.items()
         if key != "content_hash" and not str(key).startswith("_")
     }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    encoded = _canonical_json(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -323,6 +475,7 @@ def _canonical_snapshot_row(
     materialized_at: datetime,
     run_id: str,
     writer_id: str,
+    journal_genesis_sha256: str,
 ) -> dict[str, object]:
     event_time = datetime.fromisoformat(str(payload["event_time"]))
     open_time = datetime.fromisoformat(str(payload["open_time"]))
@@ -362,6 +515,7 @@ def _canonical_snapshot_row(
             "local_record_id": f"{symbol}:{timeframe}:{event_stamp}",
             "run_id": run_id,
             "writer_id": writer_id,
+            "source_journal_genesis_sha256": journal_genesis_sha256,
         }
     )
     required = (
@@ -380,6 +534,10 @@ def _canonical_snapshot_row(
         "quote_count",
         "coverage_measurement",
         "stale_seconds",
+        "source_lineage_sha256",
+        "source_journal_genesis_sha256",
+        "source_first_commit_sequence",
+        "source_last_commit_sequence",
     )
     missing = [key for key in required if key not in row]
     if missing:
@@ -428,14 +586,32 @@ def _validate_snapshot_row(row: Mapping[str, object]) -> None:
         "quote_count",
         "coverage_measurement",
         "stale_seconds",
+        "source_lineage_sha256",
+        "source_journal_genesis_sha256",
+        "source_first_commit_sequence",
+        "source_last_commit_sequence",
     )
     missing = [key for key in required if row.get(key) in (None, "")]
     if missing:
         raise BidAskBridgeError(f"canonical snapshot is missing provenance: {missing}")
     if row.get("source") != "oanda_pricing_stream_bid_ask":
         raise BidAskBridgeError("canonical snapshot source is invalid")
-    if row.get("ohlc_scope") != "closed_bar_after_prediction":
+    if row.get("ohlc_scope") != "completed_bid_ask_bar":
         raise BidAskBridgeError("canonical snapshot scope is invalid")
+    if row.get("quote_provider") != "oanda":
+        raise BidAskBridgeError("canonical snapshot provider is invalid")
+    if row.get("collection_mode") != "live_stream":
+        raise BidAskBridgeError("canonical snapshot collection mode is invalid")
+    if row.get("source_endpoint_class") != "streaming_pricing":
+        raise BidAskBridgeError("canonical snapshot endpoint class is invalid")
+    for field_name in ("source_lineage_sha256", "source_journal_genesis_sha256"):
+        digest = row.get(field_name)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise BidAskBridgeError(f"canonical snapshot {field_name} is invalid")
     if row.get("ts") != event_stamp or row.get("capture_slot") != event_stamp:
         raise BidAskBridgeError("canonical snapshot time identity is inconsistent")
     if normalize_symbol(symbol) != symbol or timeframe not in DEFAULT_OUTPUT_TIMEFRAMES:
@@ -476,6 +652,17 @@ def _validate_snapshot_row(row: Mapping[str, object]) -> None:
         raise BidAskBridgeError("canonical snapshot quote_count must be positive")
     if not isinstance(row.get("all_quotes_tradable"), bool):
         raise BidAskBridgeError("canonical snapshot all_quotes_tradable must be boolean")
+    first_sequence = row.get("source_first_commit_sequence")
+    last_sequence = row.get("source_last_commit_sequence")
+    if (
+        isinstance(first_sequence, bool)
+        or not isinstance(first_sequence, int)
+        or isinstance(last_sequence, bool)
+        or not isinstance(last_sequence, int)
+        or first_sequence < 1
+        or last_sequence < first_sequence
+    ):
+        raise BidAskBridgeError("canonical snapshot source commit sequence range is invalid")
     for field_name in ("data_quality_flags", "source_quality_states"):
         values = row.get(field_name)
         if not isinstance(values, list) or not all(
@@ -522,74 +709,193 @@ def _same_snapshot(left: Mapping[str, object], right: Mapping[str, object]) -> b
         "source",
         "schema_version",
         "ohlc_scope",
+        "source_lineage_sha256",
+        "source_journal_genesis_sha256",
+        "source_first_commit_sequence",
+        "source_last_commit_sequence",
     )
     return all(left.get(key) == right.get(key) for key in comparable)
 
 
-def _append_snapshot_rows(path: Path, rows: Sequence[Mapping[str, object]]) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            handle.seek(0)
-            existing: dict[tuple[str, str, str], dict[str, object]] = {}
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise BidAskBridgeError(
-                        f"malformed canonical JSONL at {path}:{line_number}"
-                    ) from error
-                if not isinstance(parsed, dict):
-                    raise BidAskBridgeError(
-                        f"non-object canonical JSONL row at {path}:{line_number}"
-                    )
-                _validate_snapshot_row(parsed)
-                key = _snapshot_key(parsed)
-                prior = existing.get(key)
-                if prior is not None and not _same_snapshot(prior, parsed):
-                    raise BidAskBridgeError(
-                        f"conflicting existing canonical snapshots for natural key {key}"
-                    )
-                existing[key] = parsed
+def _decode_snapshot_row(row: sqlite3.Row) -> dict[str, object]:
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError as error:
+        raise BidAskBridgeError("canonical snapshot payload_json is malformed") from error
+    if not isinstance(payload, dict):
+        raise BidAskBridgeError("canonical snapshot payload_json is not an object")
+    _validate_snapshot_row(payload)
+    indexed = {
+        "event_time": str(row["event_time"]),
+        "symbol": str(row["symbol"]),
+        "timeframe": str(row["timeframe"]),
+        "capture_slot": str(row["capture_slot"]),
+        "available_time": str(row["available_time"]),
+        "ingested_time": str(row["ingested_time"]),
+        "schema_version": int(row["schema_version"]),
+        "content_hash": str(row["content_hash"]),
+    }
+    if any(payload.get(key) != value for key, value in indexed.items()):
+        raise BidAskBridgeError("canonical snapshot indexed columns disagree with payload")
+    return {str(key): value for key, value in payload.items()}
 
-            pending: list[dict[str, object]] = []
+
+def read_snapshot_rows(path: str | Path) -> tuple[dict[str, object], ...]:
+    """Read and validate all canonical rows for offline audit/tests."""
+
+    with _connect_store(Path(path), readonly=True) as connection:
+        rows = connection.execute("SELECT * FROM snapshots ORDER BY event_time, symbol, timeframe")
+        return tuple(_decode_snapshot_row(row) for row in rows)
+
+
+def read_latest_snapshot_slot(
+    path: str | Path,
+) -> tuple[datetime, tuple[dict[str, object], ...]]:
+    """Read and validate every row in the latest logical event-time slot."""
+
+    with _connect_store(Path(path), readonly=True) as connection:
+        latest = connection.execute("SELECT MAX(event_time) FROM snapshots").fetchone()[0]
+        if latest is None:
+            raise BidAskBridgeError("canonical snapshot store has no rows")
+        try:
+            latest_time = datetime.fromisoformat(str(latest))
+        except ValueError as error:
+            raise BidAskBridgeError("canonical snapshot latest event_time is invalid") from error
+        if latest_time.tzinfo is None or latest_time.utcoffset() is None:
+            raise BidAskBridgeError("canonical snapshot latest event_time is naive")
+        rows = tuple(
+            _decode_snapshot_row(row)
+            for row in connection.execute(
+                "SELECT * FROM snapshots WHERE event_time = ? ORDER BY symbol, timeframe",
+                (str(latest),),
+            )
+        )
+    if not rows:
+        raise BidAskBridgeError("canonical snapshot latest slot is empty")
+    return latest_time.astimezone(UTC), rows
+
+
+def _transaction_test_hook(stage: str) -> None:
+    """Fault-injection boundary used only by the synthetic crash probe."""
+
+    del stage
+
+
+def _write_store_transaction(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    prior_state: dict[str, Any] | None,
+    next_state: dict[str, object],
+) -> int:
+    with _connect_store(path, readonly=False, create=True) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current_state = _state_from_connection(connection)
+            if current_state != prior_state:
+                raise BidAskBridgeError(
+                    "canonical bridge state changed concurrently; refusing stale checkpoint advance"
+                )
+            if current_state is None:
+                row_count = int(connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0])
+                if row_count:
+                    raise BidAskBridgeError(
+                        "canonical snapshot rows exist without their transactional checkpoint"
+                    )
+
+            appended = 0
             for raw in rows:
                 row = dict(raw)
                 _validate_snapshot_row(row)
-                key = _snapshot_key(row)
-                prior = existing.get(key)
-                if prior is not None:
+                event_time, symbol, timeframe = _snapshot_key(row)
+                existing = connection.execute(
+                    "SELECT * FROM snapshots "
+                    "WHERE event_time = ? AND symbol = ? AND timeframe = ?",
+                    (event_time, symbol, timeframe),
+                ).fetchone()
+                if existing is not None:
+                    prior = _decode_snapshot_row(existing)
                     if not _same_snapshot(prior, row):
                         raise BidAskBridgeError(
-                            f"conflicting canonical snapshot for natural key {key}"
+                            "conflicting canonical snapshot for natural key "
+                            f"{(event_time, symbol, timeframe)}"
                         )
                     continue
-                existing[key] = row
-                pending.append(row)
+                connection.execute(
+                    """
+                    INSERT INTO snapshots (
+                        event_time, symbol, timeframe, capture_slot,
+                        available_time, ingested_time, schema_version,
+                        content_hash, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_time,
+                        symbol,
+                        timeframe,
+                        row["capture_slot"],
+                        row["available_time"],
+                        row["ingested_time"],
+                        row["schema_version"],
+                        row["content_hash"],
+                        _canonical_json(row),
+                    ),
+                )
+                appended += 1
 
-            handle.seek(0, os.SEEK_END)
-            for row in pending:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-            if pending:
-                handle.flush()
-                os.fsync(handle.fileno())
-                directory_fd = os.open(path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            return len(pending)
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _transaction_test_hook("after_snapshot_inserts")
+            config = {
+                key: value
+                for key, value in next_state.items()
+                if key
+                not in {
+                    "schema_version",
+                    "next_position",
+                    "checkpoint_commit_entry_sha256",
+                    "last_materialized_close",
+                    "updated_at",
+                }
+            }
+            position = ReplayPosition.from_dict(next_state["next_position"])
+            connection.execute(
+                """
+                INSERT INTO bridge_state (
+                    singleton, schema_version, config_json,
+                    next_commit_sequence, next_row_index,
+                    checkpoint_commit_entry_sha256,
+                    last_materialized_close, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    config_json = excluded.config_json,
+                    next_commit_sequence = excluded.next_commit_sequence,
+                    next_row_index = excluded.next_row_index,
+                    checkpoint_commit_entry_sha256 =
+                        excluded.checkpoint_commit_entry_sha256,
+                    last_materialized_close = excluded.last_materialized_close,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    BRIDGE_STATE_SCHEMA,
+                    _canonical_json(config),
+                    position.commit_sequence,
+                    position.row_index,
+                    next_state["checkpoint_commit_entry_sha256"],
+                    next_state["last_materialized_close"],
+                    next_state["updated_at"],
+                ),
+            )
+            _transaction_test_hook("before_commit")
+            connection.commit()
+            return appended
+        except BaseException:
+            connection.rollback()
+            raise
 
 
 def materialize_increment(
     *,
     ingest_log_dir: str | Path,
-    state_path: str | Path,
     output_path: str | Path,
     instruments: Sequence[str],
     timeframes: Sequence[str] = DEFAULT_OUTPUT_TIMEFRAMES,
@@ -623,12 +929,11 @@ def materialize_increment(
         raise BidAskBridgeError(f"timeframes must be a subset of {DEFAULT_OUTPUT_TIMEFRAMES}")
 
     source = Path(ingest_log_dir)
-    checkpoint = Path(state_path)
     destination = Path(output_path)
     journal_root = source / "capture_journal"
     if not source.is_dir() or not journal_root.is_dir():
         raise BidAskBridgeError(f"ingest log directory is invalid: {source}")
-    state = _load_state(checkpoint)
+    state = _load_store_state(destination)
     requested_position = (
         ReplayPosition.origin()
         if state is None
@@ -672,7 +977,7 @@ def materialize_increment(
         for record in committed_records
         if ReplayPosition(record.commit_sequence, record.row_index) >= start_position
     ]
-    located = [_locate_quote(record) for record in unread]
+    located = [_locate_quote(record, commit_entry_hashes) for record in unread]
     selected_rows = [item for item in located if _symbol(item.market.instrument) in selected]
     cutoff = now - close_delay
     pending_positions = [
@@ -707,21 +1012,21 @@ def materialize_increment(
                 materialized_at=now,
                 run_id=run_id,
                 writer_id=writer_id,
+                journal_genesis_sha256=journal_genesis,
             )
             for timeframe in output_timeframes
         )
 
     appended = 0
+    last_close = (
+        bars[-1].close_time.isoformat() if bars else state and state.get("last_materialized_close")
+    )
     if write:
-        appended = _append_snapshot_rows(destination, rows)
-        last_close = (
-            bars[-1].close_time.isoformat()
-            if bars
-            else state and state.get("last_materialized_close")
-        )
-        _atomic_write_json(
-            checkpoint,
-            {
+        appended = _write_store_transaction(
+            destination,
+            rows,
+            prior_state=state,
+            next_state={
                 "schema_version": BRIDGE_STATE_SCHEMA,
                 "ingest_log_directory": str(source.resolve()),
                 "journal_root": str(journal_root.resolve()),
@@ -737,8 +1042,6 @@ def materialize_increment(
                 "output_path": str(destination.resolve()),
             },
         )
-    else:
-        last_close = bars[-1].close_time.isoformat() if bars else None
     return BridgeResult(
         input_rows=len(unread),
         completed_bars=len(bars),

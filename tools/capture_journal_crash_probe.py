@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -35,7 +36,7 @@ _EXPECTED_CHILD_EXITS = {
     "after_utc_rotation": 94,
     "after_capacity_rejection": 95,
     "during_utc_rotation": 96,
-    "materializer_before_checkpoint": 98,
+    "materializer_before_atomic_commit": 98,
 }
 
 
@@ -154,16 +155,16 @@ def _child(stage: str, root: Path) -> None:
             pass
         else:
             os._exit(97)
-    elif stage == "materializer_before_checkpoint":
+    elif stage == "materializer_before_atomic_commit":
 
-        def crash_before_checkpoint(_path: Path, _payload: dict[str, object]) -> None:
-            os._exit(_EXPECTED_CHILD_EXITS["materializer_before_checkpoint"])
+        def crash_before_commit(hook_stage: str) -> None:
+            if hook_stage == "after_snapshot_inserts":
+                os._exit(_EXPECTED_CHILD_EXITS["materializer_before_atomic_commit"])
 
-        setattr(bid_ask_bridge, "_atomic_write_json", crash_before_checkpoint)
+        setattr(bid_ask_bridge, "_transaction_test_hook", crash_before_commit)
         bid_ask_bridge.materialize_increment(
             ingest_log_dir=root / "log",
-            state_path=root / "state.json",
-            output_path=root / "prices.jsonl",
+            output_path=root / "prices.sqlite3",
             instruments=["USDJPY"],
             as_of=PROBE_TIME + timedelta(minutes=1, seconds=31),
         )
@@ -309,7 +310,7 @@ def run_probe(root: Path) -> dict[str, Any]:
         ),
     }
 
-    materializer_root = root / "materializer_before_checkpoint"
+    materializer_root = root / "materializer_before_atomic_commit"
     materializer_log = QuoteLog(materializer_root / "log", legacy_jsonl=False)
     for sequence, seconds in enumerate((5, 50), start=1):
         when = PROBE_TIME + timedelta(seconds=seconds)
@@ -321,7 +322,13 @@ def run_probe(root: Path) -> dict[str, Any]:
             stamp: datetime = when,
             number: int = sequence,
         ) -> list[CollectedQuote]:
-            return [_quote(raw, when=stamp, sequence=number)]
+            return [
+                replace(
+                    _quote(raw, when=stamp, sequence=number),
+                    source_endpoint_class="streaming_pricing",
+                    collection_mode="live_stream",
+                )
+            ]
 
         def materializer_clock(*, stamp: datetime = when) -> datetime:
             return stamp
@@ -332,36 +339,38 @@ def run_probe(root: Path) -> dict[str, Any]:
             log=materializer_log,
             now=materializer_clock,
         )
-    materializer_exit = _run_child("materializer_before_checkpoint", materializer_root)
-    materializer_output = materializer_root / "prices.jsonl"
-    rows_before_resume = (
-        len(materializer_output.read_text(encoding="utf-8").splitlines())
-        if materializer_output.is_file()
-        else 0
-    )
-    state_before_resume = (materializer_root / "state.json").exists()
+    materializer_exit = _run_child("materializer_before_atomic_commit", materializer_root)
+    materializer_output = materializer_root / "prices.sqlite3"
+    with sqlite3.connect(materializer_output) as connection:
+        rows_before_resume = int(connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0])
+        state_before_resume = int(
+            connection.execute("SELECT COUNT(*) FROM bridge_state").fetchone()[0]
+        )
     resumed = bid_ask_bridge.materialize_increment(
         ingest_log_dir=materializer_root / "log",
-        state_path=materializer_root / "state.json",
         output_path=materializer_output,
         instruments=["USDJPY"],
         as_of=PROBE_TIME + timedelta(minutes=1, seconds=31),
     )
-    rows_after_resume = len(materializer_output.read_text(encoding="utf-8").splitlines())
-    results["materializer_before_checkpoint"] = {
+    with sqlite3.connect(materializer_output) as connection:
+        rows_after_resume = int(connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0])
+        state_after_resume = int(
+            connection.execute("SELECT COUNT(*) FROM bridge_state").fetchone()[0]
+        )
+    results["materializer_before_atomic_commit"] = {
         "child_exit": materializer_exit,
         "rows_durable_before_resume": rows_before_resume,
-        "checkpoint_exists_before_resume": state_before_resume,
+        "checkpoint_rows_before_resume": state_before_resume,
         "rows_after_resume": rows_after_resume,
         "rows_appended_on_resume": resumed.appended_rows,
-        "checkpoint_exists_after_resume": (materializer_root / "state.json").is_file(),
+        "checkpoint_rows_after_resume": state_after_resume,
         "passed": (
-            materializer_exit == _EXPECTED_CHILD_EXITS["materializer_before_checkpoint"]
-            and rows_before_resume == 4
-            and not state_before_resume
+            materializer_exit == _EXPECTED_CHILD_EXITS["materializer_before_atomic_commit"]
+            and rows_before_resume == 0
+            and state_before_resume == 0
             and rows_after_resume == 4
-            and resumed.appended_rows == 0
-            and (materializer_root / "state.json").is_file()
+            and resumed.appended_rows == 4
+            and state_after_resume == 1
         ),
     }
 

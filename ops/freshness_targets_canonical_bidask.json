@@ -15,8 +15,8 @@
     },
     {
       "name": "canonical_bidask_prices",
-      "path": "logs/briefing_tf_bidask_prices.jsonl",
-      "kind": "jsonl",
+      "path": "logs/briefing_tf_bidask_prices.sqlite3",
+      "kind": "canonical_bidask_sqlite",
       "required_schema_version": 3,
       "required_fields": [
         "ts",
@@ -36,7 +36,9 @@
         "all_quotes_tradable",
         "quote_count",
         "coverage_measurement",
-        "stale_seconds"
+        "stale_seconds",
+        "source_lineage_sha256",
+        "source_journal_genesis_sha256"
       ],
       "aware_time_fields": [
         "ts",

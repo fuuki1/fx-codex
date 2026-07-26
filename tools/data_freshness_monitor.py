@@ -42,6 +42,10 @@ from data_platform.collect.capture_journal import (  # noqa: E402
     CaptureJournal,
     CaptureJournalError,
 )
+from data_platform.runtime.bid_ask_bridge import (  # noqa: E402
+    BidAskBridgeError,
+    read_latest_snapshot_slot,
+)
 
 DEFAULT_CONFIG_PATH = "ops/freshness_targets.json"
 DEFAULT_STATE_PATH = "logs/freshness_state.json"
@@ -221,6 +225,7 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
 
     integrity_failure: str | None = None
     activity_path = file_path
+    logical_update: datetime | None = None
     if target.kind == "capture_journal":
         shards = tuple(sorted(file_path.glob("capture-????-??-??.sqlite3")))
         if not shards:
@@ -241,15 +246,33 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
             CaptureJournal(file_path, verify=False).verify_tail()
         except CaptureJournalError:
             integrity_failure = "journal_integrity_failure"
+    elif target.kind == "canonical_bidask_sqlite":
+        try:
+            logical_update, latest_rows = read_latest_snapshot_slot(file_path)
+            for row in latest_rows:
+                contract_reason = _jsonl_contract_failure(row, target, now=now)
+                if contract_reason:
+                    raise BidAskBridgeError(contract_reason)
+            if target.required_symbols and target.required_timeframes:
+                _apply_snapshot_coverage(
+                    result,
+                    list(latest_rows),
+                    target,
+                    latest_slot=logical_update.isoformat(),
+                )
+        except BidAskBridgeError:
+            result.status = STATUS_CRITICAL
+            result.reason = "canonical_snapshot_integrity_failure"
+            return result
 
-    mtime = datetime.fromtimestamp(activity_path.stat().st_mtime, tz=UTC)
-    wall_age = (now - mtime).total_seconds()
+    activity_time = logical_update or datetime.fromtimestamp(activity_path.stat().st_mtime, tz=UTC)
+    wall_age = (now - activity_time).total_seconds()
     age = (
-        open_hours_between(mtime, now) * 3600.0
+        open_hours_between(activity_time, now) * 3600.0
         if target.market_hours_only and wall_age > 0
         else wall_age
     )
-    result.last_update = mtime.isoformat()
+    result.last_update = activity_time.isoformat()
     result.age_seconds = round(age, 1)
 
     if target.critical_after_seconds is not None and age > target.critical_after_seconds:
@@ -260,7 +283,9 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
         result.reason = "stale_warning"
     if wall_age < -MAX_FUTURE_SKEW_SECONDS:
         result.status = STATUS_CRITICAL
-        result.reason = "file_mtime_future"
+        result.reason = (
+            "canonical_timestamp_future" if logical_update is not None else "file_mtime_future"
+        )
 
     if integrity_failure is not None:
         result.status = STATUS_CRITICAL
@@ -367,6 +392,18 @@ def _apply_capture_coverage(
         result.status = STATUS_CRITICAL
         result.reason = "coverage_metadata_missing"
         return
+    _apply_snapshot_coverage(result, parsed, target, latest_slot=latest_slot)
+
+
+def _apply_snapshot_coverage(
+    result: TargetResult,
+    parsed: list[dict[str, object]],
+    target: TargetConfig,
+    *,
+    latest_slot: str,
+) -> None:
+    """Validate the full natural-key coverage of one logical snapshot slot."""
+
     observed = {
         (str(row.get("symbol")), str(row.get("timeframe")))
         for row in parsed
@@ -667,7 +704,7 @@ def run_monitor(
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="学習データ鮮度監視")
     parser.add_argument("--root", default=".", help="fx-codexリポジトリのルート")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
@@ -678,6 +715,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="通知せず判定とレポートだけ更新する（通知状態は変更しない）",
     )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import sqlite3
 
 import pytest
 
@@ -14,15 +16,14 @@ from data_platform.runtime.bid_ask_bridge import (
     BidAskBridgeError,
     ReplayPosition,
     materialize_increment,
+    read_snapshot_rows,
 )
 
 T0 = datetime(2026, 7, 17, 9, 0, tzinfo=UTC)
 
 
 def _load_snapshot_entries(path) -> list[dict]:
-    rows = [
-        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
+    rows = list(read_snapshot_rows(path))
     for row in rows:
         payload = {key: value for key, value in row.items() if key != "content_hash"}
         encoded = json.dumps(
@@ -61,7 +62,7 @@ def _quote(
         revision_id=None,
         raw_payload_sha256=hashlib.sha256(payload).hexdigest(),
         source_endpoint_class="streaming_pricing",
-        collection_mode="continuous",
+        collection_mode="live_stream",
     )
 
 
@@ -97,12 +98,10 @@ def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(tmp
         (50, 150.10),
         (65, 150.20),
     )
-    state = tmp_path / "state.json"
-    output = tmp_path / "prices.jsonl"
+    output = tmp_path / "prices.sqlite3"
 
     first = materialize_increment(
         ingest_log_dir=log_directory,
-        state_path=state,
         output_path=output,
         instruments=["USDJPY"],
         as_of=T0 + timedelta(minutes=1, seconds=31),
@@ -115,13 +114,13 @@ def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(tmp
     rows = _load_snapshot_entries(output)
     assert {row["timeframe"] for row in rows} == {"15m", "1h", "4h", "1d"}
     assert {row["ts"] for row in rows} == {(T0 + timedelta(minutes=1)).isoformat()}
-    assert all(row["ohlc_scope"] == "closed_bar_after_prediction" for row in rows)
+    assert all(row["ohlc_scope"] == "completed_bid_ask_bar" for row in rows)
     assert all(row["open_time"] == T0.isoformat() for row in rows)
     assert all(row["bid"] == pytest.approx(150.10) for row in rows)
     assert all(row["ask"] == pytest.approx(150.12) for row in rows)
     assert all(row["quote_count"] == 2 for row in rows)
     assert all(row["account_environment"] == "practice" for row in rows)
-    assert all(row["collection_mode"] == "continuous" for row in rows)
+    assert all(row["collection_mode"] == "live_stream" for row in rows)
     assert all(row["source_endpoint_class"] == "streaming_pricing" for row in rows)
     assert all(row["source_quality_states"] == ["usable"] for row in rows)
     assert all("source_coverage" not in row for row in rows)
@@ -129,24 +128,27 @@ def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(tmp
         row["coverage_measurement"] == "unmeasured_provider_sampling_cadence" for row in rows
     )
     assert all("provider_sampling_cadence_unmeasured" in row["data_quality_flags"] for row in rows)
+    assert all(len(row["source_lineage_sha256"]) == 64 for row in rows)
+    assert all(len(row["source_journal_genesis_sha256"]) == 64 for row in rows)
 
-    # Simulate a crash after output fsync but before checkpoint replacement.
-    state.unlink()
+    # Rows and checkpoint share the same database. Removing it removes both,
+    # so origin replay safely reconstructs every natural key.
+    output.unlink()
+    for suffix in ("-wal", "-shm"):
+        output.with_name(output.name + suffix).unlink(missing_ok=True)
     replay = materialize_increment(
         ingest_log_dir=log_directory,
-        state_path=state,
         output_path=output,
         instruments=["USDJPY"],
         as_of=T0 + timedelta(minutes=1, seconds=31),
     )
     assert replay.completed_bars == 1
-    assert replay.appended_rows == 0
+    assert replay.appended_rows == 4
     assert len(_load_snapshot_entries(output)) == 4
 
     second_commit, _count = _commit_quotes(log, store, (125, 150.30))
     advanced = materialize_increment(
         ingest_log_dir=log_directory,
-        state_path=state,
         output_path=output,
         instruments=["USDJPY"],
         as_of=T0 + timedelta(minutes=2, seconds=31),
@@ -166,12 +168,10 @@ def test_bridge_retains_first_open_quote_until_its_minute_is_complete(tmp_path) 
         (5, 150.0),
         (65, 150.2),
     )
-    state = tmp_path / "state.json"
-    output = tmp_path / "prices.jsonl"
+    output = tmp_path / "prices.sqlite3"
 
     result = materialize_increment(
         ingest_log_dir=log_directory,
-        state_path=state,
         output_path=output,
         instruments=["USDJPY"],
         as_of=T0 + timedelta(minutes=1, seconds=31),
@@ -181,7 +181,6 @@ def test_bridge_retains_first_open_quote_until_its_minute_is_complete(tmp_path) 
 
     resumed = materialize_increment(
         ingest_log_dir=log_directory,
-        state_path=state,
         output_path=output,
         instruments=["USDJPY"],
         as_of=T0 + timedelta(minutes=2, seconds=31),
@@ -195,11 +194,9 @@ def test_bridge_fails_closed_on_configuration_change(tmp_path) -> None:
     log_directory = tmp_path / "log"
     log = QuoteLog(log_directory)
     _commit_quotes(log, ImmutableRawStore(tmp_path / "raw"), (5, 150.0))
-    state = tmp_path / "state.json"
-    output = tmp_path / "prices.jsonl"
+    output = tmp_path / "prices.sqlite3"
     materialize_increment(
         ingest_log_dir=log_directory,
-        state_path=state,
         output_path=output,
         instruments=["USDJPY"],
         as_of=T0 + timedelta(minutes=1, seconds=31),
@@ -208,8 +205,59 @@ def test_bridge_fails_closed_on_configuration_change(tmp_path) -> None:
     with pytest.raises(BidAskBridgeError, match="source/config changed"):
         materialize_increment(
             ingest_log_dir=log_directory,
-            state_path=state,
             output_path=output,
             instruments=["USDJPY", "EURUSD"],
             as_of=T0 + timedelta(minutes=2),
+        )
+
+
+def test_snapshot_store_enforces_unique_immutable_natural_keys(tmp_path) -> None:
+    log_directory = tmp_path / "log"
+    log = QuoteLog(log_directory)
+    _commit_quotes(log, ImmutableRawStore(tmp_path / "raw"), (5, 150.0))
+    output = tmp_path / "prices.sqlite3"
+    materialize_increment(
+        ingest_log_dir=log_directory,
+        output_path=output,
+        instruments=["USDJPY"],
+        as_of=T0 + timedelta(minutes=1, seconds=31),
+    )
+
+    with sqlite3.connect(output) as connection:
+        mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE snapshots SET content_hash = ?",
+                ("0" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM snapshots")
+        count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+
+    assert mode == "wal"
+    assert count == 4
+
+
+def test_bridge_rejects_replay_provenance_from_canonical_output(tmp_path) -> None:
+    log_directory = tmp_path / "log"
+    log = QuoteLog(log_directory)
+    payload = b"replay"
+    replay_quote = replace(
+        _quote(payload, 5, 150.0),
+        collection_mode="replay",
+        source_endpoint_class="replay_fixture",
+    )
+    ingest_payload(
+        payload,
+        parser=lambda _raw: [replay_quote],
+        log=log,
+        now=lambda: T0 + timedelta(seconds=6),
+    )
+
+    with pytest.raises(BidAskBridgeError, match="collection_mode=live_stream"):
+        materialize_increment(
+            ingest_log_dir=log_directory,
+            output_path=tmp_path / "prices.sqlite3",
+            instruments=["USDJPY"],
+            as_of=T0 + timedelta(minutes=1, seconds=31),
         )

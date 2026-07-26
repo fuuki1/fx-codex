@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize completed 1-minute OANDA bid/ask bars for outcome scoring."""
+"""Materialize completed OANDA bid/ask bars into a transactional shadow DB."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from fx_intel.universe import MVP_SYMBOLS  # noqa: E402
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ingest-log-dir", type=Path, required=True)
-    parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--instruments",
@@ -46,7 +45,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = materialize_increment(
             ingest_log_dir=args.ingest_log_dir,
-            state_path=args.state,
             output_path=args.output,
             instruments=args.instruments,
             timeframes=args.timeframes,
