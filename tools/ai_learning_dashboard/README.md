@@ -6,7 +6,7 @@
 ## 起動
 
 ```bash
-cd ~/trader/fx-codex
+cd /Users/fuuki/srv/fx-codex
 python3 tools/ai_learning_dashboard/server.py --host 127.0.0.1 --port 8765
 ```
 
@@ -39,9 +39,8 @@ python3 tools/learning_capture.py
 `fx_briefing.py --dry-run` は表示確認用で、判断ログ・学習ファイルを保存しません。
 保存だけ行いDiscordに送らない場合は `fx_briefing.py --no-discord` を使います。
 
-上部の運用状態パネルは、`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh` の稼働有無、
-判断ログ、時間足別価格スナップショット、学習プロファイル、各実行ログの更新時刻を
-読み取り専用で確認します。Discord送信ループは自動起動しません。
+上部の運用状態パネルは、削除済み旧loopの残存process、判断ログ、時間足別価格
+スナップショット、学習プロファイル、各実行ログの更新時刻を読み取り専用で確認します。
 
 ループ確認と復旧手順は `docs/FX_AI_OPERATIONS.md` にまとめています。
 

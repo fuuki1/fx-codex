@@ -26,7 +26,7 @@ open/high/low/bid/ask/spread も保存する。fx_briefing の時間足別採点
     .venv/bin/python fx_tf_snapshot.py                       # 既定ペアを1回記録
     .venv/bin/python fx_tf_snapshot.py --symbols USDJPY GBPJPY
     .venv/bin/python fx_tf_snapshot.py --dry-run             # 追記せず内容を表示
-    ./fx_tf_snapshot_loop.sh &                               # 5分ごとに自動記録
+    # 定期運用は com.fx-codex.snapshot のlaunchdワンショットを使う
 """
 
 from __future__ import annotations
