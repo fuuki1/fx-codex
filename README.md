@@ -27,7 +27,6 @@ fx_backtester/
   analysis.py               # OOS、月次、ペア別、DD期間、Monte Carlo、商用ゲート
   models.py                 # Instrument、Position、Trade
   risk.py                   # 1%リスク、1日2%損失停止、月次利益ターゲット
-  tradingview.py            # TradingView Alert Webhook受信
   walk_forward.py           # ウォークフォワード検証
   strategies/
     ai_logistic.py           # ローリング学習するAI/ML方向予測戦略
@@ -91,11 +90,10 @@ launchd のワンショットジョブだけを常駐させます。
 | `com.fx-codex.briefing` | 5分境界 | 時間足別の判断ジャーナル・学習プロファイル・統合通知 |
 | `com.fx-codex.health` | 5分 | 鮮度監視と運用通知（収集ジョブから独立） |
 
-`--signal-board` と `fx_briefing_loop.sh` は**開発・一時確認専用**です。Mac miniの
-正規サービス、cron、旧plistのいずれかが動いている間は起動せず、正規の
-`logs/*.jsonl` へ同時に書き込ませてはいけません。表示確認は、ジャーナルを保存しない
-`--dry-run` を優先してください。排他ロックは同じロック名を使う呼出し同士にしか効かず、
-rawな手動コマンドとの共存を自動的に安全にはしません。
+`--signal-board --dry-run`は**開発・一時確認専用**です。Mac miniの正規サービス、
+cron、旧plistのいずれかが動いている間は、正規の`logs/*.jsonl`を更新する手動コマンドを
+実行してはいけません。旧常駐loopは多重writerの原因になるため削除済みです。排他ロックは
+同じロック名を使う呼出し同士にしか効かず、rawな手動コマンドとの共存を自動的に安全にはしません。
 
 2026-07-10の実機監査で観測した状態は、この正規構成と一致していませんでした。旧サービス・
 cron・過去の多重writer、価格系列の鮮度異常があり、リポジトリは観測時点で`origin/main`から
@@ -125,10 +123,8 @@ calendar/macro等のsource cacheは取得処理により更新され、イベン
 `tools/learning_capture.py`を使いますが、どちらも状態を更新するためMac miniの正規サービス稼働中には
 手動実行しません。
 
-開発用の`fx_briefing_loop.sh`は5分境界（00/05/10…分）ごとに、**上位3候補・
-エントリー適性・4層のデータ品質を1通へまとめたFXシグナルボード**を送ります。
-発注経路は存在しません。障害通知はボードへ
-集約せず、正規運用では独立した`com.fx-codex.health`から運用Webhookへ送ります。
+FXシグナルボードは`--signal-board --dry-run`で単発確認します。常駐loopや定期Discord送信へ
+転用せず、障害通知は独立した`com.fx-codex.health`から運用Webhookへ送ります。
 
 ### 時間足別モード (`--per-timeframe`)
 
@@ -161,9 +157,8 @@ calendar/macro等のsource cacheは取得処理により更新され、イベン
 ```
 
 Mac miniの正規運用では`com.fx-codex.snapshot`だけが価格専用系列を供給します。
-`fx_briefing_loop.sh`と`fx_tf_snapshot_loop.sh`を同時に起動する旧方式、または
-launchdとraw loopの併走は禁止です。開発機で一時的にどちらかを使う場合も、正規ログと
-分離した作業ディレクトリで単独実行し、終了後にwriterが残っていないことを確認します。
+削除済みの旧loopが別checkout・cron・既存processに残っていた場合は競合writerとして停止し、
+正規ログへ書き込ませません。
 
 ### MFE/MAE/TP/SL期待値監視ランナー
 
@@ -313,36 +308,6 @@ python3 -m fx_backtester.cli qa-data \
   --expected-frequency h \
   --output data_qa.csv
 ```
-
-TradingView Alert Webhookを受信する場合:
-
-```bash
-export TRADINGVIEW_WEBHOOK_SECRET="change-me"
-
-python3 -m fx_backtester.cli tradingview-webhook \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --secret-env TRADINGVIEW_WEBHOOK_SECRET \
-  --output runs/tradingview_alerts.jsonl
-```
-
-TradingViewのWebhook URLには、公開HTTPS URLを指定します。ローカル検証ではngrokやCloudflare Tunnelなどで `http://127.0.0.1:8080/webhook/tradingview` を外部公開してください。TradingViewのAlertメッセージ例:
-
-```json
-{
-  "secret": "change-me",
-  "exchange": "{{exchange}}",
-  "ticker": "{{ticker}}",
-  "time": "{{time}}",
-  "timeframe": "{{interval}}",
-  "action": "{{strategy.order.action}}",
-  "price": "{{strategy.order.price}}",
-  "contracts": "{{strategy.order.contracts}}",
-  "order_id": "{{strategy.order.id}}"
-}
-```
-
-受信したAlertはJSONLで保存します。これは実注文ではなく、paper/forward証跡を作るための連携です。
 
 研究パックを使った最大構成のバックテスト:
 

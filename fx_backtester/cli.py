@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,6 @@ from fx_backtester.strategies.filters import (
     NoTradeFilterConfig,
     RegimeFilterConfig,
 )
-from fx_backtester.tradingview import TradingViewWebhookConfig, run_tradingview_webhook_server
 from fx_backtester.validation import validate_backtest_inputs, validate_trade_log_contract
 from fx_backtester.walk_forward import WalkForwardConfig, WalkForwardValidator
 
@@ -181,22 +179,6 @@ def main(argv: list[str] | None = None) -> int:
     analyze_parser.add_argument("--forward-trades", help="Optional forward/paper trade_log CSV")
     analyze_parser.add_argument("--no-html", action="store_false", dest="write_html", default=True)
 
-    tradingview_parser = subparsers.add_parser("tradingview-webhook")
-    tradingview_parser.add_argument("--host", default="127.0.0.1")
-    tradingview_parser.add_argument("--port", type=int, default=8080)
-    tradingview_parser.add_argument("--path", default="/webhook/tradingview")
-    tradingview_parser.add_argument(
-        "--output",
-        default="runs/tradingview_alerts.jsonl",
-        help="JSONL path for received TradingView alerts",
-    )
-    tradingview_parser.add_argument("--secret", help="Shared secret expected in the alert JSON")
-    tradingview_parser.add_argument(
-        "--secret-env",
-        help="Environment variable that contains the shared secret",
-    )
-    tradingview_parser.add_argument("--max-body-bytes", type=int, default=65_536)
-
     args = parser.parse_args(argv)
     if args.command == "backtest":
         return _run_backtest(args)
@@ -210,8 +192,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_audit_run(args)
     if args.command == "analyze-run":
         return _run_analyze_run(args)
-    if args.command == "tradingview-webhook":
-        return _run_tradingview_webhook(args)
     raise ValueError(args.command)
 
 
@@ -536,32 +516,6 @@ def _run_analyze_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_tradingview_webhook(args: argparse.Namespace) -> int:
-    secret = _webhook_secret(args)
-    config = TradingViewWebhookConfig(
-        host=args.host,
-        port=args.port,
-        path=args.path,
-        output_path=Path(args.output),
-        secret=secret,
-        max_body_bytes=args.max_body_bytes,
-    )
-    print(
-        json.dumps(
-            {
-                "status": "listening",
-                "url": f"http://{config.host}:{config.port}{config.path}",
-                "health_url": f"http://{config.host}:{config.port}/health",
-                "output": str(config.output_path),
-                "secret_required": secret is not None,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
-    return run_tradingview_webhook_server(config)
-
-
 def _build_config(args: argparse.Namespace) -> BacktestConfig:
     spread_items = _preset_value(args, "spread_pips")
     slippage_items = _preset_value(args, "slippage_pips")
@@ -628,17 +582,6 @@ def _preset_value(args: argparse.Namespace, key: str) -> Any:
     if value == default:
         return PRESETS[preset_name].get(key, value)
     return value
-
-
-def _webhook_secret(args: argparse.Namespace) -> str | None:
-    if args.secret and args.secret_env:
-        raise ValueError("Use either --secret or --secret-env, not both")
-    if args.secret_env:
-        secret = os.environ.get(args.secret_env)
-        if not secret:
-            raise ValueError(f"Environment variable {args.secret_env!r} is not set")
-        return secret
-    return args.secret
 
 
 def _optional_pct_value(value: float | None) -> float | None:

@@ -84,8 +84,9 @@ CSV価格データ ─▶ data.py(読込・QA) ─▶ strategies/*.py(シグナ�
 ## 2. 分析・通知システム (`fx_intel/`, ルート直下スクリプト)
 
 Mac miniの正規運用は`~/Desktop`ではなく`/Users/fuuki/srv/fx-codex`からlaunchdで実行する。
-手動の`--signal-board`/`fx_briefing_loop.sh`は開発・一時確認用であり、正規サービス、cron、
-旧plistと同時に動かさない。特に同一の判断ジャーナルへ複数経路から追記してはいけない。
+手動の`--signal-board --dry-run`は開発・一時確認用であり、正規サービス、cron、旧plistと
+同時に状態更新コマンドを動かさない。旧常駐loopは削除済みで、別checkoutに残るprocessも
+競合writerとして扱う。
 
 ### 2-1. `fx_briefing.py` + `fx_intel/` — 正規の統合通知
 
@@ -129,15 +130,14 @@ fx_intel/calendar.py       (legacy実績をshadow診断)
 
 ### FXシグナルボード（開発・一時確認専用）
 
-`fx_briefing_loop.sh`は5分境界（00/05/10…分）ごとに時間足別分析を行い、**上位3候補・エントリー適性・
-データ品質をまとめた「FXシグナルボード」1通**を送信できる。ただし開発・一時確認専用であり、
-Mac miniの正規運用には組み込まない。loopは`--no-price-write`を使うが判断ジャーナルは更新するため、
-launchd briefingとの併走も禁止する。`--dry-run`はauthoritative journal/model状態を更新しないが、
-source cacheやevent exportは更新し得るため、完全なzero-write確認は正規runtimeと分離したcopyで行う。
+FXシグナルボードは`fx_briefing.py --signal-board --dry-run`で単発確認する。旧常駐loopは
+多重writerを作るため削除済みで、Mac miniの正規運用には再導入しない。`--dry-run`は
+authoritative journal/model状態を更新しないが、source cacheやevent exportは更新し得るため、
+完全なzero-write確認は正規runtimeと分離したcopyで行う。
 
 - ボードのヘッダーは「データ品質（テクニカル/ニュース/経済指標/マクロ）」を表示する。
   発注経路は存在しないため、システム状態（executor死活監視など）は表示しない。
-- `fx_tf_snapshot_loop.sh`は開発機の一時検証用に限る。Mac miniではlaunchd snapshotの代替・併走に使わない。
+- 価格系列の定期取得はlaunchd snapshotだけが所有する。
 
 ---
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Capture local learning logs without posting to Discord.
 
-This runner is a safe one-shot alternative to fx_briefing_loop.sh while
-bootstrapping the dashboard. It writes journals, learning profiles, timeframe
-price snapshots, and monitoring JSON, but all briefing runs use --no-discord.
+This runner is the explicit one-shot path for bootstrapping the dashboard.
+It writes journals, learning profiles, timeframe price snapshots, and monitoring
+JSON, but all briefing runs use --no-discord.
 """
 
 from __future__ import annotations
