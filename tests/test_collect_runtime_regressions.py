@@ -15,7 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 import data_platform.collect.oanda as oanda
-from data_platform.collect.oanda import OandaConfig, requests_transport, stream_quotes
+from data_platform.collect.oanda import (
+    CollectorConfigError,
+    OandaConfig,
+    requests_transport,
+    stream_quotes,
+)
 from data_platform.collect.raw_first import QuoteLog, RawFirstError
 from data_platform.raw.immutable_store import ImmutableRawStore
 from tools.fx_quote_collector import (
@@ -48,7 +53,7 @@ def _heartbeat_line() -> bytes:
 
 
 def _config() -> OandaConfig:
-    return OandaConfig(token="tok", account_id="acc", environment="practice")
+    return OandaConfig(token="tok", account_id="acc-001", environment="practice")
 
 
 def test_default_reconnect_path_calls_real_sleep(
@@ -194,9 +199,54 @@ def test_requests_transport_closes_response(monkeypatch: pytest.MonkeyPatch) -> 
     )
     monkeypatch.setitem(sys.modules, "requests", fake_requests)
 
-    assert list(requests_transport("https://example.invalid", "masked")) == [b"line"]
+    url = (
+        "https://stream-fxpractice.oanda.com/v3/accounts/acc-001/pricing/stream?instruments=USD_JPY"
+    )
+    assert list(requests_transport(url, "masked")) == [b"line"]
     assert response.closed is True
     assert observed_kwargs["allow_redirects"] is False
+
+
+def test_requests_transport_rejects_non_oanda_destination_before_sending_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {"value": False}
+
+    def fake_get(*_args: object, **_kwargs: object) -> object:
+        called["value"] = True
+        raise AssertionError("must not send request")
+
+    fake_requests = SimpleNamespace(
+        get=fake_get,
+        exceptions=SimpleNamespace(RequestException=RuntimeError),
+    )
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    with pytest.raises(CollectorConfigError, match="refusing to send"):
+        list(requests_transport("https://example.invalid/pricing/stream", "masked"))
+    assert called["value"] is False
+
+
+def test_stream_can_count_without_retaining_per_message_results(tmp_path: Path) -> None:
+    log = QuoteLog(tmp_path / "log")
+    counts = {"accepted": 0}
+
+    state, results = stream_quotes(
+        _config(),
+        ["USD_JPY"],
+        store=None,
+        log=log,
+        transport=lambda _url, _token: iter([_price_line(), _price_line()]),
+        max_messages=2,
+        retain_results=False,
+        on_result=lambda result: counts.__setitem__(
+            "accepted", counts["accepted"] + result.accepted_count
+        ),
+    )
+
+    assert state.stopped_reason == "max_messages_reached"
+    assert results == []
+    assert counts == {"accepted": 2}
 
 
 def test_stop_predicate_stops_before_next_message(tmp_path: Path) -> None:

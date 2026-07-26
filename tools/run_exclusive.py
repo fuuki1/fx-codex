@@ -134,7 +134,7 @@ def run_locked(
             signal.signal(signal.SIGINT, previous_int)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="排他ロック付きコマンド実行")
     parser.add_argument("--name", required=True, help="ロック名(ジョブ識別子)")
     parser.add_argument("--locks-dir", default=DEFAULT_LOCKS_DIR)
@@ -145,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         help="ロック取得失敗(先行実行中)時の終了コード。既定0=正常スキップ",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- の後に実行コマンド")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     command = args.command

@@ -120,7 +120,8 @@ def _load_env_file(path: Path) -> dict[str, str]:
         value = raw_value.strip()
         if key not in allowed:
             raise CollectorConfigError(
-                f"unsupported key in collector env file at line {line_number}: {key}"
+                f"unsupported key in collector env file at line {line_number} "
+                "(key and value are not logged)"
             )
         if key in values:
             raise CollectorConfigError(f"duplicate key in collector env file: {key}")
@@ -279,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         return EX_TEMPFAIL
 
     state: ConnectionState | None = None
-    results: list[Any] = []
+    counts = {"accepted": 0, "quarantined": 0}
     stop_requested = {"flag": False}
     try:
         # The streaming path writes exact raw bytes and terminal rows into one
@@ -306,7 +307,12 @@ def main(argv: list[str] | None = None) -> int:
 
         signal.signal(signal.SIGTERM, _graceful)
         signal.signal(signal.SIGINT, _graceful)
-        state, results = stream_quotes(
+
+        def _count_result(result: Any) -> None:
+            counts["accepted"] += result.accepted_count
+            counts["quarantined"] += len(result.quarantined)
+
+        state, retained_results = stream_quotes(
             config,
             args.instruments,
             store=None,
@@ -317,9 +323,13 @@ def main(argv: list[str] | None = None) -> int:
             should_stop=lambda: stop_requested["flag"],
             source_endpoint_class="streaming_pricing",
             collection_mode="live_stream",
+            retain_results=False,
+            on_result=_count_result,
         )
-        accepted = sum(result.accepted_count for result in results)
-        quarantined = sum(len(result.quarantined) for result in results)
+        if retained_results:
+            raise RuntimeError("production collector unexpectedly retained per-message results")
+        accepted = counts["accepted"]
+        quarantined = counts["quarantined"]
         stopped_reason = state.stopped_reason or "stream_returned"
         if "token_expired" in stopped_reason:
             exit_code = EX_NOPERM
@@ -356,8 +366,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return exit_code
     except OSError as error:
-        accepted = sum(result.accepted_count for result in results)
-        quarantined = sum(len(result.quarantined) for result in results)
+        accepted = counts["accepted"]
+        quarantined = counts["quarantined"]
         detail = f"{type(error).__name__}: {error}"
         try:
             _record_incident(
@@ -387,8 +397,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[collector] I/O failure: {type(error).__name__}", file=sys.stderr)
         return EX_IOERR
     except Exception as error:
-        accepted = sum(result.accepted_count for result in results)
-        quarantined = sum(len(result.quarantined) for result in results)
+        accepted = counts["accepted"]
+        quarantined = counts["quarantined"]
         detail = f"{type(error).__name__}: {error}"
         try:
             _record_incident(

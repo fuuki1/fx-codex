@@ -39,8 +39,8 @@ validate_release() {
     return 70
   }
   local approved_sha="${FX_CODEX_APPROVED_SHA:-}"
-  [[ -n "$approved_sha" ]] || {
-    echo "拒否: FX_CODEX_APPROVED_SHA にレビュー済みcommitを指定してください" >&2
+  [[ "${#approved_sha}" == 40 ]] && [[ -z "${approved_sha//[0-9a-f]/}" ]] || {
+    echo "拒否: FX_CODEX_APPROVED_SHA にレビュー済み40桁commit SHAを指定してください" >&2
     return 78
   }
   local head resolved
@@ -84,6 +84,15 @@ validate_release() {
       return 70
     }
     render_plist "$label" | plutil -lint - >/dev/null
+    render_plist "$label" | "$PYTHON" -c '
+import plistlib
+import sys
+from tools.run_exclusive import build_parser
+
+arguments = plistlib.loads(sys.stdin.buffer.read())["ProgramArguments"]
+separator = arguments.index("--")
+build_parser().parse_args([*arguments[2:separator], "--", "/usr/bin/true"])
+'
   done
 }
 
@@ -123,19 +132,22 @@ case "$CMD" in
     ;;
   install)
     validate_release
+    for label in "$COLLECTOR_LABEL" $LABELS; do
+      if loaded "$label" || [[ -e "$AGENTS_DIR/$label.plist" ]]; then
+        echo "拒否: 既存label/plistを上書きしません。先に明示的にuninstallしてください: $label" >&2
+        exit 78
+      fi
+    done
     mkdir -p "$AGENTS_DIR" "$ROOT/collect/logs" "$ROOT/collect/state" "$ROOT/logs/locks"
-    collector_preexisting=0
-    loaded "$COLLECTOR_LABEL" && collector_preexisting=1
     "$ROOT/scripts/quote_collector_launchd.sh" install
     installed_labels=()
     for label in $LABELS; do
       if ! install_label "$label"; then
+        remove_label "$label"
         for installed in $installed_labels; do
           remove_label "$installed"
         done
-        if (( collector_preexisting == 0 )); then
-          "$ROOT/scripts/quote_collector_launchd.sh" uninstall
-        fi
+        "$ROOT/scripts/quote_collector_launchd.sh" uninstall
         echo "導入失敗: 新規に追加したcanonical shadowサービスをrollbackしました" >&2
         exit 70
       fi

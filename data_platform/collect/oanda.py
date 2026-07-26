@@ -34,9 +34,11 @@ import hashlib
 import json
 import os
 import random
+import re
 import socket
 import time
 from typing import Literal
+from urllib.parse import parse_qs, urlsplit
 
 from data_platform.collect.contract import CollectedQuote
 from data_platform.collect.raw_first import IngestResult, QuoteLog, ingest_payload
@@ -56,6 +58,10 @@ _STREAM_HOSTS = {
     "live": "https://stream-fxtrade.oanda.com",
 }
 _READ_ONLY_PATH = "/v3/accounts/{account_id}/pricing/stream"
+_ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{1,126}[A-Za-z0-9]")
+_STREAM_PATH_PATTERN = re.compile(
+    r"/v3/accounts/[A-Za-z0-9][A-Za-z0-9-]{1,126}[A-Za-z0-9]/pricing/stream"
+)
 HEARTBEAT_TIMEOUT_SECONDS = 15.0  # OANDA emits HEARTBEAT every ~5s
 
 CollectionMode = Literal["live_stream", "replay"]
@@ -100,20 +106,68 @@ class OandaConfig:
             )
         if environment not in _STREAM_HOSTS:
             raise CollectorConfigError(
-                f"{ENV_ENVIRONMENT} must be 'practice' or 'live', got {environment!r}"
+                f"{ENV_ENVIRONMENT} must be exactly 'practice' or 'live' "
+                "(the supplied value is not logged)"
             )
-        return cls(token=token, account_id=account, environment=environment)
+        config = cls(token=token, account_id=account, environment=environment)
+        config._validate_account_id()
+        return config
+
+    def _validate_account_id(self) -> None:
+        if _ACCOUNT_ID_PATTERN.fullmatch(self.account_id) is None:
+            raise CollectorConfigError(
+                f"{ENV_ACCOUNT} has an invalid format (the supplied value is not logged)"
+            )
 
     def stream_url(self, instruments: Sequence[str]) -> str:
         if not instruments:
             raise CollectorConfigError("at least one instrument is required")
+        self._validate_account_id()
         path = _READ_ONLY_PATH.format(account_id=self.account_id)
         try:
             resolved = tuple(dict.fromkeys(to_oanda_instrument(value) for value in instruments))
         except ValueError as error:
             raise CollectorConfigError(str(error)) from error
         joined = "%2C".join(resolved)
-        return f"{_STREAM_HOSTS[self.environment]}{path}?instruments={joined}"
+        try:
+            host = _STREAM_HOSTS[self.environment]
+        except KeyError as error:
+            raise CollectorConfigError(
+                f"{ENV_ENVIRONMENT} must be exactly 'practice' or 'live'"
+            ) from error
+        url = f"{host}{path}?instruments={joined}"
+        _validate_pricing_stream_url(url)
+        return url
+
+
+def _validate_pricing_stream_url(url: str) -> None:
+    """Reject any token destination outside the exact OANDA pricing stream."""
+
+    parsed = urlsplit(url)
+    allowed_hosts = {urlsplit(value).hostname for value in _STREAM_HOSTS.values()}
+    query = parse_qs(parsed.query, strict_parsing=True)
+    instruments = query.get("instruments", [])
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in allowed_hosts
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or _STREAM_PATH_PATTERN.fullmatch(parsed.path) is None
+        or set(query) != {"instruments"}
+        or len(instruments) != 1
+        or not instruments[0]
+    ):
+        raise CollectorConfigError(
+            "refusing to send the OANDA token outside the exact HTTPS pricing-stream endpoint"
+        )
+    try:
+        resolved = instruments[0].split(",")
+        if any(to_oanda_instrument(value) != value for value in resolved):
+            raise ValueError("non-canonical instrument")
+    except ValueError as error:
+        raise CollectorConfigError("pricing-stream URL contains an invalid instrument") from error
 
 
 def _writer_id() -> str:
@@ -190,6 +244,7 @@ def requests_transport(url: str, token: str) -> Iterator[bytes]:  # pragma: no c
 
     import requests
 
+    _validate_pricing_stream_url(url)
     try:
         with requests.get(
             url,
@@ -229,6 +284,8 @@ def stream_quotes(
     max_messages: int | None = None,
     source_endpoint_class: EndpointClass = "replay_fixture",
     collection_mode: CollectionMode = "replay",
+    retain_results: bool = True,
+    on_result: Callable[[IngestResult], None] | None = None,
 ) -> tuple[ConnectionState, list[IngestResult]]:
     """Run the stream through raw-first ingest with reconnect semantics.
 
@@ -282,9 +339,11 @@ def stream_quotes(
                         collection_mode=collection_mode,
                     )
 
-                results.append(
-                    ingest_payload(line, parser=_parser, store=store, log=log, now=lambda: now)
-                )
+                result = ingest_payload(line, parser=_parser, store=store, log=log, now=lambda: now)
+                if on_result is not None:
+                    on_result(result)
+                if retain_results:
+                    results.append(result)
                 if not alive:
                     break
                 if max_messages is not None and messages_seen >= max_messages:

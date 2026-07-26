@@ -57,6 +57,7 @@ def test_materializer_reads_only_committed_ingest_and_uses_a_separate_shadow_lab
         == "/srv/fx-codex/logs/briefing_tf_bidask_prices.jsonl"
     )
     assert payload["StartInterval"] == 60
+    assert "--timeout-seconds" not in arguments
 
 
 def test_canonical_health_uses_isolated_state_and_report_files() -> None:
@@ -71,6 +72,7 @@ def test_canonical_health_uses_isolated_state_and_report_files() -> None:
     assert (
         arguments[arguments.index("--report") + 1] == "logs/canonical_bidask_freshness_report.json"
     )
+    assert "--timeout-seconds" not in arguments
 
 
 def test_canonical_freshness_requires_hash_provenance_and_full_universe() -> None:
@@ -95,3 +97,12 @@ def test_installer_requires_clean_approved_sha_and_checks_legacy_checkouts() -> 
     assert '"$HOME/Desktop/fx-codex" "$HOME/fx-codex"' in script
     assert "'trader/**'" in script
     assert 'quote_collector_launchd.sh" dry-run' in script
+    assert "既存label/plistを上書きしません" in script
+
+
+def test_direct_collector_installer_cannot_bypass_approved_sha_gate() -> None:
+    script = (ROOT / "scripts" / "quote_collector_launchd.sh").read_text(encoding="utf-8")
+
+    assert "FX_CODEX_APPROVED_SHA" in script
+    assert '"${#approved_sha}" == 40' in script
+    assert "status --porcelain=v1 --untracked-files=all" in script
