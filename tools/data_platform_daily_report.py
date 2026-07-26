@@ -36,7 +36,7 @@ from data_platform.collect.capture_journal import (
 )
 from data_platform.raw.immutable_store import ImmutableRawStore, RawStoreError
 
-REQUIRED_PAIRS = frozenset({"USDJPY", "EURUSD", "GBPUSD"})
+REQUIRED_PAIRS = frozenset({"USDJPY", "EURUSD", "GBPUSD", "AUDUSD"})
 MAX_REPORT_AGE_DAYS = 4
 FRESHNESS_SAMPLE_MAX = 100_000
 MAX_FUTURE_SKEW_SECONDS = 5.0
@@ -107,15 +107,51 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def _same_day_boolean(
+def _same_day_evidence(
     payload: dict[str, Any] | None,
     *,
     day: date,
     boolean_field: str,
+    evidence_role: str,
+    generated_at: datetime,
+) -> tuple[bool, str | None]:
+    if (
+        payload is None
+        or payload.get("report_date") != day.isoformat()
+        or payload.get("evidence_role") != evidence_role
+        or payload.get(boolean_field) is not True
+    ):
+        return False, None
+    source_id = payload.get("source_id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        return False, None
+    observed = payload.get("observed_at")
+    if observed is None:
+        return False, None
+    observed_at = _parse_timestamp(observed, f"{evidence_role}.observed_at")
+    if observed_at.date() != day:
+        return False, None
+    if observed_at > generated_at + timedelta(seconds=MAX_FUTURE_SKEW_SECONDS):
+        return False, None
+    return True, source_id.strip()
+
+
+def _evidence_is_distinct(
+    *,
+    paths: tuple[Path | None, ...],
+    digests: tuple[str | None, ...],
+    source_ids: tuple[str | None, ...],
 ) -> bool:
-    if payload is None or payload.get("report_date") != day.isoformat():
+    if any(path is None for path in paths):
         return False
-    return payload.get(boolean_field) is True
+    resolved_paths = {str(path.resolve()) for path in paths if path is not None}
+    present_digests = {digest for digest in digests if digest is not None}
+    present_source_ids = {source_id for source_id in source_ids if source_id is not None}
+    return (
+        len(resolved_paths) == len(paths)
+        and len(present_digests) == len(digests)
+        and len(present_source_ids) == len(source_ids)
+    )
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -189,13 +225,13 @@ def build_daily_report(
             quote_count += 1
             instrument = str(row.get("instrument", ""))
             pair_counts[instrument] += 1
-            if (
+            is_primary = (
                 row.get("provider") == "oanda"
                 and row.get("collection_mode") == "live_stream"
                 and row.get("account_environment") == "live"
+                and row.get("source_endpoint_class") == "streaming_pricing"
                 and row.get("quality_state") == "usable"
-            ):
-                observed_primary_pairs.add(instrument)
+            )
 
             raw_hash = str(row.get("raw_payload_sha256", ""))
             if legacy_raw_store is not None and raw_hash not in checked_hashes:
@@ -207,28 +243,51 @@ def build_daily_report(
 
             event = row.get("provider_event_time")
             received = row.get("received_at")
-            if event is not None and received is not None:
+            timestamps_valid = True
+            received_at: datetime | None = None
+            event_at: datetime | None = None
+            if received is None:
+                if "received_timestamp_missing" not in raw_errors:
+                    raw_errors.append("received_timestamp_missing")
+                timestamps_valid = False
+            else:
                 received_at = _parse_timestamp(received, "received_at")
-                event_at = _parse_timestamp(event, "provider_event_time")
                 future_limit = generated_at + timedelta(seconds=MAX_FUTURE_SKEW_SECONDS)
-                if received_at > future_limit or event_at > future_limit:
+                if received_at > future_limit:
                     if "future_quote_timestamp" not in raw_errors:
                         raw_errors.append("future_quote_timestamp")
+                    timestamps_valid = False
+            if event is None:
+                if is_primary and "primary_event_timestamp_missing" not in raw_errors:
+                    raw_errors.append("primary_event_timestamp_missing")
+                timestamps_valid = False
+            else:
+                event_at = _parse_timestamp(event, "provider_event_time")
+                future_limit = generated_at + timedelta(seconds=MAX_FUTURE_SKEW_SECONDS)
+                if event_at > future_limit:
+                    if "future_quote_timestamp" not in raw_errors:
+                        raw_errors.append("future_quote_timestamp")
+                    timestamps_valid = False
+            if received_at is not None and event_at is not None:
                 lag = (received_at - event_at).total_seconds()
                 if lag < -MAX_FUTURE_SKEW_SECONDS:
                     if "provider_event_after_receipt" not in raw_errors:
                         raw_errors.append("provider_event_after_receipt")
-                observed_lag = max(0.0, lag)
-                freshness_seen += 1
-                freshness_max = (
-                    observed_lag if freshness_max is None else max(freshness_max, observed_lag)
-                )
-                if len(freshness_sample) < FRESHNESS_SAMPLE_MAX:
-                    freshness_sample.append(observed_lag)
-                else:
-                    replacement = freshness_rng.randrange(freshness_seen)
-                    if replacement < FRESHNESS_SAMPLE_MAX:
-                        freshness_sample[replacement] = observed_lag
+                    timestamps_valid = False
+                if timestamps_valid:
+                    observed_lag = max(0.0, lag)
+                    freshness_seen += 1
+                    freshness_max = (
+                        observed_lag if freshness_max is None else max(freshness_max, observed_lag)
+                    )
+                    if len(freshness_sample) < FRESHNESS_SAMPLE_MAX:
+                        freshness_sample.append(observed_lag)
+                    else:
+                        replacement = freshness_rng.randrange(freshness_seen)
+                        if replacement < FRESHNESS_SAMPLE_MAX:
+                            freshness_sample[replacement] = observed_lag
+            if is_primary and timestamps_valid:
+                observed_primary_pairs.add(instrument)
             flags = row.get("quality_flags", [])
             if isinstance(flags, list):
                 flag_counts.update(str(flag) for flag in flags)
@@ -293,22 +352,34 @@ def build_daily_report(
     primary_payload, primary_sha = _load_json_object(primary_evidence)
     secondary_payload, secondary_sha = _load_json_object(secondary_evidence)
     replay_payload, replay_sha = _load_json_object(replay_evidence)
-    primary_health_ok = _same_day_boolean(
+    primary_health_ok, primary_source_id = _same_day_evidence(
         primary_payload,
         day=day,
         boolean_field="primary_up",
+        evidence_role="primary_health",
+        generated_at=generated_at,
     )
     primary_pair_coverage_ok = REQUIRED_PAIRS.issubset(observed_primary_pairs)
     primary_up = primary_health_ok and primary_pair_coverage_ok
-    secondary_up = _same_day_boolean(
+    secondary_up, secondary_source_id = _same_day_evidence(
         secondary_payload,
         day=day,
         boolean_field="secondary_up",
+        evidence_role="independent_secondary",
+        generated_at=generated_at,
     )
-    replay_ok = _same_day_boolean(
+    replay_ok, replay_source_id = _same_day_evidence(
         replay_payload,
         day=day,
         boolean_field="replay_ok",
+        evidence_role="deterministic_replay",
+        generated_at=generated_at,
+    )
+    supporting_evidence_contract_ok = primary_health_ok and secondary_up and replay_ok
+    supporting_evidence_distinct = _evidence_is_distinct(
+        paths=(primary_evidence, secondary_evidence, replay_evidence),
+        digests=(primary_sha, secondary_sha, replay_sha),
+        source_ids=(primary_source_id, secondary_source_id, replay_source_id),
     )
     raw_hash_verified = quote_count > 0 and not raw_errors
     qualifying_day = (
@@ -318,6 +389,8 @@ def build_daily_report(
         and critical_incidents == 0
         and primary_up
         and secondary_up
+        and supporting_evidence_contract_ok
+        and supporting_evidence_distinct
     )
 
     disk = shutil.disk_usage(collection_root)
@@ -335,6 +408,8 @@ def build_daily_report(
         "primary_health_ok": primary_health_ok,
         "primary_pair_coverage_ok": primary_pair_coverage_ok,
         "secondary_up": secondary_up,
+        "supporting_evidence_contract_ok": supporting_evidence_contract_ok,
+        "supporting_evidence_distinct": supporting_evidence_distinct,
         "required_pairs": sorted(REQUIRED_PAIRS),
         "observed_primary_pairs": sorted(observed_primary_pairs),
         "quote_count": quote_count,
@@ -360,14 +435,17 @@ def build_daily_report(
             "primary": {
                 "path": str(primary_evidence) if primary_evidence else None,
                 "sha256": primary_sha,
+                "source_id": primary_source_id,
             },
             "secondary": {
                 "path": str(secondary_evidence) if secondary_evidence else None,
                 "sha256": secondary_sha,
+                "source_id": secondary_source_id,
             },
             "replay": {
                 "path": str(replay_evidence) if replay_evidence else None,
                 "sha256": replay_sha,
+                "source_id": replay_source_id,
             },
         },
         "unmet_conditions": [
@@ -380,6 +458,8 @@ def build_daily_report(
                 ("primary_health_ok", primary_health_ok),
                 ("primary_pair_coverage_ok", primary_pair_coverage_ok),
                 ("secondary_up", secondary_up),
+                ("supporting_evidence_contract_ok", supporting_evidence_contract_ok),
+                ("supporting_evidence_distinct", supporting_evidence_distinct),
             )
             if not passed
         ],

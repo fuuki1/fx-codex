@@ -15,8 +15,9 @@ Current state:
 - raw-first capture: hash-chained, daily-sharded SQLite transaction journal
 - completed one-minute materializer: implemented as a separate shadow service
 - canonical freshness monitor: isolated from the existing briefing gate
-- Mac mini installation: blocked until a clean approved SHA, credential file,
-  and legacy execution-checkout isolation are all present
+- Mac mini installation: stopped and not installed; a future attempt remains
+  blocked until a clean approved SHA, credential file, reviewed clean-install
+  window, and legacy execution-checkout isolation are all present
 - 30 qualifying trading days: 0 until prospective operation starts
 
 Practice/demo data may validate connectivity but does not count as production
@@ -69,8 +70,9 @@ The command must fail when:
 - the runtime checkout is dirty
 - a separate known checkout still tracks `trader/` or `executor.py`
 
-A successful dry-run validates all three plists and the collector configuration
-without printing credential values.
+A successful dry-run validates all three plists, parses the nested collector,
+materializer and freshness command arguments with their real CLI parsers, and
+checks the collector configuration without printing credential values.
 
 ## 4. launchd lifecycle
 
@@ -88,6 +90,12 @@ collector plist launches `/bin/sh scripts/run_quote_collector.sh --launchd
 ...`. The wrapper loads the mode-600 credential file through the daemon's
 narrow `--env-file` parser and refuses to fall back to an unreviewed system
 Python.
+
+Installation is deliberately clean-install only: it refuses to overwrite an
+existing canonical plist or loaded label. If a later label fails during the
+same installation attempt, the installer rolls back only the labels/plists it
+created in that attempt. Replacing a prior canonical installation requires an
+explicit reviewed uninstall and a new approved SHA.
 
 All repository launchd templates set `Umask=63` (decimal `0077`) so newly
 created service logs and runtime files are private by default. This is defense
@@ -137,16 +145,23 @@ Production streaming disables the old per-message raw files and compatibility
 JSONL. One UTC-day SQLite shard contains insert-only raw events, terminal
 events, and quote rows; SQLite WAL/SHM companions mean at most three active
 files per daily shard. Evidence tables reject update/delete, events are
-SHA-256 chained across daily shards, and an 8 GiB active-shard ceiling fails
-closed before accepting another raw message. A terminal transaction is still
-allowed to finish an already-durable raw message.
+SHA-256 chained across daily shards, and an 8 GiB active-shard ceiling reserves
+space for the raw payload plus a bounded 4 MiB terminal transaction before
+accepting another raw message. The limit is rechecked inside both write
+transactions. A terminal payload that exceeds its bound is replaced by a
+minimal `QUARANTINED` terminal record; an unbounded terminal cannot consume the
+reserved capacity.
 
 The materializer reads only hash-verified rows whose journal state is
 `COMMITTED`. Raw-only interrupted captures and terminal `QUARANTINED` or
 `UNAVAILABLE` captures are not visible. Startup recovery appends
-`UNAVAILABLE`; it never edits raw evidence. The bridge checkpoint is bound to
-journal root, genesis hash, commit-entry hash, configuration, and output path;
-a mismatch stops advancement for an explicit audited migration.
+`UNAVAILABLE`; it never edits raw evidence. Materialized snapshots and the
+bridge checkpoint live in one SQLite WAL database and commit in one
+`BEGIN IMMEDIATE` transaction. The checkpoint is bound to journal root, genesis
+hash, commit-entry hash, configuration, and output path; a mismatch stops
+advancement for an explicit audited migration. Deleting the database deletes
+both snapshots and checkpoint, so the next run reconstructs from journal
+genesis instead of accepting an orphan checkpoint.
 
 Run the bounded functional probe, full logical-day capacity probe, and process
 crash injection before approval:
@@ -162,18 +177,20 @@ python tools/capture_journal_archive_probe.py \
   --report /path/outside/the/hot/journal/archive_restore_probe.json
 ```
 
-The output is synthetic functional evidence, not provider-captured data or
-trading evidence. It must report throughput above 16 messages/second, no
-raw-only visibility, successful unavailable recovery, no more than three files
-for one daily shard, and successful full verified replay. `--full-day`
+The output is synthetic functional evidence, not provider-captured data,
+production-daemon RSS evidence, or trading evidence. It exits nonzero unless
+the report records `passed=true`, including throughput of at least 16
+messages/second, no raw-only visibility, successful unavailable recovery, no
+more than three files for one daily shard, successful full verified replay,
+and the configured post-run disk reserve. `--full-day`
 represents 1,382,400 messages over one logical UTC day and refuses to start
 unless its target volume has the configured disk reserve. The probe runs as
 fast as the host permits; its logical event-time span, not its wall time, is
 one day. The process probe covers termination after the raw commit, during the
 terminal transaction, after the terminal commit, before and after UTC rotation,
 after a synthetic active-shard capacity rejection, and after materialized rows
-are fsynced but before their replay checkpoint is replaced. That capacity case
-is not evidence of target-host filesystem `ENOSPC` behavior.
+are inserted but before the single snapshot/checkpoint transaction commits.
+That capacity case is not evidence of target-host filesystem `ENOSPC` behavior.
 
 Seal only a non-active historical shard. Sealing verifies the complete hot
 journal, checkpoints that shard, creates a deterministic gzip snapshot and a
@@ -267,23 +284,45 @@ python -m tools.data_platform_daily_report \
   --output-dir "$HOME/srv/fx-codex/collect/operations"
 ```
 
-The three supporting files must be same-day JSON objects:
+The three supporting files must be distinct, same-day JSON objects. Each needs
+an aware `observed_at`, its exact `evidence_role`, and a nonempty `source_id`
+that differs from the other roles:
 
 ```json
-{"report_date": "2026-07-14", "primary_up": true}
+{
+  "report_date": "2026-07-14",
+  "observed_at": "2026-07-14T23:59:00+00:00",
+  "evidence_role": "primary_health",
+  "source_id": "oanda_primary_health",
+  "primary_up": true
+}
 ```
 
 ```json
-{"report_date": "2026-07-14", "secondary_up": true}
+{
+  "report_date": "2026-07-14",
+  "observed_at": "2026-07-14T23:59:00+00:00",
+  "evidence_role": "independent_secondary",
+  "source_id": "approved_secondary_feed",
+  "secondary_up": true
+}
 ```
 
 ```json
-{"report_date": "2026-07-14", "replay_ok": true}
+{
+  "report_date": "2026-07-14",
+  "observed_at": "2026-07-14T23:59:00+00:00",
+  "evidence_role": "deterministic_replay",
+  "source_id": "capture_journal_replay",
+  "replay_ok": true
+}
 ```
 
-The generator binds each file by SHA-256 and independently verifies that the
-accepted log contains usable live OANDA quotes for USDJPY, EURUSD and GBPUSD.
-A single quote or a health declaration without three-pair coverage does not make
+The generator requires different resolved paths, SHA-256 values and `source_id`
+values, then independently verifies that the accepted log contains usable live
+OANDA streaming quotes for USDJPY, EURUSD, GBPUSD and AUDUSD. Every qualifying
+primary row needs aware provider-event and receipt timestamps within the future
+skew bound. A health declaration without four-pair coverage does not make
 `primary_up=true`.
 
 The generator also verifies journal-bound raw bytes, quote counts, freshness,
@@ -315,6 +354,8 @@ replay_ok is true
 critical_incidents == 0
 primary_up is true
 secondary_up is true
+supporting_evidence_contract_ok is true
+supporting_evidence_distinct is true
 ```
 
 Renaming or copying a report to manufacture another day is rejected because the

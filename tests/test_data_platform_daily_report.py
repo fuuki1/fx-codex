@@ -88,15 +88,28 @@ def _write_journal_quote(
 
 
 def _write_support(path: Path, field: str, value: bool, *, day: date = DAY) -> None:
+    role, source_id = {
+        "primary_up": ("primary_health", "oanda_primary_health"),
+        "secondary_up": ("independent_secondary", "independent_secondary_feed"),
+        "replay_ok": ("deterministic_replay", "capture_journal_replay"),
+    }[field]
     path.write_text(
-        json.dumps({"report_date": day.isoformat(), field: value}),
+        json.dumps(
+            {
+                "report_date": day.isoformat(),
+                "observed_at": STAMP.isoformat(),
+                "evidence_role": role,
+                "source_id": source_id,
+                field: value,
+            }
+        ),
         encoding="utf-8",
     )
 
 
 def test_daily_report_qualifies_only_with_bound_same_day_evidence(tmp_path: Path) -> None:
     collection_root = tmp_path / "collect"
-    for instrument in ("USDJPY", "EURUSD", "GBPUSD"):
+    for instrument in ("USDJPY", "EURUSD", "GBPUSD", "AUDUSD"):
         _write_quote(collection_root, instrument, hashlib.sha256(instrument.encode()).digest())
 
     primary = tmp_path / "primary.json"
@@ -121,14 +134,19 @@ def test_daily_report_qualifies_only_with_bound_same_day_evidence(tmp_path: Path
     assert report["secondary_up"] is True
     assert report["replay_ok"] is True
     assert report["critical_incidents"] == 0
-    assert report["quote_count"] == 3
+    assert report["quote_count"] == 4
+    assert report["supporting_evidence_contract_ok"] is True
+    assert report["supporting_evidence_distinct"] is True
     assert report["supporting_evidence"]["primary"]["sha256"]
     assert not (collection_root / "log" / "capture_journal").exists()
 
 
 def test_daily_report_reads_canonical_journal_without_legacy_files(tmp_path: Path) -> None:
     collection_root = tmp_path / "collect"
-    for sequence, instrument in enumerate(("USDJPY", "EURUSD", "GBPUSD"), start=1):
+    for sequence, instrument in enumerate(
+        ("USDJPY", "EURUSD", "GBPUSD", "AUDUSD"),
+        start=1,
+    ):
         _write_journal_quote(
             collection_root,
             instrument,
@@ -152,16 +170,19 @@ def test_daily_report_reads_canonical_journal_without_legacy_files(tmp_path: Pat
 
     assert report["qualifying_day"] is True
     assert report["raw_hash_verified"] is True
-    assert report["quote_count"] == 3
-    assert report["raw_blob_count_verified"] == 3
-    assert report["freshness_seconds"]["population_count"] == 3
-    assert report["freshness_seconds"]["sample_count"] == 3
+    assert report["quote_count"] == 4
+    assert report["raw_blob_count_verified"] == 4
+    assert report["freshness_seconds"]["population_count"] == 4
+    assert report["freshness_seconds"]["sample_count"] == 4
     assert not (collection_root / "log" / "quotes.jsonl").exists()
 
 
 def test_invalid_canonical_journal_never_falls_back_to_legacy_logs(tmp_path: Path) -> None:
     collection_root = tmp_path / "collect"
-    for sequence, instrument in enumerate(("USDJPY", "EURUSD", "GBPUSD"), start=1):
+    for sequence, instrument in enumerate(
+        ("USDJPY", "EURUSD", "GBPUSD", "AUDUSD"),
+        start=1,
+    ):
         _write_journal_quote(
             collection_root,
             instrument,
@@ -229,7 +250,7 @@ def test_daily_report_is_nonqualifying_when_supporting_evidence_is_missing(
     tmp_path: Path,
 ) -> None:
     collection_root = tmp_path / "collect"
-    for instrument in ("USDJPY", "EURUSD", "GBPUSD"):
+    for instrument in ("USDJPY", "EURUSD", "GBPUSD", "AUDUSD"):
         _write_quote(collection_root, instrument, instrument.encode())
 
     primary = tmp_path / "primary.json"
@@ -285,3 +306,59 @@ def test_daily_report_refuses_historical_backfill_window(tmp_path: Path) -> None
     assert report["prospective_window_ok"] is False
     assert report["qualifying_day"] is False
     assert "prospective_window_ok" in report["unmet_conditions"]
+
+
+def test_primary_quote_without_event_time_is_nonqualifying(tmp_path: Path) -> None:
+    collection_root = tmp_path / "collect"
+    for instrument in ("USDJPY", "EURUSD", "GBPUSD", "AUDUSD"):
+        _write_quote(collection_root, instrument, instrument.encode())
+    quote_log = collection_root / "log" / "quotes.jsonl"
+    rows = [json.loads(line) for line in quote_log.read_text().splitlines()]
+    rows[0]["provider_event_time"] = None
+    rows[0]["received_at"] = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+    quote_log.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    primary = tmp_path / "primary.json"
+    secondary = tmp_path / "secondary.json"
+    replay = tmp_path / "replay.json"
+    _write_support(primary, "primary_up", True)
+    _write_support(secondary, "secondary_up", True)
+    _write_support(replay, "replay_ok", True)
+
+    report = build_daily_report(
+        collection_root=collection_root,
+        day=DAY,
+        primary_evidence=primary,
+        secondary_evidence=secondary,
+        replay_evidence=replay,
+    )
+
+    assert report["qualifying_day"] is False
+    assert report["raw_hash_verified"] is False
+    assert report["primary_pair_coverage_ok"] is False
+    assert report["freshness_seconds"]["population_count"] == 3
+    assert "primary_event_timestamp_missing" in report["raw_verification_errors"]
+    assert "future_quote_timestamp" in report["raw_verification_errors"]
+
+
+def test_supporting_evidence_cannot_reuse_one_file_for_all_roles(tmp_path: Path) -> None:
+    collection_root = tmp_path / "collect"
+    for instrument in ("USDJPY", "EURUSD", "GBPUSD", "AUDUSD"):
+        _write_quote(collection_root, instrument, instrument.encode())
+    evidence = tmp_path / "evidence.json"
+    _write_support(evidence, "primary_up", True)
+
+    report = build_daily_report(
+        collection_root=collection_root,
+        day=DAY,
+        primary_evidence=evidence,
+        secondary_evidence=evidence,
+        replay_evidence=evidence,
+    )
+
+    assert report["qualifying_day"] is False
+    assert report["supporting_evidence_contract_ok"] is False
+    assert report["supporting_evidence_distinct"] is False
+    assert "supporting_evidence_distinct" in report["unmet_conditions"]

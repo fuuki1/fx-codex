@@ -110,6 +110,7 @@ def run_soak(
     *,
     messages: int,
     message_rate: int = DOCUMENTED_FOUR_PAIR_MESSAGES_PER_SECOND,
+    min_free_after_bytes: int = DEFAULT_MIN_FREE_AFTER_BYTES,
     progress_every: int = 0,
     progress: Callable[[int, int, float], None] | None = None,
 ) -> dict[str, Any]:
@@ -117,6 +118,8 @@ def run_soak(
         raise ValueError("messages must be positive")
     if message_rate < 1:
         raise ValueError("message_rate must be positive")
+    if min_free_after_bytes < 0:
+        raise ValueError("min_free_after_bytes must be non-negative")
     if progress_every < 0:
         raise ValueError("progress_every must be non-negative")
     existing = tuple((root / "log" / "capture_journal").glob("capture-*.sqlite3"))
@@ -209,11 +212,27 @@ def run_soak(
     bytes_per_message = total_bytes / messages
     repository_revision, worktree_dirty = _repository_evidence()
     free_bytes_after = shutil.disk_usage(root).free
+    throughput_ok = throughput >= DOCUMENTED_FOUR_PAIR_MESSAGES_PER_SECOND
+    bounded_file_layout = len(files) <= journal_shards * 3
+    incomplete_invisible = visible_before_recovery == 0
+    recovery_ok = recovered == (incomplete.capture_id,)
+    integrity_verified = replayed_count == messages
+    post_run_disk_reserve_ok = free_bytes_after >= min_free_after_bytes
+    checks = {
+        "throughput_at_least_documented_rate": throughput_ok,
+        "bounded_file_layout": bounded_file_layout,
+        "incomplete_raw_invisible": incomplete_invisible,
+        "recovery_appended_unavailable": recovery_ok,
+        "full_verified_replay": integrity_verified,
+        "post_run_disk_reserve": post_run_disk_reserve_ok,
+    }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "evidence_class": "synthetic_functional_capacity_probe",
         "payload_profile": "representative_oanda_price_json_not_provider_captured",
         "parser_profile": "production_parse_price_line_with_replay_provenance",
+        "memory_evidence_scope": "probe_process_peak_not_production_daemon",
+        "production_daemon_rss_validated": False,
         "logical_window_start": base.isoformat(),
         "logical_window_end": logical_end.isoformat(),
         "messages": messages,
@@ -243,13 +262,15 @@ def run_soak(
         },
         "journal_file_count": len(files),
         "journal_shard_count": journal_shards,
-        "bounded_file_layout": len(files) <= journal_shards * 3,
+        "bounded_file_layout": bounded_file_layout,
         "journal_bytes": total_bytes,
         "main_window_journal_file_count": len(main_window_files),
         "main_window_journal_shard_count": main_window_shards,
         "main_window_journal_bytes": main_window_bytes,
         "free_bytes_before": free_bytes_before,
         "free_bytes_after": free_bytes_after,
+        "minimum_free_after_bytes": min_free_after_bytes,
+        "post_run_disk_reserve_ok": post_run_disk_reserve_ok,
         "disk_bytes_consumed": max(0, free_bytes_before - free_bytes_after),
         "bytes_per_message": round(bytes_per_message, 3),
         "linear_estimated_bytes_at_documented_daily_max": round(
@@ -259,8 +280,11 @@ def run_soak(
         "replayed_quotes": replayed_count,
         "incomplete_visible_before_recovery": visible_before_recovery,
         "recovered_capture_id": incomplete.capture_id,
-        "recovery_appended_unavailable": recovered == (incomplete.capture_id,),
-        "integrity_verified_after_recovery": replayed_count == messages,
+        "recovery_appended_unavailable": recovery_ok,
+        "integrity_verified_after_recovery": integrity_verified,
+        "integrity_errors": [],
+        "checks": checks,
+        "passed": all(checks.values()),
         "generated_at": datetime.now(UTC).isoformat(),
         "platform": platform.platform(),
         "python_version": platform.python_version(),
@@ -284,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-free-after-gib", type=float, default=10.0)
     args = parser.parse_args(argv)
     messages = FULL_DAY_MESSAGES if args.full_day else (args.messages or 10_000)
+    min_free_after_bytes = round(args.min_free_after_gib * 1024**3)
 
     if args.report is not None and args.report.exists():
         parser.error(f"report is create-only and already exists: {args.report}")
@@ -294,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         with tempfile.TemporaryDirectory(prefix="fx-capture-journal-soak-") as temporary:
             output_root = Path(temporary)
             if args.full_day:
-                required = FULL_DAY_MAX_EXPECTED_BYTES + round(args.min_free_after_gib * 1024**3)
+                required = FULL_DAY_MAX_EXPECTED_BYTES + min_free_after_bytes
                 available = shutil.disk_usage(output_root).free
                 if available < required:
                     parser.error(
@@ -304,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             report = run_soak(
                 output_root,
                 messages=messages,
+                min_free_after_bytes=min_free_after_bytes,
                 progress_every=args.progress_every,
                 progress=lambda completed, total, elapsed: print(
                     f"progress {completed}/{total} elapsed_seconds={elapsed:.1f}",
@@ -314,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         args.output_root.mkdir(parents=True, exist_ok=True)
         if args.full_day:
-            required = FULL_DAY_MAX_EXPECTED_BYTES + round(args.min_free_after_gib * 1024**3)
+            required = FULL_DAY_MAX_EXPECTED_BYTES + min_free_after_bytes
             available = shutil.disk_usage(args.output_root).free
             if available < required:
                 parser.error(
@@ -324,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_soak(
             args.output_root,
             messages=messages,
+            min_free_after_bytes=min_free_after_bytes,
             progress_every=args.progress_every,
             progress=lambda completed, total, elapsed: print(
                 f"progress {completed}/{total} elapsed_seconds={elapsed:.1f}",
@@ -344,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             handle.flush()
             os.fsync(handle.fileno())
     print(encoded, end="")
-    return 0
+    return 0 if report["passed"] else 1
 
 
 if __name__ == "__main__":

@@ -6,12 +6,13 @@ import pytest
 from tools.capture_journal_soak import (
     DOCUMENTED_FOUR_PAIR_MESSAGES_PER_SECOND,
     _representative_payload,
+    main,
     run_soak,
 )
 
 
 def test_soak_reports_bounded_files_and_crash_recovery(tmp_path: Path) -> None:
-    report = run_soak(tmp_path, messages=50)
+    report = run_soak(tmp_path, messages=50, min_free_after_bytes=0)
 
     assert report["replayed_quotes"] == 50
     assert report["journal_file_count"] <= 3
@@ -26,6 +27,11 @@ def test_soak_reports_bounded_files_and_crash_recovery(tmp_path: Path) -> None:
     assert report["journal_shard_count"] == 1
     assert report["main_window_journal_shard_count"] == 1
     assert report["bounded_file_layout"] is True
+    assert report["passed"] is True
+    assert all(report["checks"].values())
+    assert report["post_run_disk_reserve_ok"] is True
+    assert report["production_daemon_rss_validated"] is False
+    assert report["memory_evidence_scope"] == "probe_process_peak_not_production_daemon"
 
 
 def test_representative_payload_contains_oanda_price_shape() -> None:
@@ -47,3 +53,23 @@ def test_soak_rejects_invalid_rate(tmp_path: Path) -> None:
             messages=DOCUMENTED_FOUR_PAIR_MESSAGES_PER_SECOND,
             message_rate=0,
         )
+
+
+def test_soak_cli_returns_failure_when_post_run_reserve_fails(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--messages",
+            "1",
+            "--progress-every",
+            "0",
+            "--min-free-after-gib",
+            "1000000",
+        ]
+    )
+
+    report = capsys.readouterr().out
+    assert exit_code == 1
+    assert '"passed": false' in report
+    assert '"post_run_disk_reserve": false' in report
