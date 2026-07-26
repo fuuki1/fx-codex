@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -33,6 +34,8 @@ from data_platform.quality.state import QualityState
 JOURNAL_SCHEMA_VERSION = 1
 ZERO_SHA256 = "0" * 64
 DEFAULT_MAX_SHARD_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_MAX_TERMINAL_BYTES = 4 * 1024 * 1024
+_SQLITE_WRITE_ALLOWANCE_BYTES = 128 * 1024
 _DATABASE_GLOB = "capture-????-??-??.sqlite3"
 _ACCEPTED_STATES = frozenset({QualityState.USABLE, QualityState.DEGRADED})
 
@@ -205,6 +208,7 @@ class CaptureJournal:
         *,
         verify: bool = True,
         max_shard_bytes: int = DEFAULT_MAX_SHARD_BYTES,
+        max_terminal_bytes: int = DEFAULT_MAX_TERMINAL_BYTES,
     ) -> None:
         if (
             isinstance(max_shard_bytes, bool)
@@ -212,10 +216,17 @@ class CaptureJournal:
             or max_shard_bytes < 1
         ):
             raise CaptureJournalError("max_shard_bytes must be a positive integer")
+        if (
+            isinstance(max_terminal_bytes, bool)
+            or not isinstance(max_terminal_bytes, int)
+            or max_terminal_bytes < 4096
+        ):
+            raise CaptureJournalError("max_terminal_bytes must be an integer >= 4096")
         self.root = Path(root)
         if self.root.is_symlink():
             raise CaptureJournalError(f"capture journal root cannot be a symlink: {self.root}")
         self.max_shard_bytes = max_shard_bytes
+        self.max_terminal_bytes = max_terminal_bytes
         self.root.mkdir(parents=True, exist_ok=True)
         if verify and self.shard_paths():
             self.verify()
@@ -242,9 +253,11 @@ class CaptureJournal:
         details["raw_size_bytes"] = len(raw_payload)
         metadata_json = _canonical_json(details, field_name="metadata")
         shard = self._writable_shard(timestamp)
-        self._assert_shard_capacity(shard, incoming_bytes=len(raw_payload))
+        reserved_bytes = len(raw_payload) + self.max_terminal_bytes
+        self._assert_shard_capacity(shard, incoming_bytes=reserved_bytes)
         with self._connect(shard) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_shard_capacity(shard, incoming_bytes=reserved_bytes)
             sequence, previous_hash, previous_time = self._head(connection)
             if previous_time is not None and timestamp < previous_time:
                 raise CaptureJournalError("journal occurred_at moved backwards")
@@ -447,17 +460,57 @@ class CaptureJournal:
                 if reason:
                     for flag in str(reason).split(","):
                         quality_flag_counts[flag] = quality_flag_counts.get(flag, 0) + 1
+            terminal_metadata = {
+                "accepted_count": len(accepted),
+                "quarantined_count": len(encoded_rows) - len(accepted),
+                "quality_flag_counts": quality_flag_counts,
+            }
+            if (
+                self._terminal_payload_size(encoded_rows, terminal_metadata)
+                > self.max_terminal_bytes
+            ):
+                fallback_reason = "terminal_payload_limit_exceeded"
+                fallback_row = (
+                    "quarantined",
+                    _canonical_json(
+                        {
+                            "raw_sha256": capture.raw_sha256,
+                            "reason": fallback_reason,
+                            "occurred_at": timestamp.isoformat(),
+                        },
+                        field_name="quarantine",
+                    ),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                terminal = self._insert_terminal(
+                    connection,
+                    capture,
+                    state=JournalState.QUARANTINED,
+                    occurred_at=timestamp,
+                    rows=[fallback_row],
+                    metadata={
+                        "accepted_count": 0,
+                        "quarantined_count": 1,
+                        "quality_flag_counts": {fallback_reason: 1},
+                        "reason": fallback_reason,
+                    },
+                )
+                connection.commit()
+                rejected = tuple(
+                    quote.with_quality(QualityState.QUARANTINED, fallback_reason)
+                    for quote in quotes
+                )
+                return FinalizedQuotes(terminal, (), rejected)
             terminal = self._insert_terminal(
                 connection,
                 capture,
                 state=JournalState.COMMITTED,
                 occurred_at=timestamp,
                 rows=encoded_rows,
-                metadata={
-                    "accepted_count": len(accepted),
-                    "quarantined_count": len(encoded_rows) - len(accepted),
-                    "quality_flag_counts": quality_flag_counts,
-                },
+                metadata=terminal_metadata,
             )
             for (provider, instrument), (
                 last_event_time,
@@ -522,10 +575,21 @@ class CaptureJournal:
             connection.commit()
         return entry
 
-    def recover_incomplete(self, *, occurred_at: datetime) -> tuple[str, ...]:
+    def recover_incomplete(
+        self,
+        *,
+        occurred_at: datetime,
+        shard_limit: int | None = None,
+    ) -> tuple[str, ...]:
         timestamp = _aware_utc(occurred_at, field_name="occurred_at")
+        if shard_limit is not None and (
+            isinstance(shard_limit, bool) or not isinstance(shard_limit, int) or shard_limit < 1
+        ):
+            raise CaptureJournalError("shard_limit must be a positive integer or None")
         recovered: list[str] = []
         paths = self.shard_paths()
+        if shard_limit is not None:
+            paths = paths[-shard_limit:]
         candidates: list[CaptureRef] = []
         for path in paths:
             with self._connect(path, readonly=True) as connection:
@@ -587,7 +651,7 @@ class CaptureJournal:
     def iter_entries(self, *, start_sequence: int = 0) -> Iterator[JournalEntry]:
         """Stream journal entry metadata without retaining the full history."""
 
-        for path in self.shard_paths():
+        for path in self._paths_for_start_sequence(start_sequence):
             with self._connect(path, readonly=True) as connection:
                 rows = connection.execute(
                     "SELECT * FROM events WHERE sequence >= ? ORDER BY sequence",
@@ -642,7 +706,7 @@ class CaptureJournal:
 
         found_anchor = start_sequence == 0
         previous_time: datetime | None = None
-        for path in self.shard_paths():
+        for path in self._paths_for_start_sequence(start_sequence):
             with self._connect(path, readonly=True) as connection:
                 events = connection.execute(
                     "SELECT * FROM events WHERE sequence >= ? ORDER BY sequence",
@@ -802,6 +866,7 @@ class CaptureJournal:
         for path in paths:
             shard_date = self._shard_date(path)
             with self._connect(path, readonly=True) as connection:
+                _validate_schema_objects(connection, path)
                 meta = connection.execute("SELECT * FROM shard_meta WHERE singleton = 1").fetchone()
                 if meta is None:
                     raise CaptureJournalError(f"shard metadata is missing: {path}")
@@ -870,23 +935,109 @@ class CaptureJournal:
                     previous_time = occurred_at
                     expected_sequence += 1
 
-    def verify_tail(self) -> None:
-        """Verify the active shard and publication tail without full replay."""
+    def verify_tail(self) -> JournalEntry:
+        """Verify active schema, cross-shard anchor, and publication tail."""
 
         paths = self.shard_paths()
         if not paths:
             raise CaptureJournalError("capture journal has no shards")
         path = paths[-1]
+        expected_previous_sequence = 0
+        expected_previous_hash = ZERO_SHA256
+        if len(paths) > 1:
+            previous_path = paths[-2]
+            with self._connect(previous_path, readonly=True) as previous_connection:
+                _validate_schema_objects(previous_connection, previous_path)
+                previous_quick = previous_connection.execute("PRAGMA quick_check").fetchone()
+                if previous_quick is None or previous_quick[0] != "ok":
+                    raise CaptureJournalError(f"SQLite quick_check failed: {previous_path}")
+                previous = previous_connection.execute(
+                    "SELECT * FROM events ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()
+                if previous is None:
+                    raise CaptureJournalError(
+                        f"previous journal shard has no events: {previous_path}"
+                    )
+                try:
+                    previous_state = JournalState(previous["state"])
+                    prior_occurred_at = _aware_utc(
+                        datetime.fromisoformat(previous["occurred_at"]),
+                        field_name="occurred_at",
+                    )
+                    previous_metadata = json.loads(previous["metadata_json"])
+                except (ValueError, TypeError, json.JSONDecodeError) as error:
+                    raise CaptureJournalError("previous journal tail schema is invalid") from error
+                previous_metadata_json = _canonical_json(
+                    previous_metadata,
+                    field_name="metadata",
+                )
+                previous_hash = _event_hash(
+                    sequence=int(previous["sequence"]),
+                    capture_id=_sha256(previous["capture_id"], field_name="capture_id"),
+                    raw_sha256=_sha256(previous["raw_sha256"], field_name="raw_sha256"),
+                    state=previous_state,
+                    occurred_at=prior_occurred_at.isoformat(),
+                    previous_entry_sha256=_sha256(
+                        previous["previous_entry_sha256"],
+                        field_name="previous_entry_sha256",
+                    ),
+                    metadata_json=previous_metadata_json,
+                )
+                if (
+                    previous_metadata_json != previous["metadata_json"]
+                    or previous_hash != previous["entry_sha256"]
+                ):
+                    raise CaptureJournalError("previous journal tail hash changed")
+                if previous_state is JournalState.RAW_DURABLE:
+                    if (
+                        hashlib.sha256(bytes(previous["raw_payload"])).hexdigest()
+                        != previous["raw_sha256"]
+                    ):
+                        raise CaptureJournalError("previous journal tail raw hash mismatch")
+                else:
+                    if previous["raw_payload"] is not None:
+                        raise CaptureJournalError(
+                            "previous journal tail terminal contains raw payload"
+                        )
+                    self._verify_terminal(
+                        previous_connection,
+                        previous,
+                        previous_metadata,
+                    )
+                expected_previous_sequence = int(previous["sequence"])
+                expected_previous_hash = _sha256(
+                    previous_hash,
+                    field_name="previous_entry_sha256",
+                )
         with self._connect(path, readonly=True) as connection:
+            _validate_schema_objects(connection, path)
             quick = connection.execute("PRAGMA quick_check").fetchone()
             if quick is None or quick[0] != "ok":
                 raise CaptureJournalError(f"SQLite quick_check failed: {path}")
+            meta = connection.execute("SELECT * FROM shard_meta WHERE singleton = 1").fetchone()
+            if (
+                meta is None
+                or int(meta["schema_version"]) != JOURNAL_SCHEMA_VERSION
+                or str(meta["shard_date"]) != self._shard_date(path)
+                or int(meta["previous_sequence"]) != expected_previous_sequence
+                or str(meta["previous_entry_sha256"]) != expected_previous_hash
+            ):
+                raise CaptureJournalError(f"active journal shard boundary changed: {path}")
+            first = connection.execute(
+                "SELECT sequence, previous_entry_sha256 " "FROM events ORDER BY sequence LIMIT 1"
+            ).fetchone()
+            if first is None:
+                raise CaptureJournalError(f"active journal shard has no events: {path}")
+            if (
+                int(first["sequence"]) != expected_previous_sequence + 1
+                or str(first["previous_entry_sha256"]) != expected_previous_hash
+            ):
+                raise CaptureJournalError(f"active journal first-event anchor changed: {path}")
             rows = connection.execute(
                 "SELECT * FROM events ORDER BY sequence DESC LIMIT 2"
             ).fetchall()
-            if not rows:
-                raise CaptureJournalError(f"active journal shard has no events: {path}")
             rows = list(reversed(rows))
+            previous_time: datetime | None = None
             for index, row in enumerate(rows):
                 try:
                     state = JournalState(row["state"])
@@ -898,6 +1049,8 @@ class CaptureJournal:
                 except (ValueError, TypeError, json.JSONDecodeError) as error:
                     raise CaptureJournalError("journal tail schema is invalid") from error
                 metadata_json = _canonical_json(metadata, field_name="metadata")
+                if metadata_json != row["metadata_json"]:
+                    raise CaptureJournalError("journal tail metadata is not canonical")
                 expected_hash = _event_hash(
                     sequence=int(row["sequence"]),
                     capture_id=_sha256(row["capture_id"], field_name="capture_id"),
@@ -914,11 +1067,17 @@ class CaptureJournal:
                     raise CaptureJournalError("journal tail entry hash mismatch")
                 if index and row["previous_entry_sha256"] != rows[index - 1]["entry_sha256"]:
                     raise CaptureJournalError("journal tail hash chain mismatch")
+                if previous_time is not None and occurred_at < previous_time:
+                    raise CaptureJournalError("journal tail occurred_at moved backwards")
                 if state is JournalState.RAW_DURABLE:
                     if hashlib.sha256(bytes(row["raw_payload"])).hexdigest() != row["raw_sha256"]:
                         raise CaptureJournalError("journal tail raw hash mismatch")
                 else:
+                    if row["raw_payload"] is not None:
+                        raise CaptureJournalError("journal tail terminal contains raw payload")
                     self._verify_terminal(connection, row, metadata)
+                previous_time = occurred_at
+            return self._entry_from_row(rows[-1], self._shard_date(path))
 
     def checkpoint(self) -> None:
         paths = self.shard_paths()
@@ -1049,6 +1208,16 @@ class CaptureJournal:
             "rows_sha256": _rows_hash(encoded_pairs),
         }
         metadata_json = _canonical_json(details, field_name="metadata")
+        terminal_bytes = self._terminal_payload_size(rows, details)
+        if terminal_bytes > self.max_terminal_bytes:
+            raise CaptureJournalError(
+                "terminal payload capacity exceeded: "
+                f"projected={terminal_bytes}, max={self.max_terminal_bytes}"
+            )
+        self._assert_shard_capacity(
+            self._path_for_date(occurred_at.date().isoformat()),
+            incoming_bytes=terminal_bytes,
+        )
         next_sequence = sequence + 1
         entry_hash = _event_hash(
             sequence=next_sequence,
@@ -1156,6 +1325,25 @@ class CaptureJournal:
             if row is not None:
                 return True
         return False
+
+    def _paths_for_start_sequence(self, start_sequence: int) -> tuple[Path, ...]:
+        paths = self.shard_paths()
+        if start_sequence <= 0:
+            return paths
+        for index in range(len(paths) - 1, -1, -1):
+            path = paths[index]
+            with self._connect(path, readonly=True) as connection:
+                bounds = connection.execute(
+                    "SELECT MIN(sequence), MAX(sequence) FROM events"
+                ).fetchone()
+            if bounds is None or bounds[0] is None or bounds[1] is None:
+                continue
+            minimum, maximum = int(bounds[0]), int(bounds[1])
+            if minimum <= start_sequence <= maximum:
+                return paths[index:]
+            if maximum < start_sequence:
+                break
+        return ()
 
     def _writable_shard(self, occurred_at: datetime) -> Path:
         date = _aware_utc(occurred_at, field_name="occurred_at").date().isoformat()
@@ -1393,20 +1581,62 @@ class CaptureJournal:
     def _assert_shard_capacity(self, path: Path, *, incoming_bytes: int) -> None:
         companions = (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
         observed = sum(candidate.stat().st_size for candidate in companions if candidate.exists())
-        # Reserve a conservative page allowance for the raw event and indexes.
-        projected = observed + incoming_bytes + 64 * 1024
+        # Reserve a conservative page allowance for SQLite pages and indexes.
+        projected = observed + incoming_bytes + _SQLITE_WRITE_ALLOWANCE_BYTES
         if projected > self.max_shard_bytes:
             raise CaptureJournalError(
                 "active journal shard capacity exceeded: "
                 f"projected={projected}, max={self.max_shard_bytes}"
             )
 
+    @staticmethod
+    def _terminal_payload_size(
+        rows: Sequence[tuple[str, str, str | None, str | None, str | None, str | None]],
+        metadata: Mapping[str, object],
+    ) -> int:
+        """Conservative encoded terminal size before SQLite page overhead."""
+
+        row_bytes = sum(len(payload_json.encode("ascii")) + 256 for _, payload_json, *_ in rows)
+        metadata_bytes = len(_canonical_json(metadata, field_name="metadata").encode("ascii"))
+        return row_bytes + metadata_bytes + 2048
+
+
+def _normalized_schema_objects(connection: sqlite3.Connection) -> tuple[tuple[str, str, str], ...]:
+    rows = connection.execute("""
+        SELECT type, name, sql
+        FROM sqlite_master
+        WHERE type IN ('table', 'index', 'trigger')
+          AND name NOT LIKE 'sqlite_%'
+          AND sql IS NOT NULL
+        ORDER BY type, name
+        """).fetchall()
+    return tuple(
+        (
+            str(row[0]),
+            str(row[1]),
+            " ".join(str(row[2]).split()),
+        )
+        for row in rows
+    )
+
+
+@lru_cache(maxsize=1)
+def _expected_schema_objects() -> tuple[tuple[str, str, str], ...]:
+    with sqlite3.connect(":memory:") as connection:
+        CaptureJournal._create_schema(connection)
+        return _normalized_schema_objects(connection)
+
+
+def _validate_schema_objects(connection: sqlite3.Connection, path: Path) -> None:
+    if _normalized_schema_objects(connection) != _expected_schema_objects():
+        raise CaptureJournalError(f"journal schema objects changed: {path}")
+
 
 class CommittedCaptureReader:
     """Compatibility-named reader for the canonical journal boundary."""
 
-    def __init__(self, journal_root: str | Path) -> None:
-        self.journal = CaptureJournal(journal_root)
+    def __init__(self, journal_root: str | Path, *, verify: bool = True) -> None:
+        self.journal = CaptureJournal(journal_root, verify=verify)
 
     def read_quotes(
         self,

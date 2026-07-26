@@ -281,6 +281,27 @@ def test_capture_journal_target_checks_active_shard_integrity(monitor, tmp_path)
     assert invalid.reason == "journal_integrity_failure"
 
 
+def test_capture_journal_reads_do_not_refresh_logical_freshness(monitor, tmp_path):
+    journal_root = tmp_path / "collect" / "log" / "capture_journal"
+    old_event = NOW - timedelta(seconds=1000)
+    journal = monitor.CaptureJournal(journal_root)
+    journal.begin(b"old-provider-message", occurred_at=old_event)
+    target = monitor.TargetConfig(
+        name="journal",
+        path="collect/log/capture_journal",
+        kind="capture_journal",
+        warn_after_seconds=900,
+        critical_after_seconds=2700,
+    )
+
+    first = monitor.check_target(target, tmp_path, NOW)
+    second = monitor.check_target(target, tmp_path, NOW)
+
+    assert first.status == second.status == "warning"
+    assert first.age_seconds == second.age_seconds == 1000.0
+    assert first.last_update == second.last_update == old_event.isoformat()
+
+
 def test_canonical_sqlite_uses_logical_slot_time_and_validates_every_row(monitor, tmp_path):
     log_directory = tmp_path / "collect" / "log"
     log = QuoteLog(log_directory, legacy_jsonl=False)

@@ -87,7 +87,9 @@ def _commit_quotes(
     return commit.sequence, result.accepted_count
 
 
-def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(tmp_path) -> None:
+def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     log_directory = tmp_path / "log"
     log = QuoteLog(log_directory)
     store = ImmutableRawStore(tmp_path / "raw")
@@ -97,6 +99,10 @@ def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(tmp
         (5, 150.00),
         (50, 150.10),
         (65, 150.20),
+    )
+    monkeypatch.setattr(
+        "data_platform.collect.capture_journal.CaptureJournal.verify",
+        lambda _self: (_ for _ in ()).throw(AssertionError("unexpected full-history verify")),
     )
     output = tmp_path / "prices.sqlite3"
 

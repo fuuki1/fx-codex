@@ -224,6 +224,23 @@ def test_restore_target_symlink_is_rejected(tmp_path: Path) -> None:
     assert external.read_bytes() == b"must-not-be-touched"
 
 
+def test_restore_destination_root_symlink_is_rejected_before_writing(tmp_path: Path) -> None:
+    log, archive_root = _three_day_journal(tmp_path)
+    sealed = seal_historical_shard(
+        log.journal.root,
+        archive_root,
+        shard_date="2026-07-20",
+    )
+    external = tmp_path / "external-root"
+    external.mkdir()
+    destination = tmp_path / "restored-link"
+    destination.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(JournalArchiveError, match="cannot contain a symlink"):
+        restore_archive_set([sealed.manifest_path], destination)
+    assert list(external.iterdir()) == []
+
+
 def test_seal_rejects_naive_timestamp(tmp_path: Path) -> None:
     log, archive_root = _three_day_journal(tmp_path)
 

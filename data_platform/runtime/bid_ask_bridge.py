@@ -942,7 +942,9 @@ def materialize_increment(
     expected_entry_sha256 = None if state is None else state.get("checkpoint_commit_entry_sha256")
     if expected_entry_sha256 is not None and not isinstance(expected_entry_sha256, str):
         raise BidAskBridgeError("bridge checkpoint entry hash has an invalid type")
-    reader = CommittedCaptureReader(journal_root)
+    # read_quotes verifies the origin chain or the stored hash anchor itself;
+    # avoid a second full-history constructor verification every minute.
+    reader = CommittedCaptureReader(journal_root, verify=False)
     try:
         committed_records = reader.read_quotes(
             start_sequence=requested_position.commit_sequence,

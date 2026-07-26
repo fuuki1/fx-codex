@@ -15,13 +15,15 @@ from types import SimpleNamespace
 import pytest
 
 import data_platform.collect.oanda as oanda
+from data_platform.collect.capture_journal import CaptureJournal
 from data_platform.collect.oanda import (
     CollectorConfigError,
     OandaConfig,
     requests_transport,
     stream_quotes,
 )
-from data_platform.collect.raw_first import QuoteLog, RawFirstError
+from data_platform.collect.raw_first import QuoteLog, RawFirstError, ingest_payload
+from data_platform.collect.reconnect import ConnectionState
 from data_platform.raw.immutable_store import ImmutableRawStore
 from tools.fx_quote_collector import (
     EX_SOFTWARE,
@@ -332,6 +334,40 @@ def test_unexpected_runtime_error_is_persisted(
     assert terminal["error_type"] == "RuntimeError"
     incidents = list((tmp_path / "state" / "incidents").glob("collector_runtime_failure_*.json"))
     assert len(incidents) == 1
+
+
+def test_production_startup_uses_tail_verification_not_full_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
+    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    seed = QuoteLog(tmp_path / "log", legacy_jsonl=False)
+    ingest_payload(
+        _price_line(),
+        parser=lambda raw: oanda.parse_price_line(
+            raw,
+            environment="practice",
+            connection_id="seed",
+            tradable_allowed=False,
+        ),
+        log=seed,
+    )
+    monkeypatch.setattr(
+        CaptureJournal,
+        "verify",
+        lambda _self: (_ for _ in ()).throw(AssertionError("unexpected full-history verify")),
+    )
+    state = ConnectionState(heartbeat_timeout_seconds=15.0)
+    state.stop("max_messages_reached")
+    monkeypatch.setattr(
+        "tools.fx_quote_collector.stream_quotes",
+        lambda *_args, **_kwargs: (state, []),
+    )
+
+    code = daemon_main(["--output-root", str(tmp_path)])
+
+    assert code == 0
 
 
 def test_launchd_wrapper_exit_mapping_and_env_loading(tmp_path: Path) -> None:

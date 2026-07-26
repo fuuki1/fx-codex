@@ -286,8 +286,17 @@ def main(argv: list[str] | None = None) -> int:
         # The streaming path writes exact raw bytes and terminal rows into one
         # daily SQLite shard.  Per-message raw files and compatibility JSONL
         # are deliberately disabled to keep inode growth bounded.
-        log = QuoteLog(args.output_root / "log", legacy_jsonl=False)
-        recovered = log.journal.recover_incomplete(occurred_at=datetime.now(UTC))
+        log = QuoteLog(
+            args.output_root / "log",
+            legacy_jsonl=False,
+            verify_journal=False,
+        )
+        if log.journal.shard_paths():
+            log.journal.verify_tail()
+        recovered = log.journal.recover_incomplete(
+            occurred_at=datetime.now(UTC),
+            shard_limit=2,
+        )
         if recovered:
             print(
                 f"[collector] recovered {len(recovered)} incomplete capture(s) as unavailable",

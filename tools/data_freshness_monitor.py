@@ -233,17 +233,10 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
             result.reason = "journal_shard_missing"
             return result
         active = shards[-1]
-        companions = (
-            active,
-            Path(f"{active}-wal"),
-            Path(f"{active}-shm"),
-        )
-        activity_path = max(
-            (path for path in companions if path.exists()),
-            key=lambda path: path.stat().st_mtime_ns,
-        )
+        activity_path = active
         try:
-            CaptureJournal(file_path, verify=False).verify_tail()
+            journal_tail = CaptureJournal(file_path, verify=False).verify_tail()
+            logical_update = journal_tail.occurred_at
         except CaptureJournalError:
             integrity_failure = "journal_integrity_failure"
     elif target.kind == "canonical_bidask_sqlite":

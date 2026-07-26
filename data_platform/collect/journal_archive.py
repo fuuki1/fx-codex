@@ -573,6 +573,15 @@ def _validate_manifest_chain(manifests: Sequence[Mapping[str, Any]]) -> None:
         previous = current
 
 
+def _reject_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    for component in (absolute, *absolute.parents):
+        if component.is_symlink():
+            raise JournalArchiveError(
+                f"restore destination path cannot contain a symlink: {component}"
+            )
+
+
 def restore_archive_set(
     manifest_paths: Sequence[str | Path],
     destination_root: str | Path,
@@ -584,7 +593,9 @@ def restore_archive_set(
     manifests = [item[1] for item in loaded]
     _validate_manifest_chain(manifests)
     destination = Path(destination_root)
+    _reject_symlink_components(destination)
     destination.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(destination)
     expected_names = {
         f"capture-{manifest['shard']['shard_date']}.sqlite3" for manifest in manifests
     }

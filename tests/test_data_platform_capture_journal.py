@@ -137,6 +137,19 @@ def test_evidence_tables_reject_update_and_delete(tmp_path: Path) -> None:
             connection.execute("DELETE FROM quote_rows")
 
 
+def test_full_and_tail_verification_require_original_schema_objects(tmp_path: Path) -> None:
+    log = QuoteLog(tmp_path / "log", legacy_jsonl=False)
+    _ingest(log, b"schema-guard")
+    shard = log.journal.shard_paths()[0]
+    with sqlite3.connect(shard) as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+
+    with pytest.raises(CaptureJournalError, match="schema objects changed"):
+        log.journal.verify()
+    with pytest.raises(CaptureJournalError, match="schema objects changed"):
+        log.journal.verify_tail()
+
+
 def test_shard_capacity_limit_fails_closed_before_raw_append(tmp_path: Path) -> None:
     journal = CaptureJournal(tmp_path / "journal", max_shard_bytes=1)
 
@@ -144,6 +157,34 @@ def test_shard_capacity_limit_fails_closed_before_raw_append(tmp_path: Path) -> 
         journal.begin(b"provider-message", occurred_at=NOW)
 
     assert journal.entries() == ()
+
+
+def test_oversized_terminal_is_replaced_by_bounded_quarantine(tmp_path: Path) -> None:
+    journal = CaptureJournal(
+        tmp_path / "journal",
+        max_shard_bytes=2 * 1024 * 1024,
+        max_terminal_bytes=4096,
+    )
+    payload = b"x"
+    capture = journal.begin(payload, occurred_at=NOW)
+
+    finalized = journal.finalize_quotes(
+        capture,
+        [_quote(payload)],
+        occurred_at=NOW,
+        stale_after_seconds=30.0,
+        extra_quarantine=({"reason": "oversized", "detail": "x" * (1024 * 1024)},),
+    )
+
+    assert finalized.entry.state is JournalState.QUARANTINED
+    assert finalized.entry.metadata["reason"] == "terminal_payload_limit_exceeded"
+    assert finalized.accepted == ()
+    assert len(finalized.quarantined) == 1
+    assert journal.read_quotes() == ()
+    assert (
+        sum(path.stat().st_size for path in (tmp_path / "journal").iterdir() if path.is_file())
+        <= 2 * 1024 * 1024
+    )
 
 
 def test_non_sqlite_shard_fails_as_journal_error(tmp_path: Path) -> None:
