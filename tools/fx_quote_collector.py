@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Read-only FX quote collector daemon (launchd entrypoint).
+"""Read-only Tiingo FX quote collector daemon (launchd entrypoint).
 
-Runs the OANDA pricing stream through the raw-first ingest pipeline under a
-single-writer exclusive lock. This process is structurally incapable of
-trading: it imports only ``data_platform.collect`` (no executor, no order
-endpoint — enforced by tests) and constructs only the pricing-stream URL.
-OANDA tokens must still be handled as potentially trading-capable secrets.
+Runs Tiingo's Forex top-of-book WebSocket through the raw-first ingest pipeline
+under a single-writer exclusive lock. This process is structurally incapable
+of trading: it imports only the market-data collector and has no account or
+broker API. The configured usage scope attests that storage is internal,
+non-display use under an active Tiingo subscription.
 
 Fail-closed rules:
 - missing credentials -> exit 78 (EX_CONFIG) without touching the quote log
@@ -37,19 +37,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data_platform.collect.oanda import (  # noqa: E402
-    ENV_ACCOUNT,
-    ENV_ENVIRONMENT,
+from data_platform.collect.tiingo import (  # noqa: E402
+    ENV_DERIVED_DATA_APPROVAL,
+    ENV_PLAN,
     ENV_TOKEN,
+    ENV_USAGE_SCOPE,
+    SOURCE_ENDPOINT_CLASS,
     CollectorConfigError,
-    OandaConfig,
-    requests_transport,
+    TiingoConfig,
     stream_quotes,
+    websocket_transport,
 )
 from data_platform.collect.raw_first import QuoteLog  # noqa: E402
 from data_platform.collect.reconnect import ConnectionState  # noqa: E402
 from tools.run_exclusive import ExclusiveLock  # noqa: E402
-from fx_intel.universe import MVP_OANDA_INSTRUMENTS, to_oanda_instrument  # noqa: E402
+from fx_intel.universe import MVP_SYMBOLS, normalize_mvp_symbols  # noqa: E402
 
 EX_OK = 0
 EX_UNAVAILABLE = 69
@@ -59,7 +61,7 @@ EX_TEMPFAIL = 75
 EX_NOPERM = 77
 EX_CONFIG = 78
 
-DEFAULT_INSTRUMENTS = MVP_OANDA_INSTRUMENTS
+DEFAULT_INSTRUMENTS = MVP_SYMBOLS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,14 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--instruments",
         nargs="+",
         default=list(DEFAULT_INSTRUMENTS),
-        help="OANDA instrument names, e.g. USD_JPY",
+        help="supported FX symbols, e.g. USDJPY",
     )
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument(
         "--env-file",
         type=Path,
         default=None,
-        help="optional mode-600 KEY=VALUE file containing only FX_OANDA_* credentials",
+        help="optional mode-600 KEY=VALUE file containing only FX_TIINGO_* settings",
     )
     parser.add_argument(
         "--dry-run",
@@ -101,7 +103,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
     if mode != 0o600:
         raise CollectorConfigError(f"collector env file must be mode 600, got {mode:o}: {path}")
 
-    allowed = {ENV_TOKEN, ENV_ACCOUNT, ENV_ENVIRONMENT}
+    allowed = {ENV_TOKEN, ENV_PLAN, ENV_USAGE_SCOPE, ENV_DERIVED_DATA_APPROVAL}
     values: dict[str, str] = {}
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -225,17 +227,18 @@ def _record_incident(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        args.instruments = list(dict.fromkeys(to_oanda_instrument(v) for v in args.instruments))
+        args.instruments = list(normalize_mvp_symbols(args.instruments))
     except ValueError as error:
         print(f"[collector] config error: {error}", file=sys.stderr)
         return EX_CONFIG
     try:
         environment = _load_env_file(args.env_file) if args.env_file is not None else None
-        config = OandaConfig.from_env(environment)
+        config = TiingoConfig.from_env(environment)
     except CollectorConfigError as error:
         print(f"[collector] config error: {error}", file=sys.stderr)
         print(
-            f"[collector] required env vars: {ENV_TOKEN}, {ENV_ACCOUNT}, {ENV_ENVIRONMENT}",
+            "[collector] required env vars: "
+            f"{ENV_TOKEN}, {ENV_PLAN}, {ENV_USAGE_SCOPE}, {ENV_DERIVED_DATA_APPROVAL}",
             file=sys.stderr,
         )
         return EX_CONFIG
@@ -244,7 +247,11 @@ def main(argv: list[str] | None = None) -> int:
         "config": repr(config),
         "instruments": list(args.instruments),
         "output_root": str(args.output_root),
-        "endpoint_class": "streaming_pricing (GET-only application path)",
+        "endpoint_class": SOURCE_ENDPOINT_CLASS,
+        "storage_contract": "internal non-display use while Tiingo subscription is active",
+        "derived_data_contract": (
+            "written approval reference present and masked; operator attestation only"
+        ),
     }
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
@@ -326,11 +333,11 @@ def main(argv: list[str] | None = None) -> int:
             args.instruments,
             store=None,
             log=log,
-            transport=requests_transport,
+            transport=websocket_transport,
             max_messages=args.max_messages,
             sleeper=_sleep_interruptibly,
             should_stop=lambda: stop_requested["flag"],
-            source_endpoint_class="streaming_pricing",
+            source_endpoint_class=SOURCE_ENDPOINT_CLASS,
             collection_mode="live_stream",
             retain_results=False,
             on_result=_count_result,

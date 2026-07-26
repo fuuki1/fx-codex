@@ -15,11 +15,15 @@ TMPL="$ROOT/ops/launchd/$LABEL.plist.tmpl"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 WRAPPER="$ROOT/scripts/run_quote_collector.sh"
 ENV_FILE="${FX_CODEX_COLLECTOR_ENV_FILE:-$HOME/.config/fx-codex/collector.env}"
-OUTPUT_ROOT="${FX_CODEX_COLLECTOR_OUTPUT_ROOT:-$ROOT/collect}"
+OUTPUT_ROOT="${FX_CODEX_COLLECTOR_OUTPUT_ROOT:-$ROOT/collect/tiingo-v1}"
 CMD="${1:-status}"
 
 render_plist() {
-  sed -e "s|__ROOT__|$ROOT|g" -e "s|__HOME__|$HOME|g" "$TMPL"
+  sed \
+    -e "s|__ROOT__|$ROOT|g" \
+    -e "s|__HOME__|$HOME|g" \
+    -e "s|__COLLECT_ROOT__|$OUTPUT_ROOT|g" \
+    "$TMPL"
 }
 
 validate_files() {

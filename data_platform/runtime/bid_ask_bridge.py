@@ -29,14 +29,21 @@ from data_platform.collect.capture_journal import (
     JournalState,
 )
 from data_platform.collect.contract import CollectedQuote
+from data_platform.collect.tiingo import (
+    ACCOUNT_ENVIRONMENT,
+    CANONICAL_SOURCE,
+    PROVIDER,
+    SOURCE_ENDPOINT_CLASS,
+    SOURCE_RECORD_PREFIX,
+)
 from data_platform.contracts.market_quote import MarketQuote
 from data_platform.materialize.bid_ask_bars import BAR_INTERVALS, BidAskBar, materialize_bars
 from data_platform.quality.state import QualityState
 from fx_intel.universe import normalize_symbol
 
-BRIDGE_STATE_SCHEMA = 3
-SNAPSHOT_SCHEMA_VERSION = 3
-SNAPSHOT_STORE_SCHEMA_VERSION = 1
+BRIDGE_STATE_SCHEMA = 4
+SNAPSHOT_SCHEMA_VERSION = 4
+SNAPSHOT_STORE_SCHEMA_VERSION = 2
 DEFAULT_OUTPUT_TIMEFRAMES = ("15m", "1h", "4h", "1d")
 _REPLAY_ROW_BITS = 32
 
@@ -389,13 +396,17 @@ def _bar_snapshot(bar: BidAskBar, located: Sequence[_LocatedQuote]) -> dict[str,
     collection_modes = sorted({item.collected.collection_mode for item in window})
     endpoint_classes = sorted({item.collected.source_endpoint_class for item in window})
     quality_states = sorted({str(item.collected.quality_state) for item in window})
-    if providers != ["oanda"]:
-        raise BidAskBridgeError("canonical bridge accepts only provider=oanda")
+    if providers != [PROVIDER]:
+        raise BidAskBridgeError(f"canonical bridge accepts only provider={PROVIDER}")
+    if environments != [ACCOUNT_ENVIRONMENT]:
+        raise BidAskBridgeError(
+            f"canonical bridge accepts only account_environment={ACCOUNT_ENVIRONMENT}"
+        )
     if collection_modes != ["live_stream"]:
         raise BidAskBridgeError("canonical bridge accepts only collection_mode=live_stream")
-    if endpoint_classes != ["streaming_pricing"]:
+    if endpoint_classes != [SOURCE_ENDPOINT_CLASS]:
         raise BidAskBridgeError(
-            "canonical bridge accepts only source_endpoint_class=streaming_pricing"
+            f"canonical bridge accepts only source_endpoint_class={SOURCE_ENDPOINT_CLASS}"
         )
     lineage = [
         {
@@ -451,7 +462,9 @@ def _bar_snapshot(bar: BidAskBar, located: Sequence[_LocatedQuote]) -> dict[str,
         "source_last_commit_sequence": max(item.position.commit_sequence for item in window),
         "open_time": bar.open_time.isoformat(),
         "event_time": bar.close_time.isoformat(),
-        "source_record_id": (f"oanda-pricing:{bar.instrument}:1m:{bar.close_time.isoformat()}"),
+        "source_record_id": (
+            f"{SOURCE_RECORD_PREFIX}:{bar.instrument}:1m:{bar.close_time.isoformat()}"
+        ),
         "ohlc_scope": "completed_bid_ask_bar",
         "data_quality_flags": list(dict.fromkeys(flags)),
     }
@@ -511,7 +524,7 @@ def _canonical_snapshot_row(
             "symbol": symbol,
             "timeframe": timeframe,
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "source": "oanda_pricing_stream_bid_ask",
+            "source": CANONICAL_SOURCE,
             "local_record_id": f"{symbol}:{timeframe}:{event_stamp}",
             "run_id": run_id,
             "writer_id": writer_id,
@@ -594,15 +607,17 @@ def _validate_snapshot_row(row: Mapping[str, object]) -> None:
     missing = [key for key in required if row.get(key) in (None, "")]
     if missing:
         raise BidAskBridgeError(f"canonical snapshot is missing provenance: {missing}")
-    if row.get("source") != "oanda_pricing_stream_bid_ask":
+    if row.get("source") != CANONICAL_SOURCE:
         raise BidAskBridgeError("canonical snapshot source is invalid")
     if row.get("ohlc_scope") != "completed_bid_ask_bar":
         raise BidAskBridgeError("canonical snapshot scope is invalid")
-    if row.get("quote_provider") != "oanda":
+    if row.get("quote_provider") != PROVIDER:
         raise BidAskBridgeError("canonical snapshot provider is invalid")
+    if row.get("account_environment") != ACCOUNT_ENVIRONMENT:
+        raise BidAskBridgeError("canonical snapshot account environment is invalid")
     if row.get("collection_mode") != "live_stream":
         raise BidAskBridgeError("canonical snapshot collection mode is invalid")
-    if row.get("source_endpoint_class") != "streaming_pricing":
+    if row.get("source_endpoint_class") != SOURCE_ENDPOINT_CLASS:
         raise BidAskBridgeError("canonical snapshot endpoint class is invalid")
     for field_name in ("source_lineage_sha256", "source_journal_genesis_sha256"):
         digest = row.get(field_name)

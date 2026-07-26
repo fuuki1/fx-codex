@@ -34,6 +34,11 @@ from data_platform.collect.capture_journal import (
     CaptureJournalError,
     JournalState,
 )
+from data_platform.collect.tiingo import (
+    ACCOUNT_ENVIRONMENT,
+    PROVIDER,
+    SOURCE_ENDPOINT_CLASS,
+)
 from data_platform.raw.immutable_store import ImmutableRawStore, RawStoreError
 
 REQUIRED_PAIRS = frozenset({"USDJPY", "EURUSD", "GBPUSD", "AUDUSD"})
@@ -226,10 +231,10 @@ def build_daily_report(
             instrument = str(row.get("instrument", ""))
             pair_counts[instrument] += 1
             is_primary = (
-                row.get("provider") == "oanda"
+                row.get("provider") == PROVIDER
                 and row.get("collection_mode") == "live_stream"
-                and row.get("account_environment") == "live"
-                and row.get("source_endpoint_class") == "streaming_pricing"
+                and row.get("account_environment") == ACCOUNT_ENVIRONMENT
+                and row.get("source_endpoint_class") == SOURCE_ENDPOINT_CLASS
                 and row.get("quality_state") == "usable"
             )
 

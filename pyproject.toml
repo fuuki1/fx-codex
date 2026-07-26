@@ -9,6 +9,7 @@ dependencies = [
   "pandas>=2.0",
   "requests>=2.31",
   "tradingview-ta>=3.3",
+  "websocket-client>=1.9",
 ]
 
 [project.scripts]

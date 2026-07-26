@@ -46,8 +46,8 @@ def _quote(
 ) -> CollectedQuote:
     observed = T0 + timedelta(seconds=second)
     return CollectedQuote(
-        provider="oanda",
-        account_environment="practice",
+        provider="tiingo",
+        account_environment="datafeed",
         instrument=instrument,
         provider_event_time=observed,
         received_at=observed + timedelta(milliseconds=100),
@@ -55,13 +55,13 @@ def _quote(
         ask=bid + 0.02,
         bid_size=None,
         ask_size=None,
-        tradable=True,
+        tradable=False,
         sequence_id=None,
         connection_id="connection-1",
         writer_id="collector-1",
         revision_id=None,
         raw_payload_sha256=hashlib.sha256(payload).hexdigest(),
-        source_endpoint_class="streaming_pricing",
+        source_endpoint_class="tiingo_fx_websocket",
         collection_mode="live_stream",
     )
 
@@ -125,10 +125,11 @@ def test_bridge_materializes_only_completed_minutes_and_replays_idempotently(
     assert all(row["bid"] == pytest.approx(150.10) for row in rows)
     assert all(row["ask"] == pytest.approx(150.12) for row in rows)
     assert all(row["quote_count"] == 2 for row in rows)
-    assert all(row["account_environment"] == "practice" for row in rows)
+    assert all(row["account_environment"] == "datafeed" for row in rows)
     assert all(row["collection_mode"] == "live_stream" for row in rows)
-    assert all(row["source_endpoint_class"] == "streaming_pricing" for row in rows)
+    assert all(row["source_endpoint_class"] == "tiingo_fx_websocket" for row in rows)
     assert all(row["source_quality_states"] == ["usable"] for row in rows)
+    assert all(row["all_quotes_tradable"] is False for row in rows)
     assert all("source_coverage" not in row for row in rows)
     assert all(
         row["coverage_measurement"] == "unmeasured_provider_sampling_cadence" for row in rows
@@ -261,6 +262,32 @@ def test_bridge_rejects_replay_provenance_from_canonical_output(tmp_path) -> Non
     )
 
     with pytest.raises(BidAskBridgeError, match="collection_mode=live_stream"):
+        materialize_increment(
+            ingest_log_dir=log_directory,
+            output_path=tmp_path / "prices.sqlite3",
+            instruments=["USDJPY"],
+            as_of=T0 + timedelta(minutes=1, seconds=31),
+        )
+
+
+def test_bridge_rejects_legacy_oanda_rows_from_tiingo_store(tmp_path) -> None:
+    log_directory = tmp_path / "log"
+    log = QuoteLog(log_directory)
+    payload = b"legacy-oanda"
+    legacy_quote = replace(
+        _quote(payload, 5, 150.0),
+        provider="oanda",
+        account_environment="live",
+        source_endpoint_class="streaming_pricing",
+    )
+    ingest_payload(
+        payload,
+        parser=lambda _raw: [legacy_quote],
+        log=log,
+        now=lambda: T0 + timedelta(seconds=6),
+    )
+
+    with pytest.raises(BidAskBridgeError, match="provider=tiingo"):
         materialize_increment(
             ingest_log_dir=log_directory,
             output_path=tmp_path / "prices.sqlite3",

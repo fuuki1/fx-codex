@@ -2,16 +2,30 @@
 
 ## 1. Scope and current status
 
-This runbook covers only `data_platform/collect/` and the OANDA pricing-stream
-`GET` endpoint. The application is structurally pricing-only and does not
-authorize broker orders or account mutation. The OANDA personal access token
-must nevertheless be treated as potentially trading-capable: the safety
-boundary is the endpoint allowlist and absence of mutation code, not token
-scope.
+This runbook covers the production Tiingo Forex WebSocket collector under
+`data_platform/collect/`. The application is structurally market-data-only and
+has no broker account or order API. The legacy OANDA adapter remains available
+for historical replay and compatibility tests, but the production daemon does
+not import or call it.
+
+Tiingo's terms permit local storage for internal consumption while the
+applicable subscription is active. They prohibit redistribution and require
+deletion of Tiingo data when the subscription expires, is cancelled, or is
+terminated. Creating or retaining derived data requires express written
+approval, with additional limits after termination. The operator must read the
+current terms before installation:
+
+- <https://api.tiingo.com/tos/>
+- <https://www.tiingo.com/documentation/websockets/forex>
+- <https://www.tiingo.com/about/pricing>
 
 Current state:
 
-- OANDA pricing adapter: implemented, credentials not committed
+- Tiingo top-of-book WebSocket adapter: implemented, credentials not committed
+- Tiingo provider connectivity and payload shape on the target host: not yet
+  validated; the Forex WebSocket documentation currently labels the API beta
+- legacy OANDA adapter: retained for historical replay/tests, not the
+  production daemon
 - raw-first capture: hash-chained, daily-sharded SQLite transaction journal
 - completed one-minute materializer: implemented as a separate shadow service
 - canonical freshness monitor: isolated from the existing briefing gate
@@ -20,12 +34,13 @@ Current state:
   window, and legacy execution-checkout isolation are all present
 - 30 qualifying trading days: 0 until prospective operation starts
 
-Practice/demo data may validate connectivity but does not count as production
-market-data evidence.
+The Tiingo `free` plan may validate connectivity but must not be assumed to
+have enough bandwidth for prospective all-update collection. Realized message
+rate and plan bandwidth must be measured before the 30-day clock starts.
 
-The pricing transport does not follow HTTP redirects. A redirect is a
-fail-closed connection error because the personal token must not be forwarded
-outside the hard-coded pricing host/path contract.
+The transport permits only `wss://api.tiingo.com/fx`, disables redirects and
+does not log provider error bodies. Any endpoint deviation fails closed before
+the API token is sent.
 
 ## 2. Credential file
 
@@ -34,20 +49,48 @@ Create the file outside the repository:
 ```bash
 mkdir -p ~/.config/fx-codex
 cat > ~/.config/fx-codex/collector.env <<'EOF'
-FX_OANDA_API_TOKEN=<personal access token; treat as trading-capable secret>
-FX_OANDA_ACCOUNT_ID=<account id>
-FX_OANDA_ENV=practice
+FX_TIINGO_API_TOKEN=<Tiingo market-data API token>
+FX_TIINGO_PLAN=power
+FX_TIINGO_USAGE_SCOPE=internal_nonredisplay_active_subscription
+FX_TIINGO_DERIVED_DATA_APPROVAL_REF=<Tiingo written approval or agreement reference>
 EOF
 chmod 600 ~/.config/fx-codex/collector.env
 ```
 
-Only the three `FX_OANDA_*` keys are accepted. The daemon parses the file as
-data; it does not source or evaluate it as shell code. Token and account values
-are masked in dry-run output and must never be committed.
+Only these four `FX_TIINGO_*` keys are accepted. `FX_TIINGO_PLAN` must be
+`free`, `power`, or `commercial` and must match the plan actually attached to
+the token. The usage-scope value is an explicit operator attestation that the
+collection is internal, non-display use and the applicable subscription is
+active. `FX_TIINGO_DERIVED_DATA_APPROVAL_REF` must identify Tiingo's express
+written approval for creation and retention of the derived quote/bar evidence
+this pipeline produces. Neither setting is a substitute for the actual
+approval or Tiingo contract.
 
-Use `FX_OANDA_ENV=live` only when the account and token are explicitly approved
-for prospective non-demo data collection. This repository still calls only the
-pricing-stream endpoint; no environment value authorizes execution code.
+The daemon parses the file as data; it does not source or evaluate it as shell
+code. The token is masked in dry-run output and must never be committed.
+
+Tiingo data is isolated under `collect/tiingo-v1/` and materialized into
+`logs/briefing_tf_bidask_prices_tiingo_v1.sqlite3`. This prevents a new Tiingo
+journal or schema-v4 snapshot store from silently mixing with historical OANDA
+evidence.
+
+### Subscription termination
+
+Before a Tiingo subscription expires or is cancelled:
+
+1. uninstall the collector topology and verify all three launchd labels are
+   stopped
+2. inventory the Tiingo raw journal, snapshots, reports, archives, backups and
+   any derived datasets
+3. obtain explicit review of the deletion target and preservation obligations
+4. delete Tiingo data as required by the then-current terms, including copies
+   and derived data unless written retention approval exists
+5. record the stop time, deletion scope, reviewer and evidence hashes without
+   recording the token
+
+There is intentionally no automatic deletion command. Deletion is destructive,
+and this repository must preserve user data until the exact Tiingo-owned scope
+has been independently reviewed.
 
 ## 3. Pre-install validation
 
@@ -141,6 +184,12 @@ The collector never forward-fills, averages conflicting providers, converts
 missing values to zero, or marks injected/replay transport as live. Only the
 production daemon explicitly assigns `collection_mode=live_stream`.
 
+The sole pre-raw security exception is an inbound provider message containing
+the exact configured API token (including its JSON-escaped form). Such a
+credential-reflection payload is not made durable; the collector stops as an
+authorization incident. This prevents raw-first evidence from becoming a
+credential leak.
+
 Production streaming disables the old per-message raw files and compatibility
 JSONL. One UTC-day SQLite shard contains insert-only raw events, terminal
 events, and quote rows; SQLite WAL/SHM companions mean at most three active
@@ -199,7 +248,7 @@ the source shard:
 
 ```bash
 python tools/capture_journal_archive.py seal \
-  --journal-root "$HOME/srv/fx-codex/collect/log/capture_journal" \
+  --journal-root "$HOME/srv/fx-codex/collect/tiingo-v1/log/capture_journal" \
   --archive-root /approved/separate/archive/root \
   --shard-date 2026-07-20
 python tools/capture_journal_archive.py verify \
@@ -221,29 +270,31 @@ python tools/capture_journal_archive.py restore \
 Archive payloads and manifests are mode `0440`; restored SQLite shards are
 mode `0640`. Seal, verification, and restore preflight their working-file
 requirements and retain at least 1 GiB of filesystem reserve. No automated
-retention deletion exists. Do not remove hot shards until an approved disk
-budget, off-host backup, independent full-prefix restore and evidence-retention
-policy are all recorded. At roughly 5 GB/day, even a 30-day hot window would
-require about 150 GB before filesystem and safety headroom, so a policy must be
-based on target-host measurement rather than that illustrative number.
+routine retention deletion exists. Do not remove hot shards until an approved
+disk budget, off-host backup, independent full-prefix restore and
+evidence-retention policy are all recorded. The Tiingo
+subscription-termination obligation above is a separate contractual deletion
+event and takes precedence. Capacity must be based on target-host measurement,
+not an assumed message rate.
 
-OANDA documents that the pricing stream sends at most four prices per second
-per instrument and may omit intermediate prices. Therefore the output records
-provider sampling coverage as unmeasured and never describes the stream as
-complete ticks, dealer flow, or consolidated OTC FX data.
+The collector requests `thresholdLevel=5`, which Tiingo documents as every
+top-of-book update available through this feed. This is still a
+vendor-normalized aggregate, not venue-native dealer flow or consolidated OTC
+FX. The output therefore records provider sampling coverage as unmeasured,
+marks the vendor aggregation limitation, and does not infer completeness.
 
 ## 6. Runtime state and incidents
 
 Terminal state:
 
 ```text
-~/srv/fx-codex/collect/state/last_run.json
+~/srv/fx-codex/collect/tiingo-v1/state/last_run.json
 ```
 
 Incidents:
 
 ```text
-~/srv/fx-codex/collect/state/incidents/*.json
+~/srv/fx-codex/collect/tiingo-v1/state/incidents/*.json
 ```
 
 Recorded terminal categories include:
@@ -261,9 +312,10 @@ stderr remains the fallback evidence in that case.
 
 ## 7. Reconnect semantics
 
-`max_reconnects` limits consecutive failed connections. A valid PRICE or
-HEARTBEAT message resets the consecutive-failure budget. The lifetime
-`reconnect_count` remains cumulative for audit reporting.
+`max_reconnects` limits consecutive failed connections. A valid Tiingo quote,
+heartbeat or informational message (`A`, `H`, or `I`) resets the
+consecutive-failure budget. The lifetime `reconnect_count` remains cumulative
+for audit reporting.
 
 Each disconnect opens an explicit gap. Heartbeat timeout marks the connection
 non-tradable before a late quote is processed. Token rejection never retries.
@@ -276,12 +328,12 @@ Generate a report after the trading day closes:
 
 ```bash
 python -m tools.data_platform_daily_report \
-  --collection-root "$HOME/srv/fx-codex/collect" \
+  --collection-root "$HOME/srv/fx-codex/collect/tiingo-v1" \
   --date 2026-07-14 \
   --primary-evidence /path/to/primary_health_2026-07-14.json \
   --secondary-evidence /path/to/secondary_health_2026-07-14.json \
   --replay-evidence /path/to/replay_health_2026-07-14.json \
-  --output-dir "$HOME/srv/fx-codex/collect/operations"
+  --output-dir "$HOME/srv/fx-codex/collect/tiingo-v1/operations"
 ```
 
 The three supporting files must be distinct, same-day JSON objects. Each needs
@@ -293,7 +345,7 @@ that differs from the other roles:
   "report_date": "2026-07-14",
   "observed_at": "2026-07-14T23:59:00+00:00",
   "evidence_role": "primary_health",
-  "source_id": "oanda_primary_health",
+  "source_id": "tiingo_primary_health",
   "primary_up": true
 }
 ```
@@ -319,11 +371,11 @@ that differs from the other roles:
 ```
 
 The generator requires different resolved paths, SHA-256 values and `source_id`
-values, then independently verifies that the accepted log contains usable live
-OANDA streaming quotes for USDJPY, EURUSD, GBPUSD and AUDUSD. Every qualifying
-primary row needs aware provider-event and receipt timestamps within the future
-skew bound. A health declaration without four-pair coverage does not make
-`primary_up=true`.
+values, then independently verifies that the accepted log contains usable
+Tiingo live-stream rows from the exact Forex WebSocket for USDJPY, EURUSD,
+GBPUSD and AUDUSD. Every qualifying primary row needs aware provider-event and
+receipt timestamps within the future-skew bound. A health declaration without
+four-pair coverage does not make `primary_up=true`.
 
 The generator also verifies journal-bound raw bytes, quote counts, freshness,
 quarantine flags, critical incidents and disk headroom. Missing, stale or
@@ -365,14 +417,18 @@ filename must equal `daily_report_<report_date>.json`.
 
 Before the 30-day clock can legitimately start:
 
-1. connect an approved live non-demo OANDA pricing stream while treating the
-   token as potentially trading-capable
-2. create an independently measured same-day primary-health artifact
-3. connect an independent prospective secondary source
-4. generate same-day deterministic replay evidence
-5. schedule the daily-report command under a reviewed single-writer service
-6. connect alerting for token failure, incidents, stale data and non-qualifying days
-7. confirm clock synchronization, measured disk budget, off-host backup and an
+1. obtain Tiingo's express written Derived Data approval, confirm the active
+   plan permits this exact internal auto-save scope, and record its reference
+2. validate the beta Forex WebSocket payload and all four pairs on the isolated
+   Mac mini without exposing the token
+3. measure realized message volume, bandwidth and disk use against the active
+   plan and target-host capacity
+4. create an independently measured same-day primary-health artifact
+5. connect an independent prospective secondary source
+6. generate same-day deterministic replay evidence
+7. schedule the daily-report command under a reviewed single-writer service
+8. connect alerting for token failure, incidents, stale data and non-qualifying days
+9. confirm clock synchronization, measured disk budget, off-host backup and an
    independently verified archive/restore retention policy on the Mac mini
 
 Until these are complete, the data-platform score remains evidence-capped.

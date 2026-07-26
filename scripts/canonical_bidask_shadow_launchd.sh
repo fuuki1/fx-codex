@@ -10,6 +10,7 @@ setopt NULL_GLOB
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 PYTHON="$ROOT/.venv/bin/python"
+COLLECT_ROOT="$ROOT/collect/tiingo-v1"
 COLLECTOR_LABEL="com.fx-codex.quote-collector"
 LABELS=(
   com.fx-codex.bidask-materializer
@@ -22,6 +23,7 @@ render_plist() {
   sed \
     -e "s|__ROOT__|$ROOT|g" \
     -e "s|__PYTHON__|$PYTHON|g" \
+    -e "s|__COLLECT_ROOT__|$COLLECT_ROOT|g" \
     "$ROOT/ops/launchd/$label.plist.tmpl"
 }
 
@@ -77,7 +79,8 @@ validate_release() {
     }
   done
 
-  "$ROOT/scripts/quote_collector_launchd.sh" dry-run >/dev/null
+  FX_CODEX_COLLECTOR_OUTPUT_ROOT="$COLLECT_ROOT" \
+    "$ROOT/scripts/quote_collector_launchd.sh" dry-run >/dev/null
   for label in $LABELS; do
     [[ -f "$ROOT/ops/launchd/$label.plist.tmpl" ]] || {
       echo "拒否: plist templateがありません: $label" >&2
@@ -146,8 +149,9 @@ case "$CMD" in
         exit 78
       fi
     done
-    mkdir -p "$AGENTS_DIR" "$ROOT/collect/logs" "$ROOT/collect/state" "$ROOT/logs/locks"
-    "$ROOT/scripts/quote_collector_launchd.sh" install
+    mkdir -p "$AGENTS_DIR" "$COLLECT_ROOT/logs" "$COLLECT_ROOT/state" "$ROOT/logs/locks"
+    FX_CODEX_COLLECTOR_OUTPUT_ROOT="$COLLECT_ROOT" \
+      "$ROOT/scripts/quote_collector_launchd.sh" install
     installed_labels=()
     for label in $LABELS; do
       if ! install_label "$label"; then
@@ -155,7 +159,8 @@ case "$CMD" in
         for installed in $installed_labels; do
           remove_label "$installed"
         done
-        "$ROOT/scripts/quote_collector_launchd.sh" uninstall
+        FX_CODEX_COLLECTOR_OUTPUT_ROOT="$COLLECT_ROOT" \
+          "$ROOT/scripts/quote_collector_launchd.sh" uninstall
         echo "導入失敗: 新規に追加したcanonical shadowサービスをrollbackしました" >&2
         exit 70
       fi
@@ -185,8 +190,9 @@ case "$CMD" in
     for label in $LABELS; do
       remove_label "$label"
     done
-    "$ROOT/scripts/quote_collector_launchd.sh" uninstall
-    echo "removed canonical shadow services; collect/log/state data was retained"
+    FX_CODEX_COLLECTOR_OUTPUT_ROOT="$COLLECT_ROOT" \
+      "$ROOT/scripts/quote_collector_launchd.sh" uninstall
+    echo "removed canonical shadow services; $COLLECT_ROOT data was retained"
     ;;
   *)
     echo "usage: $0 {dry-run|install|status|uninstall|rollback}" >&2

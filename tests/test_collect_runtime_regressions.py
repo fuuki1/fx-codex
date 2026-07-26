@@ -294,9 +294,16 @@ def test_log_bootstrap_fails_closed_on_malformed_row(tmp_path: Path) -> None:
 def test_duplicate_writer_creates_incident_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
-    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
-    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
     held = ExclusiveLock("quote-collector", locks_dir=tmp_path / "state")
     assert held.acquire() is True
     try:
@@ -318,9 +325,16 @@ def test_duplicate_writer_creates_incident_record(
 def test_unexpected_runtime_error_is_persisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
-    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
-    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
     monkeypatch.setattr(
         "tools.fx_quote_collector.stream_quotes",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
@@ -339,9 +353,16 @@ def test_unexpected_runtime_error_is_persisted(
 def test_production_startup_uses_tail_verification_not_full_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
-    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
-    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
     seed = QuoteLog(tmp_path / "log", legacy_jsonl=False)
     ingest_payload(
         _price_line(),
@@ -406,9 +427,10 @@ def test_launchd_wrapper_exit_mapping_and_env_loading(tmp_path: Path) -> None:
     env_dir.mkdir(parents=True)
     env_file = env_dir / "collector.env"
     env_file.write_text(
-        "FX_OANDA_API_TOKEN=TOP-SECRET\n"
-        "FX_OANDA_ACCOUNT_ID=ACCOUNT-SECRET\n"
-        "FX_OANDA_ENV=practice\n",
+        "FX_TIINGO_API_TOKEN=TOP-SECRET\n"
+        "FX_TIINGO_PLAN=free\n"
+        "FX_TIINGO_USAGE_SCOPE=internal_nonredisplay_active_subscription\n"
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF=tiingo-approval-2026-001\n",
         encoding="utf-8",
     )
     env_file.chmod(0o600)
@@ -426,5 +448,4 @@ def test_launchd_wrapper_exit_mapping_and_env_loading(tmp_path: Path) -> None:
     )
     assert configured.returncode == 0
     assert "TOP-SECRET" not in configured.stdout
-    assert "ACCOUNT-SECRET" not in configured.stdout
     assert "***masked***" in configured.stdout

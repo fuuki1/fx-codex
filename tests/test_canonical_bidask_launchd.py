@@ -14,6 +14,7 @@ def _rendered_plist(label: str) -> dict:
         .replace("__ROOT__", "/srv/fx-codex")
         .replace("__PYTHON__", "/srv/fx-codex/.venv/bin/python")
         .replace("__HOME__", "/Users/fx")
+        .replace("__COLLECT_ROOT__", "/srv/fx-codex/collect/tiingo-v1")
     )
     return plistlib.loads(rendered.encode("utf-8"))
 
@@ -22,10 +23,10 @@ def test_quote_collector_writes_under_the_selected_runtime_root() -> None:
     payload = _rendered_plist("com.fx-codex.quote-collector")
     arguments = payload["ProgramArguments"]
 
-    assert arguments[-2:] == ["--output-root", "/srv/fx-codex/collect"]
+    assert arguments[-2:] == ["--output-root", "/srv/fx-codex/collect/tiingo-v1"]
     assert payload["WorkingDirectory"] == "/srv/fx-codex"
-    assert payload["StandardOutPath"].startswith("/srv/fx-codex/collect/")
-    assert payload["StandardErrorPath"].startswith("/srv/fx-codex/collect/")
+    assert payload["StandardOutPath"].startswith("/srv/fx-codex/collect/tiingo-v1/")
+    assert payload["StandardErrorPath"].startswith("/srv/fx-codex/collect/tiingo-v1/")
 
 
 def test_canonical_services_create_private_runtime_files() -> None:
@@ -51,10 +52,12 @@ def test_materializer_reads_only_committed_ingest_and_uses_a_separate_shadow_lab
     assert payload["Label"] == "com.fx-codex.bidask-materializer"
     assert "com.fx-codex.snapshot" not in payload["Label"]
     assert "/srv/fx-codex/tools/materialize_bid_ask_prices.py" in arguments
-    assert arguments[arguments.index("--ingest-log-dir") + 1] == "/srv/fx-codex/collect/log"
+    assert (
+        arguments[arguments.index("--ingest-log-dir") + 1] == "/srv/fx-codex/collect/tiingo-v1/log"
+    )
     assert (
         arguments[arguments.index("--output") + 1]
-        == "/srv/fx-codex/logs/briefing_tf_bidask_prices.sqlite3"
+        == "/srv/fx-codex/logs/briefing_tf_bidask_prices_tiingo_v1.sqlite3"
     )
     assert "--state" not in arguments
     assert payload["StartInterval"] == 60
@@ -84,7 +87,7 @@ def test_canonical_freshness_requires_hash_provenance_and_full_universe() -> Non
     targets = {target["name"]: target for target in payload["targets"]}
     prices = targets["canonical_bidask_prices"]
 
-    assert prices["required_schema_version"] == 3
+    assert prices["required_schema_version"] == 4
     assert prices["verify_content_hash"] is True
     assert prices["kind"] == "canonical_bidask_sqlite"
     assert prices["required_symbols"] == ["USDJPY", "EURUSD", "GBPUSD", "AUDUSD"]

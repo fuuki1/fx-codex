@@ -311,8 +311,8 @@ def test_canonical_sqlite_uses_logical_slot_time_and_validates_every_row(monitor
     def parser(_raw: bytes) -> list[CollectedQuote]:
         return [
             CollectedQuote(
-                provider="oanda",
-                account_environment="practice",
+                provider="tiingo",
+                account_environment="datafeed",
                 instrument=symbol,
                 provider_event_time=event_time,
                 received_at=event_time + timedelta(milliseconds=100),
@@ -326,7 +326,7 @@ def test_canonical_sqlite_uses_logical_slot_time_and_validates_every_row(monitor
                 writer_id="collector-1",
                 revision_id=None,
                 raw_payload_sha256=hashlib.sha256(payload).hexdigest(),
-                source_endpoint_class="streaming_pricing",
+                source_endpoint_class="tiingo_fx_websocket",
                 collection_mode="live_stream",
             )
             for symbol, bid in (
@@ -356,7 +356,7 @@ def test_canonical_sqlite_uses_logical_slot_time_and_validates_every_row(monitor
         kind="canonical_bidask_sqlite",
         warn_after_seconds=180,
         critical_after_seconds=600,
-        required_schema_version=3,
+        required_schema_version=4,
         required_fields=(
             "event_time",
             "content_hash",

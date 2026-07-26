@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "comment_ja": "canonical OANDA bid/ask shadow収集経路専用。既存briefingの鮮度ゲートとは分離し、承認前の判断入力には使用しない。",
+  "comment_ja": "canonical Tiingo bid/ask shadow収集経路専用。既存briefingの鮮度ゲートとは分離し、承認前の判断入力には使用しない。",
   "cooldown_seconds": 21600,
   "market_hours_only": true,
   "targets": [
     {
       "name": "quote_capture_journal",
-      "path": "collect/log/capture_journal",
+      "path": "collect/tiingo-v1/log/capture_journal",
       "kind": "capture_journal",
       "expected_interval_seconds": 30,
       "warn_after_seconds": 120,
@@ -15,9 +15,9 @@
     },
     {
       "name": "canonical_bidask_prices",
-      "path": "logs/briefing_tf_bidask_prices.sqlite3",
+      "path": "logs/briefing_tf_bidask_prices_tiingo_v1.sqlite3",
       "kind": "canonical_bidask_sqlite",
-      "required_schema_version": 3,
+      "required_schema_version": 4,
       "required_fields": [
         "ts",
         "event_time",

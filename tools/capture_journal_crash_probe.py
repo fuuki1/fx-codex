@@ -42,8 +42,8 @@ _EXPECTED_CHILD_EXITS = {
 
 def _quote(raw: bytes, *, when: datetime, sequence: int) -> CollectedQuote:
     return CollectedQuote(
-        provider="oanda",
-        account_environment="practice",
+        provider="tiingo",
+        account_environment="datafeed",
         instrument="USDJPY",
         provider_event_time=when,
         received_at=when,
@@ -325,7 +325,7 @@ def run_probe(root: Path) -> dict[str, Any]:
             return [
                 replace(
                     _quote(raw, when=stamp, sequence=number),
-                    source_endpoint_class="streaming_pricing",
+                    source_endpoint_class="tiingo_fx_websocket",
                     collection_mode="live_stream",
                 )
             ]

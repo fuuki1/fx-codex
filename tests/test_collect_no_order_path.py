@@ -22,6 +22,7 @@ COLLECT_MODULES = [
     "data_platform.collect.raw_first",
     "data_platform.collect.reconnect",
     "data_platform.collect.oanda",
+    "data_platform.collect.tiingo",
     "data_platform.collect.dukascopy",
     "data_platform.collect.fred_macro",
     "data_platform.collect.divergence",
@@ -86,6 +87,7 @@ def test_source_contains_no_order_endpoint_or_live_switch() -> None:
 SECRET_PATTERNS = [
     # OANDA personal access tokens look like 32hex-32hex
     re.compile(r"[0-9a-f]{32}-[0-9a-f]{32}"),
+    re.compile(r"FX_TIINGO_API_TOKEN\s*=\s*[A-Za-z0-9_-]{24,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
     re.compile(r"-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----"),
     re.compile(r"(api|access)[-_]?(key|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{24,}"),

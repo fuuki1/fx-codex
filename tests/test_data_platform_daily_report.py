@@ -22,8 +22,8 @@ def _write_quote(collection_root: Path, instrument: str, payload: bytes) -> None
     store = ImmutableRawStore(collection_root / "raw")
     ref = store.put(payload)
     quote = CollectedQuote(
-        provider="oanda",
-        account_environment="live",
+        provider="tiingo",
+        account_environment="datafeed",
         instrument=instrument,
         provider_event_time=STAMP,
         received_at=STAMP,
@@ -37,7 +37,7 @@ def _write_quote(collection_root: Path, instrument: str, payload: bytes) -> None
         writer_id="writer",
         revision_id=None,
         raw_payload_sha256=ref.sha256,
-        source_endpoint_class="streaming_pricing",
+        source_endpoint_class="tiingo_fx_websocket",
         collection_mode="live_stream",
     )
     log_path = collection_root / "log" / "quotes.jsonl"
@@ -59,8 +59,8 @@ def _write_journal_quote(
     def parser(raw: bytes) -> list[CollectedQuote]:
         return [
             CollectedQuote(
-                provider="oanda",
-                account_environment="live",
+                provider="tiingo",
+                account_environment="datafeed",
                 instrument=instrument,
                 provider_event_time=stamp + timedelta(seconds=sequence),
                 received_at=stamp + timedelta(seconds=sequence),
@@ -74,7 +74,7 @@ def _write_journal_quote(
                 writer_id="writer",
                 revision_id=None,
                 raw_payload_sha256=hashlib.sha256(raw).hexdigest(),
-                source_endpoint_class="streaming_pricing",
+                source_endpoint_class="tiingo_fx_websocket",
                 collection_mode="live_stream",
             )
         ]
@@ -89,7 +89,7 @@ def _write_journal_quote(
 
 def _write_support(path: Path, field: str, value: bool, *, day: date = DAY) -> None:
     role, source_id = {
-        "primary_up": ("primary_health", "oanda_primary_health"),
+        "primary_up": ("primary_health", "tiingo_primary_health"),
         "secondary_up": ("independent_secondary", "independent_secondary_feed"),
         "replay_ok": ("deterministic_replay", "capture_journal_replay"),
     }[field]

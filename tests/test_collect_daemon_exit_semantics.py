@@ -14,9 +14,16 @@ from tools.fx_quote_collector import EX_UNAVAILABLE, main as daemon_main
 def test_exhausted_reconnect_budget_is_transient_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("FX_OANDA_API_TOKEN", "secret")
-    monkeypatch.setenv("FX_OANDA_ACCOUNT_ID", "account")
-    monkeypatch.setenv("FX_OANDA_ENV", "practice")
+    monkeypatch.setenv("FX_TIINGO_API_TOKEN", "secret")
+    monkeypatch.setenv("FX_TIINGO_PLAN", "free")
+    monkeypatch.setenv(
+        "FX_TIINGO_USAGE_SCOPE",
+        "internal_nonredisplay_active_subscription",
+    )
+    monkeypatch.setenv(
+        "FX_TIINGO_DERIVED_DATA_APPROVAL_REF",
+        "tiingo-approval-2026-001",
+    )
     state = ConnectionState(heartbeat_timeout_seconds=15.0)
     state.stop("max_reconnects_exhausted")
     monkeypatch.setattr(
