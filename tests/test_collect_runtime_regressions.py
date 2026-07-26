@@ -163,6 +163,8 @@ def test_transport_timeout_is_classified_as_heartbeat_gap(tmp_path: Path) -> Non
 def test_requests_transport_closes_response(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeResponse:
         status_code = 200
+        is_redirect = False
+        is_permanent_redirect = False
 
         def __init__(self) -> None:
             self.closed = False
@@ -180,14 +182,21 @@ def test_requests_transport_closes_response(monkeypatch: pytest.MonkeyPatch) -> 
             yield b"line"
 
     response = FakeResponse()
+    observed_kwargs: dict[str, object] = {}
+
+    def fake_get(*_args: object, **kwargs: object) -> FakeResponse:
+        observed_kwargs.update(kwargs)
+        return response
+
     fake_requests = SimpleNamespace(
-        get=lambda *_args, **_kwargs: response,
+        get=fake_get,
         exceptions=SimpleNamespace(RequestException=RuntimeError),
     )
     monkeypatch.setitem(sys.modules, "requests", fake_requests)
 
     assert list(requests_transport("https://example.invalid", "masked")) == [b"line"]
     assert response.closed is True
+    assert observed_kwargs["allow_redirects"] is False
 
 
 def test_stop_predicate_stops_before_next_message(tmp_path: Path) -> None:

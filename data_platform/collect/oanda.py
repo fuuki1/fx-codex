@@ -12,9 +12,11 @@ mutating method. ``tests/test_collect_no_order_path.py`` scans for violations.
 Credentials are read from environment variables and are REQUIRED — without
 them the collector fails closed (``CollectorConfigError``) instead of
 degrading to a mock. Values are never logged; ``repr`` masks both token and
-account id.
+account id. OANDA personal access tokens may authorize broader account API
+access; the safety boundary here is the pricing-only URL allowlist and absence
+of order/trade/position mutation code, not a claimed read-only token scope.
 
-    FX_OANDA_API_TOKEN     personal access token (read-only scope suffices)
+    FX_OANDA_API_TOKEN     personal access token (treat as trading-capable secret)
     FX_OANDA_ACCOUNT_ID    account id the pricing stream is scoped to
     FX_OANDA_ENV           "practice" or "live"
 
@@ -44,6 +46,7 @@ from data_platform.collect.reconnect import (
     TokenExpiredError,
 )
 from data_platform.raw.immutable_store import ImmutableRawStore
+from fx_intel.universe import normalize_symbol, to_oanda_instrument
 
 ENV_TOKEN = "FX_OANDA_API_TOKEN"
 ENV_ACCOUNT = "FX_OANDA_ACCOUNT_ID"
@@ -105,7 +108,11 @@ class OandaConfig:
         if not instruments:
             raise CollectorConfigError("at least one instrument is required")
         path = _READ_ONLY_PATH.format(account_id=self.account_id)
-        joined = "%2C".join(instruments)
+        try:
+            resolved = tuple(dict.fromkeys(to_oanda_instrument(value) for value in instruments))
+        except ValueError as error:
+            raise CollectorConfigError(str(error)) from error
+        joined = "%2C".join(resolved)
         return f"{_STREAM_HOSTS[self.environment]}{path}?instruments={joined}"
 
 
@@ -148,7 +155,7 @@ def parse_price_line(
         CollectedQuote(
             provider="oanda",
             account_environment=environment,
-            instrument=str(payload["instrument"]).replace("_", ""),
+            instrument=normalize_symbol(str(payload["instrument"])),
             provider_event_time=datetime.fromisoformat(str(payload["time"])),
             received_at=received,
             bid=float(top_bid["price"]),
@@ -189,9 +196,14 @@ def requests_transport(url: str, token: str) -> Iterator[bytes]:  # pragma: no c
             headers={"Authorization": f"Bearer {token}"},
             stream=True,
             timeout=(10, HEARTBEAT_TIMEOUT_SECONDS),
+            allow_redirects=False,
         ) as response:
             if response.status_code in (401, 403):
                 raise TokenExpiredError(f"authorization rejected (HTTP {response.status_code})")
+            if response.is_redirect or response.is_permanent_redirect:
+                raise ConnectionError(
+                    f"pricing transport rejected redirect (HTTP {response.status_code})"
+                )
             response.raise_for_status()
             yield from response.iter_lines()
     except TokenExpiredError:
@@ -204,7 +216,7 @@ def stream_quotes(
     config: OandaConfig,
     instruments: Sequence[str],
     *,
-    store: ImmutableRawStore,
+    store: ImmutableRawStore | None,
     log: QuoteLog,
     transport: Transport,
     state: ConnectionState | None = None,

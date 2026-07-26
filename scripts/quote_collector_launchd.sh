@@ -15,7 +15,7 @@ TMPL="$ROOT/ops/launchd/$LABEL.plist.tmpl"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 WRAPPER="$ROOT/scripts/run_quote_collector.sh"
 ENV_FILE="${FX_CODEX_COLLECTOR_ENV_FILE:-$HOME/.config/fx-codex/collector.env}"
-OUTPUT_ROOT="$HOME/srv/fx-codex/collect"
+OUTPUT_ROOT="${FX_CODEX_COLLECTOR_OUTPUT_ROOT:-$ROOT/collect}"
 CMD="${1:-status}"
 
 render_plist() {

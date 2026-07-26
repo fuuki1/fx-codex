@@ -24,6 +24,7 @@ import math
 import re
 from typing import Any
 
+from data_platform.contracts.market_quote import MarketQuote
 from data_platform.quality.state import QualityState
 
 COLLECT_SCHEMA_VERSION = 1
@@ -150,6 +151,40 @@ class CollectedQuote:
         """Measured spread only — always ``ask - bid``."""
 
         return self.ask - self.bid
+
+    def to_market_quote(self, *, fallback_sequence_id: int | None = None) -> MarketQuote:
+        """Bridge an accepted collected quote into the bar materializer contract.
+
+        Some pricing streams (including OANDA's) do not publish a sequence
+        number.  In that case the caller must supply a durable, replay-stable
+        sequence such as the accepted JSONL record's byte offset.  Arrival
+        counters and process-local indexes are deliberately rejected because
+        they change after a restart.
+        """
+
+        sequence_id = self.sequence_id
+        if sequence_id is None:
+            sequence_id = fallback_sequence_id
+        if sequence_id is None:
+            raise QuoteContractError(
+                "a provider sequence_id or durable fallback_sequence_id is required"
+            )
+        source_timestamp = self.provider_event_time or self.received_at
+        return MarketQuote(
+            source_id=self.provider,
+            instrument=self.instrument,
+            bid=self.bid,
+            ask=self.ask,
+            source_timestamp=source_timestamp,
+            received_timestamp=self.received_at,
+            available_at=self.received_at,
+            sequence_id=sequence_id,
+            writer_id=self.writer_id,
+            tradable=self.tradable,
+            bid_size=self.bid_size,
+            ask_size=self.ask_size,
+            revision_id=self.revision_id,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

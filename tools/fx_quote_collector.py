@@ -4,8 +4,8 @@
 Runs the OANDA pricing stream through the raw-first ingest pipeline under a
 single-writer exclusive lock. This process is structurally incapable of
 trading: it imports only ``data_platform.collect`` (no executor, no order
-endpoint — enforced by tests) and its credentials are read-only pricing
-scope.
+endpoint — enforced by tests) and constructs only the pricing-stream URL.
+OANDA tokens must still be handled as potentially trading-capable secrets.
 
 Fail-closed rules:
 - missing credentials -> exit 78 (EX_CONFIG) without touching the quote log
@@ -48,8 +48,8 @@ from data_platform.collect.oanda import (  # noqa: E402
 )
 from data_platform.collect.raw_first import QuoteLog  # noqa: E402
 from data_platform.collect.reconnect import ConnectionState  # noqa: E402
-from data_platform.raw.immutable_store import ImmutableRawStore  # noqa: E402
 from tools.run_exclusive import ExclusiveLock  # noqa: E402
+from fx_intel.universe import MVP_OANDA_INSTRUMENTS, to_oanda_instrument  # noqa: E402
 
 EX_OK = 0
 EX_UNAVAILABLE = 69
@@ -59,7 +59,7 @@ EX_TEMPFAIL = 75
 EX_NOPERM = 77
 EX_CONFIG = 78
 
-DEFAULT_INSTRUMENTS = ("USD_JPY", "EUR_USD", "GBP_USD")
+DEFAULT_INSTRUMENTS = MVP_OANDA_INSTRUMENTS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -224,6 +224,11 @@ def _record_incident(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        args.instruments = list(dict.fromkeys(to_oanda_instrument(v) for v in args.instruments))
+    except ValueError as error:
+        print(f"[collector] config error: {error}", file=sys.stderr)
+        return EX_CONFIG
+    try:
         environment = _load_env_file(args.env_file) if args.env_file is not None else None
         config = OandaConfig.from_env(environment)
     except CollectorConfigError as error:
@@ -238,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": repr(config),
         "instruments": list(args.instruments),
         "output_root": str(args.output_root),
-        "endpoint_class": "streaming_pricing (read-only)",
+        "endpoint_class": "streaming_pricing (GET-only application path)",
     }
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
@@ -277,8 +282,16 @@ def main(argv: list[str] | None = None) -> int:
     results: list[Any] = []
     stop_requested = {"flag": False}
     try:
-        store = ImmutableRawStore(args.output_root / "raw")
-        log = QuoteLog(args.output_root / "log")
+        # The streaming path writes exact raw bytes and terminal rows into one
+        # daily SQLite shard.  Per-message raw files and compatibility JSONL
+        # are deliberately disabled to keep inode growth bounded.
+        log = QuoteLog(args.output_root / "log", legacy_jsonl=False)
+        recovered = log.journal.recover_incomplete(occurred_at=datetime.now(UTC))
+        if recovered:
+            print(
+                f"[collector] recovered {len(recovered)} incomplete capture(s) as unavailable",
+                file=sys.stderr,
+            )
 
         def _graceful(_signum: int, _frame: FrameType | None) -> None:
             stop_requested["flag"] = True
@@ -296,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         state, results = stream_quotes(
             config,
             args.instruments,
-            store=store,
+            store=None,
             log=log,
             transport=requests_transport,
             max_messages=args.max_messages,
