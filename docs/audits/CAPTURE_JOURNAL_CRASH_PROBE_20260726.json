@@ -1,0 +1,56 @@
+{
+  "evidence_class": "synthetic_process_crash_probe",
+  "generated_at": "2026-07-26T01:54:32.596688+00:00",
+  "passed": true,
+  "schema_version": 1,
+  "stages": {
+    "after_capacity_rejection": {
+      "child_exit": 95,
+      "durable_entries_after_restart": 2,
+      "passed": true,
+      "verified_quotes_after_restart": 1
+    },
+    "after_raw_commit": {
+      "child_exit": 91,
+      "passed": true,
+      "published_quotes_before_recovery": 0,
+      "recovered_unavailable_count": 1
+    },
+    "after_terminal_commit": {
+      "child_exit": 93,
+      "passed": true,
+      "verified_quotes_after_restart": 1
+    },
+    "after_utc_rotation": {
+      "child_exit": 94,
+      "head_sequence": 4,
+      "passed": true,
+      "shard_count": 2,
+      "verified_quotes_after_restart": 2
+    },
+    "during_terminal_transaction": {
+      "child_exit": 92,
+      "passed": true,
+      "published_quotes_before_recovery": 0,
+      "recovered_unavailable_count": 1,
+      "uncommitted_rows_after_restart": 0
+    },
+    "during_utc_rotation": {
+      "child_exit": 96,
+      "passed": true,
+      "shard_count_after_resume": 2,
+      "shard_count_before_resume": 1,
+      "verified_quotes_after_resume": 2,
+      "verified_quotes_before_resume": 1
+    },
+    "materializer_before_checkpoint": {
+      "checkpoint_exists_after_resume": true,
+      "checkpoint_exists_before_resume": false,
+      "child_exit": 98,
+      "passed": true,
+      "rows_after_resume": 4,
+      "rows_appended_on_resume": 0,
+      "rows_durable_before_resume": 4
+    }
+  }
+}

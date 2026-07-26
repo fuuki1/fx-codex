@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build one fail-closed prospective data-platform daily report.
 
-The report streams the append-only quote logs, verifies immutable raw blobs, and
+The report reads the canonical capture journal (or legacy batch logs), verifies raw bytes, and
 binds same-day primary-health, independent-secondary and deterministic-replay
 evidence by SHA-256. Missing, stale or contradictory evidence is recorded as a
 failure; it is never inferred. Reports outside the prospective generation
@@ -17,21 +17,29 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from collections.abc import Iterable, Iterator
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import random
 import shutil
 import sys
 from typing import Any
 
+from data_platform.collect.capture_journal import (
+    CaptureJournal,
+    CaptureJournalError,
+    JournalState,
+)
 from data_platform.raw.immutable_store import ImmutableRawStore, RawStoreError
 
 REQUIRED_PAIRS = frozenset({"USDJPY", "EURUSD", "GBPUSD"})
 MAX_REPORT_AGE_DAYS = 4
+FRESHNESS_SAMPLE_MAX = 100_000
+MAX_FUTURE_SKEW_SECONDS = 5.0
 
 
 class DailyReportError(RuntimeError):
@@ -152,60 +160,124 @@ def build_daily_report(
     generated_at = datetime.now(UTC)
     age_days = (generated_at.date() - day).days
     prospective_window_ok = 0 <= age_days <= MAX_REPORT_AGE_DAYS
-    raw_store = ImmutableRawStore(collection_root / "raw")
     checked_hashes: set[str] = set()
     raw_errors: list[str] = []
     pair_counts: Counter[str] = Counter()
     observed_primary_pairs: set[str] = set()
-    freshness: list[float] = []
+    freshness_sample: list[float] = []
+    freshness_seen = 0
+    freshness_max: float | None = None
+    freshness_rng = random.Random(0)
     flag_counts: Counter[str] = Counter()
     quote_count = 0
+    journal_raw_count = 0
 
-    for row in _iter_jsonl(collection_root / "log" / "quotes.jsonl"):
-        if not _matches_day(row, day):
-            continue
-        quote_count += 1
-        instrument = str(row.get("instrument", ""))
-        pair_counts[instrument] += 1
-        if (
-            row.get("provider") == "oanda"
-            and row.get("collection_mode") == "live_stream"
-            and row.get("account_environment") == "live"
-            and row.get("quality_state") == "usable"
-        ):
-            observed_primary_pairs.add(instrument)
+    journal_root = collection_root / "log" / "capture_journal"
+    journal_present = journal_root.is_dir() and any(journal_root.glob("capture-????-??-??.sqlite3"))
+    journal = CaptureJournal(journal_root, verify=False) if journal_present else None
+    journal_verified = False
 
-        raw_hash = str(row.get("raw_payload_sha256", ""))
-        if raw_hash not in checked_hashes:
-            checked_hashes.add(raw_hash)
-            try:
-                raw_store.get(raw_hash)
-            except (OSError, RawStoreError, ValueError) as error:
-                raw_errors.append(f"{raw_hash[:12]}: {type(error).__name__}")
+    def consume_quote_rows(
+        rows: Iterable[dict[str, Any]],
+        *,
+        legacy_raw_store: ImmutableRawStore | None,
+    ) -> None:
+        nonlocal freshness_max, freshness_seen, quote_count
+        for row in rows:
+            if not _matches_day(row, day):
+                continue
+            quote_count += 1
+            instrument = str(row.get("instrument", ""))
+            pair_counts[instrument] += 1
+            if (
+                row.get("provider") == "oanda"
+                and row.get("collection_mode") == "live_stream"
+                and row.get("account_environment") == "live"
+                and row.get("quality_state") == "usable"
+            ):
+                observed_primary_pairs.add(instrument)
 
-        event = row.get("provider_event_time")
-        received = row.get("received_at")
-        if event is not None and received is not None:
-            lag = (
-                _parse_timestamp(received, "received_at")
-                - _parse_timestamp(event, "provider_event_time")
-            ).total_seconds()
-            freshness.append(max(0.0, lag))
-        flags = row.get("quality_flags", [])
-        if isinstance(flags, list):
-            flag_counts.update(str(flag) for flag in flags)
+            raw_hash = str(row.get("raw_payload_sha256", ""))
+            if legacy_raw_store is not None and raw_hash not in checked_hashes:
+                checked_hashes.add(raw_hash)
+                try:
+                    legacy_raw_store.get(raw_hash)
+                except (OSError, RawStoreError, ValueError) as error:
+                    raw_errors.append(f"{raw_hash[:12]}: {type(error).__name__}")
+
+            event = row.get("provider_event_time")
+            received = row.get("received_at")
+            if event is not None and received is not None:
+                received_at = _parse_timestamp(received, "received_at")
+                event_at = _parse_timestamp(event, "provider_event_time")
+                future_limit = generated_at + timedelta(seconds=MAX_FUTURE_SKEW_SECONDS)
+                if received_at > future_limit or event_at > future_limit:
+                    if "future_quote_timestamp" not in raw_errors:
+                        raw_errors.append("future_quote_timestamp")
+                lag = (received_at - event_at).total_seconds()
+                if lag < -MAX_FUTURE_SKEW_SECONDS:
+                    if "provider_event_after_receipt" not in raw_errors:
+                        raw_errors.append("provider_event_after_receipt")
+                observed_lag = max(0.0, lag)
+                freshness_seen += 1
+                freshness_max = (
+                    observed_lag if freshness_max is None else max(freshness_max, observed_lag)
+                )
+                if len(freshness_sample) < FRESHNESS_SAMPLE_MAX:
+                    freshness_sample.append(observed_lag)
+                else:
+                    replacement = freshness_rng.randrange(freshness_seen)
+                    if replacement < FRESHNESS_SAMPLE_MAX:
+                        freshness_sample[replacement] = observed_lag
+            flags = row.get("quality_flags", [])
+            if isinstance(flags, list):
+                flag_counts.update(str(flag) for flag in flags)
+
+    if journal_present:
+        assert journal is not None
+        try:
+            consume_quote_rows(
+                (record.quote.to_dict() for record in journal.iter_verified_quotes()),
+                legacy_raw_store=None,
+            )
+            journal_verified = True
+        except CaptureJournalError as error:
+            raw_errors.append(f"capture_journal: {type(error).__name__}: {error}")
+    else:
+        consume_quote_rows(
+            _iter_jsonl(collection_root / "log" / "quotes.jsonl"),
+            legacy_raw_store=ImmutableRawStore(collection_root / "raw"),
+        )
 
     quarantine_count = 0
-    for row in _iter_jsonl(collection_root / "log" / "quarantine.jsonl"):
-        if not _matches_day(row, day):
-            continue
-        quarantine_count += 1
-        flags = row.get("quality_flags", [])
-        if isinstance(flags, list):
-            flag_counts.update(str(flag) for flag in flags)
-        reason = row.get("reason")
-        if reason:
-            flag_counts.update(str(reason).split(","))
+    if journal_verified:
+        assert journal is not None
+        for entry in journal.iter_entries():
+            if entry.occurred_at.date() != day:
+                continue
+            if entry.state is JournalState.RAW_DURABLE:
+                journal_raw_count += 1
+                continue
+            quarantine_count += int(entry.metadata.get("quarantined_count", 0))
+            journal_flags = entry.metadata.get("quality_flag_counts", {})
+            if isinstance(journal_flags, dict):
+                for flag, count in journal_flags.items():
+                    if isinstance(count, int) and count > 0:
+                        flag_counts[str(flag)] += count
+            reason = entry.metadata.get("reason")
+            if reason:
+                flag_counts.update(str(reason).split(","))
+    elif not journal_present:
+        for row in _iter_jsonl(collection_root / "log" / "quarantine.jsonl"):
+            if not _matches_day(row, day):
+                continue
+            quarantine_count += 1
+            flags = row.get("quality_flags", [])
+            if isinstance(flags, list):
+                flag_counts.update(str(flag) for flag in flags)
+            reason = row.get("reason")
+            if reason:
+                flag_counts.update(str(reason).split(","))
 
     incident_rows: list[dict[str, Any]] = []
     incidents_dir = collection_root / "state" / "incidents"
@@ -270,12 +342,17 @@ def build_daily_report(
         "quarantine_count": quarantine_count,
         "quality_flag_counts": dict(sorted(flag_counts.items())),
         "freshness_seconds": {
-            "p50": _percentile(freshness, 0.50),
-            "p95": _percentile(freshness, 0.95),
-            "p99": _percentile(freshness, 0.99),
-            "max": max(freshness) if freshness else None,
+            "p50": _percentile(freshness_sample, 0.50),
+            "p95": _percentile(freshness_sample, 0.95),
+            "p99": _percentile(freshness_sample, 0.99),
+            "max": freshness_max,
+            "population_count": freshness_seen,
+            "sample_count": len(freshness_sample),
+            "sample_method": "deterministic_reservoir_v1",
         },
-        "raw_blob_count_verified": len(checked_hashes) - len(raw_errors),
+        "raw_blob_count_verified": (
+            journal_raw_count if journal_verified else max(0, len(checked_hashes) - len(raw_errors))
+        ),
         "raw_verification_errors": raw_errors,
         "incident_types": [str(incident.get("type", "unknown")) for incident in incident_rows],
         "disk_free_bytes": disk.free,

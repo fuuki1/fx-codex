@@ -6,13 +6,15 @@ from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 from data_platform.collect.contract import CollectedQuote
+from data_platform.collect.raw_first import QuoteLog, ingest_payload
 from data_platform.raw.immutable_store import ImmutableRawStore
 from tools.data_platform_daily_report import build_daily_report
 
-DAY = datetime.now(UTC).date()
-STAMP = datetime.combine(DAY, datetime.min.time(), tzinfo=UTC) + timedelta(hours=12)
+STAMP = datetime.now(UTC) - timedelta(minutes=1)
+DAY = STAMP.date()
 MAX_AGE_FOR_TEST = 10
 
 
@@ -42,6 +44,47 @@ def _write_quote(collection_root: Path, instrument: str, payload: bytes) -> None
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(quote.to_dict(), sort_keys=True) + "\n")
+
+
+def _write_journal_quote(
+    collection_root: Path,
+    instrument: str,
+    payload: bytes,
+    *,
+    sequence: int,
+    stamp: datetime = STAMP,
+) -> None:
+    log = QuoteLog(collection_root / "log", legacy_jsonl=False)
+
+    def parser(raw: bytes) -> list[CollectedQuote]:
+        return [
+            CollectedQuote(
+                provider="oanda",
+                account_environment="live",
+                instrument=instrument,
+                provider_event_time=stamp + timedelta(seconds=sequence),
+                received_at=stamp + timedelta(seconds=sequence),
+                bid=155.001,
+                ask=155.004,
+                bid_size=None,
+                ask_size=None,
+                tradable=True,
+                sequence_id=sequence,
+                connection_id="connection",
+                writer_id="writer",
+                revision_id=None,
+                raw_payload_sha256=hashlib.sha256(raw).hexdigest(),
+                source_endpoint_class="streaming_pricing",
+                collection_mode="live_stream",
+            )
+        ]
+
+    ingest_payload(
+        payload,
+        parser=parser,
+        log=log,
+        now=lambda: stamp + timedelta(seconds=sequence),
+    )
 
 
 def _write_support(path: Path, field: str, value: bool, *, day: date = DAY) -> None:
@@ -80,6 +123,106 @@ def test_daily_report_qualifies_only_with_bound_same_day_evidence(tmp_path: Path
     assert report["critical_incidents"] == 0
     assert report["quote_count"] == 3
     assert report["supporting_evidence"]["primary"]["sha256"]
+    assert not (collection_root / "log" / "capture_journal").exists()
+
+
+def test_daily_report_reads_canonical_journal_without_legacy_files(tmp_path: Path) -> None:
+    collection_root = tmp_path / "collect"
+    for sequence, instrument in enumerate(("USDJPY", "EURUSD", "GBPUSD"), start=1):
+        _write_journal_quote(
+            collection_root,
+            instrument,
+            instrument.encode(),
+            sequence=sequence,
+        )
+    primary = tmp_path / "primary.json"
+    secondary = tmp_path / "secondary.json"
+    replay = tmp_path / "replay.json"
+    _write_support(primary, "primary_up", True)
+    _write_support(secondary, "secondary_up", True)
+    _write_support(replay, "replay_ok", True)
+
+    report = build_daily_report(
+        collection_root=collection_root,
+        day=DAY,
+        primary_evidence=primary,
+        secondary_evidence=secondary,
+        replay_evidence=replay,
+    )
+
+    assert report["qualifying_day"] is True
+    assert report["raw_hash_verified"] is True
+    assert report["quote_count"] == 3
+    assert report["raw_blob_count_verified"] == 3
+    assert report["freshness_seconds"]["population_count"] == 3
+    assert report["freshness_seconds"]["sample_count"] == 3
+    assert not (collection_root / "log" / "quotes.jsonl").exists()
+
+
+def test_invalid_canonical_journal_never_falls_back_to_legacy_logs(tmp_path: Path) -> None:
+    collection_root = tmp_path / "collect"
+    for sequence, instrument in enumerate(("USDJPY", "EURUSD", "GBPUSD"), start=1):
+        _write_journal_quote(
+            collection_root,
+            instrument,
+            f"journal-{instrument}".encode(),
+            sequence=sequence,
+        )
+        _write_quote(
+            collection_root,
+            instrument,
+            f"legacy-{instrument}".encode(),
+        )
+    shard = next((collection_root / "log" / "capture_journal").glob("capture-*.sqlite3"))
+    with sqlite3.connect(shard) as connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.execute(
+            "UPDATE events SET raw_payload = ? WHERE sequence = 1",
+            (b"tampered",),
+        )
+
+    primary = tmp_path / "primary.json"
+    secondary = tmp_path / "secondary.json"
+    replay = tmp_path / "replay.json"
+    _write_support(primary, "primary_up", True)
+    _write_support(secondary, "secondary_up", True)
+    _write_support(replay, "replay_ok", True)
+    report = build_daily_report(
+        collection_root=collection_root,
+        day=DAY,
+        primary_evidence=primary,
+        secondary_evidence=secondary,
+        replay_evidence=replay,
+    )
+
+    assert report["qualifying_day"] is False
+    assert report["raw_hash_verified"] is False
+    assert report["quote_count"] == 0
+    assert report["primary_pair_coverage_ok"] is False
+    assert "capture_journal" in report["raw_verification_errors"][0]
+
+
+def test_future_canonical_quote_is_nonqualifying(tmp_path: Path) -> None:
+    collection_root = tmp_path / "collect"
+    future = datetime.now(UTC) + timedelta(minutes=10)
+    _write_journal_quote(
+        collection_root,
+        "USDJPY",
+        b"future",
+        sequence=1,
+        stamp=future,
+    )
+
+    report = build_daily_report(
+        collection_root=collection_root,
+        day=future.date(),
+        primary_evidence=None,
+        secondary_evidence=None,
+        replay_evidence=None,
+    )
+
+    assert report["raw_hash_verified"] is False
+    assert "future_quote_timestamp" in report["raw_verification_errors"]
 
 
 def test_daily_report_is_nonqualifying_when_supporting_evidence_is_missing(

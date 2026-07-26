@@ -1,22 +1,30 @@
-# Runbook: read-only bid/ask collector
+# Runbook: analysis-only bid/ask collector
 
 ## 1. Scope and current status
 
-This runbook covers only `data_platform/collect/` and the read-only OANDA
-pricing stream. It does not authorize broker orders or account mutation.
+This runbook covers only `data_platform/collect/` and the OANDA pricing-stream
+`GET` endpoint. The application is structurally pricing-only and does not
+authorize broker orders or account mutation. The OANDA personal access token
+must nevertheless be treated as potentially trading-capable: the safety
+boundary is the endpoint allowlist and absence of mutation code, not token
+scope.
 
-Current state on `integration/research-v3`:
+Current state:
 
 - OANDA pricing adapter: implemented, credentials not committed
-- Dukascopy historical bid/ask evidence: available
-- independent historical comparison: available
-- prospective secondary live source: not yet connected
-- prospective daily-report generator: implemented fail-closed
-- Mac mini installation: not yet performed
+- raw-first capture: hash-chained, daily-sharded SQLite transaction journal
+- completed one-minute materializer: implemented as a separate shadow service
+- canonical freshness monitor: isolated from the existing briefing gate
+- Mac mini installation: blocked until a clean approved SHA, credential file,
+  and legacy execution-checkout isolation are all present
 - 30 qualifying trading days: 0 until prospective operation starts
 
 Practice/demo data may validate connectivity but does not count as production
 market-data evidence.
+
+The pricing transport does not follow HTTP redirects. A redirect is a
+fail-closed connection error because the personal token must not be forwarded
+outside the hard-coded pricing host/path contract.
 
 ## 2. Credential file
 
@@ -25,7 +33,7 @@ Create the file outside the repository:
 ```bash
 mkdir -p ~/.config/fx-codex
 cat > ~/.config/fx-codex/collector.env <<'EOF'
-FX_OANDA_API_TOKEN=<read-only token>
+FX_OANDA_API_TOKEN=<personal access token; treat as trading-capable secret>
 FX_OANDA_ACCOUNT_ID=<account id>
 FX_OANDA_ENV=practice
 EOF
@@ -37,14 +45,15 @@ data; it does not source or evaluate it as shell code. Token and account values
 are masked in dry-run output and must never be committed.
 
 Use `FX_OANDA_ENV=live` only when the account and token are explicitly approved
-for prospective non-demo data collection. Read-only pricing access does not
-permit trading.
+for prospective non-demo data collection. This repository still calls only the
+pricing-stream endpoint; no environment value authorizes execution code.
 
 ## 3. Pre-install validation
 
 ```bash
 cd ~/srv/fx-codex
-scripts/quote_collector_launchd.sh dry-run
+FX_CODEX_APPROVED_SHA=<approved-40-character-commit> \
+  scripts/canonical_bidask_shadow_launchd.sh dry-run
 ```
 
 The command must fail when:
@@ -56,21 +65,29 @@ The command must fail when:
 - the approved virtual-environment Python is unavailable
 - the plist is malformed
 - the Python collector configuration is invalid
+- `HEAD` differs from `FX_CODEX_APPROVED_SHA`
+- the runtime checkout is dirty
+- a separate known checkout still tracks `trader/` or `executor.py`
 
-A successful dry-run prints the rendered plist and a validation result without
-printing credential values.
+A successful dry-run validates all three plists and the collector configuration
+without printing credential values.
 
 ## 4. launchd lifecycle
 
 ```bash
-scripts/quote_collector_launchd.sh install
-scripts/quote_collector_launchd.sh status
-scripts/quote_collector_launchd.sh uninstall
+FX_CODEX_APPROVED_SHA=<approved-40-character-commit> \
+  scripts/canonical_bidask_shadow_launchd.sh install
+scripts/canonical_bidask_shadow_launchd.sh status
+scripts/canonical_bidask_shadow_launchd.sh uninstall
 ```
 
-The plist launches `/bin/sh scripts/run_quote_collector.sh --launchd ...`.
-The wrapper loads the mode-600 credential file through the daemon's narrow
-`--env-file` parser and refuses to fall back to an unreviewed system Python.
+The topology installs separate collector, materializer, and canonical-health
+labels. It does not replace `com.fx-codex.snapshot`, change the existing
+briefing freshness report, or wire canonical prices into decisions. The
+collector plist launches `/bin/sh scripts/run_quote_collector.sh --launchd
+...`. The wrapper loads the mode-600 credential file through the daemon's
+narrow `--env-file` parser and refuses to fall back to an unreviewed system
+Python.
 
 Expected operator-action exits are translated to wrapper exit 0 so launchd does
 not loop:
@@ -94,21 +111,101 @@ restart after `ThrottleInterval`:
 
 ```text
 provider bytes
-  -> immutable content-addressed raw store
-  -> read-back SHA-256 verification
+  -> raw_durable SQLite transaction (exact bytes + SHA-256)
+  -> committed read-back SHA-256 verification
   -> schema validation
   -> normalized quote
   -> quality classification
-  -> append-only accepted/quarantine JSONL
+  -> atomic terminal transaction (rows + disposition + hash binding)
+  -> COMMITTED journal state
+  -> completed one-minute bid/ask shadow rows
 ```
 
 The collector never forward-fills, averages conflicting providers, converts
 missing values to zero, or marks injected/replay transport as live. Only the
 production daemon explicitly assigns `collection_mode=live_stream`.
 
-Accepted-log bootstrap streams JSONL line-by-line. A malformed accepted row
-stops startup because silently skipping it could invalidate duplicate and
-ordering detection.
+Production streaming disables the old per-message raw files and compatibility
+JSONL. One UTC-day SQLite shard contains insert-only raw events, terminal
+events, and quote rows; SQLite WAL/SHM companions mean at most three active
+files per daily shard. Evidence tables reject update/delete, events are
+SHA-256 chained across daily shards, and an 8 GiB active-shard ceiling fails
+closed before accepting another raw message. A terminal transaction is still
+allowed to finish an already-durable raw message.
+
+The materializer reads only hash-verified rows whose journal state is
+`COMMITTED`. Raw-only interrupted captures and terminal `QUARANTINED` or
+`UNAVAILABLE` captures are not visible. Startup recovery appends
+`UNAVAILABLE`; it never edits raw evidence. The bridge checkpoint is bound to
+journal root, genesis hash, commit-entry hash, configuration, and output path;
+a mismatch stops advancement for an explicit audited migration.
+
+Run the bounded functional probe, full logical-day capacity probe, and process
+crash injection before approval:
+
+```bash
+python tools/capture_journal_soak.py --messages 10000
+python tools/capture_journal_soak.py \
+  --full-day \
+  --report /path/outside/the/hot/journal/full_day_soak.json
+python tools/capture_journal_crash_probe.py \
+  --report /path/outside/the/hot/journal/crash_probe.json
+python tools/capture_journal_archive_probe.py \
+  --report /path/outside/the/hot/journal/archive_restore_probe.json
+```
+
+The output is synthetic functional evidence, not provider-captured data or
+trading evidence. It must report throughput above 16 messages/second, no
+raw-only visibility, successful unavailable recovery, no more than three files
+for one daily shard, and successful full verified replay. `--full-day`
+represents 1,382,400 messages over one logical UTC day and refuses to start
+unless its target volume has the configured disk reserve. The probe runs as
+fast as the host permits; its logical event-time span, not its wall time, is
+one day. The process probe covers termination after the raw commit, during the
+terminal transaction, after the terminal commit, before and after UTC rotation,
+after a synthetic active-shard capacity rejection, and after materialized rows
+are fsynced but before their replay checkpoint is replaced. That capacity case
+is not evidence of target-host filesystem `ENOSPC` behavior.
+
+Seal only a non-active historical shard. Sealing verifies the complete hot
+journal, checkpoints that shard, creates a deterministic gzip snapshot and a
+canonical hash manifest, and verifies the resulting archive. It never removes
+the source shard:
+
+```bash
+python tools/capture_journal_archive.py seal \
+  --journal-root "$HOME/srv/fx-codex/collect/log/capture_journal" \
+  --archive-root /approved/separate/archive/root \
+  --shard-date 2026-07-20
+python tools/capture_journal_archive.py verify \
+  --manifest /approved/separate/archive/root/capture-2026-07-20.sqlite3.manifest.json
+```
+
+Restore drills require an empty destination and an explicit, contiguous set of
+manifests beginning at journal genesis. The command restores create-only
+SQLite files, checks archive and database hashes and metadata, then verifies
+the complete cross-shard journal:
+
+```bash
+python tools/capture_journal_archive.py restore \
+  --manifest /approved/separate/archive/root/capture-2026-07-20.sqlite3.manifest.json \
+  --manifest /approved/separate/archive/root/capture-2026-07-21.sqlite3.manifest.json \
+  --destination-root /approved/empty/restore-drill-root
+```
+
+Archive payloads and manifests are mode `0440`; restored SQLite shards are
+mode `0640`. Seal, verification, and restore preflight their working-file
+requirements and retain at least 1 GiB of filesystem reserve. No automated
+retention deletion exists. Do not remove hot shards until an approved disk
+budget, off-host backup, independent full-prefix restore and evidence-retention
+policy are all recorded. At roughly 5 GB/day, even a 30-day hot window would
+require about 150 GB before filesystem and safety headroom, so a policy must be
+based on target-host measurement rather than that illustrative number.
+
+OANDA documents that the pricing stream sends at most four prices per second
+per instrument and may omit intermediate prices. Therefore the output records
+provider sampling coverage as unmeasured and never describes the stream as
+complete ticks, dealer flow, or consolidated OTC FX data.
 
 ## 6. Runtime state and incidents
 
@@ -181,11 +278,17 @@ accepted log contains usable live OANDA quotes for USDJPY, EURUSD and GBPUSD.
 A single quote or a health declaration without three-pair coverage does not make
 `primary_up=true`.
 
-The generator also checks immutable raw blobs, quote counts, freshness,
+The generator also verifies journal-bound raw bytes, quote counts, freshness,
 quarantine flags, critical incidents and disk headroom. Missing, stale or
 contradictory evidence produces `qualifying_day=false`; it is never inferred.
 Reports older than the prospective generation window are non-qualifying, which
 prevents retrospective construction of operational history.
+
+Canonical journal rows and entry metadata are streamed rather than loaded as a
+full-history list. Freshness `max` is exact across the report population; p50,
+p95 and p99 use a deterministic reservoir of at most 100,000 observations and
+record both population and sample counts. If a canonical journal exists but
+fails verification, the report does not fall back to legacy JSONL.
 
 Exit codes:
 
@@ -213,12 +316,14 @@ filename must equal `daily_report_<report_date>.json`.
 
 Before the 30-day clock can legitimately start:
 
-1. connect an approved live non-demo OANDA read-only stream
+1. connect an approved live non-demo OANDA pricing stream while treating the
+   token as potentially trading-capable
 2. create an independently measured same-day primary-health artifact
 3. connect an independent prospective secondary source
 4. generate same-day deterministic replay evidence
 5. schedule the daily-report command under a reviewed single-writer service
 6. connect alerting for token failure, incidents, stale data and non-qualifying days
-7. confirm clock synchronization and backup/retention on the Mac mini
+7. confirm clock synchronization, measured disk budget, off-host backup and an
+   independently verified archive/restore retention policy on the Mac mini
 
 Until these are complete, the data-platform score remains evidence-capped.
