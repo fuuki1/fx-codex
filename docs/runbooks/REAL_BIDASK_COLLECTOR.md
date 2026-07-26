@@ -89,6 +89,14 @@ collector plist launches `/bin/sh scripts/run_quote_collector.sh --launchd
 narrow `--env-file` parser and refuses to fall back to an unreviewed system
 Python.
 
+All repository launchd templates set `Umask=63` (decimal `0077`) so newly
+created service logs and runtime files are private by default. This is defense
+in depth, not secret scrubbing: preserve and restrict any historical log that
+contains a credential, revoke/reissue that credential at the provider, and do
+not treat `chmod` alone as incident recovery. Discord and provider transport
+errors must report only sanitized error type/status information, never a
+request URL.
+
 Expected operator-action exits are translated to wrapper exit 0 so launchd does
 not loop:
 

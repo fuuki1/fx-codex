@@ -3,6 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.fx-codex.snapshot</string>
+  <key>Umask</key><integer>63</integer>
   <!-- 5分毎に価格スナップショットを1回実行(while-trueループではなくlaunchdが周期を管理)。
        run_exclusive.pyの排他ロックで手動起動やcronとの二重実行を防ぐ。
        秘密情報はplistに置かない(.envから実行時に読む)。 -->

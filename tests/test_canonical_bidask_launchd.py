@@ -28,6 +28,15 @@ def test_quote_collector_writes_under_the_selected_runtime_root() -> None:
     assert payload["StandardErrorPath"].startswith("/srv/fx-codex/collect/")
 
 
+def test_canonical_services_create_private_runtime_files() -> None:
+    for label in (
+        "com.fx-codex.quote-collector",
+        "com.fx-codex.bidask-materializer",
+        "com.fx-codex.bidask-health",
+    ):
+        assert _rendered_plist(label)["Umask"] == 0o77
+
+
 def test_runtime_collection_root_cannot_dirty_the_approved_checkout() -> None:
     patterns = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 

@@ -104,11 +104,58 @@ pre-commit evidence. Any approval must include
 `data_platform/collect/capture_journal.py` and
 `data_platform/collect/journal_archive.py`.
 
-A new read-only target-host audit attempt to the configured SSH alias
-`trader-mini` failed at authentication (`Permission denied`) before any remote
-command ran. Consequently, the prior Mac mini observations have not been
-refreshed and current host state remains unknown. No deploy, service change,
-credential read, or remote filesystem change was attempted.
+A first target-host audit attempt to the configured SSH alias `trader-mini`
+failed at authentication. After the host key configuration was repaired, a
+read-only audit succeeded at `2026-07-26T02:48:29Z` as user `fuuki`:
+
+- the active runtime was `/Users/fuuki/srv/fx-codex`, branch
+  `deploy/main-20260723`, at base SHA
+  `bee7427ec0272fbb2fce85345a22e39e8ceb9cf7`;
+- the runtime was dirty: one modified dashboard server file, one untracked
+  dashboard JavaScript file, and one untracked `.env` backup;
+- the candidate canonical installer was absent because PR #71 was not merged;
+- canonical quote collector, materializer and health labels were not loaded;
+- the private canonical collector credential file was absent;
+- cron had no active writer entry, and no `trader`, `executor`,
+  `--promote-live`, quote collector or bid/ask materializer process was found;
+- `/Users/fuuki/Desktop/fx-codex` and `/Users/fuuki/fx-codex` were both dirty
+  and each tracked 61 prohibited legacy execution paths;
+- Docker was unavailable, so container absence remained unverified;
+- the filesystem reported 142,949,112 KiB available, less than the synthetic
+  30-day hot-journal estimate before backup and safety headroom.
+
+The legacy journal audit remained inadmissible for canonical evidence and also
+confirmed historical contamination:
+
+| Journal | Rows | Duplicate rows | Time reversals | Gap intervals |
+|---|---:|---:|---:|---:|
+| fusion | 1,554 | 551 (35.5%) | 21 | 16 |
+| timeframe | 21,460 | 19,292 (89.9%) | 14 | 28 |
+
+Freshness reported `ok` for its two configured targets at the observation
+time, but that does not repair historical duplicates or qualify canonical
+collection. A currently active per-timeframe briefing child had run for more
+than ten minutes; it was not killed or restarted during the audit.
+
+### Notification credential incident
+
+Severity: **P0 credential exposure; containment incomplete**.
+
+The historical `logs/launchd/health.err.log` contained a complete Discord
+webhook credential inside a transport exception and was mode `0644`. The
+credential is intentionally omitted from this audit. The file content was
+preserved with SHA-256
+`f7179faeacbdf95ca155dbe53d15ead8ea4aa15db3a5a8b2dba40c3ef29b5e06`,
+and the smallest reversible containment changed only its mode to `0600`;
+the hash remained unchanged. The Discord webhook must still be revoked and
+reissued before notification recovery can pass.
+
+The candidate delivery layer already discards exception text that could
+contain the request URL and has a regression test for secret-safe transport
+failure. As defense in depth, all launchd plist templates now set decimal
+`Umask=63` (`0077`) so newly created service logs and runtime files are private
+by default. This does not sanitize historical files or rotate the exposed
+credential.
 
 ## Scope and evidence
 
@@ -183,7 +230,12 @@ envelope, rotation/compaction protocol, retention proof or restore benchmark.
    not contain the canonical materializer.
 5. The host has no approved off-host archive target or retention budget, and
    the local free-space observation cannot support a 30-day hot window.
-6. Material data-path changes still require independent adversarial review.
+6. PR #71 has passing CI but no review submission, approval or review thread;
+   material data-path changes still require independent adversarial review.
+7. The exposed Discord webhook has not been revoked/reissued, so notification
+   delivery is not trusted.
+8. Historical fusion/timeframe journals contain duplicates and time reversals;
+   they cannot be promoted as canonical evidence.
 
 ## Remaining remediation before deployment
 

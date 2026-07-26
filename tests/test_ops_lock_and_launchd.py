@@ -177,6 +177,14 @@ def test_plist_template_renders_to_valid_xml(template, tmp_path):
     keys = [el.text for el in root.iter("key")]
     for required in ("Label", "ProgramArguments", "WorkingDirectory", "ProcessType"):
         assert required in keys, f"{template}: {required} がない"
+    dictionary = root.find("dict")
+    assert dictionary is not None
+    children = list(dictionary)
+    umask_index = next(
+        index for index, node in enumerate(children) if node.tag == "key" and node.text == "Umask"
+    )
+    assert children[umask_index + 1].tag == "integer"
+    assert children[umask_index + 1].text == "63"
     # 周期起動の定義がどちらかは必ずある
     assert "StartInterval" in keys or "StartCalendarInterval" in keys
     # 排他ロックランナー経由で起動している
