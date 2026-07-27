@@ -117,6 +117,9 @@ def _append_decision_batch(path: Path, rows: list[dict[str, object]]) -> None:
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
     )
@@ -546,6 +549,107 @@ def test_orphaned_pending_decision_does_not_block_later_commit(tmp_path: Path) -
     assert recovered.predictions_inserted == 1
     assert audit.audit_events == 2
     assert audit.predictions == 2
+
+
+def test_crashed_receipt_cannot_be_resurrected_after_later_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    pending = _decision("decision-late-a", minutes=15)
+    pending_id = str(pending["decision_id"])
+    pending_transaction = decision_commit.transaction_id_for([pending_id])
+    pending_full = decision_log.append_decision_events(
+        decisions,
+        [pending],
+        transaction_id=pending_transaction,
+    )
+    pending_compact = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [pending],
+        decision_transaction_id=pending_transaction,
+    )
+    original_append = decision_commit._append_locked_line  # noqa: SLF001
+
+    def fail_final_commit(handle, path, serialized):
+        if path == decisions.resolve():
+            raise OSError("simulated crash before final full commit")
+        return original_append(handle, path, serialized)
+
+    monkeypatch.setattr(decision_commit, "_append_locked_line", fail_final_commit)
+    with pytest.raises(OSError, match="simulated crash"):
+        decision_commit.append_commit(
+            decisions,
+            decision_ids=[pending_id],
+            full_batch_sha256=str(pending_full["batch_sha256"]),
+            full_batch_line_start_offset=int(pending_full["line_start_offset"]),
+            full_batch_line_sha256=str(pending_full["line_sha256"]),
+            compact_batch_sha256=str(pending_compact["batch_sha256"]),
+            compact_batch_line_start_offset=int(pending_compact["line_start_offset"]),
+            compact_batch_byte_length=int(pending_compact["byte_length"]),
+            compact_batch_payload_sha256=str(pending_compact["payload_sha256"]),
+            mode="per_timeframe",
+            committed_at=NOW,
+        )
+
+    monkeypatch.setattr(decision_commit, "_append_locked_line", original_append)
+    _append_decision_batch(
+        decisions,
+        [_decision("decision-committed-b", minutes=30)],
+    )
+    synced = shadow.sync_sources(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="sync-after-crash",
+    )
+    full_size_after_sync = decisions.stat().st_size
+    compact_size_after_sync = compact_path.stat().st_size
+
+    with pytest.raises(
+        decision_commit.DecisionCommitError,
+        match="full batch line reference",
+    ):
+        decision_commit.append_commit(
+            decisions,
+            decision_ids=[pending_id],
+            full_batch_sha256=str(pending_full["batch_sha256"]),
+            full_batch_line_start_offset=int(pending_full["line_start_offset"]),
+            full_batch_line_sha256=str(pending_full["line_sha256"]),
+            compact_batch_sha256=str(pending_compact["batch_sha256"]),
+            compact_batch_line_start_offset=int(pending_compact["line_start_offset"]),
+            compact_batch_byte_length=int(pending_compact["byte_length"]),
+            compact_batch_payload_sha256=str(pending_compact["payload_sha256"]),
+            mode="per_timeframe",
+            committed_at=NOW,
+        )
+    retried = shadow.sync_sources(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="sync-after-rejected-retry",
+    )
+    replay = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="full-replay-after-rejected-retry",
+    )
+
+    assert synced["sources"]["decisions"]["status"] == "quality_failure"
+    assert synced["sources"]["decisions"]["rejections"] == 1
+    assert synced["sources"]["decisions"]["predictions_inserted"] == 1
+    assert retried["sources"]["decisions"]["status"] == "no_change"
+    assert decisions.stat().st_size == full_size_after_sync
+    assert compact_path.stat().st_size == compact_size_after_sync
+    assert replay["verdict"] == "full_replay_verified"
+    assert replay["sources"]["decisions"]["incremental_rejections"] == 1
+    with store.open_operational_reader(database) as opened:
+        audit = opened.audit()
+    assert audit.audit_events == 2
+    assert audit.predictions == 2
+    assert audit.ingest_rejections == 1
 
 
 def test_decision_sync_reads_commit_just_beyond_max_bytes(tmp_path: Path) -> None:

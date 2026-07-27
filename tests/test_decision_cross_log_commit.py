@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
+import hashlib
 import json
 import os
 import tracemalloc
@@ -82,6 +83,9 @@ def test_full_and_compact_are_hidden_until_exact_commit(tmp_path) -> None:
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
     )
@@ -107,24 +111,139 @@ def test_wrong_compact_hash_does_not_publish_either_log(tmp_path) -> None:
         [_full_event(decision_id)],
         transaction_id=transaction_id,
     )
-    journal._append_journal_batch(  # noqa: SLF001
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
         compact_path,
         [_compact_row(decision_id)],
         decision_transaction_id=transaction_id,
     )
-    decision_commit.append_commit(
-        full_path,
-        decision_ids=[decision_id],
-        full_batch_sha256=str(full_batch["batch_sha256"]),
-        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
-        full_batch_line_sha256=str(full_batch["line_sha256"]),
-        compact_batch_sha256="0" * 64,
-        mode="per_timeframe",
-        committed_at=NOW,
-    )
+    with pytest.raises(
+        decision_commit.DecisionCommitError,
+        match="compact batch reference",
+    ):
+        decision_commit.append_commit(
+            full_path,
+            decision_ids=[decision_id],
+            full_batch_sha256=str(full_batch["batch_sha256"]),
+            full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+            full_batch_line_sha256=str(full_batch["line_sha256"]),
+            compact_batch_sha256="0" * 64,
+            compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+            compact_batch_byte_length=int(compact_batch["byte_length"]),
+            compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+            mode="per_timeframe",
+            committed_at=NOW,
+        )
 
     assert list(decision_log.read_decision_events(full_path)) == []
     assert list(journal.read_entries(compact_path)) == []
+
+
+def test_post_full_fsync_retry_is_idempotent_with_new_timestamp(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-post-fsync"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+
+    def finalize(committed_at: datetime) -> dict[str, object]:
+        return decision_commit.append_commit(
+            full_path,
+            decision_ids=[decision_id],
+            full_batch_sha256=str(full_batch["batch_sha256"]),
+            full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+            full_batch_line_sha256=str(full_batch["line_sha256"]),
+            compact_batch_sha256=str(compact_batch["batch_sha256"]),
+            compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+            compact_batch_byte_length=int(compact_batch["byte_length"]),
+            compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+            mode="per_timeframe",
+            committed_at=committed_at,
+        )
+
+    original_append = decision_commit._append_locked_line  # noqa: SLF001
+
+    def crash_after_full_fsync(handle, path, serialized):
+        offset = original_append(handle, path, serialized)
+        if path == full_path.resolve():
+            raise OSError("simulated crash after final full fsync")
+        return offset
+
+    monkeypatch.setattr(
+        decision_commit,
+        "_append_locked_line",
+        crash_after_full_fsync,
+    )
+    with pytest.raises(OSError, match="after final full fsync"):
+        finalize(NOW)
+    full_size = full_path.stat().st_size
+    compact_size = compact_path.stat().st_size
+
+    monkeypatch.setattr(decision_commit, "_append_locked_line", original_append)
+    recovered = finalize(NOW + timedelta(seconds=1))
+
+    assert recovered["committed_at"] == NOW.isoformat()
+    assert full_path.stat().st_size == full_size
+    assert compact_path.stat().st_size == compact_size
+    assert list(decision_commit.load_commits(full_path, verify_compact=False)) == [transaction_id]
+    assert [row["decision_id"] for row in decision_log.read_decision_events(full_path)] == [
+        decision_id
+    ]
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [decision_id]
+
+
+def test_compact_replacement_before_finalize_is_rejected(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-compact-replaced"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    full_size = full_path.stat().st_size
+    replacement = tmp_path / "replacement-compact.jsonl"
+    replacement.write_bytes(b"")
+    os.replace(replacement, compact_path)
+
+    with pytest.raises(
+        decision_commit.DecisionCommitError,
+        match="compact batch reference",
+    ):
+        decision_commit.append_commit(
+            full_path,
+            decision_ids=[decision_id],
+            full_batch_sha256=str(full_batch["batch_sha256"]),
+            full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+            full_batch_line_sha256=str(full_batch["line_sha256"]),
+            compact_batch_sha256=str(compact_batch["batch_sha256"]),
+            compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+            compact_batch_byte_length=int(compact_batch["byte_length"]),
+            compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+            mode="per_timeframe",
+            committed_at=NOW,
+        )
+
+    assert full_path.stat().st_size == full_size
+    assert decision_commit.load_commits(full_path, verify_compact=False) == {}
+    assert list(decision_log.read_decision_events(full_path)) == []
 
 
 def test_commit_mode_must_match_full_events_and_compact_filename(tmp_path) -> None:
@@ -149,6 +268,9 @@ def test_commit_mode_must_match_full_events_and_compact_filename(tmp_path) -> No
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
     )
@@ -187,6 +309,9 @@ def test_commit_requires_canonical_full_wrapper_schema(tmp_path) -> None:
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
     )
@@ -207,7 +332,103 @@ def test_commit_requires_canonical_full_wrapper_schema(tmp_path) -> None:
     assert list(journal.read_entries(compact_path)) == []
 
 
-def test_prepared_receipt_without_full_commit_is_hidden_and_late_retry_recovers(
+def test_distinct_valid_receipts_fail_closed_for_both_readers(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-conflicting-receipts"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+    original_receipt = json.loads(compact_path.read_text(encoding="utf-8").splitlines()[-1])
+    original_commit = json.loads(full_path.read_text(encoding="utf-8").splitlines()[-1])
+    conflicting_commit = {
+        **original_commit,
+        "committed_at": (NOW + timedelta(seconds=1)).isoformat(),
+    }
+    conflicting_commit["commit_record_sha256"] = decision_commit.canonical_sha256(
+        {key: value for key, value in conflicting_commit.items() if key != "commit_record_sha256"}
+    )
+    commit_payload = decision_commit._serialized_json_line(conflicting_commit)  # noqa: SLF001
+    conflicting_receipt = {
+        **original_receipt,
+        "committed_at": conflicting_commit["committed_at"],
+        "full_commit_record_sha256": conflicting_commit["commit_record_sha256"],
+        "full_commit_line_start_offset": full_path.stat().st_size,
+        "full_commit_line_sha256": hashlib.sha256(commit_payload).hexdigest(),
+    }
+    conflicting_receipt["receipt_record_sha256"] = decision_commit.canonical_sha256(
+        {key: value for key, value in conflicting_receipt.items() if key != "receipt_record_sha256"}
+    )
+    with compact_path.open("ab") as handle:
+        handle.write(decision_commit._serialized_json_line(conflicting_receipt))  # noqa: SLF001
+    with full_path.open("ab") as handle:
+        handle.write(commit_payload)
+
+    assert decision_commit.load_commits(full_path, verify_compact=False) == {}
+    assert list(decision_log.read_decision_events(full_path)) == []
+    assert list(journal.read_entries(compact_path)) == []
+
+
+def test_nan_receipt_is_ignored_without_crashing_compact_reader(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-nan-receipt"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+    malformed = json.loads(compact_path.read_text(encoding="utf-8").splitlines()[-1])
+    malformed["committed_at"] = float("nan")
+    with compact_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(malformed, allow_nan=True) + "\n")
+
+    assert decision_commit.validated_receipt(malformed) is None
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [decision_id]
+
+
+def test_prepared_receipt_without_commit_is_hidden_and_late_retry_fails_closed(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,6 +457,9 @@ def test_prepared_receipt_without_full_commit_is_hidden_and_late_retry_recovers(
             full_batch_line_start_offset=int(full_batch["line_start_offset"]),
             full_batch_line_sha256=str(full_batch["line_sha256"]),
             compact_batch_sha256=str(compact_batch["batch_sha256"]),
+            compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+            compact_batch_byte_length=int(compact_batch["byte_length"]),
+            compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
             mode="per_timeframe",
             committed_at=NOW,
         )
@@ -265,14 +489,19 @@ def test_prepared_receipt_without_full_commit_is_hidden_and_late_retry_recovers(
         "decision-committed-b"
     ]
 
-    commit("decision-late-a", full_a, compact_a)
+    with pytest.raises(
+        decision_commit.DecisionCommitError,
+        match="full batch line reference",
+    ):
+        commit("decision-late-a", full_a, compact_a)
     assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [
-        "decision-late-a",
-        "decision-committed-b",
+        "decision-committed-b"
     ]
     assert [row["decision_id"] for row in decision_log.read_decision_events(full_path)] == [
-        "decision-late-a",
         "decision-committed-b",
+    ]
+    assert list(decision_commit.load_commits(full_path, verify_compact=False)) == [
+        decision_commit.transaction_id_for(["decision-committed-b"])
     ]
 
 
@@ -301,6 +530,9 @@ def test_compact_reader_never_calls_full_history_commit_scan(
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
     )

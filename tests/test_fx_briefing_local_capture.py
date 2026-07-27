@@ -315,7 +315,7 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
         pytest.skip("FX市場休場中はSL/TP付きプランが生成されないため検証不能")
 
     candidate_id = "pol-overall-tp"
-    journal_path = tmp_path / "briefing_journal.jsonl"
+    journal_path = fx_briefing.DEFAULT_JOURNAL_PATH
     learning_path = tmp_path / "briefing_learning.json"
     promotion_path = tmp_path / "promotion_state.json"
     registry_path = tmp_path / "trade_improvement_candidates.json"

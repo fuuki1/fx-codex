@@ -26,6 +26,7 @@ JSONLへ追記し、次回以降の実行で過去の方向判断が的中して
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -294,13 +295,15 @@ def _append_journal_batch(
     payload = "".join(
         json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
         for row in [*committed_rows, marker]
-    )
+    ).encode("utf-8")
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
+    with target.open("a+b", buffering=0) as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            handle.write(payload)
-            handle.flush()
+            line_start_offset = os.lseek(handle.fileno(), 0, os.SEEK_END)
+            written = handle.write(payload)
+            if written != len(payload):
+                raise OSError(f"short append to {target}: {written}/{len(payload)}")
             os.fsync(handle.fileno())
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -309,6 +312,9 @@ def _append_journal_batch(
         "decision_ids": decision_ids,
         "batch_sha256": batch_sha256,
         "journal_batch_id": batch_id,
+        "line_start_offset": line_start_offset,
+        "byte_length": len(payload),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
     }
 
 
@@ -544,7 +550,6 @@ def _read_entries_from_handle(
             expected_size = entry.get("journal_batch_size")
             indices = [row.get("journal_batch_index") for row in pending_rows]
             decision_ids = [row.get("decision_id") for row in pending_rows]
-            batch_sha256 = decision_commit.canonical_sha256(pending_rows)
             locally_complete = (
                 batch_id
                 and batch_id == pending_id
@@ -559,6 +564,7 @@ def _read_entries_from_handle(
             elif locally_complete:
                 marker_decision_ids = entry.get("decision_ids")
                 try:
+                    batch_sha256 = decision_commit.canonical_sha256(pending_rows)
                     normalized_marker_ids = (
                         decision_commit.normalize_decision_ids(marker_decision_ids)
                         if marker_decision_ids
@@ -579,7 +585,7 @@ def _read_entries_from_handle(
                         and entry.get("decision_ids_sha256") == expected_ids_hash
                         and entry.get("journal_batch_sha256") == batch_sha256
                     )
-                except decision_commit.DecisionCommitError:
+                except (decision_commit.DecisionCommitError, TypeError, ValueError):
                     integrity_matches = False
                 requires_commit = bool(entry.get("requires_cross_log_commit")) or any(
                     is_pit_eligible_entry(row) for row in pending_rows

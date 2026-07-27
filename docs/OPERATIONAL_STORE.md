@@ -34,15 +34,23 @@ an explicit, repeatedly parity-verified reader cutover.
 - A new PIT-eligible decision is visible only after a four-stage cross-log
   transaction: fsync the full decision batch; fsync the compact journal batch
   and its local marker; while holding both files exclusively, fsync a
-  self-hashed compact receipt that pins the exact full-wrapper and expected
-  full-commit byte offsets and line hashes; finally fsync the self-hashed
-  commit into that reserved full-log position. Readers hold shared locks on
-  both files and verify the two referenced full lines with bounded seeks.
+  self-hashed compact receipt that pins the compact batch's byte offset,
+  length, and payload hash plus the exact full-wrapper and expected full-commit
+  byte offsets and line hashes; finally fsync the self-hashed commit into that
+  reserved full-log position. The finalizer rechecks the pinned compact bytes
+  while both files are locked, so compact replacement or truncation cannot
+  produce a successful full commit. Readers hold shared locks on both files
+  and verify the referenced compact batch and two full lines.
   They therefore fail closed on a missing, forged, conflicting, replaced,
   truncated, or metadata-preserving rewritten record without rescanning the
-  1 GiB full log. A crash before the final full commit leaves only an invisible
-  prepared receipt; later valid transactions and a late retry can still
-  progress without losing pending wrapper state.
+  1 GiB full log. A retry after the final full `fsync` detects and returns the
+  already-durable transaction without appending a timestamp-dependent second
+  commit; multiple distinct valid commit receipts for one transaction fail
+  closed. A crash before the final full commit leaves only an invisible
+  prepared receipt. A later wrapper invalidates that older pending transaction,
+  so later valid work can progress while every reader and replay consistently
+  retains the older wrapper as an explicit orphan instead of resurrecting it
+  after its operational cursor has advanced.
 - A cursor can advance only in the same transaction as a contiguous SHA-256
   chunk manifest. Malformed complete lines advance only after an append-only
   rejection record is committed. An incomplete trailing line is left unread.

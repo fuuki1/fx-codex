@@ -37,6 +37,9 @@ def write_committed_decision_events(
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode=mode,
         committed_at=datetime.now(UTC),
     )
@@ -105,6 +108,9 @@ def write_committed_compact_rows(
         full_batch_line_start_offset=int(full_batch["line_start_offset"]),
         full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
         mode=mode,
         committed_at=datetime.now(UTC),
     )

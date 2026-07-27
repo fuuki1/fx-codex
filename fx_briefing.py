@@ -455,6 +455,22 @@ def finalize_decision_transaction(
         full_batch_line_start_offset, int
     ):
         raise decision_commit.DecisionCommitError("full decision batch is missing its byte offset")
+    compact_batch_line_start_offset = compact_batch.get("line_start_offset")
+    if isinstance(compact_batch_line_start_offset, bool) or not isinstance(
+        compact_batch_line_start_offset, int
+    ):
+        raise decision_commit.DecisionCommitError(
+            "compact decision batch is missing its byte offset"
+        )
+    compact_batch_byte_length = compact_batch.get("byte_length")
+    if (
+        isinstance(compact_batch_byte_length, bool)
+        or not isinstance(compact_batch_byte_length, int)
+        or compact_batch_byte_length <= 0
+    ):
+        raise decision_commit.DecisionCommitError(
+            "compact decision batch is missing its byte length"
+        )
     decision_commit.append_commit(
         DEFAULT_DECISION_LOG_PATH,
         decision_ids=decision_ids,
@@ -462,6 +478,9 @@ def finalize_decision_transaction(
         full_batch_line_start_offset=full_batch_line_start_offset,
         full_batch_line_sha256=str(full_batch.get("line_sha256") or ""),
         compact_batch_sha256=str(compact_batch.get("batch_sha256") or ""),
+        compact_batch_line_start_offset=compact_batch_line_start_offset,
+        compact_batch_byte_length=compact_batch_byte_length,
+        compact_batch_payload_sha256=str(compact_batch.get("payload_sha256") or ""),
         mode=mode,
         committed_at=now,
     )

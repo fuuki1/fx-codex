@@ -725,22 +725,30 @@ def _compact_batches_from_suffix(
     """Return receipt-complete compact batches and their suffix end boundaries."""
 
     verified_by_transaction: dict[str, _CompactBatch] = {}
+    verified_conflicts: set[str] = set()
     pending_batches: dict[str, dict[str, object]] = {}
     batch_conflicts: set[str] = set()
     pending_id = ""
     pending_rows: list[dict[str, object]] = []
+    pending_start_offset: int | None = None
+    pending_payload = bytearray()
     relative_offset = 0
     for line in raw.splitlines(keepends=True):
+        line_start_offset = start_offset + relative_offset
         relative_offset += len(line)
         try:
             value: Any = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         if not isinstance(value, dict):
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         if value.get("event_type") == decision_commit.RECEIPT_EVENT_TYPE:
             receipt = decision_commit.validated_receipt(value)
@@ -764,12 +772,24 @@ def _compact_batches_from_suffix(
                         batch_sha256=str(descriptor["compact_batch_sha256"]),
                         mode=expected_mode,
                     )
+                    and decision_commit.receipt_matches_compact_evidence(
+                        receipt,
+                        line_start_offset=cast(
+                            int,
+                            descriptor["compact_batch_line_start_offset"],
+                        ),
+                        byte_length=cast(
+                            int,
+                            descriptor["compact_batch_byte_length"],
+                        ),
+                        payload_sha256=str(descriptor["compact_batch_payload_sha256"]),
+                    )
                     and decision_commit.receipt_matches_full_evidence(
                         receipt,
                         full_handle,
                     )
                 ):
-                    verified_by_transaction[transaction_id] = _CompactBatch(
+                    candidate = _CompactBatch(
                         end_offset=start_offset + relative_offset,
                         transaction_id=transaction_id,
                         decision_ids_sha256=str(descriptor["decision_ids_sha256"]),
@@ -777,8 +797,20 @@ def _compact_batches_from_suffix(
                         full_batch_sha256=str(receipt["full_batch_sha256"]),
                         full_commit_record_sha256=str(receipt["full_commit_record_sha256"]),
                     )
+                    verified_previous = verified_by_transaction.get(transaction_id)
+                    if (
+                        verified_previous is not None
+                        and verified_previous.full_commit_record_sha256
+                        != candidate.full_commit_record_sha256
+                    ):
+                        verified_conflicts.add(transaction_id)
+                        verified_by_transaction.pop(transaction_id, None)
+                    elif transaction_id not in verified_conflicts:
+                        verified_by_transaction[transaction_id] = candidate
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         batch_id = str(value.get("journal_batch_id") or "")
         if value.get("event_type") == journal.JOURNAL_BATCH_COMMIT:
@@ -787,25 +819,40 @@ def _compact_batches_from_suffix(
                 value,
                 expected_mode=expected_mode,
             )
-            if descriptor is not None:
+            if descriptor is not None and pending_start_offset is not None:
+                exact_payload = bytes(pending_payload) + line
+                descriptor.update(
+                    {
+                        "compact_batch_line_start_offset": pending_start_offset,
+                        "compact_batch_byte_length": len(exact_payload),
+                        "compact_batch_payload_sha256": hashlib.sha256(exact_payload).hexdigest(),
+                    }
+                )
                 transaction_id = str(descriptor["decision_transaction_id"])
-                previous = pending_batches.get(transaction_id)
-                if previous is not None and previous != descriptor:
+                batch_previous = pending_batches.get(transaction_id)
+                if batch_previous is not None and batch_previous != descriptor:
                     batch_conflicts.add(transaction_id)
                     pending_batches.pop(transaction_id, None)
                 elif transaction_id not in batch_conflicts:
                     pending_batches[transaction_id] = descriptor
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         if batch_id:
             if batch_id != pending_id:
                 pending_id = batch_id
                 pending_rows = []
+                pending_start_offset = line_start_offset
+                pending_payload.clear()
             pending_rows.append(value)
+            pending_payload.extend(line)
             continue
         pending_id = ""
         pending_rows = []
+        pending_start_offset = None
+        pending_payload.clear()
     return sorted(
         verified_by_transaction.values(),
         key=lambda batch: batch.end_offset,

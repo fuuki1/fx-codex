@@ -9,7 +9,7 @@ two bounded seeks into the large full log per transaction.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, UTC
 import fcntl
@@ -99,6 +99,9 @@ def append_commit(
     full_batch_line_start_offset: int,
     full_batch_line_sha256: str,
     compact_batch_sha256: str,
+    compact_batch_line_start_offset: int,
+    compact_batch_byte_length: int,
+    compact_batch_payload_sha256: str,
     mode: str,
     committed_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -117,6 +120,22 @@ def append_commit(
     normalized_full_line_sha256 = _required_sha256(
         full_batch_line_sha256,
         "full_batch_line_sha256",
+    )
+    if (
+        isinstance(compact_batch_line_start_offset, bool)
+        or not isinstance(compact_batch_line_start_offset, int)
+        or compact_batch_line_start_offset < 0
+    ):
+        raise DecisionCommitError("compact_batch_line_start_offset must be non-negative")
+    if (
+        isinstance(compact_batch_byte_length, bool)
+        or not isinstance(compact_batch_byte_length, int)
+        or compact_batch_byte_length <= 0
+    ):
+        raise DecisionCommitError("compact_batch_byte_length must be positive")
+    normalized_compact_payload_sha256 = _required_sha256(
+        compact_batch_payload_sha256,
+        "compact_batch_payload_sha256",
     )
     timestamp = (committed_at or datetime.now(UTC)).astimezone(UTC)
     record: dict[str, object] = {
@@ -149,16 +168,41 @@ def append_commit(
                 raise
             handles[candidate] = handle
         full_handle = handles[target]
-        if not _full_batch_handle_reference_matches(
+        compact_handle = handles[compact_path]
+        if not _compact_batch_handle_reference_matches(
+            compact_handle,
+            line_start_offset=compact_batch_line_start_offset,
+            byte_length=compact_batch_byte_length,
+            payload_sha256=normalized_compact_payload_sha256,
+            transaction_id=transaction_id,
+            decision_ids=normalized_ids,
+            batch_sha256=str(record["compact_batch_sha256"]),
+            mode=normalized_mode,
+        ):
+            raise DecisionCommitError("compact batch reference is missing or mismatched")
+        existing_commit = _full_batch_finalize_state(
             full_handle,
             line_start_offset=full_batch_line_start_offset,
             line_sha256=normalized_full_line_sha256,
             transaction_id=transaction_id,
             decision_ids=normalized_ids,
             batch_sha256=str(record["full_batch_sha256"]),
+            compact_batch_sha256=str(record["compact_batch_sha256"]),
             mode=normalized_mode,
-        ):
-            raise DecisionCommitError("full batch line reference is missing or mismatched")
+        )
+        if existing_commit is not None:
+            compact_handle.seek(0)
+            existing_receipts = _load_compact_receipts_from_handles(
+                compact_handle,
+                full_handle,
+                expected_mode=normalized_mode,
+            )
+            if receipt_matches_commit(
+                existing_receipts.get(transaction_id),
+                existing_commit,
+            ):
+                return existing_commit
+            raise DecisionCommitError("existing full commit is missing one exact compact receipt")
         commit_payload = _serialized_json_line(record)
         commit_line_start_offset = os.lseek(full_handle.fileno(), 0, os.SEEK_END)
         commit_line_sha256 = hashlib.sha256(commit_payload).hexdigest()
@@ -175,6 +219,9 @@ def append_commit(
             "full_commit_record_sha256": record["commit_record_sha256"],
             "full_batch_line_start_offset": full_batch_line_start_offset,
             "full_batch_line_sha256": normalized_full_line_sha256,
+            "compact_batch_line_start_offset": compact_batch_line_start_offset,
+            "compact_batch_byte_length": compact_batch_byte_length,
+            "compact_batch_payload_sha256": normalized_compact_payload_sha256,
             "full_commit_line_start_offset": commit_line_start_offset,
             "full_commit_line_sha256": commit_line_sha256,
         }
@@ -233,28 +280,12 @@ def load_commits(
     """Load commits backed by exact full wrappers and, optionally, compact batches."""
 
     target = Path(path)
-    full_batches: dict[str, dict[str, object]] = {}
-    full_conflicts: set[str] = set()
-    candidate_commits: dict[str, dict[str, object]] = {}
-    commit_conflicts: set[str] = set()
     try:
         handle = target.open(encoding="utf-8")
     except OSError:
         return {}
     with handle:
-        for line in handle:
-            try:
-                raw: Any = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            _accumulate_commit_value(
-                raw,
-                full_batches=full_batches,
-                full_conflicts=full_conflicts,
-                candidate_commits=candidate_commits,
-                commit_conflicts=commit_conflicts,
-            )
-    commits = _matching_full_commits(full_batches, candidate_commits)
+        commits = commits_from_values(_iter_json_values(handle))
     if not verify_compact:
         return commits
     verified_by_mode: dict[str, dict[str, dict[str, object]]] = {}
@@ -277,50 +308,42 @@ def load_commits(
     return output
 
 
-def commits_from_values(values: Sequence[object]) -> dict[str, dict[str, object]]:
-    """Validate commit markers and their full wrappers in one stable prefix."""
+def _iter_json_values(lines: Iterable[str]) -> Iterator[object]:
+    for line in lines:
+        try:
+            yield json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            yield None
 
-    full_batches: dict[str, dict[str, object]] = {}
-    full_conflicts: set[str] = set()
-    candidate_commits: dict[str, dict[str, object]] = {}
-    commit_conflicts: set[str] = set()
+
+def commits_from_values(values: Iterable[object]) -> dict[str, dict[str, object]]:
+    """Validate commits whose wrapper is the newest pending full batch."""
+
+    pending: dict[str, dict[str, object]] = {}
+    output: dict[str, dict[str, object]] = {}
+    conflicts: set[str] = set()
     for raw in values:
-        _accumulate_commit_value(
-            raw,
-            full_batches=full_batches,
-            full_conflicts=full_conflicts,
-            candidate_commits=candidate_commits,
-            commit_conflicts=commit_conflicts,
+        is_full_record = (
+            isinstance(raw, Mapping) and raw.get("event_type") == DECISION_BATCH_EVENT_TYPE
         )
-    return _matching_full_commits(full_batches, candidate_commits)
-
-
-def _accumulate_commit_value(
-    raw: object,
-    *,
-    full_batches: dict[str, dict[str, object]],
-    full_conflicts: set[str],
-    candidate_commits: dict[str, dict[str, object]],
-    commit_conflicts: set[str],
-) -> None:
-    full = _full_batch_descriptor(raw)
-    if full is not None:
-        transaction_id, descriptor = full
-        _accumulate_unique(
-            full_batches,
-            full_conflicts,
-            transaction_id,
-            descriptor,
-        )
-    record = _validated_record(raw)
-    if record is not None:
+        if is_full_record:
+            pending.clear()
+            full = _full_batch_descriptor(raw)
+            if full is not None:
+                transaction_id, descriptor = full
+                pending[transaction_id] = descriptor
+            continue
+        record = _validated_record(raw)
+        if record is None:
+            continue
         transaction_id = str(record["decision_transaction_id"])
-        _accumulate_unique(
-            candidate_commits,
-            commit_conflicts,
-            transaction_id,
-            record,
-        )
+        full_batch = pending.pop(transaction_id, None)
+        if full_batch is not None and _commit_matches_full_batch(record, full_batch):
+            _accumulate_unique(output, conflicts, transaction_id, record)
+        elif output.get(transaction_id) != record:
+            conflicts.add(transaction_id)
+            output.pop(transaction_id, None)
+    return output
 
 
 def _full_batch_descriptor(
@@ -343,7 +366,8 @@ def _full_batch_descriptor(
     try:
         decision_ids = normalize_decision_ids([event.get("decision_id") for event in events])
         transaction_id = transaction_id_for(decision_ids)
-    except DecisionCommitError:
+        full_batch_sha256 = canonical_sha256(events)
+    except (DecisionCommitError, TypeError, ValueError):
         return None
     modes = {str(event.get("mode") or "") for event in events}
     if len(modes) != 1:
@@ -356,7 +380,7 @@ def _full_batch_descriptor(
     descriptor: dict[str, object] = {
         "decision_ids": decision_ids,
         "decision_ids_sha256": decision_ids_sha256(decision_ids),
-        "full_batch_sha256": canonical_sha256(events),
+        "full_batch_sha256": full_batch_sha256,
         "mode": mode,
     }
     if (
@@ -383,21 +407,16 @@ def _accumulate_unique(
         records[transaction_id] = value
 
 
-def _matching_full_commits(
-    full_batches: Mapping[str, Mapping[str, object]],
-    candidate_commits: Mapping[str, dict[str, object]],
-) -> dict[str, dict[str, object]]:
-    output: dict[str, dict[str, object]] = {}
-    for transaction_id, record in candidate_commits.items():
-        full_batch = full_batches.get(transaction_id)
-        if full_batch is not None and (
-            record.get("decision_ids") == full_batch["decision_ids"]
-            and record.get("decision_ids_sha256") == full_batch["decision_ids_sha256"]
-            and record.get("full_batch_sha256") == full_batch["full_batch_sha256"]
-            and record.get("mode") == full_batch["mode"]
-        ):
-            output[transaction_id] = record
-    return output
+def _commit_matches_full_batch(
+    record: Mapping[str, object],
+    full_batch: Mapping[str, object],
+) -> bool:
+    return (
+        record.get("decision_ids") == full_batch["decision_ids"]
+        and record.get("decision_ids_sha256") == full_batch["decision_ids_sha256"]
+        and record.get("full_batch_sha256") == full_batch["full_batch_sha256"]
+        and record.get("mode") == full_batch["mode"]
+    )
 
 
 @contextmanager
@@ -473,17 +492,27 @@ def _load_compact_receipts_from_handles(
     candidate_receipts: dict[str, list[dict[str, object]]] = {}
     pending_id = ""
     pending_rows: list[dict[str, object]] = []
+    pending_start_offset: int | None = None
+    pending_payload = bytearray()
     compact_handle.seek(0)
-    for line in compact_handle:
+    while True:
+        line_start_offset = compact_handle.tell()
+        line = compact_handle.readline()
+        if not line:
+            break
         try:
             raw: Any = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         if not isinstance(raw, dict):
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         if raw.get("event_type") == RECEIPT_EVENT_TYPE:
             receipt = validated_receipt(raw)
@@ -492,6 +521,8 @@ def _load_compact_receipts_from_handles(
                 candidate_receipts.setdefault(transaction_id, []).append(receipt)
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         batch_id = str(raw.get("journal_batch_id") or "")
         if raw.get("event_type") == "journal_batch_commit":
@@ -500,7 +531,15 @@ def _load_compact_receipts_from_handles(
                 raw,
                 expected_mode=expected_mode,
             )
-            if descriptor is not None:
+            if descriptor is not None and pending_start_offset is not None:
+                exact_payload = bytes(pending_payload) + line
+                descriptor.update(
+                    {
+                        "compact_batch_line_start_offset": pending_start_offset,
+                        "compact_batch_byte_length": len(exact_payload),
+                        "compact_batch_payload_sha256": hashlib.sha256(exact_payload).hexdigest(),
+                    }
+                )
                 transaction_id = str(descriptor["decision_transaction_id"])
                 _accumulate_unique(
                     batches,
@@ -510,15 +549,22 @@ def _load_compact_receipts_from_handles(
                 )
             pending_id = ""
             pending_rows = []
+            pending_start_offset = None
+            pending_payload.clear()
             continue
         if batch_id:
             if batch_id != pending_id:
                 pending_id = batch_id
                 pending_rows = []
+                pending_start_offset = line_start_offset
+                pending_payload.clear()
             pending_rows.append(raw)
+            pending_payload.extend(line)
             continue
         pending_id = ""
         pending_rows = []
+        pending_start_offset = None
+        pending_payload.clear()
 
     verified: dict[str, dict[str, object]] = {}
     for transaction_id, receipts in candidate_receipts.items():
@@ -540,9 +586,18 @@ def _load_compact_receipts_from_handles(
                 batch_sha256=str(batch["compact_batch_sha256"]),
                 mode=expected_mode,
             )
+            and receipt_matches_compact_evidence(
+                receipt,
+                line_start_offset=cast(
+                    int,
+                    batch["compact_batch_line_start_offset"],
+                ),
+                byte_length=cast(int, batch["compact_batch_byte_length"]),
+                payload_sha256=str(batch["compact_batch_payload_sha256"]),
+            )
             and receipt_matches_full_evidence(receipt, full_handle)
         ]
-        if matching:
+        if len({str(receipt["full_commit_record_sha256"]) for receipt in matching}) == 1:
             verified[transaction_id] = matching[-1]
     return verified
 
@@ -567,9 +622,9 @@ def compact_batch_descriptor(
         normalized_ids = normalize_decision_ids(decision_ids)
         ids_hash = decision_ids_sha256(normalized_ids)
         transaction_id = transaction_id_for(normalized_ids)
-    except DecisionCommitError:
+        batch_hash = canonical_sha256(rows)
+    except (DecisionCommitError, TypeError, ValueError):
         return None
-    batch_hash = canonical_sha256(rows)
     if (
         marker.get("journal_batch_size") != len(rows)
         or [row.get("journal_batch_index") for row in rows] != list(range(len(rows)))
@@ -611,6 +666,10 @@ def validated_receipt(value: object) -> dict[str, object] | None:
             value.get("compact_batch_sha256"),
             "compact_batch_sha256",
         )
+        compact_payload_hash = _required_sha256(
+            value.get("compact_batch_payload_sha256"),
+            "compact_batch_payload_sha256",
+        )
         full_commit_hash = _required_sha256(
             value.get("full_commit_record_sha256"),
             "full_commit_record_sha256",
@@ -624,43 +683,53 @@ def validated_receipt(value: object) -> dict[str, object] | None:
             "full_commit_line_sha256",
         )
         compact_path_for_mode(DEFAULT_COMMIT_FILENAME, str(value.get("mode") or ""))
-    except (DecisionCommitError, TypeError):
-        return None
-    offsets = (
-        value.get("full_batch_line_start_offset"),
-        value.get("full_commit_line_start_offset"),
-    )
-    if any(isinstance(offset, bool) or not isinstance(offset, int) for offset in offsets):
-        return None
-    batch_offset, commit_offset = offsets
-    assert isinstance(batch_offset, int)
-    assert isinstance(commit_offset, int)
-    if batch_offset < 0 or commit_offset <= batch_offset:
-        return None
-    if (
-        value.get("decision_transaction_id") != transaction_id
-        or value.get("decision_ids_sha256") != decision_ids_sha256(decision_ids)
-        or value.get("full_batch_sha256") != full_hash
-        or value.get("compact_batch_sha256") != compact_hash
-    ):
-        return None
-    reconstructed_commit = {
-        "schema_version": SCHEMA_VERSION,
-        "event_type": COMMIT_EVENT_TYPE,
-        "decision_transaction_id": transaction_id,
-        "decision_ids": decision_ids,
-        "decision_ids_sha256": decision_ids_sha256(decision_ids),
-        "full_batch_sha256": full_hash,
-        "compact_batch_sha256": compact_hash,
-        "mode": value.get("mode"),
-        "committed_at": value.get("committed_at"),
-    }
-    reconstructed_commit["commit_record_sha256"] = canonical_sha256(reconstructed_commit)
-    if reconstructed_commit["commit_record_sha256"] != full_commit_hash:
-        return None
-    stored_hash = value.get("receipt_record_sha256")
-    unsigned = {key: item for key, item in value.items() if key != "receipt_record_sha256"}
-    if stored_hash != canonical_sha256(unsigned):
+        offsets = (
+            value.get("full_batch_line_start_offset"),
+            value.get("compact_batch_line_start_offset"),
+            value.get("full_commit_line_start_offset"),
+        )
+        compact_byte_length = value.get("compact_batch_byte_length")
+        if any(isinstance(offset, bool) or not isinstance(offset, int) for offset in offsets):
+            return None
+        if (
+            isinstance(compact_byte_length, bool)
+            or not isinstance(compact_byte_length, int)
+            or compact_byte_length <= 0
+        ):
+            return None
+        batch_offset, compact_offset, commit_offset = offsets
+        assert isinstance(batch_offset, int)
+        assert isinstance(compact_offset, int)
+        assert isinstance(commit_offset, int)
+        if batch_offset < 0 or compact_offset < 0 or commit_offset <= batch_offset:
+            return None
+        if (
+            value.get("decision_transaction_id") != transaction_id
+            or value.get("decision_ids_sha256") != decision_ids_sha256(decision_ids)
+            or value.get("full_batch_sha256") != full_hash
+            or value.get("compact_batch_sha256") != compact_hash
+            or value.get("compact_batch_payload_sha256") != compact_payload_hash
+        ):
+            return None
+        reconstructed_commit = {
+            "schema_version": SCHEMA_VERSION,
+            "event_type": COMMIT_EVENT_TYPE,
+            "decision_transaction_id": transaction_id,
+            "decision_ids": decision_ids,
+            "decision_ids_sha256": decision_ids_sha256(decision_ids),
+            "full_batch_sha256": full_hash,
+            "compact_batch_sha256": compact_hash,
+            "mode": value.get("mode"),
+            "committed_at": value.get("committed_at"),
+        }
+        reconstructed_commit["commit_record_sha256"] = canonical_sha256(reconstructed_commit)
+        if reconstructed_commit["commit_record_sha256"] != full_commit_hash:
+            return None
+        stored_hash = value.get("receipt_record_sha256")
+        unsigned = {key: item for key, item in value.items() if key != "receipt_record_sha256"}
+        if stored_hash != canonical_sha256(unsigned):
+            return None
+    except (DecisionCommitError, TypeError, ValueError):
         return None
     return value
 
@@ -684,6 +753,24 @@ def receipt_matches_compact(
         and validated.get("decision_ids_sha256") == decision_ids_sha256(normalized_ids)
         and validated.get("compact_batch_sha256") == batch_sha256
         and validated.get("mode") == mode
+    )
+
+
+def receipt_matches_compact_evidence(
+    receipt: Mapping[str, object] | None,
+    *,
+    line_start_offset: int,
+    byte_length: int,
+    payload_sha256: str,
+) -> bool:
+    """Match one receipt to the exact compact batch bytes it finalizes."""
+
+    validated = validated_receipt(receipt)
+    return (
+        validated is not None
+        and validated.get("compact_batch_line_start_offset") == line_start_offset
+        and validated.get("compact_batch_byte_length") == byte_length
+        and validated.get("compact_batch_payload_sha256") == payload_sha256
     )
 
 
@@ -725,6 +812,15 @@ def receipt_matches_full_evidence(
         offset=batch_offset,
         expected_sha256=str(validated["full_batch_line_sha256"]),
     )
+    if batch_line is None:
+        return False
+    batch_line_end = full_handle.tell()
+    if _has_intervening_full_batch(
+        full_handle,
+        start_offset=batch_line_end,
+        end_offset=commit_offset,
+    ):
+        return False
     commit_line = _read_hashed_json_line(
         full_handle,
         offset=commit_offset,
@@ -743,6 +839,29 @@ def receipt_matches_full_evidence(
         and descriptor["mode"] == validated["mode"]
         and receipt_matches_commit(validated, record)
     )
+
+
+def _has_intervening_full_batch(
+    handle: IO[bytes],
+    *,
+    start_offset: int,
+    end_offset: int,
+) -> bool:
+    if start_offset > end_offset:
+        return True
+    handle.seek(start_offset)
+    while handle.tell() < end_offset:
+        remaining = end_offset - handle.tell()
+        line = handle.readline(remaining)
+        if not line.endswith(b"\n"):
+            return True
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return True
+        if isinstance(value, Mapping) and value.get("event_type") == DECISION_BATCH_EVENT_TYPE:
+            return True
+    return handle.tell() != end_offset
 
 
 def _read_hashed_json_line(
@@ -775,7 +894,51 @@ def _mode_for_compact_path(path: Path) -> str:
     )
 
 
-def _full_batch_handle_reference_matches(
+def _compact_batch_handle_reference_matches(
+    handle: IO[bytes],
+    *,
+    line_start_offset: int,
+    byte_length: int,
+    payload_sha256: str,
+    transaction_id: str,
+    decision_ids: Sequence[object],
+    batch_sha256: str,
+    mode: str,
+) -> bool:
+    if line_start_offset:
+        handle.seek(line_start_offset - 1)
+        if handle.read(1) != b"\n":
+            return False
+    handle.seek(line_start_offset)
+    payload = handle.read(byte_length)
+    if (
+        len(payload) != byte_length
+        or not payload.endswith(b"\n")
+        or hashlib.sha256(payload).hexdigest() != payload_sha256
+    ):
+        return False
+    values: list[object] = []
+    for line in payload.splitlines():
+        try:
+            values.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+    if len(values) < 2 or not all(isinstance(value, Mapping) for value in values):
+        return False
+    rows = cast(list[Mapping[str, object]], values[:-1])
+    marker = cast(Mapping[str, object], values[-1])
+    descriptor = compact_batch_descriptor(rows, marker, expected_mode=mode)
+    return (
+        descriptor is not None
+        and descriptor["decision_transaction_id"] == transaction_id
+        and descriptor["decision_ids"] == normalize_decision_ids(decision_ids)
+        and descriptor["decision_ids_sha256"] == decision_ids_sha256(decision_ids)
+        and descriptor["compact_batch_sha256"] == batch_sha256
+        and descriptor["mode"] == mode
+    )
+
+
+def _full_batch_finalize_state(
     handle: IO[bytes],
     *,
     line_start_offset: int,
@@ -783,24 +946,56 @@ def _full_batch_handle_reference_matches(
     transaction_id: str,
     decision_ids: Sequence[object],
     batch_sha256: str,
+    compact_batch_sha256: str,
     mode: str,
-) -> bool:
+) -> dict[str, object] | None:
     raw = _read_hashed_json_line(
         handle,
         offset=line_start_offset,
         expected_sha256=line_sha256,
     )
     full = _full_batch_descriptor(raw)
+    normalized_ids = normalize_decision_ids(decision_ids)
     if full is None:
-        return False
+        raise DecisionCommitError("full batch line reference is missing or mismatched")
     full_transaction_id, descriptor = full
-    return (
+    if not (
         full_transaction_id == transaction_id
-        and descriptor["decision_ids"] == normalize_decision_ids(decision_ids)
-        and descriptor["decision_ids_sha256"] == decision_ids_sha256(decision_ids)
+        and descriptor["decision_ids"] == normalized_ids
+        and descriptor["decision_ids_sha256"] == decision_ids_sha256(normalized_ids)
         and descriptor["full_batch_sha256"] == batch_sha256
         and descriptor["mode"] == mode
-    )
+    ):
+        raise DecisionCommitError("full batch line reference is missing or mismatched")
+
+    existing: dict[str, object] | None = None
+    later_batch_seen = False
+    for later_line in handle:
+        try:
+            later = json.loads(later_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise DecisionCommitError("full log suffix is malformed")
+        if isinstance(later, Mapping) and later.get("event_type") == DECISION_BATCH_EVENT_TYPE:
+            later_batch_seen = True
+            continue
+        record = _validated_record(later)
+        if record is None or record.get("decision_transaction_id") != transaction_id:
+            continue
+        record_matches = (
+            _commit_matches_full_batch(record, descriptor)
+            and record.get("compact_batch_sha256") == compact_batch_sha256
+        )
+        if not record_matches or (later_batch_seen and existing is None):
+            raise DecisionCommitError("full decision transaction has conflicting finalization")
+        if existing is None:
+            existing = record
+        elif existing != record:
+            raise DecisionCommitError("full decision transaction has conflicting finalization")
+    if existing is not None:
+        return existing
+    if later_batch_seen:
+        raise DecisionCommitError("full batch line reference is missing or mismatched")
+    return None
 
 
 def matching_commit(
@@ -847,7 +1042,7 @@ def _validated_record(value: object) -> dict[str, object] | None:
         full_hash = _required_sha256(value.get("full_batch_sha256"), "full_batch_sha256")
         compact_hash = _required_sha256(value.get("compact_batch_sha256"), "compact_batch_sha256")
         compact_path_for_mode(DEFAULT_COMMIT_FILENAME, str(value.get("mode") or ""))
-    except (DecisionCommitError, TypeError):
+    except (DecisionCommitError, TypeError, ValueError):
         return None
     if (
         value.get("decision_transaction_id") != transaction_id
@@ -858,7 +1053,11 @@ def _validated_record(value: object) -> dict[str, object] | None:
         return None
     stored_hash = value.get("commit_record_sha256")
     unsigned = {key: item for key, item in value.items() if key != "commit_record_sha256"}
-    if stored_hash != canonical_sha256(unsigned):
+    try:
+        expected_hash = canonical_sha256(unsigned)
+    except (TypeError, ValueError):
+        return None
+    if stored_hash != expected_hash:
         return None
     return value
 

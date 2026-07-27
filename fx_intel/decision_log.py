@@ -476,9 +476,9 @@ def decision_events_from_batch(
         decision_ids = decision_commit.normalize_decision_ids(
             [event.get("decision_id") for event in events]
         )
-    except decision_commit.DecisionCommitError:
+        batch_sha256 = decision_commit.canonical_sha256(events)
+    except (decision_commit.DecisionCommitError, TypeError, ValueError):
         return []
-    batch_sha256 = decision_commit.canonical_sha256(events)
     if (
         batch.get("decision_ids") != decision_ids
         or batch.get("decision_ids_sha256") != decision_commit.decision_ids_sha256(decision_ids)
