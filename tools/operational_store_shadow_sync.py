@@ -35,6 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_paths(bootstrap)
     bootstrap.add_argument("--parity-report", type=Path, required=True)
     bootstrap.add_argument("--report", type=Path, required=True)
+    bootstrap.add_argument(
+        "--allow-source-prefix",
+        action="store_true",
+        help=(
+            "parity snapshotのbytes/hashをlive append-only sourceのprefixとして"
+            "検証し、そのlive inodeへcursorを設定する"
+        ),
+    )
 
     sync = subparsers.add_parser(
         "sync",
@@ -58,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
                 decision_path=args.decisions,
                 price_path=args.prices,
                 writer_id=args.writer_id,
+                allow_source_prefix=args.allow_source_prefix,
             )
         else:
             payload = sync_sources(

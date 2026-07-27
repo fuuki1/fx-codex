@@ -131,6 +131,7 @@ def bootstrap_candidate(
     decision_path: str | Path,
     price_path: str | Path,
     writer_id: str,
+    allow_source_prefix: bool = False,
 ) -> dict[str, object]:
     """Attach durable EOF cursors only to an unchanged parity-verified candidate."""
 
@@ -165,10 +166,12 @@ def bootstrap_candidate(
     decision_snapshot = _verified_snapshot(
         decisions,
         _mapping(sources.get("decisions"), "sources.decisions"),
+        allow_prefix=allow_source_prefix,
     )
     price_snapshot = _verified_snapshot(
         prices,
         _mapping(sources.get("prices"), "sources.prices"),
+        allow_prefix=allow_source_prefix,
     )
     captured_at = datetime.now(UTC)
     with open_operational_writer(database, writer_id=writer_id) as store:
@@ -218,6 +221,7 @@ def bootstrap_candidate(
             "shadow_projection_only",
             "append_only_raw_remains_authoritative",
             "no_production_read_cutover",
+            *(["bootstrapped_from_verified_live_prefix"] if allow_source_prefix else []),
         ],
     }
 
@@ -497,6 +501,86 @@ def fingerprint_complete_source(
     )
 
 
+def fingerprint_complete_prefix(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
+) -> CompleteSourceSnapshot:
+    """Verify one immutable complete prefix of a longer append-only JSONL."""
+
+    target = Path(path).resolve()
+    if not target.is_file():
+        raise BootstrapEvidenceMismatch(f"raw source does not exist: {target}")
+    if expected_bytes < 0:
+        raise BootstrapEvidenceMismatch("expected_bytes must be non-negative")
+    digest = hashlib.sha256()
+    row_count = 0
+    line_start = 0
+    last_line_start = 0
+    total = 0
+    final_byte = b""
+    with target.open("rb") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        before = os.fstat(handle.fileno())
+        if before.st_size < expected_bytes:
+            raise BootstrapEvidenceMismatch(f"raw source is shorter than verified prefix: {target}")
+        remaining = expected_bytes
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise BootstrapEvidenceMismatch(
+                    f"raw source ended inside verified prefix: {target}"
+                )
+            digest.update(chunk)
+            final_byte = chunk[-1:]
+            position = 0
+            while True:
+                newline = chunk.find(b"\n", position)
+                if newline < 0:
+                    break
+                last_line_start = line_start
+                line_start = total + newline + 1
+                row_count += 1
+                position = newline + 1
+            total += len(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise BootstrapEvidenceMismatch(
+                f"raw source identity changed while hashing prefix: {target}"
+            )
+        if after.st_size < expected_bytes:
+            raise BootstrapEvidenceMismatch(f"raw source truncated below verified prefix: {target}")
+        if total and final_byte != b"\n":
+            raise BootstrapEvidenceMismatch(
+                f"verified prefix has an incomplete final JSONL line: {target}"
+            )
+        if total:
+            handle.seek(last_line_start)
+            last_line = handle.read(total - last_line_start)
+            last_line_hash = hashlib.sha256(last_line).hexdigest()
+        else:
+            last_line_hash = EMPTY_SHA256
+    actual_hash = digest.hexdigest()
+    if actual_hash != expected_sha256:
+        raise BootstrapEvidenceMismatch(
+            "raw source prefix SHA-256 mismatch for "
+            f"{target}: expected {expected_sha256}, got {actual_hash}"
+        )
+    return CompleteSourceSnapshot(
+        path=str(target),
+        device_id=after.st_dev,
+        inode=after.st_ino,
+        bytes=expected_bytes,
+        mtime_ns=after.st_mtime_ns,
+        sha256=actual_hash,
+        row_count=row_count,
+        last_line_start_offset=last_line_start,
+        last_line_sha256=last_line_hash,
+    )
+
+
 def runtime_provenance() -> dict[str, object]:
     """Capture the exact shadow-sync implementation and runtime identity."""
 
@@ -527,15 +611,26 @@ def runtime_provenance() -> dict[str, object]:
 def _verified_snapshot(
     actual_path: Path,
     reported: Mapping[str, object],
+    *,
+    allow_prefix: bool,
 ) -> CompleteSourceSnapshot:
     reported_path = Path(_required_text(reported.get("path"), "source.path")).resolve()
-    if reported_path != actual_path:
+    if reported_path != actual_path and not allow_prefix:
         raise BootstrapEvidenceMismatch(
             f"raw source path differs from parity report: {actual_path} != {reported_path}"
         )
     expected_bytes = reported.get("bytes")
     if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int):
         raise BootstrapEvidenceMismatch("source.bytes must be an integer")
+    if reported_path != actual_path:
+        return fingerprint_complete_prefix(
+            actual_path,
+            expected_sha256=_required_sha256(
+                reported.get("sha256"),
+                "source.sha256",
+            ),
+            expected_bytes=expected_bytes,
+        )
     return fingerprint_complete_source(
         actual_path,
         expected_sha256=_required_sha256(reported.get("sha256"), "source.sha256"),
@@ -791,6 +886,7 @@ __all__ = [
     "SourceSyncResult",
     "bootstrap_candidate",
     "fingerprint_complete_source",
+    "fingerprint_complete_prefix",
     "runtime_provenance",
     "sync_one_source",
     "sync_sources",

@@ -127,6 +127,28 @@ runs/python314-safe-venv/bin/python tools/operational_read_api.py \
   --port 8770
 ```
 
+For a large source that continues to receive canonical locked appends, migration
+may run against an immutable APFS clone instead. Bootstrap can then bind the
+verified clone bytes to the matching prefix of the live inode:
+
+```bash
+runs/python314-safe-venv/bin/python tools/operational_store_shadow_sync.py \
+  bootstrap \
+  --allow-source-prefix \
+  --db runs/operational-migration/candidate.sqlite3 \
+  --parity-report runs/operational-migration/parity.json \
+  --report runs/operational-migration/shadow-bootstrap.json \
+  --decisions logs/briefing_decisions.jsonl \
+  --prices logs/briefing_tf_prices.jsonl \
+  --writer-id shadow-bootstrap
+```
+
+This mode hashes exactly the clone's reported byte count from each live source
+under the source-file shared lock, requires the prefix to end on a complete
+line, and pins the live device/inode at that byte offset. Any later complete
+lines are consumed by the first normal sync. It does not accept truncation,
+prefix drift, identity replacement, or a non-append-only producer.
+
 `sync` returns exit 1 after durably recording a malformed row or a new
 PIT-ineligible decision. Integrity/identity failures return exit 2 and do not
 advance that source. A no-change run returns exit 0 without creating a chunk.

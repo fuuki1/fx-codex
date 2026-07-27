@@ -181,6 +181,81 @@ def test_bootstrap_then_append_sync_and_retry_is_noop(tmp_path: Path) -> None:
         assert audit.ingest_rejections == 0
 
 
+def test_bootstrap_verified_snapshot_prefix_onto_live_append_only_sources(
+    tmp_path: Path,
+) -> None:
+    snapshots = tmp_path / "snapshots"
+    live = tmp_path / "live"
+    snapshots.mkdir()
+    live.mkdir()
+    snapshot_decisions = snapshots / "decisions.jsonl"
+    snapshot_prices = snapshots / "prices.jsonl"
+    live_decisions = live / "decisions.jsonl"
+    live_prices = live / "prices.jsonl"
+    database = tmp_path / "candidate.sqlite3"
+    parity_path = tmp_path / "parity.json"
+    _write_jsonl(snapshot_decisions, [_decision("decision-1")])
+    _write_jsonl(snapshot_prices, [_price("price-1")])
+    live_decisions.write_bytes(snapshot_decisions.read_bytes())
+    live_prices.write_bytes(snapshot_prices.read_bytes())
+
+    with store.open_operational_writer(database, writer_id="migration") as opened:
+        migration.migrate_jsonl_candidate(
+            opened,
+            decision_path=snapshot_decisions,
+            decision_sha256=store.file_sha256(snapshot_decisions),
+            price_path=snapshot_prices,
+            price_sha256=store.file_sha256(snapshot_prices),
+            run_id="prefix-migration",
+            now=NOW,
+        )
+        opened.checkpoint("TRUNCATE")
+    with store.open_operational_reader(database) as opened:
+        parity = migration.verify_candidate_parity(
+            opened,
+            decision_path=snapshot_decisions,
+            decision_sha256=store.file_sha256(snapshot_decisions),
+            price_path=snapshot_prices,
+            price_sha256=store.file_sha256(snapshot_prices),
+        ).to_dict()
+    parity["database_sha256"] = store.file_sha256(database)
+    parity_path.write_text(json.dumps(parity), encoding="utf-8")
+    decision_prefix_bytes = live_decisions.stat().st_size
+    price_prefix_bytes = live_prices.stat().st_size
+    with live_decisions.open("ab") as handle:
+        handle.write(_line(_decision("decision-2", minutes=15)))
+    with live_prices.open("ab") as handle:
+        handle.write(_line(_price("price-2", minutes=15)))
+
+    bootstrap = shadow.bootstrap_candidate(
+        database_path=database,
+        parity_report_path=parity_path,
+        decision_path=live_decisions,
+        price_path=live_prices,
+        writer_id="prefix-bootstrap",
+        allow_source_prefix=True,
+    )
+    synced = shadow.sync_sources(
+        database_path=database,
+        decision_path=live_decisions,
+        price_path=live_prices,
+        writer_id="prefix-sync",
+    )
+
+    assert "bootstrapped_from_verified_live_prefix" in bootstrap["limitations"]
+    with store.open_operational_reader(database) as opened:
+        decision_cursor = opened.source_cursor("decisions")
+        price_cursor = opened.source_cursor("prices")
+        assert decision_cursor is not None
+        assert price_cursor is not None
+        assert decision_cursor.source_path == str(live_decisions.resolve())
+        assert price_cursor.source_path == str(live_prices.resolve())
+        assert decision_cursor.byte_offset > decision_prefix_bytes
+        assert price_cursor.byte_offset > price_prefix_bytes
+    assert synced["sources"]["decisions"]["audit_events_inserted"] == 1
+    assert synced["sources"]["prices"]["inserted"] == 1
+
+
 def test_two_source_sync_rolls_back_decision_advance_when_price_fails(
     tmp_path: Path,
 ) -> None:
