@@ -690,9 +690,8 @@ def _verify_incremental_decision_commits(
             full_handle=locked_handles[decision_path],
         )
 
-        search_start = 0
         matched_end = 0
-        for expected_record in expected:
+        for index, expected_record in enumerate(expected):
             key = (
                 str(expected_record.get("decision_transaction_id") or ""),
                 str(expected_record.get("decision_ids_sha256") or ""),
@@ -700,34 +699,30 @@ def _verify_incremental_decision_commits(
                 str(expected_record.get("full_batch_sha256") or ""),
                 str(expected_record.get("commit_record_sha256") or ""),
             )
-            match_index = next(
-                (
-                    index
-                    for index in range(search_start, len(batches))
-                    if (
-                        batches[index].transaction_id,
-                        batches[index].decision_ids_sha256,
-                        batches[index].batch_sha256,
-                        batches[index].full_batch_sha256,
-                        batches[index].full_commit_record_sha256,
-                    )
-                    == key
-                ),
-                None,
-            )
-            if match_index is None:
+            if index >= len(batches):
                 raise ShadowSyncError(
                     "decision cross-log commit failed compact batch verification in suffix: "
                     f"{support_path.name}:{key[0]}"
                 )
-            matched_batch = batches[match_index]
+            matched_batch = batches[index]
+            observed_key = (
+                matched_batch.transaction_id,
+                matched_batch.decision_ids_sha256,
+                matched_batch.batch_sha256,
+                matched_batch.full_batch_sha256,
+                matched_batch.full_commit_record_sha256,
+            )
+            if observed_key != key:
+                raise ShadowSyncError(
+                    "compact suffix transaction order or evidence differs from full log: "
+                    f"{support_path.name}:{key[0]}"
+                )
             matched_end = matched_batch.end_offset
             verified_commits[key[0]] = decision_commit.bind_commit_to_full_line(
                 expected_record,
                 line_start_offset=matched_batch.full_batch_line_start_offset,
                 line_sha256=matched_batch.full_batch_line_sha256,
             )
-            search_start = match_index + 1
 
         consumed_length = matched_end - cursor.byte_offset
         if consumed_length <= 0:
@@ -759,16 +754,15 @@ def _compact_batches_from_suffix(
     expected_mode: str,
     full_handle: IO[bytes],
 ) -> list[_CompactBatch]:
-    """Return receipt-complete compact batches and their suffix end boundaries."""
+    """Parse a strict, one-to-one sequence of compact batch/receipt pairs."""
 
-    verified_by_transaction: dict[str, _CompactBatch] = {}
-    verified_conflicts: set[str] = set()
-    pending_batches: dict[str, dict[str, object]] = {}
-    batch_conflicts: set[str] = set()
+    verified: list[_CompactBatch] = []
+    verified_transaction_ids: set[str] = set()
     pending_id = ""
     pending_rows: list[dict[str, object]] = []
     pending_start_offset: int | None = None
     pending_payload = bytearray()
+    awaiting_receipt: dict[str, object] | None = None
     relative_offset = 0
     for line in raw.splitlines(keepends=True):
         line_start_offset = start_offset + relative_offset
@@ -788,26 +782,30 @@ def _compact_batches_from_suffix(
             receipt = decision_commit.validated_receipt(value)
             if receipt is None:
                 raise ShadowSyncError(f"invalid compact receipt at byte {line_start_offset}")
+            if pending_id or pending_rows or awaiting_receipt is None:
+                raise ShadowSyncError(
+                    f"compact receipt has no immediately preceding batch at byte "
+                    f"{line_start_offset}"
+                )
             transaction_id = str(receipt["decision_transaction_id"])
-            descriptor = pending_batches.get(transaction_id)
+            descriptor = awaiting_receipt
             descriptor_ids = (
                 cast(Sequence[object], descriptor["decision_ids"])
-                if descriptor is not None
-                and isinstance(descriptor.get("decision_ids"), Sequence)
+                if isinstance(descriptor.get("decision_ids"), Sequence)
                 and not isinstance(descriptor.get("decision_ids"), (str, bytes))
                 else None
             )
             if (
-                descriptor is not None
-                and descriptor_ids is not None
-                and decision_commit.receipt_matches_compact(
+                descriptor_ids is None
+                or str(descriptor["decision_transaction_id"]) != transaction_id
+                or not decision_commit.receipt_matches_compact(
                     receipt,
                     transaction_id=transaction_id,
                     decision_ids=descriptor_ids,
                     batch_sha256=str(descriptor["compact_batch_sha256"]),
                     mode=expected_mode,
                 )
-                and decision_commit.receipt_matches_compact_evidence(
+                or not decision_commit.receipt_matches_compact_evidence(
                     receipt,
                     line_start_offset=cast(
                         int,
@@ -819,12 +817,19 @@ def _compact_batches_from_suffix(
                     ),
                     payload_sha256=str(descriptor["compact_batch_payload_sha256"]),
                 )
-                and decision_commit.receipt_matches_full_evidence(
+                or not decision_commit.receipt_matches_full_evidence(
                     receipt,
                     full_handle,
                 )
             ):
-                candidate = _CompactBatch(
+                raise ShadowSyncError(
+                    f"compact receipt differs from its preceding batch at byte "
+                    f"{line_start_offset}"
+                )
+            if transaction_id in verified_transaction_ids:
+                raise ShadowSyncError(f"duplicate compact transaction in suffix: {transaction_id}")
+            verified.append(
+                _CompactBatch(
                     end_offset=start_offset + relative_offset,
                     transaction_id=transaction_id,
                     decision_ids_sha256=str(descriptor["decision_ids_sha256"]),
@@ -837,67 +842,54 @@ def _compact_batches_from_suffix(
                     ),
                     full_batch_line_sha256=str(receipt["full_batch_line_sha256"]),
                 )
-                verified_previous = verified_by_transaction.get(transaction_id)
-                if (
-                    verified_previous is not None
-                    and verified_previous.full_commit_record_sha256
-                    != candidate.full_commit_record_sha256
-                ):
-                    verified_conflicts.add(transaction_id)
-                    verified_by_transaction.pop(transaction_id, None)
-                elif transaction_id not in verified_conflicts:
-                    verified_by_transaction[transaction_id] = candidate
-            pending_id = ""
-            pending_rows = []
-            pending_start_offset = None
-            pending_payload.clear()
+            )
+            verified_transaction_ids.add(transaction_id)
+            awaiting_receipt = None
             continue
         batch_id = str(value.get("journal_batch_id") or "")
         if value.get("event_type") == journal.JOURNAL_BATCH_COMMIT:
-            descriptor = decision_commit.compact_batch_descriptor(
+            if awaiting_receipt is not None:
+                raise ShadowSyncError(
+                    f"compact batch is missing its receipt before byte {line_start_offset}"
+                )
+            completed_descriptor = decision_commit.compact_batch_descriptor(
                 pending_rows,
                 value,
                 expected_mode=expected_mode,
             )
-            if descriptor is None or pending_start_offset is None:
+            if completed_descriptor is None or pending_start_offset is None:
                 raise ShadowSyncError(f"invalid compact batch marker at byte {line_start_offset}")
             exact_payload = bytes(pending_payload) + line
-            descriptor.update(
+            completed_descriptor.update(
                 {
                     "compact_batch_line_start_offset": pending_start_offset,
                     "compact_batch_byte_length": len(exact_payload),
                     "compact_batch_payload_sha256": hashlib.sha256(exact_payload).hexdigest(),
                 }
             )
-            transaction_id = str(descriptor["decision_transaction_id"])
-            batch_previous = pending_batches.get(transaction_id)
-            if batch_previous is not None and batch_previous != descriptor:
-                batch_conflicts.add(transaction_id)
-                pending_batches.pop(transaction_id, None)
-            elif transaction_id not in batch_conflicts:
-                pending_batches[transaction_id] = descriptor
+            awaiting_receipt = completed_descriptor
             pending_id = ""
             pending_rows = []
             pending_start_offset = None
             pending_payload.clear()
             continue
         if batch_id:
-            if batch_id != pending_id:
+            if awaiting_receipt is not None:
+                raise ShadowSyncError(
+                    f"compact batch is missing its receipt before byte {line_start_offset}"
+                )
+            if pending_id and batch_id != pending_id:
+                raise ShadowSyncError(
+                    f"compact batch id changed before its marker at byte {line_start_offset}"
+                )
+            if not pending_id:
                 pending_id = batch_id
-                pending_rows = []
                 pending_start_offset = line_start_offset
-                pending_payload.clear()
             pending_rows.append(value)
             pending_payload.extend(line)
             continue
-        pending_id = ""
-        pending_rows = []
-        pending_start_offset = None
-        pending_payload.clear()
-    return sorted(
-        verified_by_transaction.values(),
-        key=lambda batch: batch.end_offset,
-    )
+        raise ShadowSyncError(f"unknown compact decision suffix object at byte {line_start_offset}")
+    return verified
 
 
 def _advance_cursor_for_chunk(
@@ -914,15 +906,18 @@ def _advance_cursor_for_chunk(
         raise ShadowSyncError(f"cursor chunk is not newline-complete: {cursor.source_name}")
     final_line_relative_start = raw.rfind(b"\n", 0, len(raw) - 1) + 1
     final_line = raw[final_line_relative_start:]
+    end_offset = cursor.byte_offset + len(raw)
+    if source_size < end_offset:
+        raise ShadowSyncError(f"observed source size precedes cursor advance: {cursor.source_name}")
     store.advance_source_cursor(
         source_name=cursor.source_name,
         expected_offset=cursor.byte_offset,
-        end_offset=cursor.byte_offset + len(raw),
+        end_offset=end_offset,
         chunk_sha256=hashlib.sha256(raw).hexdigest(),
         last_line_start_offset=cursor.byte_offset + final_line_relative_start,
         last_line_sha256=hashlib.sha256(final_line).hexdigest(),
         row_count=raw.count(b"\n"),
-        source_size_at_sync=source_size,
+        source_size_at_sync=end_offset,
         source_mtime_ns=source_mtime_ns,
         source_ctime_ns=source_ctime_ns,
         captured_at=captured_at,

@@ -718,12 +718,17 @@ def test_orphaned_pending_decision_does_not_block_later_commit(tmp_path: Path) -
     assert audit.predictions == 2
 
 
-def test_crashed_receipt_cannot_be_resurrected_after_later_sync(
+def test_crashed_receipt_blocks_later_sync_and_cannot_be_resurrected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
     compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    support_name = f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact_path.name}"
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(support_name)
+        audit_before = opened.audit()
     pending = _decision("decision-late-a", minutes=15)
     pending_id = str(pending["decision_id"])
     pending_transaction = decision_commit.transaction_id_for([pending_id])
@@ -765,14 +770,18 @@ def test_crashed_receipt_cannot_be_resurrected_after_later_sync(
         decisions,
         [_decision("decision-committed-b", minutes=30)],
     )
-    synced = shadow.sync_sources(
-        database_path=database,
-        decision_path=decisions,
-        price_path=prices,
-        writer_id="sync-after-crash",
-    )
-    full_size_after_sync = decisions.stat().st_size
-    compact_size_after_sync = compact_path.stat().st_size
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="compact receipt differs from its preceding batch",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="sync-after-crash",
+        )
+    full_size_after_failed_sync = decisions.stat().st_size
+    compact_size_after_failed_sync = compact_path.stat().st_size
 
     with pytest.raises(
         decision_commit.DecisionCommitError,
@@ -791,12 +800,16 @@ def test_crashed_receipt_cannot_be_resurrected_after_later_sync(
             mode="per_timeframe",
             committed_at=NOW,
         )
-    retried = shadow.sync_sources(
-        database_path=database,
-        decision_path=decisions,
-        price_path=prices,
-        writer_id="sync-after-rejected-retry",
-    )
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="compact receipt differs from its preceding batch",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="sync-after-rejected-retry",
+        )
     replay = full_replay.run_full_replay(
         database_path=database,
         decision_path=decisions,
@@ -804,19 +817,15 @@ def test_crashed_receipt_cannot_be_resurrected_after_later_sync(
         writer_id="full-replay-after-rejected-retry",
     )
 
-    assert synced["sources"]["decisions"]["status"] == "quality_failure"
-    assert synced["sources"]["decisions"]["rejections"] == 1
-    assert synced["sources"]["decisions"]["predictions_inserted"] == 1
-    assert retried["sources"]["decisions"]["status"] == "no_change"
-    assert decisions.stat().st_size == full_size_after_sync
-    assert compact_path.stat().st_size == compact_size_after_sync
-    assert replay["verdict"] == "full_replay_verified"
-    assert replay["sources"]["decisions"]["incremental_rejections"] == 1
+    assert decisions.stat().st_size == full_size_after_failed_sync
+    assert compact_path.stat().st_size == compact_size_after_failed_sync
+    assert replay["verdict"] == "full_replay_failed"
     with store.open_operational_reader(database) as opened:
-        audit = opened.audit()
-    assert audit.audit_events == 2
-    assert audit.predictions == 2
-    assert audit.ingest_rejections == 1
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert opened.source_cursor(support_name) == support_cursor_before
+        assert opened.audit() == audit_before
+        with pytest.raises(read_model.ReadModelStaleError):
+            read_model.require_current_source_snapshot(opened)
 
 
 def test_post_cursor_conflicting_commit_fails_sync_and_read_api_snapshot(
@@ -1421,6 +1430,160 @@ def test_sync_cannot_consume_invalid_compact_tail_with_later_valid_append(
             decision_path=decisions,
             price_path=prices,
             writer_id="reject-invalid-compact-tail",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert (
+            opened.source_cursor(f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}")
+            == support_cursor_before
+        )
+        assert opened.audit() == audit_before
+
+
+def test_sync_rejects_unknown_compact_object_before_later_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    with compact.open("ab") as handle:
+        handle.write(b'{"unexpected":"valid-json"}\n')
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}"
+        )
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="unknown compact decision suffix object",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-unknown-compact-object",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert (
+            opened.source_cursor(f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}")
+            == support_cursor_before
+        )
+        assert opened.audit() == audit_before
+        with pytest.raises(read_model.ReadModelStaleError):
+            read_model.require_current_source_snapshot(opened)
+
+
+def test_sync_rejects_unmatched_compact_receipt_before_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    prior_receipt = compact.read_bytes().splitlines(keepends=True)[-1]
+    with compact.open("ab") as handle:
+        handle.write(prior_receipt)
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}"
+        )
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="receipt has no immediately preceding batch",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-unmatched-compact-receipt",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert (
+            opened.source_cursor(f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}")
+            == support_cursor_before
+        )
+        assert opened.audit() == audit_before
+
+
+def test_sync_rejects_unmatched_compact_batch_before_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    orphan = _decision("orphan", minutes=10)
+    journal._append_journal_batch(  # noqa: SLF001
+        compact,
+        [orphan],
+        decision_transaction_id=decision_commit.transaction_id_for(["orphan"]),
+    )
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}"
+        )
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="batch is missing its receipt",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-unmatched-compact-batch",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert (
+            opened.source_cursor(f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}")
+            == support_cursor_before
+        )
+        assert opened.audit() == audit_before
+
+
+def test_sync_rejects_receipt_that_differs_from_preceding_compact_batch(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    prior_receipt = compact.read_bytes().splitlines(keepends=True)[-1]
+    orphan = _decision("orphan", minutes=10)
+    journal._append_journal_batch(  # noqa: SLF001
+        compact,
+        [orphan],
+        decision_transaction_id=decision_commit.transaction_id_for(["orphan"]),
+    )
+    with compact.open("ab") as handle:
+        handle.write(prior_receipt)
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}"
+        )
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="receipt differs from its preceding batch",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-mismatched-compact-receipt",
         )
 
     with store.open_operational_reader(database) as opened:

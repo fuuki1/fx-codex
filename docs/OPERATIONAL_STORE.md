@@ -199,6 +199,13 @@ every already-consumed SHA-256 chunk for that source. A same-length historical
 rewrite therefore cannot be hidden by a later valid append and a refreshed
 ctime. No-change polls remain constant-time and compare the pinned inode,
 size, mtime, ctime, and final-line boundary without scanning full history.
+New compact suffixes are a strict sequence of batch rows, one batch marker,
+and one matching receipt per full-log commit. Unknown objects, malformed or
+non-finite JSON, missing receipts, duplicate/conflicting transactions, and
+out-of-order evidence stop sync before any cursor or projection changes.
+A crash that leaves an unmatched compact transaction is therefore an explicit
+incident requiring a fresh SHA-256-verified candidate rebuild; later valid
+traffic cannot silently consume or bypass the abandoned bytes.
 
 The full replay holds the operational single-writer lease and shared raw-file
 locks while it:
