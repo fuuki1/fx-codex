@@ -343,6 +343,69 @@ def _fit(embeds: Sequence[Mapping[str, object]]) -> list[dict]:
     return [macro, *[_shrink(embed, per_symbol) for embed in visible[1:]]]
 
 
+def _batch_embeds(embeds: Sequence[Mapping[str, object]]) -> list[list[dict]]:
+    """内容を削らず、Discordの1メッセージ上限(embed合計文字数・個数)ごとに分ける。
+
+    `_fit`(縮小して1通に収める)と異なり、embedは丸ごと保持したまま複数メッセージへ
+    振り分ける。単体で上限を超えるembedだけは、Discordが受理できるよう`_shrink`で
+    上限内へ抑える(この1件のみ情報が削れる)。
+    """
+
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    used = 0
+    for embed in embeds:
+        row = (
+            _shrink(embed, MAX_EMBED_CHARS)
+            if _embed_chars(embed) > MAX_EMBED_CHARS
+            else dict(embed)
+        )
+        size = _embed_chars(row)
+        over_char_budget = current and used + size > MAX_EMBED_CHARS
+        over_count_budget = len(current) >= MAX_EMBEDS
+        if over_char_budget or over_count_budget:
+            batches.append(current)
+            current = []
+            used = 0
+        current.append(row)
+        used += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def split_timeframe_payloads(payload: Mapping[str, object]) -> list[dict]:
+    """1つのブリーフィングpayloadを、Discord上限内の複数payloadへ分割する。
+
+    embedを削らず`_batch_embeds`で分け、各メッセージへ同じusernameを付ける。
+    contentは(長さ制限のある)先頭メッセージにだけ載せ、2通目以降には付けない。
+    embedが上限内に収まる通常時は1件のリストを返す(既存挙動と同じ送信結果)。
+    """
+
+    username = payload.get("username")
+    content = payload.get("content")
+    embeds = payload.get("embeds")
+    embed_list = list(embeds) if isinstance(embeds, Sequence) else []
+    if not embed_list:
+        single: dict[str, object] = {}
+        if username is not None:
+            single["username"] = username
+        if content is not None:
+            single["content"] = content
+        return [single]
+
+    batches = _batch_embeds(embed_list)
+    payloads: list[dict] = []
+    for index, batch in enumerate(batches):
+        message: dict[str, object] = {"embeds": batch}
+        if username is not None:
+            message["username"] = username
+        if index == 0 and content is not None:
+            message["content"] = content
+        payloads.append(message)
+    return payloads
+
+
 def build_timeframe_discord_payload(
     plans_by_symbol: Mapping[str, Sequence[TimeframePlan]],
     analysis: MarketAnalysis,

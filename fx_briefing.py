@@ -367,7 +367,10 @@ def load_strategy_params() -> tuple[int, int, float, str | None]:
 
 
 def post_to_discord(webhook_url: str, payload: dict) -> None:
-    discord_delivery.send_webhook(webhook_url, payload)
+    """Send each payload only after enforcing Discord's per-message limits."""
+
+    for message in tf_briefing.split_timeframe_payloads(payload):
+        discord_delivery.send_webhook(webhook_url, message)
 
 
 def persist_decision_audit_batch(

@@ -5,10 +5,70 @@ from __future__ import annotations
 from datetime import datetime, UTC
 
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
-from fx_intel.tf_briefing import build_timeframe_discord_payload
+from fx_intel.tf_briefing import (
+    MAX_EMBED_CHARS,
+    MAX_EMBEDS,
+    _embed_chars,
+    build_timeframe_discord_payload,
+    split_timeframe_payloads,
+)
 from fx_intel.timeframe import TimeframePlan
 
 NOW = datetime(2026, 6, 29, 9, 0, tzinfo=UTC)
+
+
+def _embed(name: str, chars: int) -> dict:
+    return {"title": name, "fields": [{"name": "f", "value": "x" * max(0, chars - 1)}]}
+
+
+def test_split_keeps_single_message_when_within_limit() -> None:
+    payload = {
+        "username": "u",
+        "content": "c",
+        "embeds": [_embed("a", 500), _embed("b", 500)],
+    }
+    messages = split_timeframe_payloads(payload)
+    assert len(messages) == 1  # 上限内は1通のまま
+    assert messages[0]["content"] == "c"
+    assert len(messages[0]["embeds"]) == 2
+
+
+def test_split_divides_when_char_budget_exceeded() -> None:
+    # 各3000文字のembed3個 = 9000文字 > MAX_EMBED_CHARS(5800) → 複数通に分割
+    payload = {
+        "username": "fx-codex 統合デスク",
+        "content": "見出し",
+        "embeds": [_embed("a", 3000), _embed("b", 3000), _embed("c", 3000)],
+    }
+    messages = split_timeframe_payloads(payload)
+
+    assert len(messages) >= 2  # 分割された
+    # 各メッセージはDiscordの合計文字数上限内
+    for message in messages:
+        total = sum(_embed_chars(e) for e in message["embeds"])
+        assert total <= MAX_EMBED_CHARS
+    # 内容(embed総数)は保持される
+    assert sum(len(m["embeds"]) for m in messages) == 3
+    # contentは先頭メッセージにだけ、usernameは全メッセージに付く
+    assert messages[0]["content"] == "見出し"
+    assert all("content" not in m for m in messages[1:])
+    assert all(m["username"] == "fx-codex 統合デスク" for m in messages)
+
+
+def test_split_caps_embed_count_per_message() -> None:
+    payload = {"embeds": [_embed(str(i), 50) for i in range(MAX_EMBEDS + 3)]}
+    messages = split_timeframe_payloads(payload)
+    assert len(messages) >= 2
+    for message in messages:
+        assert len(message["embeds"]) <= MAX_EMBEDS
+
+
+def test_split_shrinks_single_oversized_embed() -> None:
+    payload = {"embeds": [_embed("huge", MAX_EMBED_CHARS + 4000)]}
+    messages = split_timeframe_payloads(payload)
+    assert len(messages) == 1
+    # 単体で上限超過のembedはshrinkで上限内へ抑えられる
+    assert _embed_chars(messages[0]["embeds"][0]) <= MAX_EMBED_CHARS
 
 
 def _plan(timeframe, horizon, direction, conviction, close=156.0):
