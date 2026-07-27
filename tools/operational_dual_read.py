@@ -119,8 +119,12 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json_create_only(args.output, report)
     except (DualReadError, HTTPError, OSError, URLError, ValueError) as error:
         return _error(str(error))
-    print(json.dumps({"ok": report["verdict"] == "parity_verified", **report}))
-    return 0 if report["verdict"] == "parity_verified" else 1
+    verified = report["verdict"] in {
+        "parity_verified",
+        "parity_verified_with_exclusions",
+    }
+    print(json.dumps({"ok": verified, **report}))
+    return 0 if verified else 1
 
 
 def _read_decisions(

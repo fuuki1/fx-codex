@@ -54,6 +54,7 @@ def compare_dual_read(
     total_read = 0
     total_missing_from_read = 0
     total_missing_from_dashboard = 0
+    total_analysis_excluded = 0
     for timeframe in timeframes:
         active = dashboard_rows(
             dashboard_state,
@@ -67,8 +68,23 @@ def compare_dual_read(
         )
         expected_count = len(active)
         independent = independent[:expected_count]
-        active_counter = Counter(_dashboard_signature(row) for row in active)
-        read_counter = Counter(_read_signature(row) for row in independent)
+        analysis_comparable = bool(independent) and all(
+            row.get("analysis_direction_provenance") == "explicit" for row in independent
+        )
+        active_counter = Counter(
+            _dashboard_signature(
+                row,
+                include_analysis_direction=analysis_comparable,
+            )
+            for row in active
+        )
+        read_counter = Counter(
+            _read_signature(
+                row,
+                include_analysis_direction=analysis_comparable,
+            )
+            for row in independent
+        )
         missing_from_read = active_counter - read_counter
         missing_from_dashboard = read_counter - active_counter
         reports[timeframe] = {
@@ -76,6 +92,8 @@ def compare_dual_read(
             "read_rows": len(independent),
             "dashboard_duplicate_signatures": _duplicates(active_counter),
             "read_duplicate_signatures": _duplicates(read_counter),
+            "analysis_direction_comparable": analysis_comparable,
+            "analysis_direction_excluded": (0 if analysis_comparable else len(independent)),
             "missing_from_read": sum(missing_from_read.values()),
             "missing_from_dashboard": sum(missing_from_dashboard.values()),
             "missing_from_read_examples": _examples(missing_from_read),
@@ -90,13 +108,13 @@ def compare_dual_read(
         total_read += len(independent)
         total_missing_from_read += sum(missing_from_read.values())
         total_missing_from_dashboard += sum(missing_from_dashboard.values())
-    verdict = (
-        "parity_verified"
-        if total_dashboard > 0
-        and total_missing_from_read == 0
-        and total_missing_from_dashboard == 0
-        else "drift_detected"
-    )
+        total_analysis_excluded += 0 if analysis_comparable else len(independent)
+    if total_dashboard == 0 or total_missing_from_read or total_missing_from_dashboard:
+        verdict = "drift_detected"
+    elif total_analysis_excluded:
+        verdict = "parity_verified_with_exclusions"
+    else:
+        verdict = "parity_verified"
     return {
         "symbol": normalized_symbol,
         "timeframes": reports,
@@ -105,12 +123,17 @@ def compare_dual_read(
             "read_rows": total_read,
             "missing_from_read": total_missing_from_read,
             "missing_from_dashboard": total_missing_from_dashboard,
+            "analysis_direction_excluded": total_analysis_excluded,
         },
         "verdict": verdict,
     }
 
 
-def _dashboard_signature(row: Mapping[str, object]) -> str:
+def _dashboard_signature(
+    row: Mapping[str, object],
+    *,
+    include_analysis_direction: bool,
+) -> str:
     blocked = row.get("blocked_gate")
     gate = blocked.get("gate") if isinstance(blocked, dict) else ""
     return _signature(
@@ -118,20 +141,24 @@ def _dashboard_signature(row: Mapping[str, object]) -> str:
         symbol=row.get("symbol"),
         timeframe=row.get("timeframe"),
         direction=row.get("direction"),
-        analysis_direction=row.get("analysis_direction"),
+        analysis_direction=(row.get("analysis_direction") if include_analysis_direction else None),
         analysis_score=row.get("analysis_score"),
         primary_gate=gate,
         pit_eligible=row.get("pit_eligible"),
     )
 
 
-def _read_signature(row: Mapping[str, object]) -> str:
+def _read_signature(
+    row: Mapping[str, object],
+    *,
+    include_analysis_direction: bool,
+) -> str:
     return _signature(
         event_time=row.get("event_time"),
         symbol=row.get("symbol"),
         timeframe=row.get("timeframe"),
         direction=row.get("direction"),
-        analysis_direction=row.get("analysis_direction"),
+        analysis_direction=(row.get("analysis_direction") if include_analysis_direction else None),
         analysis_score=row.get("analysis_score"),
         primary_gate=row.get("primary_gate"),
         pit_eligible=row.get("pit_eligible"),

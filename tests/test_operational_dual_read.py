@@ -33,6 +33,7 @@ def _read_row(
         "timeframe": "4h",
         "direction": direction,
         "analysis_direction": "long",
+        "analysis_direction_provenance": "explicit",
         "analysis_score": 0.285,
         "primary_gate": gate,
         "pit_eligible": False,
@@ -87,6 +88,23 @@ def test_dual_read_reports_gate_drift() -> None:
     assert timeframe["verdict"] == "drift_detected"
     assert timeframe["missing_from_read"] == 1
     assert timeframe["missing_from_dashboard"] == 1
+
+
+def test_dual_read_verifies_core_fields_with_explicit_legacy_exclusion() -> None:
+    read = _read_row()
+    read["analysis_direction"] = None
+    read["analysis_direction_provenance"] = "unavailable_legacy"
+
+    report = dual.compare_dual_read(
+        _state([_dashboard_row()]),
+        {"4h": [read]},
+        symbol="USDJPY",
+        timeframes=["4h"],
+    )
+
+    assert report["verdict"] == "parity_verified_with_exclusions"
+    assert report["totals"]["analysis_direction_excluded"] == 1
+    assert report["timeframes"]["4h"]["analysis_direction_comparable"] is False
 
 
 def test_dashboard_rows_filters_symbol_and_sorts_newest_first() -> None:

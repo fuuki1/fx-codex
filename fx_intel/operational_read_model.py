@@ -92,20 +92,22 @@ def decision_page(
                ) AS direction,
                COALESCE(
                    json_extract(payload_json, '$.decision.analysis_direction'),
-                   json_extract(payload_json, '$.analysis_direction'),
-                   json_extract(
-                       payload_json,
-                       '$.decision.shadow_predictions[0].direction'
-                   ),
-                   ''
+                   json_extract(payload_json, '$.analysis_direction')
                ) AS analysis_direction,
-               COALESCE(
-                   json_extract(
+               CASE
+                   WHEN json_type(
                        payload_json,
-                       '$.decision.shadow_predictions[0].score'
-                   ),
+                       '$.decision.analysis_direction'
+                   ) IS NOT NULL
+                     OR json_type(payload_json, '$.analysis_direction') IS NOT NULL
+                   THEN 'explicit'
+                   ELSE 'unavailable_legacy'
+               END AS analysis_direction_provenance,
+               COALESCE(
                    json_extract(payload_json, '$.decision.analysis_score'),
-                   json_extract(payload_json, '$.analysis_score')
+                   json_extract(payload_json, '$.analysis_score'),
+                   json_extract(payload_json, '$.decision.composite'),
+                   json_extract(payload_json, '$.composite')
                ) AS analysis_score,
                json_extract(payload_json, '$.decision.composite') AS composite,
                json_extract(
@@ -113,7 +115,21 @@ def decision_page(
                    '$.decision.direction_threshold'
                ) AS direction_threshold,
                COALESCE(
-                   json_extract(payload_json, '$.decision.gate_trace[0].gate'),
+                   (
+                       SELECT json_extract(gate.value, '$.gate')
+                       FROM json_each(
+                           payload_json,
+                           '$.decision.gate_trace'
+                       ) AS gate
+                       WHERE json_extract(gate.value, '$.status') = 'blocked'
+                       LIMIT 1
+                   ),
+                   (
+                       SELECT json_extract(gate.value, '$.gate')
+                       FROM json_each(payload_json, '$.gate_trace') AS gate
+                       WHERE json_extract(gate.value, '$.status') = 'blocked'
+                       LIMIT 1
+                   ),
                    ''
                ) AS primary_gate,
                CASE
@@ -148,7 +164,10 @@ def decision_page(
             "source": str(row["source"]),
             "schema_version": int(row["schema_version"]),
             "direction": str(row["direction"] or ""),
-            "analysis_direction": str(row["analysis_direction"] or ""),
+            "analysis_direction": (
+                str(row["analysis_direction"]) if row["analysis_direction"] is not None else None
+            ),
+            "analysis_direction_provenance": str(row["analysis_direction_provenance"]),
             "analysis_score": _optional_float(row["analysis_score"]),
             "composite": _optional_float(row["composite"]),
             "direction_threshold": _optional_float(row["direction_threshold"]),

@@ -263,7 +263,8 @@ def test_decision_page_exposes_compact_abstention_evidence_from_current_shape(
     item = page["items"][0]
     assert item["event_id"] == "current-shape"
     assert item["direction"] == "neutral"
-    assert item["analysis_direction"] == "long"
+    assert item["analysis_direction"] is None
+    assert item["analysis_direction_provenance"] == "unavailable_legacy"
     assert item["analysis_score"] == pytest.approx(0.285)
     assert item["composite"] == pytest.approx(0.285)
     assert item["direction_threshold"] == pytest.approx(0.15)
@@ -273,6 +274,47 @@ def test_decision_page_exposes_compact_abstention_evidence_from_current_shape(
     encoded = read_model.canonical_response_bytes(page)
     assert b'"large"' not in encoded
     assert len(encoded) < 2_000
+
+
+def test_decision_page_exposes_only_explicit_analysis_direction_and_blocked_gate(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    stamp = NOW + timedelta(minutes=11)
+    with store.open_operational_writer(database, writer_id="explicit-analysis") as opened:
+        opened.record_audit_event(
+            store.AuditEventRecord(
+                event_id="explicit-analysis",
+                event_type="chart_decision",
+                symbol="USDJPY",
+                timeframe="1d",
+                event_time=stamp,
+                prediction_time=None,
+                available_time=None,
+                source="test",
+                payload={
+                    "decision": {
+                        "direction": "long",
+                        "analysis_direction": "long",
+                        "analysis_score": 0.3,
+                        "gate_trace": [
+                            {"gate": "liquidity", "status": "observed"},
+                            {"gate": "expectancy_guard", "status": "blocked"},
+                        ],
+                    }
+                },
+                pit_eligible=False,
+                pit_failure_reason="pit_flag_not_true",
+                ingested_time=stamp,
+            )
+        )
+
+    with store.open_operational_reader(database) as opened:
+        item = read_model.decision_page(opened, limit=1)["items"][0]
+
+    assert item["analysis_direction"] == "long"
+    assert item["analysis_direction_provenance"] == "explicit"
+    assert item["primary_gate"] == "expectancy_guard"
 
 
 def test_response_etag_is_strong_and_byte_exact() -> None:
