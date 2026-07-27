@@ -13,7 +13,7 @@ from fx_backtester.experiment_pipeline import GitState, evaluate_lockbox, run_ex
 from fx_backtester.failures import FailureReason, TypedFailure
 from fx_backtester.lockbox import LockboxRegistry
 
-from test_experiment_pipeline import COMMIT, _manifest_dict, _write_prices
+from tests.test_experiment_pipeline import COMMIT, _manifest_dict, _write_prices
 
 NOW = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
 
