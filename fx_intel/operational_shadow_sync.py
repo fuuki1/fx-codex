@@ -8,7 +8,7 @@ chunk record in the same transaction as its rows and cursor movement.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, UTC
 import fcntl
@@ -22,6 +22,7 @@ import subprocess
 import sys
 from typing import Any
 
+from . import decision_commit, decision_log, journal
 from .operational_migration import (
     OperationalMigrationError,
     decision_records_from_event,
@@ -168,6 +169,12 @@ def bootstrap_candidate(
         _mapping(sources.get("decisions"), "sources.decisions"),
         allow_prefix=allow_source_prefix,
     )
+    decision_support_snapshots = _verified_decision_support_snapshots(
+        decisions,
+        decision_snapshot=decision_snapshot,
+        reported=sources.get("decision_support"),
+        allow_prefix=allow_source_prefix,
+    )
     price_snapshot = _verified_snapshot(
         prices,
         _mapping(sources.get("prices"), "sources.prices"),
@@ -215,6 +222,7 @@ def bootstrap_candidate(
         },
         "sources": {
             "decisions": decision_snapshot.to_dict(),
+            "decision_support": [snapshot.to_dict() for snapshot in decision_support_snapshots],
             "prices": price_snapshot.to_dict(),
         },
         "limitations": [
@@ -333,8 +341,25 @@ def sync_one_source(
             if requested == max_bytes and available >= max_bytes:
                 raise ShadowSyncError(f"complete JSONL line exceeds max_bytes={max_bytes}: {path}")
             return _partial_only_result(cursor, before.st_size, len(raw))
-        consumed = raw[: newline + 1]
-        partial_tail = len(raw) - len(consumed)
+        complete_candidate = raw[: newline + 1]
+        partial_tail = len(raw) - len(complete_candidate)
+        if source_kind == "decisions":
+            consumed = _committed_decision_prefix(complete_candidate)
+            partial_tail += len(complete_candidate) - len(consumed)
+        else:
+            consumed = complete_candidate
+        if not consumed:
+            status = (
+                "waiting_for_decision_commit"
+                if source_kind == "decisions" and complete_candidate
+                else "waiting_for_complete_line"
+            )
+            return _partial_only_result(
+                cursor,
+                before.st_size,
+                partial_tail,
+                status=status,
+            )
         after = os.fstat(handle.fileno())
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             raise SourceRotationDetected(f"source identity changed while reading: {path}")
@@ -638,6 +663,68 @@ def _verified_snapshot(
     )
 
 
+def _verified_decision_support_snapshots(
+    decision_path: Path,
+    *,
+    decision_snapshot: CompleteSourceSnapshot,
+    reported: object,
+    allow_prefix: bool,
+) -> tuple[CompleteSourceSnapshot, ...]:
+    expected_names = _referenced_compact_names_in_prefix(
+        decision_path,
+        decision_snapshot.bytes,
+    )
+    if not isinstance(reported, Sequence) or isinstance(reported, (str, bytes)):
+        if expected_names:
+            raise BootstrapEvidenceMismatch(
+                "parity report is missing referenced decision support sources"
+            )
+        return ()
+    reported_by_name: dict[str, Mapping[str, object]] = {}
+    for index, value in enumerate(reported):
+        source = _mapping(value, f"sources.decision_support[{index}]")
+        name = Path(_required_text(source.get("path"), "source.path")).name
+        if name in reported_by_name:
+            raise BootstrapEvidenceMismatch(
+                f"duplicate decision support source in parity report: {name}"
+            )
+        reported_by_name[name] = source
+    if set(reported_by_name) != expected_names:
+        raise BootstrapEvidenceMismatch(
+            "decision support sources differ from committed full-log modes: "
+            f"{sorted(reported_by_name)} != {sorted(expected_names)}"
+        )
+    return tuple(
+        _verified_snapshot(
+            decision_path.parent / name,
+            reported_by_name[name],
+            allow_prefix=allow_prefix,
+        )
+        for name in sorted(expected_names)
+    )
+
+
+def _referenced_compact_names_in_prefix(
+    decision_path: Path,
+    prefix_bytes: int,
+) -> set[str]:
+    values: list[object] = []
+    with decision_path.open("rb") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        raw = handle.read(prefix_bytes)
+    for line in raw.splitlines():
+        try:
+            values.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    commits = decision_commit.commits_from_values(values)
+    names: set[str] = set()
+    for record in commits.values():
+        mode = str(record.get("mode") or "")
+        names.add(decision_commit.compact_path_for_mode(decision_path, mode).name)
+    return names
+
+
 def _bootstrap_snapshot(
     store: OperationalStore,
     *,
@@ -673,6 +760,7 @@ def _project_lines(
     rejections: list[tuple[int, int, str, str]] = []
     pit_ineligible = 0
     relative_offset = 0
+    parsed_lines: list[tuple[bytes, int, int, str, Any]] = []
     for line in raw.splitlines(keepends=True):
         line_start = start_offset + relative_offset
         line_end = line_start + len(line)
@@ -689,15 +777,34 @@ def _project_lines(
         if not isinstance(payload, Mapping):
             rejections.append((line_start, line_end, line_hash, "non_object_json"))
             continue
+        parsed_lines.append((line, line_start, line_end, line_hash, payload))
+
+    commits = decision_commit.commits_from_values([row[4] for row in parsed_lines])
+    for _line, line_start, line_end, line_hash, payload in parsed_lines:
         try:
             if source_kind == "decisions":
-                audit, prediction, failure = decision_records_from_event(
-                    payload,
-                    imported_at=imported_at,
-                )
-                parsed_records.append((audit, prediction))
-                if failure:
-                    pit_ineligible += 1
+                if payload.get("event_type") == decision_commit.COMMIT_EVENT_TYPE:
+                    continue
+                events: Sequence[Mapping[str, object]]
+                if payload.get("event_type") == decision_log.DECISION_BATCH_EVENT_TYPE:
+                    events = decision_log.decision_events_from_batch(
+                        payload,
+                        commits=commits,
+                    )
+                    if not events:
+                        raise OperationalMigrationError("uncommitted_or_invalid_decision_batch")
+                elif journal.is_pit_eligible_entry(payload):
+                    raise OperationalMigrationError("uncommitted_pit_event")
+                else:
+                    events = [payload]
+                for event in events:
+                    audit, prediction, failure = decision_records_from_event(
+                        event,
+                        imported_at=imported_at,
+                    )
+                    parsed_records.append((audit, prediction))
+                    if failure:
+                        pit_ineligible += 1
             elif source_kind == "prices":
                 parsed_records.append(price_record_from_row(payload))
             else:
@@ -705,6 +812,46 @@ def _project_lines(
         except (OperationalMigrationError, InvalidOperationalRecord, ValueError) as error:
             rejections.append((line_start, line_end, line_hash, _error_reason(error)))
     return parsed_records, rejections, pit_ineligible
+
+
+def _committed_decision_prefix(raw: bytes) -> bytes:
+    """Keep the newest pending batch unread without blocking later commits.
+
+    A producer crash can leave a durable full batch without its compact twin.
+    It remains pending while it is the newest transaction. Once a later batch
+    is fully committed, the older pending batch is irrecoverably orphaned by
+    the normal writer sequence and is consumed as an explicit rejection so the
+    contiguous source cursor does not stall forever.
+    """
+
+    parsed_values: list[object] = []
+    lines = raw.splitlines(keepends=True)
+    for line in lines:
+        try:
+            parsed_values.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed_values.append(None)
+    commits = decision_commit.commits_from_values(parsed_values)
+    latest_visible_batch = -1
+    for index, value in enumerate(parsed_values):
+        if (
+            isinstance(value, Mapping)
+            and value.get("event_type") == decision_log.DECISION_BATCH_EVENT_TYPE
+            and decision_log.decision_events_from_batch(value, commits=commits)
+        ):
+            latest_visible_batch = index
+    offset = 0
+    for index, (line, value) in enumerate(zip(lines, parsed_values, strict=True)):
+        if (
+            isinstance(value, Mapping)
+            and value.get("event_type") == decision_log.DECISION_BATCH_EVENT_TYPE
+        ):
+            visible = decision_log.decision_events_from_batch(value, commits=commits)
+            needs_commit = bool(value.get("requires_cross_log_commit"))
+            if not visible and needs_commit and index >= latest_visible_batch:
+                return raw[:offset]
+        offset += len(line)
+    return raw
 
 
 def _verify_cursor_contract(
@@ -781,13 +928,15 @@ def _partial_only_result(
     cursor: SourceCursor,
     source_size: int,
     partial_bytes: int,
+    *,
+    status: str = "waiting_for_complete_line",
 ) -> SourceSyncResult:
     result = _no_change_result(cursor, source_size)
     return SourceSyncResult(
         **{
             **result.__dict__,
             "partial_tail_bytes": partial_bytes,
-            "status": "waiting_for_complete_line",
+            "status": status,
         }
     )
 

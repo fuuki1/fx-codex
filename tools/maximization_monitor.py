@@ -41,7 +41,8 @@ def run_maximization_monitor(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     generated_at = _utc(now or datetime.now(UTC))
-    entries = list(journal.read_entries(journal_path))
+    all_entries = list(journal.read_entries(journal_path))
+    entries = [entry for entry in all_entries if journal.is_pit_eligible_entry(entry)]
     price_rows = list(journal.read_entries(prices_path))
     scoring_entries = entries + price_rows
 
@@ -59,6 +60,7 @@ def run_maximization_monitor(
         "profile_json_path": str(profile_json_path),
         "monitor_json_path": str(monitor_json_path),
         "decision_rows": len(entries),
+        "legacy_or_ineligible_decision_rows": len(all_entries) - len(entries),
         "price_rows": len(price_rows),
         "symbols": list(symbols),
         "timeframes": list(timeframes),

@@ -76,6 +76,7 @@ from fx_intel import (
     briefing,
     calendar,
     committee,
+    decision_commit,
     decision_feedback,
     decision_log,
     decision_pipeline,
@@ -412,16 +413,51 @@ def attach_decision_pit_metadata(
 def persist_decision_audit_batch(
     events: list[dict[str, object]],
     *,
-    now: datetime,
-) -> None:
-    """Persist the immutable decision audit without rescoring all history.
+    transaction_id: str,
+) -> dict[str, object]:
+    """Persist one pending immutable full batch without making it visible.
 
     Complete outcome scoring is owned by decision_expectancy_monitor.  Keeping
     the O(history) pass out of this five-minute producer prevents launchd from
     coalescing later decision slots as the append-only log grows.
     """
 
-    decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, events)
+    return decision_log.append_decision_events(
+        DEFAULT_DECISION_LOG_PATH,
+        events,
+        transaction_id=transaction_id,
+    )
+
+
+def finalize_decision_transaction(
+    events: list[dict[str, object]],
+    *,
+    full_batch: Mapping[str, object],
+    compact_batch: Mapping[str, object],
+    mode: str,
+    now: datetime,
+) -> None:
+    """Expose matching full/compact batches with one fsynced commit record."""
+
+    decision_ids = [str(event.get("decision_id") or "") for event in events]
+    transaction_id = decision_commit.transaction_id_for(decision_ids)
+    if (
+        full_batch.get("decision_transaction_id") != transaction_id
+        or compact_batch.get("decision_transaction_id") != transaction_id
+        or full_batch.get("decision_ids") != decision_ids
+        or compact_batch.get("decision_ids") != decision_ids
+    ):
+        raise decision_commit.DecisionCommitError(
+            "full and compact decision batches do not have identical membership"
+        )
+    decision_commit.append_commit(
+        DEFAULT_DECISION_LOG_PATH,
+        decision_ids=decision_ids,
+        full_batch_sha256=str(full_batch.get("batch_sha256") or ""),
+        compact_batch_sha256=str(compact_batch.get("batch_sha256") or ""),
+        mode=mode,
+        committed_at=now,
+    )
     decision_log.save_latest_snapshot(
         DEFAULT_DECISION_LATEST_PATH,
         events,
@@ -1091,19 +1127,33 @@ def _run_per_timeframe(
                 max_feature_available_time=max_feature_available_time,
                 mode="per_timeframe",
             )
-            # The complete append-only audit is authoritative. Persist it before
-            # exposing the compact rows to learning so a full-log failure can
-            # never leave PIT-eligible compact evidence without its audit twin.
-            persist_decision_audit_batch(decision_events, now=prediction_time)
-            journal.append_timeframe_plans(
+            decision_ids = [str(event["decision_id"]) for event in decision_events]
+            transaction_id = decision_commit.transaction_id_for(decision_ids)
+            full_batch = persist_decision_audit_batch(
+                decision_events,
+                transaction_id=transaction_id,
+            )
+            compact_batch = journal.append_timeframe_plans(
                 DEFAULT_TF_JOURNAL_PATH,
                 all_plans,
                 now=prediction_time,
                 source_cutoff=now,
                 max_feature_available_time=max_feature_available_time,
-                decision_ids=[str(event["decision_id"]) for event in decision_events],
+                decision_ids=decision_ids,
+                decision_transaction_id=transaction_id,
             )
-        except (OSError, journal.PointInTimeError) as error:
+            finalize_decision_transaction(
+                decision_events,
+                full_batch=full_batch,
+                compact_batch=compact_batch,
+                mode="per_timeframe",
+                now=prediction_time,
+            )
+        except (
+            OSError,
+            decision_commit.DecisionCommitError,
+            journal.PointInTimeError,
+        ) as error:
             print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
             return JOURNAL_WRITE_FAILURE_EXIT_CODE
 
@@ -1910,7 +1960,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_journal:
         closes = {symbol: tech_map[symbol].close() for symbol in symbols}
         stats = journal.evaluate_directional_accuracy(
-            DEFAULT_JOURNAL_PATH, closes, now=prediction_time
+            DEFAULT_JOURNAL_PATH,
+            closes,
+            now=prediction_time,
+            require_pit=True,
         )
         journal_note = journal.format_stats_ja(stats)
         if not args.dry_run:
@@ -1941,18 +1994,33 @@ def main(argv: list[str] | None = None) -> int:
                     max_feature_available_time=feature_available_time,
                     mode="fusion",
                 )
-                # See the per-timeframe path above: full audit first, then the
-                # commit-marked compact batch consumed by learning.
-                persist_decision_audit_batch(decision_events, now=prediction_time)
-                journal.append_plans(
+                decision_ids = [str(event["decision_id"]) for event in decision_events]
+                transaction_id = decision_commit.transaction_id_for(decision_ids)
+                full_batch = persist_decision_audit_batch(
+                    decision_events,
+                    transaction_id=transaction_id,
+                )
+                compact_batch = journal.append_plans(
                     DEFAULT_JOURNAL_PATH,
                     plans,
                     now=prediction_time,
                     source_cutoff=now,
                     max_feature_available_time=feature_available_time,
-                    decision_ids=[str(event["decision_id"]) for event in decision_events],
+                    decision_ids=decision_ids,
+                    decision_transaction_id=transaction_id,
                 )
-            except (OSError, journal.PointInTimeError) as error:
+                finalize_decision_transaction(
+                    decision_events,
+                    full_batch=full_batch,
+                    compact_batch=compact_batch,
+                    mode="fusion",
+                    now=prediction_time,
+                )
+            except (
+                OSError,
+                decision_commit.DecisionCommitError,
+                journal.PointInTimeError,
+            ) as error:
                 print(f"判断ジャーナル書き込み失敗: {error}", file=sys.stderr)
                 return JOURNAL_WRITE_FAILURE_EXIT_CODE
 

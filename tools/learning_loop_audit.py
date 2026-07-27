@@ -23,6 +23,7 @@ Mac mini本番・開発機のどちらでも、logs/配下のファイルとlaun
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -38,6 +39,8 @@ UTC = timezone.utc  # noqa: UP017
 
 SCHEMA_VERSION = 1
 JOURNAL_BATCH_COMMIT = "journal_batch_commit"
+DECISION_COMMIT_EVENT = "decision_cross_log_commit"
+DECISION_LOG_FILENAME = "briefing_decisions.jsonl"
 
 # fx_intel.timeframe と同じ主ホライズン(市場オープン時間換算)と許容誤差。
 PRIMARY_HORIZON_HOURS: dict[str, float] = {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
@@ -167,6 +170,7 @@ def read_jsonl(path: Path) -> JsonlFile:
     if not path.exists():
         return result
     result.exists = True
+    commits = _decision_commits(path)
     pending_id = ""
     pending_rows: list[dict] = []
     try:
@@ -187,14 +191,38 @@ def read_jsonl(path: Path) -> JsonlFile:
                 if row.get("event_type") == JOURNAL_BATCH_COMMIT:
                     expected_size = row.get("journal_batch_size")
                     indices = [item.get("journal_batch_index") for item in pending_rows]
-                    if (
+                    locally_complete = (
                         batch_id
                         and batch_id == pending_id
                         and isinstance(expected_size, int)
                         and expected_size == len(pending_rows)
                         and indices == list(range(expected_size))
+                    )
+                    has_integrity_envelope = "journal_batch_sha256" in row
+                    if (
+                        locally_complete
+                        and not has_integrity_envelope
+                        and not any(item.get("pit_eligible") is True for item in pending_rows)
                     ):
                         result.rows.extend(pending_rows)
+                    elif locally_complete:
+                        decision_ids = [item.get("decision_id") for item in pending_rows]
+                        transaction_id = str(row.get("decision_transaction_id") or "")
+                        commit = commits.get(transaction_id)
+                        if (
+                            row.get("decision_ids") == decision_ids
+                            and row.get("decision_ids_sha256") == _canonical_sha256(decision_ids)
+                            and row.get("journal_batch_sha256") == _canonical_sha256(pending_rows)
+                            and all(
+                                item.get("decision_transaction_id") == transaction_id
+                                for item in pending_rows
+                            )
+                            and commit is not None
+                            and commit.get("decision_ids") == decision_ids
+                            and commit.get("compact_batch_sha256")
+                            == row.get("journal_batch_sha256")
+                        ):
+                            result.rows.extend(pending_rows)
                     pending_id = ""
                     pending_rows = []
                     continue
@@ -206,10 +234,52 @@ def read_jsonl(path: Path) -> JsonlFile:
                     continue
                 pending_id = ""
                 pending_rows = []
-                result.rows.append(row)
+                if row.get("pit_eligible") is not True:
+                    result.rows.append(row)
     except OSError:
         result.exists = False
     return result
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _decision_commits(path: Path) -> dict[str, dict]:
+    commits: dict[str, dict] = {}
+    conflicts: set[str] = set()
+    decision_path = path.parent / DECISION_LOG_FILENAME
+    try:
+        handle = decision_path.open(encoding="utf-8")
+    except OSError:
+        return commits
+    with handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict) or row.get("event_type") != DECISION_COMMIT_EVENT:
+                continue
+            transaction_id = str(row.get("decision_transaction_id") or "")
+            stored_hash = row.get("commit_record_sha256")
+            unsigned = {key: value for key, value in row.items() if key != "commit_record_sha256"}
+            if not transaction_id or stored_hash != _canonical_sha256(unsigned):
+                continue
+            previous = commits.get(transaction_id)
+            if previous is not None and previous != row:
+                conflicts.add(transaction_id)
+                commits.pop(transaction_id, None)
+            elif transaction_id not in conflicts:
+                commits[transaction_id] = row
+    return commits
 
 
 def read_json(path: Path) -> dict | None:

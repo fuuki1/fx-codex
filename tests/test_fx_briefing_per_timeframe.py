@@ -13,6 +13,7 @@ from fx_intel.calendar import EconomicEvent
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel import trade_outcome as to
+from tests.decision_fixtures import write_committed_compact_rows
 
 
 def _view(interval, rec, close, rsi=55.0, adx=25.0, atr=0.15):
@@ -288,6 +289,11 @@ def test_per_timeframe_journal_failure_keeps_authoritative_full_decisions(
 
     assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
     assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
+    visible = list(
+        fx_briefing.decision_log.read_decision_events(fx_briefing.DEFAULT_DECISION_LOG_PATH)
+    )
+    assert visible
+    assert not any(fx_briefing.journal.is_pit_eligible_entry(row) for row in visible)
     assert "ジャーナル書き込み失敗" in capsys.readouterr().err
 
 
@@ -338,11 +344,9 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     assert fx_briefing.DEFAULT_DECISION_LATEST_PATH.exists()
     assert not fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
     assert not fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.exists()
-    decision_rows = [
-        json.loads(line)
-        for line in fx_briefing.DEFAULT_DECISION_LOG_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    decision_rows = list(
+        fx_briefing.decision_log.read_decision_events(fx_briefing.DEFAULT_DECISION_LOG_PATH)
+    )
     assert {row["timeframe"] for row in decision_rows} == {"15m", "1h", "4h", "1d"}
     latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
     assert latest["event_count"] == 4
@@ -388,7 +392,11 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
             )
         )
         price -= 0.05
-    tf_journal.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_committed_compact_rows(
+        tf_journal,
+        [json.loads(line) for line in lines],
+        mode="per_timeframe",
+    )
 
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
         _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
@@ -450,7 +458,11 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
                 }
             )
         )
-    tf_journal.write_text("\n".join(journal_lines) + "\n", encoding="utf-8")
+    write_committed_compact_rows(
+        tf_journal,
+        [json.loads(line) for line in journal_lines],
+        mode="per_timeframe",
+    )
     tf_prices.write_text("\n".join(price_lines) + "\n", encoding="utf-8")
 
     calendar_event = EconomicEvent(

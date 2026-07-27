@@ -34,6 +34,7 @@ from pathlib import Path
 from collections.abc import Iterable, Mapping, Sequence
 import uuid
 
+from . import decision_commit
 from .briefing import TradePlan
 from .market import open_hours_between
 from .timeframe import TimeframePlan
@@ -236,6 +237,80 @@ class DirectionalStats:
         return self.hits / self.evaluated
 
 
+def _append_journal_batch(
+    target: Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    decision_transaction_id: str | None,
+) -> dict[str, object]:
+    if not rows:
+        raise ValueError("journal batch must contain at least one row")
+    requires_cross_log_commit = any(is_pit_eligible_entry(row) for row in rows)
+    raw_decision_ids = [row.get("decision_id") for row in rows]
+    try:
+        decision_ids = decision_commit.normalize_decision_ids(raw_decision_ids)
+    except decision_commit.DecisionCommitError:
+        if requires_cross_log_commit or decision_transaction_id:
+            raise
+        decision_ids = []
+    expected_transaction_id = (
+        decision_commit.transaction_id_for(decision_ids) if decision_ids else ""
+    )
+    normalized_transaction_id = str(decision_transaction_id or "").strip()
+    if requires_cross_log_commit and normalized_transaction_id != expected_transaction_id:
+        raise PointInTimeError(
+            "PIT-eligible compact decisions require the canonical cross-log transaction ID"
+        )
+    if normalized_transaction_id and normalized_transaction_id != expected_transaction_id:
+        raise PointInTimeError("decision transaction ID does not match decision IDs")
+
+    batch_id = uuid.uuid4().hex
+    committed_rows = [
+        {
+            "journal_batch_id": batch_id,
+            "journal_batch_index": index,
+            "journal_batch_size": len(rows),
+            "decision_transaction_id": normalized_transaction_id or None,
+            **dict(row),
+        }
+        for index, row in enumerate(rows)
+    ]
+    batch_sha256 = decision_commit.canonical_sha256(committed_rows)
+    marker = {
+        "event_type": JOURNAL_BATCH_COMMIT,
+        "journal_batch_id": batch_id,
+        "journal_batch_size": len(rows),
+        "decision_transaction_id": normalized_transaction_id or None,
+        "decision_ids": decision_ids,
+        "decision_ids_sha256": (
+            decision_commit.decision_ids_sha256(decision_ids)
+            if decision_ids
+            else decision_commit.canonical_sha256([])
+        ),
+        "journal_batch_sha256": batch_sha256,
+        "requires_cross_log_commit": requires_cross_log_commit,
+    }
+    payload = "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+        for row in [*committed_rows, marker]
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return {
+        "decision_transaction_id": normalized_transaction_id or None,
+        "decision_ids": decision_ids,
+        "batch_sha256": batch_sha256,
+        "journal_batch_id": batch_id,
+    }
+
+
 def append_plans(
     path: str | Path,
     plans: Sequence[TradePlan],
@@ -244,7 +319,8 @@ def append_plans(
     source_cutoff: datetime | None = None,
     max_feature_available_time: datetime | None = None,
     decision_ids: Sequence[str] | None = None,
-) -> None:
+    decision_transaction_id: str | None = None,
+) -> dict[str, object]:
     """今回の判断をJSONLへ追記する(1プラン1行)。
 
     source_cutoff と max_feature_available_time の両方がある行だけをGBDTの
@@ -254,84 +330,63 @@ def append_plans(
     if decision_ids is not None and len(decision_ids) != len(plans):
         raise PointInTimeError("decision_ids must contain exactly one ID per plan")
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        batch_id = uuid.uuid4().hex
-        for index, plan in enumerate(plans):
-            pit_metadata = pit_metadata_for_plan(
-                plan,
-                prediction_time=now,
-                source_cutoff=source_utc,
-                max_feature_available_time=feature_utc,
-                decision_id=_decision_id_at(decision_ids, index),
-                mode="fusion",
-            )
-            handle.write(
-                json.dumps(
-                    {
-                        "journal_batch_id": batch_id,
-                        "journal_batch_index": index,
-                        "journal_batch_size": len(plans),
-                        "ts": now.isoformat(),
-                        **pit_metadata,
-                        "symbol": plan.symbol,
-                        "direction": plan.direction,
-                        "analysis_direction": plan.analysis_direction,
-                        "analysis_conviction": plan.analysis_conviction,
-                        "conviction": plan.conviction,
-                        "composite": plan.composite,
-                        "tech_score": plan.tech_score,
-                        "news_score": plan.news_score,
-                        "close": plan.close,
-                        "atr": plan.atr,
-                        "stop": plan.stop,
-                        "target1": plan.target1,
-                        "target2": plan.target2,
-                        "entry_bid": plan.entry_bid,
-                        "entry_ask": plan.entry_ask,
-                        "quote_observed_at": plan.quote_observed_at,
-                        "cost_model_id": plan.cost_model_id,
-                        "slippage_r": plan.slippage_r,
-                        "commission_r": plan.commission_r,
-                        "direction_threshold": plan.direction_threshold,
-                        "target_policy": plan.target_policy,
-                        "data_quality": plan.data_quality,
-                        # チャート状態の特徴量(learning.pyの状態別学習に使う)
-                        "features": plan.features,
-                        # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
-                        "components": plan.components,
-                        # 執行コスト(R換算)と期待R予測。採点(trade_outcome)が
-                        # realized_net_r を作る入力で、MLの収益ラベルの源になる。
-                        **_plan_execution(plan),
-                        "learning_dimensions": plan.learning_dimensions,
-                        "gate_trace": plan.gate_trace,
-                        "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": plan.input_context_id,
-                        "input_features": plan.input_features,
-                        "input_feature_masks": plan.input_feature_masks,
-                        "input_context_schema_version": plan.input_context.get(
-                            "context_schema_version"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        handle.write(
-            json.dumps(
-                {
-                    "event_type": JOURNAL_BATCH_COMMIT,
-                    "journal_batch_id": batch_id,
-                    "journal_batch_size": len(plans),
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
+    rows: list[dict[str, object]] = []
+    for index, plan in enumerate(plans):
+        pit_metadata = pit_metadata_for_plan(
+            plan,
+            prediction_time=now,
+            source_cutoff=source_utc,
+            max_feature_available_time=feature_utc,
+            decision_id=_decision_id_at(decision_ids, index),
+            mode="fusion",
         )
-        handle.flush()
-        os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        rows.append(
+            {
+                "ts": now.isoformat(),
+                **pit_metadata,
+                "symbol": plan.symbol,
+                "direction": plan.direction,
+                "analysis_direction": plan.analysis_direction,
+                "analysis_conviction": plan.analysis_conviction,
+                "conviction": plan.conviction,
+                "composite": plan.composite,
+                "tech_score": plan.tech_score,
+                "news_score": plan.news_score,
+                "close": plan.close,
+                "atr": plan.atr,
+                "stop": plan.stop,
+                "target1": plan.target1,
+                "target2": plan.target2,
+                "entry_bid": plan.entry_bid,
+                "entry_ask": plan.entry_ask,
+                "quote_observed_at": plan.quote_observed_at,
+                "cost_model_id": plan.cost_model_id,
+                "slippage_r": plan.slippage_r,
+                "commission_r": plan.commission_r,
+                "direction_threshold": plan.direction_threshold,
+                "target_policy": plan.target_policy,
+                "data_quality": plan.data_quality,
+                # チャート状態の特徴量(learning.pyの状態別学習に使う)
+                "features": plan.features,
+                # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
+                "components": plan.components,
+                # 執行コスト(R換算)と期待R予測。採点(trade_outcome)が
+                # realized_net_r を作る入力で、MLの収益ラベルの源になる。
+                **_plan_execution(plan),
+                "learning_dimensions": plan.learning_dimensions,
+                "gate_trace": plan.gate_trace,
+                "shadow_predictions": plan.shadow_predictions,
+                "input_context_id": plan.input_context_id,
+                "input_features": plan.input_features,
+                "input_feature_masks": plan.input_feature_masks,
+                "input_context_schema_version": plan.input_context.get("context_schema_version"),
+            }
+        )
+    return _append_journal_batch(
+        target,
+        rows,
+        decision_transaction_id=decision_transaction_id,
+    )
 
 
 def append_timeframe_plans(
@@ -342,7 +397,8 @@ def append_timeframe_plans(
     source_cutoff: datetime | None = None,
     max_feature_available_time: datetime | None = None,
     decision_ids: Sequence[str] | None = None,
-) -> None:
+    decision_transaction_id: str | None = None,
+) -> dict[str, object]:
     """時間足別の判断をJSONLへ追記する(1プラン1行)。
 
     append_plans(融合1判断)と同じスキーマに timeframe と horizon_hours を
@@ -357,88 +413,67 @@ def append_timeframe_plans(
     if decision_ids is not None and len(decision_ids) != len(plans):
         raise PointInTimeError("decision_ids must contain exactly one ID per plan")
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        batch_id = uuid.uuid4().hex
-        for index, plan in enumerate(plans):
-            pit_metadata = pit_metadata_for_plan(
-                plan,
-                prediction_time=now,
-                source_cutoff=source_utc,
-                max_feature_available_time=feature_utc,
-                decision_id=_decision_id_at(decision_ids, index),
-                mode="per_timeframe",
-            )
-            handle.write(
-                json.dumps(
-                    {
-                        "journal_batch_id": batch_id,
-                        "journal_batch_index": index,
-                        "journal_batch_size": len(plans),
-                        "ts": now.isoformat(),
-                        **pit_metadata,
-                        "symbol": plan.symbol,
-                        # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
-                        # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
-                        "timeframe": plan.timeframe,
-                        "horizon_hours": plan.horizon_hours,
-                        "direction": plan.direction,
-                        "analysis_direction": plan.analysis_direction,
-                        "analysis_conviction": plan.analysis_conviction,
-                        "conviction": plan.conviction,
-                        "composite": plan.composite,
-                        # 融合版の tech_score に相当(時間足単体の方向スコア)。
-                        # learning._signal_hit_rate が読むキー名に合わせる
-                        "tech_score": plan.tf_score,
-                        "news_score": plan.news_score,
-                        "close": plan.close,
-                        "atr": plan.atr,
-                        "rsi": plan.rsi,
-                        "adx": plan.adx,
-                        "stop": plan.stop,
-                        "target1": plan.target1,
-                        "target2": plan.target2,
-                        "entry_bid": plan.entry_bid,
-                        "entry_ask": plan.entry_ask,
-                        "quote_observed_at": plan.quote_observed_at,
-                        "cost_model_id": plan.cost_model_id,
-                        "slippage_r": plan.slippage_r,
-                        "commission_r": plan.commission_r,
-                        "direction_threshold": plan.direction_threshold,
-                        "target_policy": plan.target_policy,
-                        "data_quality": plan.data_quality,
-                        "features": plan.features,
-                        "components": plan.components,
-                        **_plan_execution(plan),
-                        "learning_dimensions": plan.learning_dimensions,
-                        "gate_trace": plan.gate_trace,
-                        "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": plan.input_context_id,
-                        "input_features": plan.input_features,
-                        "input_feature_masks": plan.input_feature_masks,
-                        "input_context_schema_version": plan.input_context.get(
-                            "context_schema_version"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        handle.write(
-            json.dumps(
-                {
-                    "event_type": JOURNAL_BATCH_COMMIT,
-                    "journal_batch_id": batch_id,
-                    "journal_batch_size": len(plans),
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
+    rows: list[dict[str, object]] = []
+    for index, plan in enumerate(plans):
+        pit_metadata = pit_metadata_for_plan(
+            plan,
+            prediction_time=now,
+            source_cutoff=source_utc,
+            max_feature_available_time=feature_utc,
+            decision_id=_decision_id_at(decision_ids, index),
+            mode="per_timeframe",
         )
-        handle.flush()
-        os.fsync(handle.fileno())
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        rows.append(
+            {
+                "ts": now.isoformat(),
+                **pit_metadata,
+                "symbol": plan.symbol,
+                # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
+                # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
+                "timeframe": plan.timeframe,
+                "horizon_hours": plan.horizon_hours,
+                "direction": plan.direction,
+                "analysis_direction": plan.analysis_direction,
+                "analysis_conviction": plan.analysis_conviction,
+                "conviction": plan.conviction,
+                "composite": plan.composite,
+                # 融合版の tech_score に相当(時間足単体の方向スコア)。
+                # learning._signal_hit_rate が読むキー名に合わせる
+                "tech_score": plan.tf_score,
+                "news_score": plan.news_score,
+                "close": plan.close,
+                "atr": plan.atr,
+                "rsi": plan.rsi,
+                "adx": plan.adx,
+                "stop": plan.stop,
+                "target1": plan.target1,
+                "target2": plan.target2,
+                "entry_bid": plan.entry_bid,
+                "entry_ask": plan.entry_ask,
+                "quote_observed_at": plan.quote_observed_at,
+                "cost_model_id": plan.cost_model_id,
+                "slippage_r": plan.slippage_r,
+                "commission_r": plan.commission_r,
+                "direction_threshold": plan.direction_threshold,
+                "target_policy": plan.target_policy,
+                "data_quality": plan.data_quality,
+                "features": plan.features,
+                "components": plan.components,
+                **_plan_execution(plan),
+                "learning_dimensions": plan.learning_dimensions,
+                "gate_trace": plan.gate_trace,
+                "shadow_predictions": plan.shadow_predictions,
+                "input_context_id": plan.input_context_id,
+                "input_features": plan.input_features,
+                "input_feature_masks": plan.input_feature_masks,
+                "input_context_schema_version": plan.input_context.get("context_schema_version"),
+            }
+        )
+    return _append_journal_batch(
+        target,
+        rows,
+        decision_transaction_id=decision_transaction_id,
+    )
 
 
 def _plan_execution(plan: object) -> dict[str, object]:
@@ -460,9 +495,14 @@ def _plan_execution(plan: object) -> dict[str, object]:
 
 
 def read_entries(path: str | Path):
-    """Read legacy rows and only complete commit-marked v2 append batches."""
+    """Read legacy rows and only cross-log-committed PIT append batches."""
+    target = Path(path)
+    commits = decision_commit.load_commits(
+        decision_commit.commit_path_for(target),
+        verify_compact=False,
+    )
     try:
-        handle = Path(path).open(encoding="utf-8")
+        handle = target.open(encoding="utf-8")
     except OSError:
         return
     pending_id = ""
@@ -482,14 +522,66 @@ def read_entries(path: str | Path):
             if entry.get("event_type") == JOURNAL_BATCH_COMMIT:
                 expected_size = entry.get("journal_batch_size")
                 indices = [row.get("journal_batch_index") for row in pending_rows]
-                if (
+                decision_ids = [row.get("decision_id") for row in pending_rows]
+                batch_sha256 = decision_commit.canonical_sha256(pending_rows)
+                locally_complete = (
                     batch_id
                     and batch_id == pending_id
                     and isinstance(expected_size, int)
                     and expected_size == len(pending_rows)
                     and indices == list(range(expected_size))
-                ):
-                    yield from pending_rows
+                )
+                has_integrity_envelope = "journal_batch_sha256" in entry
+                if locally_complete and not has_integrity_envelope:
+                    if not any(is_pit_eligible_entry(row) for row in pending_rows):
+                        yield from pending_rows
+                elif locally_complete:
+                    marker_decision_ids = entry.get("decision_ids")
+                    try:
+                        normalized_marker_ids = (
+                            decision_commit.normalize_decision_ids(marker_decision_ids)
+                            if marker_decision_ids
+                            else []
+                        )
+                        expected_ids_hash = (
+                            decision_commit.decision_ids_sha256(normalized_marker_ids)
+                            if normalized_marker_ids
+                            else decision_commit.canonical_sha256([])
+                        )
+                        integrity_matches = (
+                            normalized_marker_ids
+                            == [
+                                str(value or "").strip()
+                                for value in decision_ids
+                                if str(value or "").strip()
+                            ]
+                            and entry.get("decision_ids_sha256") == expected_ids_hash
+                            and entry.get("journal_batch_sha256") == batch_sha256
+                        )
+                    except decision_commit.DecisionCommitError:
+                        integrity_matches = False
+                    requires_commit = bool(entry.get("requires_cross_log_commit")) or any(
+                        is_pit_eligible_entry(row) for row in pending_rows
+                    )
+                    transaction_id = str(entry.get("decision_transaction_id") or "")
+                    transaction_matches_rows = all(
+                        str(row.get("decision_transaction_id") or "") == transaction_id
+                        for row in pending_rows
+                    )
+                    commit_matches = False
+                    if integrity_matches and transaction_matches_rows:
+                        try:
+                            commit_matches = decision_commit.matching_commit(
+                                commits,
+                                transaction_id=transaction_id,
+                                decision_ids=decision_ids,
+                                batch_kind="compact",
+                                batch_sha256=batch_sha256,
+                            )
+                        except decision_commit.DecisionCommitError:
+                            commit_matches = False
+                    if integrity_matches and (not requires_commit or commit_matches):
+                        yield from pending_rows
                 pending_id = ""
                 pending_rows = []
                 continue
@@ -500,10 +592,11 @@ def read_entries(path: str | Path):
                 pending_rows.append(entry)
                 continue
             # Rows written before commit-marked batching remain readable. A
-            # pending uncommitted batch is discarded before crossing formats.
+            # standalone v2 row has no proof that its full audit twin committed.
             pending_id = ""
             pending_rows = []
-            yield entry
+            if not is_pit_eligible_entry(entry):
+                yield entry
 
 
 def blocked_gate_names(entry: Mapping[str, object]) -> set[str]:
@@ -600,6 +693,8 @@ def evaluate_directional_accuracy(
     horizon_hours: float = DEFAULT_HORIZON_HOURS,
     tolerance_hours: float = DEFAULT_TOLERANCE_HOURS,
     atr_fraction: float = DEFAULT_ATR_FRACTION,
+    *,
+    require_pit: bool = False,
 ) -> DirectionalStats:
     """固定ホライズンに達した過去の方向判断を現在の終値と突き合わせる。
 
@@ -615,6 +710,8 @@ def evaluate_directional_accuracy(
     hits = 0
     flat = 0
     for entry in read_entries(target):
+        if require_pit and not is_pit_eligible_entry(entry):
+            continue
         direction = entry.get("direction")
         if direction not in ("long", "short"):
             continue

@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import journal
+from tests.decision_fixtures import write_committed_compact_rows
+
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "maximization_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 
@@ -23,8 +26,20 @@ def monitor():
 
 
 def _decision(ts: datetime) -> dict:
+    decision_id = f"decision:{ts.isoformat()}"
     return {
         "ts": ts.isoformat(),
+        "prediction_time": ts.isoformat(),
+        "source_cutoff": ts.isoformat(),
+        "max_feature_available_time": ts.isoformat(),
+        "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": decision_id,
+        "mode": "per_timeframe",
+        "producer": journal.TIMEFRAME_PRODUCER,
+        "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": f"context:{ts.isoformat()}",
+        "source_record_ids": [f"source:{ts.isoformat()}"],
         "symbol": "USDJPY",
         "timeframe": "1h",
         "direction": "long",
@@ -80,7 +95,7 @@ def test_maximization_monitor_writes_profile_monitor_and_candidates(monitor, tmp
     profile_path = tmp_path / "briefing_maximization.json"
     monitor_path = tmp_path / "maximization_monitor.json"
     decisions, prices = _losing_rows()
-    _write_jsonl(journal_path, decisions)
+    write_committed_compact_rows(journal_path, decisions, mode="per_timeframe")
     _write_jsonl(prices_path, prices)
 
     result = monitor.run_maximization_monitor(
@@ -105,7 +120,7 @@ def test_maximization_monitor_cli_quiet_returns_exit_code(monitor, tmp_path) -> 
     journal_path = tmp_path / "journal.jsonl"
     prices_path = tmp_path / "prices.jsonl"
     decisions, prices = _losing_rows()
-    _write_jsonl(journal_path, decisions)
+    write_committed_compact_rows(journal_path, decisions, mode="per_timeframe")
     _write_jsonl(prices_path, prices)
 
     exit_code = monitor.main(

@@ -21,7 +21,7 @@ import subprocess
 import sys
 from typing import Any
 
-from . import operational_contracts as contracts
+from . import decision_commit, decision_log, operational_contracts as contracts
 from .operational_store import (
     AuditEventRecord,
     BatchWriteResult,
@@ -114,6 +114,7 @@ class CandidateMigrationReport:
     completed_at: str
     runtime: Mapping[str, object]
     decision_source: SourceFingerprint
+    decision_support_sources: tuple[SourceFingerprint, ...]
     price_source: SourceFingerprint
     decisions: DecisionImportMetrics
     prices: ImportMetrics
@@ -130,6 +131,7 @@ class CandidateMigrationReport:
             "runtime": dict(self.runtime),
             "sources": {
                 "decisions": self.decision_source.to_dict(),
+                "decision_support": [source.to_dict() for source in self.decision_support_sources],
                 "prices": self.price_source.to_dict(),
             },
             "decisions": self.decisions.to_dict(),
@@ -146,6 +148,7 @@ class CandidateParityReport:
     generated_at: str
     runtime: Mapping[str, object]
     decision_source: SourceFingerprint
+    decision_support_sources: tuple[SourceFingerprint, ...]
     price_source: SourceFingerprint
     decision_objects: int
     decision_excluded: int
@@ -176,6 +179,7 @@ class CandidateParityReport:
             "runtime": dict(self.runtime),
             "sources": {
                 "decisions": self.decision_source.to_dict(),
+                "decision_support": [source.to_dict() for source in self.decision_support_sources],
                 "prices": self.price_source.to_dict(),
             },
             "decisions": {
@@ -224,6 +228,7 @@ def migrate_jsonl_candidate(
     normalized_run_id = _required(run_id, "run_id")
     started = _aware_utc(now or datetime.now(UTC), "now")
     decision_source = fingerprint_source(decision_path, decision_sha256)
+    decision_support_sources = fingerprint_decision_support_sources(decision_source.path)
     price_source = fingerprint_source(price_path, price_sha256)
 
     decisions = import_decision_jsonl(
@@ -239,6 +244,8 @@ def migrate_jsonl_candidate(
     )
 
     _assert_source_unchanged(decision_source)
+    for support_source in decision_support_sources:
+        _assert_source_unchanged(support_source)
     _assert_source_unchanged(price_source)
     database = store.audit()
     limitations: list[str] = []
@@ -282,6 +289,7 @@ def migrate_jsonl_candidate(
         completed_at=completed.isoformat(),
         runtime=runtime_provenance(),
         decision_source=decision_source,
+        decision_support_sources=decision_support_sources,
         price_source=price_source,
         decisions=decisions,
         prices=prices,
@@ -312,6 +320,36 @@ def fingerprint_source(path: str | Path, expected_sha256: str) -> SourceFingerpr
         raise SourceFingerprintMismatch(
             f"source SHA-256 mismatch for {target}: expected {expected}, got {actual}"
         )
+    return SourceFingerprint(path=str(target), bytes=after.st_size, sha256=actual)
+
+
+def fingerprint_decision_support_sources(
+    decision_path: str | Path,
+) -> tuple[SourceFingerprint, ...]:
+    """Pin every compact journal referenced by the stable full decision log."""
+
+    sources: list[SourceFingerprint] = []
+    for path in decision_commit.referenced_compact_paths(decision_path):
+        sources.append(_pin_source(path))
+    return tuple(sources)
+
+
+def _pin_source(path: str | Path) -> SourceFingerprint:
+    target = Path(path).resolve()
+    if not target.is_file():
+        raise OperationalMigrationError(
+            f"referenced decision support source does not exist: {target}"
+        )
+    before = target.stat()
+    actual = file_sha256(target)
+    after = target.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise SourceFingerprintMismatch(f"source changed while hashing: {target}")
     return SourceFingerprint(path=str(target), bytes=after.st_size, sha256=actual)
 
 
@@ -351,6 +389,7 @@ def verify_candidate_parity(
     """Re-read pinned JSONL and prove exact payload/classification parity."""
 
     decision_source = fingerprint_source(decision_path, decision_sha256)
+    decision_support_sources = fingerprint_decision_support_sources(decision_source.path)
     price_source = fingerprint_source(price_path, price_sha256)
     exclusions: Counter[str] = Counter()
 
@@ -367,57 +406,57 @@ def verify_candidate_parity(
     prediction_ids: set[str] = set()
     generated_at = datetime.now(UTC)
 
-    for _line_number, parsed, parse_error in _iter_jsonl(decision_source.path):
-        if parse_error:
+    for source_line in decision_log.iter_decision_source(decision_source.path):
+        if source_line.error:
             decision_excluded += 1
-            exclusions[f"decision:{parse_error}"] += 1
+            exclusions[f"decision:{source_line.error}"] += 1
             continue
-        assert parsed is not None
-        decision_objects += 1
-        try:
-            audit, prediction, pit_failure = decision_records_from_event(
-                parsed,
-                imported_at=generated_at,
-            )
-        except (InvalidOperationalRecord, OperationalMigrationError, ValueError) as error:
-            decision_excluded += 1
-            exclusions[f"decision:{_error_key(error)}"] += 1
-            continue
-        if audit.event_id in decision_ids:
-            decision_duplicate_ids += 1
-        decision_ids.add(audit.event_id)
-        if prediction is None:
-            decision_excluded += 1
-            exclusions[f"decision:{pit_failure}"] += 1
-        else:
-            predictions_expected += 1
-            prediction_ids.add(prediction.prediction_id)
+        for parsed in source_line.events:
+            decision_objects += 1
+            try:
+                audit, prediction, pit_failure = decision_records_from_event(
+                    parsed,
+                    imported_at=generated_at,
+                )
+            except (InvalidOperationalRecord, OperationalMigrationError, ValueError) as error:
+                decision_excluded += 1
+                exclusions[f"decision:{_error_key(error)}"] += 1
+                continue
+            if audit.event_id in decision_ids:
+                decision_duplicate_ids += 1
+            decision_ids.add(audit.event_id)
+            if prediction is None:
+                decision_excluded += 1
+                exclusions[f"decision:{pit_failure}"] += 1
+            else:
+                predictions_expected += 1
+                prediction_ids.add(prediction.prediction_id)
 
-        stored_audit = store.connection.execute(
-            """
-            SELECT payload_json, pit_eligible
-            FROM audit_events
-            WHERE event_id = ?
-            """,
-            (audit.event_id,),
-        ).fetchone()
-        if stored_audit is None:
-            audit_missing += 1
-        else:
-            if str(stored_audit["payload_json"]) != _canonical_payload(parsed):
-                audit_payload_mismatches += 1
-            if bool(stored_audit["pit_eligible"]) is not audit.pit_eligible:
-                audit_pit_mismatches += 1
-
-        if prediction is not None:
-            stored_prediction = store.connection.execute(
-                "SELECT payload_json FROM predictions WHERE prediction_id = ?",
-                (prediction.prediction_id,),
+            stored_audit = store.connection.execute(
+                """
+                SELECT payload_json, pit_eligible
+                FROM audit_events
+                WHERE event_id = ?
+                """,
+                (audit.event_id,),
             ).fetchone()
-            if stored_prediction is None:
-                predictions_missing += 1
-            elif str(stored_prediction["payload_json"]) != _canonical_payload(parsed):
-                prediction_payload_mismatches += 1
+            if stored_audit is None:
+                audit_missing += 1
+            else:
+                if str(stored_audit["payload_json"]) != _canonical_payload(parsed):
+                    audit_payload_mismatches += 1
+                if bool(stored_audit["pit_eligible"]) is not audit.pit_eligible:
+                    audit_pit_mismatches += 1
+
+            if prediction is not None:
+                stored_prediction = store.connection.execute(
+                    "SELECT payload_json FROM predictions WHERE prediction_id = ?",
+                    (prediction.prediction_id,),
+                ).fetchone()
+                if stored_prediction is None:
+                    predictions_missing += 1
+                elif str(stored_prediction["payload_json"]) != _canonical_payload(parsed):
+                    prediction_payload_mismatches += 1
 
     price_objects = 0
     price_excluded = 0
@@ -451,6 +490,8 @@ def verify_candidate_parity(
             price_payload_mismatches += 1
 
     _assert_source_unchanged(decision_source)
+    for support_source in decision_support_sources:
+        _assert_source_unchanged(support_source)
     _assert_source_unchanged(price_source)
     database = store.audit()
     audit_unexpected = max(0, database.audit_events - len(decision_ids))
@@ -484,6 +525,7 @@ def verify_candidate_parity(
         generated_at=generated_at.isoformat(),
         runtime=runtime_provenance(),
         decision_source=decision_source,
+        decision_support_sources=decision_support_sources,
         price_source=price_source,
         decision_objects=decision_objects,
         decision_excluded=decision_excluded,
@@ -521,44 +563,49 @@ def import_decision_jsonl(
     metrics = DecisionImportMetrics()
     audit_batch: list[AuditEventRecord] = []
     prediction_batch: list[PredictionRecord] = []
-    for line_number, parsed, parse_error in _iter_jsonl(path):
+    for source_line in decision_log.iter_decision_source(path):
         metrics.source_lines += 1
-        if parse_error == "malformed_json":
+        if source_line.error == "malformed_json":
             metrics.malformed_json += 1
-            metrics.exclusion_reasons[parse_error] += 1
+            metrics.exclusion_reasons[source_line.error] += 1
             continue
-        if parse_error == "non_object_json":
+        if source_line.error == "non_object_json":
             metrics.non_object_json += 1
-            metrics.exclusion_reasons[parse_error] += 1
+            metrics.exclusion_reasons[source_line.error] += 1
             continue
-        assert parsed is not None
-        metrics.json_objects += 1
-        try:
-            audit, prediction, pit_failure = decision_records_from_event(
-                parsed,
-                imported_at=imported_at,
-            )
-        except (InvalidOperationalRecord, OperationalMigrationError, ValueError) as error:
+        if source_line.error:
             metrics.structurally_invalid += 1
-            metrics.exclusion_reasons[_error_key(error)] += 1
-            continue
-        audit_batch.append(audit)
-        if prediction is None:
-            metrics.pit_ineligible += 1
             metrics.excluded += 1
-            metrics.exclusion_reasons[pit_failure] += 1
-        else:
-            metrics.pit_eligible += 1
-            prediction_batch.append(prediction)
-        if len(audit_batch) >= batch_size:
-            audit_result, prediction_result = _flush_decision_batch(
-                store,
-                audit_batch,
-                prediction_batch,
-            )
-            _add_decision_results(metrics, audit_result, prediction_result)
-            audit_batch.clear()
-            prediction_batch.clear()
+            metrics.exclusion_reasons[source_line.error] += 1
+            continue
+        for parsed in source_line.events:
+            metrics.json_objects += 1
+            try:
+                audit, prediction, pit_failure = decision_records_from_event(
+                    parsed,
+                    imported_at=imported_at,
+                )
+            except (InvalidOperationalRecord, OperationalMigrationError, ValueError) as error:
+                metrics.structurally_invalid += 1
+                metrics.exclusion_reasons[_error_key(error)] += 1
+                continue
+            audit_batch.append(audit)
+            if prediction is None:
+                metrics.pit_ineligible += 1
+                metrics.excluded += 1
+                metrics.exclusion_reasons[pit_failure] += 1
+            else:
+                metrics.pit_eligible += 1
+                prediction_batch.append(prediction)
+            if len(audit_batch) >= batch_size:
+                audit_result, prediction_result = _flush_decision_batch(
+                    store,
+                    audit_batch,
+                    prediction_batch,
+                )
+                _add_decision_results(metrics, audit_result, prediction_result)
+                audit_batch.clear()
+                prediction_batch.clear()
     if audit_batch:
         audit_result, prediction_result = _flush_decision_batch(
             store,

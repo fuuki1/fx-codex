@@ -155,7 +155,8 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
 
     rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
     payload = json.loads(latest.read_text(encoding="utf-8"))
-    assert rows[0]["decision_id"] == event["decision_id"]
+    assert rows[0]["event_type"] == decision_log.DECISION_BATCH_EVENT_TYPE
+    assert rows[0]["events"][0]["decision_id"] == event["decision_id"]
     assert payload["event_count"] == 1
     assert payload["events"][0]["decision"]["direction"] == "long"
 

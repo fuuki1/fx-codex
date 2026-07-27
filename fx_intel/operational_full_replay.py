@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from typing import Any, IO
 
+from . import decision_commit, decision_log, journal
 from .operational_migration import (
     OperationalMigrationError,
     decision_records_from_event,
@@ -129,7 +130,12 @@ def full_replay_with_store(
         raise FullReplayError(
             f"leased database differs from replay target: {store.path} != {database}"
         )
-    with lock_replay_sources(decision_path, price_path):
+    decision_support_paths = decision_commit.referenced_compact_paths(decision_path)
+    with lock_replay_sources(
+        decision_path,
+        price_path,
+        *decision_support_paths,
+    ):
         decisions = replay_source(
             store,
             source_name="decisions",
@@ -346,6 +352,26 @@ def _replay_consumed_prefix(
     expected_prediction_ids: set[str] = set()
     expected_rejection_offsets: set[int] = set()
     imported_at = datetime.now(UTC)
+    commits: dict[str, dict[str, object]] = {}
+    if metrics.source_kind == "decisions":
+        handle.seek(0)
+        prefix = handle.read(cursor.byte_offset)
+        commit_values: list[object] = []
+        for raw_line in prefix.splitlines():
+            try:
+                commit_values.append(json.loads(raw_line))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        prefix_commits = decision_commit.commits_from_values(commit_values)
+        verified_commits = decision_commit.load_commits(
+            Path(metrics.path),
+            verify_compact=True,
+        )
+        commits = {
+            transaction_id: record
+            for transaction_id, record in prefix_commits.items()
+            if verified_commits.get(transaction_id) == record
+        }
     handle.seek(0)
     while handle.tell() < cursor.byte_offset:
         line_start = handle.tell()
@@ -370,34 +396,50 @@ def _replay_consumed_prefix(
             continue
         try:
             if metrics.source_kind == "decisions":
-                audit, prediction, _failure = decision_records_from_event(
-                    parsed,
-                    imported_at=imported_at,
-                )
-                metrics.valid_rows += 1
-                _record_unique(
-                    expected_primary_ids,
-                    audit.event_id,
-                    metrics,
-                    "duplicate_decision_id",
-                )
-                _verify_audit_row(store, audit, metrics)
-                if prediction is None:
-                    metrics.pit_ineligible += 1
-                    unexpected = store.connection.execute(
-                        "SELECT 1 FROM predictions WHERE prediction_id = ?",
-                        (audit.event_id,),
-                    ).fetchone()
-                    if unexpected is not None:
-                        metrics.violations["unexpected_prediction_for_pit_failure"] += 1
-                else:
-                    _record_unique(
-                        expected_prediction_ids,
-                        prediction.prediction_id,
-                        metrics,
-                        "duplicate_prediction_id",
+                if parsed.get("event_type") == decision_commit.COMMIT_EVENT_TYPE:
+                    continue
+                if parsed.get("event_type") == decision_log.DECISION_BATCH_EVENT_TYPE:
+                    events: Sequence[Mapping[str, object]] = (
+                        decision_log.decision_events_from_batch(
+                            parsed,
+                            commits=commits,
+                        )
                     )
-                    _verify_prediction_row(store, prediction, metrics)
+                    if not events:
+                        raise OperationalMigrationError("uncommitted_or_invalid_decision_batch")
+                elif journal.is_pit_eligible_entry(parsed):
+                    raise OperationalMigrationError("uncommitted_pit_event")
+                else:
+                    events = [parsed]
+                for event in events:
+                    audit, prediction, _failure = decision_records_from_event(
+                        event,
+                        imported_at=imported_at,
+                    )
+                    metrics.valid_rows += 1
+                    _record_unique(
+                        expected_primary_ids,
+                        audit.event_id,
+                        metrics,
+                        "duplicate_decision_id",
+                    )
+                    _verify_audit_row(store, audit, metrics)
+                    if prediction is None:
+                        metrics.pit_ineligible += 1
+                        unexpected = store.connection.execute(
+                            "SELECT 1 FROM predictions WHERE prediction_id = ?",
+                            (audit.event_id,),
+                        ).fetchone()
+                        if unexpected is not None:
+                            metrics.violations["unexpected_prediction_for_pit_failure"] += 1
+                    else:
+                        _record_unique(
+                            expected_prediction_ids,
+                            prediction.prediction_id,
+                            metrics,
+                            "duplicate_prediction_id",
+                        )
+                        _verify_prediction_row(store, prediction, metrics)
             elif metrics.source_kind == "prices":
                 price = price_record_from_row(parsed)
                 metrics.valid_rows += 1

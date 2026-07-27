@@ -200,7 +200,7 @@ def test_batch_outbox_resumes_after_partial_delivery(monkeypatch, tmp_path):
     state = json.loads(outbox.read_text(encoding="utf-8"))
     assert state["batches"][0]["next_part"] == 1
     assert "part 1/2" in calls[0]["content"]
-    assert "part 2/2" in calls[1]["content"]
+    assert calls[1]["content"] == "first"
 
     resumed: list[dict] = []
     monkeypatch.setattr(
@@ -214,9 +214,28 @@ def test_batch_outbox_resumes_after_partial_delivery(monkeypatch, tmp_path):
         outbox_path=outbox,
     )
 
-    assert len(resumed) == 1
-    assert "part 2/2" in resumed[0]["content"]
+    assert [payload["content"] for payload in resumed] == [
+        "first",
+        next(
+            payload["content"]
+            for payload in resumed
+            if str(payload["content"]).startswith("fx-codex batch")
+        ),
+        "second",
+    ]
+    assert "part 2/2" in resumed[1]["content"]
     assert json.loads(outbox.read_text(encoding="utf-8"))["batches"] == []
+
+
+def test_batch_labels_do_not_truncate_existing_content() -> None:
+    original = "x" * 2000
+    payloads = [{"content": original}, {"content": "second"}]
+
+    labeled = discord_delivery._label_parts(payloads, "a" * 64)  # noqa: SLF001
+
+    assert labeled[1] == payloads[0]
+    assert labeled[3] == payloads[1]
+    assert labeled[1]["content"] == original
 
 
 def test_batch_outbox_rejects_corrupt_state(tmp_path):

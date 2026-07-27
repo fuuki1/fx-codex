@@ -31,6 +31,15 @@ an explicit, repeatedly parity-verified reader cutover.
   flush+`fsync`; shadow readers hold the matching shared lock while capturing a
   byte range. This preserves complete writer batches without making SQLite the
   evidence authority.
+- A new PIT-eligible decision is visible only after a three-step cross-log
+  transaction: fsync the full decision batch, fsync the compact journal batch
+  and its local marker, then fsync a self-hashed cross-log commit marker into
+  the full log. The marker names the exact decision IDs and both canonical
+  batch hashes. Readers fail closed on a missing, conflicting, or mismatched
+  marker; the shadow cursor stops before the newest pending full batch. If a
+  crashed producer leaves it orphaned and a later transaction commits, sync
+  records the orphan as an explicit rejection and continues from the later
+  commit instead of permanently stalling the contiguous cursor.
 - A cursor can advance only in the same transaction as a contiguous SHA-256
   chunk manifest. Malformed complete lines advance only after an append-only
   rejection record is committed. An incomplete trailing line is left unread.
@@ -92,6 +101,11 @@ runs/python314-safe-venv/bin/python tools/operational_store_benchmark.py \
   --prices snapshots/briefing_tf_prices.jsonl \
   --output runs/operational-migration/benchmark.json
 ```
+
+Migration and parity also discover every compact journal referenced by a valid
+cross-log marker, pin its path/size/SHA-256 in the report, and verify it again
+after the scan. A compact append, replacement, missing file, or hash mismatch
+invalidates the candidate even when the full decision log itself is unchanged.
 
 After exact parity has been independently reported, bootstrap the active raw
 EOF exactly once. The bootstrap refuses a changed database hash, a non-zero WAL,
@@ -160,6 +174,8 @@ locks while it:
 - re-hashes every manifest chunk and recomputes its complete-line count and
   final-line boundary;
 - re-projects every decision and price through the current adapters;
+- verifies each PIT decision's cross-log marker against the locked compact
+  journal batch before accepting the full batch;
 - compares exact canonical payloads, stored record SHA-256 values, timestamps,
   PIT eligibility, due times, OHLC fields, populations, and incremental
   rejection entries;
@@ -273,9 +289,10 @@ read-only/query-only enforcement, and exposes bounded pages plus ETags. The
 port defaults to 8770 and can be changed with
 `FX_OPERATIONAL_READ_PORT`. It is not a production read cutover.
 
-The scheduled full replay holds shared locks on both authoritative raw files,
-then performs catch-up sync and full replay inside one SQLite writer lease,
-followed by a `TRUNCATE` checkpoint. Appenders cannot change either raw
+The scheduled full replay holds shared locks on both authoritative raw files
+and every compact journal referenced by committed PIT decisions, then performs
+catch-up sync and full replay inside one SQLite writer lease, followed by a
+`TRUNCATE` checkpoint. Appenders cannot change the full, compact, or price
 snapshot between catch-up and verification.
 
 Dry-run requires explicit absolute paths and performs a read-only database

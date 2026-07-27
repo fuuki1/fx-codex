@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import decision_commit, decision_log, journal
 from fx_intel import operational_contracts as contracts
 from fx_intel import operational_full_replay as full_replay
 from fx_intel import operational_migration as migration
@@ -89,6 +90,42 @@ def _write_jsonl(path: Path, rows: list[object]) -> None:
     path.write_bytes(b"".join(_line(row) for row in rows))
 
 
+def _append_decision_batch(path: Path, rows: list[dict[str, object]]) -> None:
+    legacy = [row for row in rows if row.get("pit_eligible") is not True]
+    if legacy:
+        with path.open("ab") as handle:
+            handle.write(b"".join(_line(row) for row in legacy))
+    current = [row for row in rows if row.get("pit_eligible") is True]
+    if not current:
+        return
+    decision_ids = [str(row["decision_id"]) for row in current]
+    transaction_id = decision_commit.transaction_id_for(decision_ids)
+    full_batch = decision_log.append_decision_events(
+        path,
+        current,
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        path.parent / "briefing_tf_journal.jsonl",
+        current,
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        path,
+        decision_ids=decision_ids,
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+
+def _write_decision_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.write_bytes(b"")
+    (path.parent / "briefing_tf_journal.jsonl").write_bytes(b"")
+    _append_decision_batch(path, rows)
+
+
 def _create_bootstrapped_candidate(
     tmp_path: Path,
     *,
@@ -99,7 +136,10 @@ def _create_bootstrapped_candidate(
     prices = tmp_path / "prices.jsonl"
     database = tmp_path / "candidate.sqlite3"
     parity_path = tmp_path / "parity.json"
-    _write_jsonl(decisions, decision_rows or [_decision("decision-1")])
+    _write_decision_jsonl(
+        decisions,
+        [dict(row) for row in (decision_rows or [_decision("decision-1")])],
+    )
     _write_jsonl(prices, price_rows or [_price("price-1")])
     with store.open_operational_writer(database, writer_id="migration") as opened:
         imported = migration.migrate_jsonl_candidate(
@@ -127,6 +167,7 @@ def _create_bootstrapped_candidate(
                 "bytes": decisions.stat().st_size,
                 "sha256": store.file_sha256(decisions),
             },
+            "decision_support": [source.to_dict() for source in imported.decision_support_sources],
             "prices": {
                 "path": str(prices.resolve()),
                 "bytes": prices.stat().st_size,
@@ -148,8 +189,7 @@ def _create_bootstrapped_candidate(
 
 def test_bootstrap_then_append_sync_and_retry_is_noop(tmp_path: Path) -> None:
     database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
-    with decisions.open("ab") as handle:
-        handle.write(_line(_decision("decision-2", minutes=15)))
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
     with prices.open("ab") as handle:
         handle.write(_line(_price("price-2", minutes=15)))
 
@@ -194,10 +234,13 @@ def test_bootstrap_verified_snapshot_prefix_onto_live_append_only_sources(
     live_prices = live / "prices.jsonl"
     database = tmp_path / "candidate.sqlite3"
     parity_path = tmp_path / "parity.json"
-    _write_jsonl(snapshot_decisions, [_decision("decision-1")])
+    _write_decision_jsonl(snapshot_decisions, [_decision("decision-1")])
     _write_jsonl(snapshot_prices, [_price("price-1")])
     live_decisions.write_bytes(snapshot_decisions.read_bytes())
     live_prices.write_bytes(snapshot_prices.read_bytes())
+    (live / "briefing_tf_journal.jsonl").write_bytes(
+        (snapshots / "briefing_tf_journal.jsonl").read_bytes()
+    )
 
     with store.open_operational_writer(database, writer_id="migration") as opened:
         migration.migrate_jsonl_candidate(
@@ -222,8 +265,7 @@ def test_bootstrap_verified_snapshot_prefix_onto_live_append_only_sources(
     parity_path.write_text(json.dumps(parity), encoding="utf-8")
     decision_prefix_bytes = live_decisions.stat().st_size
     price_prefix_bytes = live_prices.stat().st_size
-    with live_decisions.open("ab") as handle:
-        handle.write(_line(_decision("decision-2", minutes=15)))
+    _append_decision_batch(live_decisions, [_decision("decision-2", minutes=15)])
     with live_prices.open("ab") as handle:
         handle.write(_line(_price("price-2", minutes=15)))
 
@@ -256,6 +298,47 @@ def test_bootstrap_verified_snapshot_prefix_onto_live_append_only_sources(
     assert synced["sources"]["prices"]["inserted"] == 1
 
 
+def test_bootstrap_rejects_compact_source_changed_after_parity(tmp_path: Path) -> None:
+    decisions = tmp_path / "decisions.jsonl"
+    prices = tmp_path / "prices.jsonl"
+    database = tmp_path / "candidate.sqlite3"
+    parity_path = tmp_path / "parity.json"
+    _write_decision_jsonl(decisions, [_decision("decision-1")])
+    _write_jsonl(prices, [_price("price-1")])
+    with store.open_operational_writer(database, writer_id="migration") as opened:
+        migration.migrate_jsonl_candidate(
+            opened,
+            decision_path=decisions,
+            decision_sha256=store.file_sha256(decisions),
+            price_path=prices,
+            price_sha256=store.file_sha256(prices),
+            run_id="compact-drift-migration",
+            now=NOW,
+        )
+        opened.checkpoint("TRUNCATE")
+    with store.open_operational_reader(database) as opened:
+        parity = migration.verify_candidate_parity(
+            opened,
+            decision_path=decisions,
+            decision_sha256=store.file_sha256(decisions),
+            price_path=prices,
+            price_sha256=store.file_sha256(prices),
+        ).to_dict()
+    parity["database_sha256"] = store.file_sha256(database)
+    parity_path.write_text(json.dumps(parity), encoding="utf-8")
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    compact.write_bytes(compact.read_bytes().replace(b"neutral", b"longxxx"))
+
+    with pytest.raises(shadow.BootstrapEvidenceMismatch, match="SHA-256"):
+        shadow.bootstrap_candidate(
+            database_path=database,
+            parity_report_path=parity_path,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="bootstrap",
+        )
+
+
 def test_two_source_sync_rolls_back_decision_advance_when_price_fails(
     tmp_path: Path,
 ) -> None:
@@ -264,8 +347,7 @@ def test_two_source_sync_rolls_back_decision_advance_when_price_fails(
         initial_cursor = opened.source_cursor("decisions")
         assert initial_cursor is not None
         initial_offset = initial_cursor.byte_offset
-    with decisions.open("ab") as handle:
-        handle.write(_line(_decision("decision-2", minutes=15)))
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
     prices.write_bytes(b"")
 
     with pytest.raises(shadow.SourceRotationDetected):
@@ -287,8 +369,7 @@ def test_scheduled_full_replay_catches_up_and_verifies_one_locked_snapshot(
     tmp_path: Path,
 ) -> None:
     database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
-    with decisions.open("ab") as handle:
-        handle.write(_line(_decision("decision-2", minutes=15)))
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
     with prices.open("ab") as handle:
         handle.write(_line(_price("price-2", minutes=15)))
 
@@ -334,7 +415,7 @@ def test_scheduled_writer_collision_records_failure_instead_of_skipping(
 
 def test_partial_final_line_is_not_consumed_until_newline_arrives(tmp_path: Path) -> None:
     database, decisions, _, _ = _create_bootstrapped_candidate(tmp_path)
-    encoded = _line(_decision("decision-2", minutes=15))
+    encoded = _line(_decision("decision-2", minutes=15, pit=False))
     initial_offset = decisions.stat().st_size
     with decisions.open("ab") as handle:
         handle.write(encoded[:-1])
@@ -359,15 +440,58 @@ def test_partial_final_line_is_not_consumed_until_newline_arrives(tmp_path: Path
 
     assert waiting.status == "waiting_for_complete_line"
     assert waiting.partial_tail_bytes == len(encoded) - 1
-    assert advanced.status == "advanced"
-    assert advanced.predictions_inserted == 1
+    assert advanced.status == "quality_failure"
+    assert advanced.audit_events_inserted == 1
+    assert advanced.predictions_inserted == 0
+
+
+def test_orphaned_pending_decision_does_not_block_later_commit(tmp_path: Path) -> None:
+    database, decisions, _, _ = _create_bootstrapped_candidate(tmp_path)
+    pending = _decision("decision-pending", minutes=15)
+    pending_transaction = decision_commit.transaction_id_for([str(pending["decision_id"])])
+    decision_log.append_decision_events(
+        decisions,
+        [pending],
+        transaction_id=pending_transaction,
+    )
+    with store.open_operational_writer(database, writer_id="pending") as opened:
+        before = opened.source_cursor("decisions")
+        assert before is not None
+        waiting = shadow.sync_one_source(
+            opened,
+            source_name="decisions",
+            source_kind="decisions",
+            source_path=decisions,
+        )
+        assert opened.source_cursor("decisions").byte_offset == before.byte_offset
+
+    _append_decision_batch(
+        decisions,
+        [_decision("decision-after-pending", minutes=30)],
+    )
+    with store.open_operational_writer(database, writer_id="recover") as opened:
+        recovered = shadow.sync_one_source(
+            opened,
+            source_name="decisions",
+            source_kind="decisions",
+            source_path=decisions,
+        )
+        audit = opened.audit()
+
+    assert waiting.status == "waiting_for_decision_commit"
+    assert recovered.status == "quality_failure"
+    assert recovered.rejections == 1
+    assert recovered.audit_events_inserted == 1
+    assert recovered.predictions_inserted == 1
+    assert audit.audit_events == 2
+    assert audit.predictions == 2
 
 
 def test_previous_line_tamper_fails_closed(tmp_path: Path) -> None:
     database, decisions, _, _ = _create_bootstrapped_candidate(tmp_path)
     original = decisions.read_bytes()
-    assert b"neutral" in original
-    decisions.write_bytes(original.replace(b"neutral", b"neutraz"))
+    assert b"committed_at" in original
+    decisions.write_bytes(original.replace(b"committed_at", b"committed_ax"))
 
     with store.open_operational_writer(database, writer_id="tamper") as opened:
         with pytest.raises(shadow.SourceBoundaryMismatch):
@@ -525,6 +649,7 @@ def test_manual_full_replay_locks_both_sources_for_the_entire_replay(
         assert {Path(path).resolve() for path in paths} == {
             decisions.resolve(),
             prices.resolve(),
+            (tmp_path / "briefing_tf_journal.jsonl").resolve(),
         }
         with original_lock(*paths):
             lock_active = True
@@ -568,7 +693,27 @@ def test_full_replay_detects_changed_raw_payload(tmp_path: Path) -> None:
     assert report["verdict"] == "full_replay_failed"
     violations = report["sources"]["decisions"]["violations"]
     assert violations["chunk_sha256_mismatch"] == 1
-    assert violations["audit_payload_or_projection_mismatch"] == 1
+    assert violations["primary_population_mismatch"] == 1
+    assert violations["prediction_population_mismatch"] == 1
+
+
+def test_full_replay_detects_changed_compact_decision_batch(tmp_path: Path) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    original = compact.read_bytes()
+    compact.write_bytes(original.replace(b"neutral", b"longxxx"))
+
+    report = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="full-replay",
+    )
+
+    assert report["verdict"] == "full_replay_failed"
+    violations = report["sources"]["decisions"]["violations"]
+    assert violations["primary_population_mismatch"] == 1
+    assert violations["prediction_population_mismatch"] == 1
 
 
 def test_full_replay_detects_changed_database_payload(tmp_path: Path) -> None:
@@ -647,7 +792,7 @@ def test_full_replay_detects_missing_database_row(tmp_path: Path) -> None:
 def test_full_replay_detects_complete_unsynced_suffix(tmp_path: Path) -> None:
     database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
     with decisions.open("ab") as handle:
-        handle.write(_line(_decision("decision-2", minutes=15)))
+        handle.write(_line(_decision("decision-2", minutes=15, pit=False)))
 
     report = full_replay.run_full_replay(
         database_path=database,

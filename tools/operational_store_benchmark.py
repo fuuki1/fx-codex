@@ -23,6 +23,7 @@ from fx_intel.operational_migration import (  # noqa: E402
     price_record_from_row,
     runtime_provenance,
 )
+from fx_intel import decision_log  # noqa: E402
 from fx_intel.operational_store import (  # noqa: E402
     OperationalStoreError,
     open_operational_reader,
@@ -113,14 +114,8 @@ def _jsonl_decision_page(
     imported_at: datetime,
 ) -> list[str]:
     latest: list[tuple[int, str, str]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
+    for source_line in decision_log.iter_decision_source(path):
+        for parsed in source_line.events:
             try:
                 audit, _prediction, _failure = decision_records_from_event(
                     parsed,

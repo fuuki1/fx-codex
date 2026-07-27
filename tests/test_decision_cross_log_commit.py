@@ -1,0 +1,131 @@
+"""Full/compact decision visibility requires one exact cross-log commit."""
+
+from __future__ import annotations
+
+from datetime import datetime, UTC
+import json
+
+from fx_intel import decision_commit, decision_log, journal
+
+NOW = datetime(2026, 7, 27, 7, 0, tzinfo=UTC)
+
+
+def _pit_envelope(decision_id: str) -> dict[str, object]:
+    return {
+        "ts": NOW.isoformat(),
+        "prediction_time": NOW.isoformat(),
+        "source_cutoff": NOW.isoformat(),
+        "max_feature_available_time": NOW.isoformat(),
+        "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": decision_id,
+        "mode": "per_timeframe",
+        "producer": journal.TIMEFRAME_PRODUCER,
+        "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": f"context:{decision_id}",
+        "source_record_ids": [f"source:{decision_id}"],
+    }
+
+
+def _full_event(decision_id: str) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "event_type": decision_log.EVENT_TYPE,
+        "symbol": "USDJPY",
+        "timeframe": "1h",
+        "horizon_hours": 1.0,
+        "source": "fx_briefing",
+        "decision": {"direction": "long", "close": 150.0},
+        **_pit_envelope(decision_id),
+    }
+
+
+def _compact_row(decision_id: str) -> dict[str, object]:
+    return {
+        "symbol": "USDJPY",
+        "timeframe": "1h",
+        "horizon_hours": 1.0,
+        "direction": "long",
+        "close": 150.0,
+        **_pit_envelope(decision_id),
+    }
+
+
+def test_full_and_compact_are_hidden_until_exact_commit(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-1"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    assert list(decision_log.read_decision_events(full_path)) == []
+
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    assert list(journal.read_entries(compact_path)) == []
+
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+    assert [row["decision_id"] for row in decision_log.read_decision_events(full_path)] == [
+        decision_id
+    ]
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [decision_id]
+    raw = [json.loads(line) for line in full_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["event_type"] for row in raw] == [
+        decision_log.DECISION_BATCH_EVENT_TYPE,
+        decision_commit.COMMIT_EVENT_TYPE,
+    ]
+
+
+def test_wrong_compact_hash_does_not_publish_either_log(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-2"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        compact_batch_sha256="0" * 64,
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+    assert list(decision_log.read_decision_events(full_path)) == []
+    assert list(journal.read_entries(compact_path)) == []
+
+
+def test_standalone_pit_event_is_never_visible(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    full_path.write_text(
+        json.dumps(_full_event("uncommitted"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    assert list(decision_log.read_decision_events(full_path)) == []
+    source_lines = list(decision_log.iter_decision_source(full_path))
+    assert source_lines[0].error == "uncommitted_pit_event"

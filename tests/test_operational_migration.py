@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import decision_commit, decision_log, journal
 from fx_intel import operational_contracts as contracts
 from fx_intel import operational_migration as migration
 from fx_intel import operational_store as store
@@ -90,10 +91,44 @@ def _write_jsonl(path: Path, rows: list[object]) -> str:
     return store.file_sha256(path)
 
 
+def _write_decision_jsonl(path: Path, rows: list[dict[str, object]]) -> str:
+    path.write_text("", encoding="utf-8")
+    compact_path = path.parent / "briefing_tf_journal.jsonl"
+    compact_path.write_text("", encoding="utf-8")
+    legacy = [row for row in rows if row.get("pit_eligible") is not True]
+    if legacy:
+        with path.open("a", encoding="utf-8") as handle:
+            for row in legacy:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    current = [row for row in rows if row.get("pit_eligible") is True]
+    if current:
+        decision_ids = [str(row["decision_id"]) for row in current]
+        transaction_id = decision_commit.transaction_id_for(decision_ids)
+        full_batch = decision_log.append_decision_events(
+            path,
+            current,
+            transaction_id=transaction_id,
+        )
+        compact_batch = journal._append_journal_batch(  # noqa: SLF001
+            compact_path,
+            current,
+            decision_transaction_id=transaction_id,
+        )
+        decision_commit.append_commit(
+            path,
+            decision_ids=decision_ids,
+            full_batch_sha256=str(full_batch["batch_sha256"]),
+            compact_batch_sha256=str(compact_batch["batch_sha256"]),
+            mode="per_timeframe",
+            committed_at=NOW,
+        )
+    return store.file_sha256(path)
+
+
 def test_candidate_keeps_legacy_audit_but_only_queues_pit_prediction(tmp_path: Path) -> None:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
-    decision_hash = _write_jsonl(
+    decision_hash = _write_decision_jsonl(
         decisions,
         [_decision("legacy", pit=False), _decision("current", pit=True)],
     )
@@ -121,12 +156,15 @@ def test_candidate_keeps_legacy_audit_but_only_queues_pit_prediction(tmp_path: P
     assert report.database.price_points == 1
     assert report.verdict == "parity_with_exclusions"
     assert report.decisions.exclusion_reasons == {"pit_flag_not_true": 1}
+    assert [Path(source.path).name for source in report.decision_support_sources] == [
+        "briefing_tf_journal.jsonl"
+    ]
 
 
 def test_no_pit_history_is_explicitly_research_only(tmp_path: Path) -> None:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
-    decision_hash = _write_jsonl(decisions, [_decision("legacy", pit=False)])
+    decision_hash = _write_decision_jsonl(decisions, [_decision("legacy", pit=False)])
     price_hash = _write_jsonl(prices, [_price("price-1")])
 
     with store.open_operational_writer(
@@ -150,7 +188,7 @@ def test_no_pit_history_is_explicitly_research_only(tmp_path: Path) -> None:
 def test_missing_market_event_time_is_excluded_without_coercion(tmp_path: Path) -> None:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
-    decision_hash = _write_jsonl(decisions, [_decision("current", pit=True)])
+    decision_hash = _write_decision_jsonl(decisions, [_decision("current", pit=True)])
     price_hash = _write_jsonl(prices, [_price("legacy-price", event_time=False)])
 
     with store.open_operational_writer(
@@ -176,7 +214,7 @@ def test_missing_market_event_time_is_excluded_without_coercion(tmp_path: Path) 
 def test_source_hash_mismatch_fails_before_database_rows(tmp_path: Path) -> None:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
-    _write_jsonl(decisions, [_decision("current", pit=True)])
+    _write_decision_jsonl(decisions, [_decision("current", pit=True)])
     price_hash = _write_jsonl(prices, [_price("price-1")])
 
     with store.open_operational_writer(
@@ -199,7 +237,7 @@ def test_source_hash_mismatch_fails_before_database_rows(tmp_path: Path) -> None
 def test_content_hash_mismatch_is_reported_and_excluded(tmp_path: Path) -> None:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
-    decision_hash = _write_jsonl(decisions, [_decision("current", pit=True)])
+    decision_hash = _write_decision_jsonl(decisions, [_decision("current", pit=True)])
     tampered = _price("price-1")
     tampered["close"] = 151.0
     price_hash = _write_jsonl(prices, [tampered])
@@ -233,7 +271,7 @@ def test_market_open_horizon_skips_weekend() -> None:
 def test_exact_candidate_payload_parity_is_verified(tmp_path: Path) -> None:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
-    decision_hash = _write_jsonl(
+    decision_hash = _write_decision_jsonl(
         decisions,
         [_decision("legacy", pit=False), _decision("current", pit=True)],
     )
@@ -276,7 +314,7 @@ def test_parity_detects_source_payload_changed_after_migration(tmp_path: Path) -
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
     original = _decision("current", pit=True)
-    decision_hash = _write_jsonl(decisions, [original])
+    decision_hash = _write_decision_jsonl(decisions, [original])
     price_hash = _write_jsonl(prices, [_price("price-1")])
     database = tmp_path / "candidate.sqlite3"
     with store.open_operational_writer(database, writer_id="migration-test") as opened:
@@ -291,7 +329,7 @@ def test_parity_detects_source_payload_changed_after_migration(tmp_path: Path) -
         )
 
     changed = {**original, "decision": {"direction": "long"}}
-    changed_hash = _write_jsonl(decisions, [changed])
+    changed_hash = _write_decision_jsonl(decisions, [changed])
     with store.open_operational_reader(database) as opened:
         parity = migration.verify_candidate_parity(
             opened,

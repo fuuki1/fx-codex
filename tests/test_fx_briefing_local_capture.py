@@ -13,6 +13,7 @@ from fx_intel import trade_outcome as to
 from fx_intel.market import is_market_open
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
+from tests.decision_fixtures import write_committed_compact_rows
 
 
 def _view(interval: str, rec: str, close: float, atr: float = 0.15):
@@ -103,9 +104,7 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert not decision_outcomes_path.exists()
     assert not decision_feedback_path.exists()
     rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
-    decision_rows = [
-        json.loads(line) for line in decision_log_path.read_text().splitlines() if line.strip()
-    ]
+    decision_rows = list(fx_briefing.decision_log.read_decision_events(decision_log_path))
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
     # This fixture deliberately supplies no macro/news/quote source records.
@@ -160,6 +159,11 @@ def test_fusion_journal_failure_keeps_authoritative_full_decision(tmp_path, caps
 
     assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
     assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
+    visible = list(
+        fx_briefing.decision_log.read_decision_events(fx_briefing.DEFAULT_DECISION_LOG_PATH)
+    )
+    assert visible
+    assert not any(fx_briefing.journal.is_pit_eligible_entry(row) for row in visible)
     assert "ジャーナル書き込み失敗" in capsys.readouterr().err
 
 
@@ -253,52 +257,48 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
     (=適用後期待Rが-1.0、サンプル数はグループ最低数を満たす)。
     """
     start = datetime(2026, 6, 22, 8, 0, tzinfo=UTC)
-    lines = []
+    rows = []
     for i in range(20):
         close = 100.0 - 1.5 * i
         prediction_time = start + timedelta(hours=i * 3)
-        lines.append(
-            json.dumps(
-                {
-                    "ts": prediction_time.isoformat(),
-                    "prediction_time": prediction_time.isoformat(),
-                    "source_cutoff": (prediction_time - timedelta(minutes=2)).isoformat(),
-                    "max_feature_available_time": (
-                        prediction_time - timedelta(seconds=1)
-                    ).isoformat(),
-                    "pit_eligible": True,
-                    "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
-                    "decision_id": f"decision:{prediction_time.isoformat()}",
-                    "mode": "fusion",
-                    "producer": fx_briefing.journal.FUSION_PRODUCER,
-                    "producer_version": fx_briefing.journal.FUSION_PRODUCER_VERSION,
-                    "input_context_id": f"context:{prediction_time.isoformat()}",
-                    "source_record_ids": [f"source:{prediction_time.isoformat()}"],
-                    "symbol": "USDJPY",
-                    "direction": "long",
-                    "conviction": 20,
-                    "composite": 0.6,
-                    "tech_score": 0.6,
-                    "news_score": 0.1,
-                    "close": close,
-                    "atr": 1.0,
-                    "stop": close - 1.0,
-                    "target1": close + 0.75,
-                    "target2": close + 1.5,
-                    "data_quality": 1.0,
-                    "target_policy": {
-                        "candidate_id": candidate_id,
-                        "scope": "overall",
-                        "key": "",
-                        "target1_r": 0.75,
-                        "target2_r": 1.5,
-                    },
-                    "features": {},
-                    "components": [],
-                }
-            )
+        rows.append(
+            {
+                "ts": prediction_time.isoformat(),
+                "prediction_time": prediction_time.isoformat(),
+                "source_cutoff": (prediction_time - timedelta(minutes=2)).isoformat(),
+                "max_feature_available_time": (prediction_time - timedelta(seconds=1)).isoformat(),
+                "pit_eligible": True,
+                "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+                "decision_id": f"decision:{prediction_time.isoformat()}",
+                "mode": "fusion",
+                "producer": fx_briefing.journal.FUSION_PRODUCER,
+                "producer_version": fx_briefing.journal.FUSION_PRODUCER_VERSION,
+                "input_context_id": f"context:{prediction_time.isoformat()}",
+                "source_record_ids": [f"source:{prediction_time.isoformat()}"],
+                "symbol": "USDJPY",
+                "direction": "long",
+                "conviction": 20,
+                "composite": 0.6,
+                "tech_score": 0.6,
+                "news_score": 0.1,
+                "close": close,
+                "atr": 1.0,
+                "stop": close - 1.0,
+                "target1": close + 0.75,
+                "target2": close + 1.5,
+                "data_quality": 1.0,
+                "target_policy": {
+                    "candidate_id": candidate_id,
+                    "scope": "overall",
+                    "key": "",
+                    "target1_r": 0.75,
+                    "target2_r": 1.5,
+                },
+                "features": {},
+                "components": [],
+            }
         )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_committed_compact_rows(path, rows, mode="fusion")
 
 
 def test_auto_paused_policy_not_applied_to_same_run_plans(

@@ -9,7 +9,7 @@ cells that can explain why confidence was boosted, dampened, or blocked.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, UTC
 import fcntl
 import hashlib
@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from . import journal
+from . import decision_commit, journal
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
 from .shadow_learning import (
@@ -31,6 +31,7 @@ from .shadow_learning import (
 
 SCHEMA_VERSION = 1
 EVENT_TYPE = "chart_decision"
+DECISION_BATCH_EVENT_TYPE = "decision_batch"
 SCORING_METHOD = "tp_sl_mfe_mae_first_touch"
 SCORING_METRICS = (
     "first_touch",
@@ -115,6 +116,13 @@ FAILURE_REASON_DEFS: dict[str, tuple[str, str]] = {
         "根拠データが欠けている判断を抑制する",
     ),
 }
+
+
+@dataclass(frozen=True)
+class DecisionSourceLine:
+    line_number: int
+    events: tuple[dict[str, object], ...] = ()
+    error: str | None = None
 
 
 def build_timeframe_decision_events(
@@ -266,24 +274,62 @@ def build_fusion_decision_events(
     return events
 
 
-def append_decision_events(path: str | Path, events: Iterable[Mapping[str, object]]) -> None:
-    """Durably append one locked audit batch; one line is one immutable event."""
+def append_decision_events(
+    path: str | Path,
+    events: Iterable[Mapping[str, object]],
+    *,
+    transaction_id: str | None = None,
+) -> dict[str, object]:
+    """Durably append one self-validating full batch as one JSONL record.
 
+    PIT-eligible events require a cross-log transaction ID. They remain hidden
+    from every reader until the compact batch and matching commit record exist.
+    """
+
+    normalized_events = [_json_ready_dict(event) for event in events]
+    if not normalized_events:
+        raise ValueError("decision batch must contain at least one event")
+    decision_ids = decision_commit.normalize_decision_ids(
+        [event.get("decision_id") for event in normalized_events]
+    )
+    expected_transaction_id = decision_commit.transaction_id_for(decision_ids)
+    requires_cross_log_commit = any(
+        journal.is_pit_eligible_entry(event) for event in normalized_events
+    )
+    normalized_transaction_id = str(transaction_id or "").strip()
+    if requires_cross_log_commit and normalized_transaction_id != expected_transaction_id:
+        raise journal.PointInTimeError(
+            "PIT-eligible full decisions require the canonical cross-log transaction ID"
+        )
+    if normalized_transaction_id and normalized_transaction_id != expected_transaction_id:
+        raise journal.PointInTimeError("decision transaction ID does not match decision IDs")
+    batch_sha256 = decision_commit.canonical_sha256(normalized_events)
+    batch = {
+        "schema_version": SCHEMA_VERSION,
+        "event_type": DECISION_BATCH_EVENT_TYPE,
+        "decision_transaction_id": normalized_transaction_id or None,
+        "decision_ids": decision_ids,
+        "decision_ids_sha256": decision_commit.decision_ids_sha256(decision_ids),
+        "decision_batch_sha256": batch_sha256,
+        "requires_cross_log_commit": requires_cross_log_commit,
+        "events": normalized_events,
+    }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = "".join(
-        json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n"
-        for event in events
-    )
+    payload = json.dumps(batch, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
     with target.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            if payload:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return {
+        "decision_transaction_id": normalized_transaction_id or None,
+        "decision_ids": decision_ids,
+        "batch_sha256": batch_sha256,
+    }
 
 
 def save_latest_snapshot(
@@ -340,24 +386,109 @@ def save_latest_snapshot(
             temporary_path.unlink()
 
 
-def read_decision_events(path: str | Path):
-    """Read append-only decision events.  Corrupt lines are skipped."""
+def read_decision_events(
+    path: str | Path,
+    *,
+    commit_path: str | Path | None = None,
+):
+    """Read legacy audit rows and only cross-log-committed PIT batches."""
 
+    for source_line in iter_decision_source(path, commit_path=commit_path):
+        yield from source_line.events
+
+
+def iter_decision_source(
+    path: str | Path,
+    *,
+    commit_path: str | Path | None = None,
+):
+    """Stream physical full-log lines with validated zero-or-more decision events."""
+
+    target = Path(path)
+    commits = decision_commit.load_commits(commit_path or decision_commit.commit_path_for(target))
     try:
-        handle = Path(path).open(encoding="utf-8")
+        handle = target.open(encoding="utf-8")
     except OSError:
         return
     with handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                yield DecisionSourceLine(line_number=line_number, error="blank_line")
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                yield DecisionSourceLine(line_number=line_number, error="malformed_json")
                 continue
-            if isinstance(event, dict):
-                yield event
+            if not isinstance(event, dict):
+                yield DecisionSourceLine(line_number=line_number, error="non_object_json")
+                continue
+            if event.get("event_type") == DECISION_BATCH_EVENT_TYPE:
+                batch_events = decision_events_from_batch(event, commits=commits)
+                if not batch_events:
+                    yield DecisionSourceLine(
+                        line_number=line_number,
+                        error="uncommitted_or_invalid_decision_batch",
+                    )
+                else:
+                    yield DecisionSourceLine(
+                        line_number=line_number,
+                        events=tuple(batch_events),
+                    )
+                continue
+            if event.get("event_type") == decision_commit.COMMIT_EVENT_TYPE:
+                yield DecisionSourceLine(line_number=line_number)
+                continue
+            if journal.is_pit_eligible_entry(event):
+                yield DecisionSourceLine(
+                    line_number=line_number,
+                    error="uncommitted_pit_event",
+                )
+                continue
+            yield DecisionSourceLine(line_number=line_number, events=(event,))
+
+
+def decision_events_from_batch(
+    batch: Mapping[str, object],
+    *,
+    commits: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Validate one full-batch wrapper and enforce cross-log visibility."""
+
+    raw_events = batch.get("events")
+    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes)):
+        return []
+    events = [dict(event) for event in raw_events if isinstance(event, Mapping)]
+    if len(events) != len(raw_events) or not events:
+        return []
+    try:
+        decision_ids = decision_commit.normalize_decision_ids(
+            [event.get("decision_id") for event in events]
+        )
+    except decision_commit.DecisionCommitError:
+        return []
+    batch_sha256 = decision_commit.canonical_sha256(events)
+    if (
+        batch.get("decision_ids") != decision_ids
+        or batch.get("decision_ids_sha256") != decision_commit.decision_ids_sha256(decision_ids)
+        or batch.get("decision_batch_sha256") != batch_sha256
+    ):
+        return []
+    requires_commit = bool(batch.get("requires_cross_log_commit"))
+    if any(journal.is_pit_eligible_entry(event) for event in events):
+        requires_commit = True
+    if not requires_commit:
+        return events
+    transaction_id = str(batch.get("decision_transaction_id") or "")
+    if not decision_commit.matching_commit(
+        commits,
+        transaction_id=transaction_id,
+        decision_ids=decision_ids,
+        batch_kind="full",
+        batch_sha256=batch_sha256,
+    ):
+        return []
+    return events
 
 
 def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, object] | None:

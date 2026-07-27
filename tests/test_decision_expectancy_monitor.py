@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from fx_intel import journal
+from tests.decision_fixtures import write_committed_decision_events
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "decision_expectancy_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -109,7 +110,11 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
     feedback_path = tmp_path / "briefing_decision_feedback.json"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
     events, prices = _losing_rows()
-    _write_jsonl(decision_log_path, events)
+    write_committed_decision_events(
+        decision_log_path,
+        events,
+        mode="per_timeframe",
+    )
     _write_jsonl(prices_path, prices)
 
     result = monitor.run_decision_expectancy_monitor(
@@ -143,7 +148,11 @@ def test_decision_expectancy_monitor_marks_immature_horizon_pending(
     decision_log_path = tmp_path / "briefing_decisions.jsonl"
     prices_path = tmp_path / "briefing_tf_prices.jsonl"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
-    _write_jsonl(decision_log_path, [_decision_event(NOW, 1)])
+    write_committed_decision_events(
+        decision_log_path,
+        [_decision_event(NOW, 1)],
+        mode="per_timeframe",
+    )
     _write_jsonl(
         prices_path,
         [
@@ -179,7 +188,11 @@ def test_decision_expectancy_monitor_fails_stale_price_series(monitor, tmp_path)
     decision_log_path = tmp_path / "briefing_decisions.jsonl"
     prices_path = tmp_path / "briefing_tf_prices.jsonl"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
-    _write_jsonl(decision_log_path, [_decision_event(NOW, 1)])
+    write_committed_decision_events(
+        decision_log_path,
+        [_decision_event(NOW, 1)],
+        mode="per_timeframe",
+    )
     _write_jsonl(prices_path, [_price(NOW, 100.0)])
 
     result = monitor.run_decision_expectancy_monitor(
@@ -203,7 +216,11 @@ def test_decision_expectancy_monitor_cli_quiet_returns_exit_code(monitor, tmp_pa
     decision_log_path = tmp_path / "decisions.jsonl"
     prices_path = tmp_path / "prices.jsonl"
     events, prices = _losing_rows()
-    _write_jsonl(decision_log_path, events)
+    write_committed_decision_events(
+        decision_log_path,
+        events,
+        mode="per_timeframe",
+    )
     _write_jsonl(prices_path, prices)
 
     exit_code = monitor.main(

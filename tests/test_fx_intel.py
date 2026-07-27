@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 import requests
 
-from fx_intel import briefing
+from fx_intel import briefing, decision_commit
 from fx_intel.calendar import (
     EconomicEvent,
     active_and_next_window,
@@ -756,6 +756,7 @@ def test_journal_records_and_validates_pit_provenance(tmp_path) -> None:
         source_cutoff=source_cutoff,
         max_feature_available_time=feature_available,
         decision_ids=["decision-1"],
+        decision_transaction_id=decision_commit.transaction_id_for(["decision-1"]),
     )
 
     entry = json.loads(path.read_text(encoding="utf-8").splitlines()[0])

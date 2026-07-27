@@ -14,6 +14,7 @@ from fx_briefing import (
 from fx_intel import briefing, journal, trade_outcome as to
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import IntervalView, PairTechnicals
+from tests.decision_fixtures import write_committed_compact_rows
 
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 DAY = timedelta(hours=24)
@@ -107,9 +108,10 @@ def _write_jsonl(path, rows: list[dict]) -> None:
             }
         )
         eligible_rows.append(row)
-    path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in eligible_rows) + "\n",
-        encoding="utf-8",
+    write_committed_compact_rows(
+        path,
+        eligible_rows,
+        mode="fusion",
     )
 
 
@@ -759,7 +761,7 @@ def test_expectancy_health_fails_for_negative_expectancy() -> None:
 
 
 def test_score_trade_outcomes_cli_writes_json_report(tmp_path) -> None:
-    journal_path = tmp_path / "journal.jsonl"
+    journal_path = tmp_path / "briefing_journal.jsonl"
     report_path = tmp_path / "trade_outcomes.json"
     monitor_path = tmp_path / "trade_monitor.json"
     rows = [
@@ -1005,7 +1007,7 @@ def test_mfe_and_mae_stop_at_the_first_exit_touch() -> None:
 
 
 def test_retest_trade_variants_cli_writes_paper_candidate(tmp_path) -> None:
-    journal_path = tmp_path / "journal.jsonl"
+    journal_path = tmp_path / "briefing_journal.jsonl"
     report_path = tmp_path / "variants.json"
     registry_path = tmp_path / "registry.json"
     rows: list[dict] = []
@@ -1094,7 +1096,7 @@ def test_retest_trade_variants_reports_symbol_direction_cell_candidates() -> Non
 
 
 def test_check_trade_outcome_health_cli_returns_failure_for_negative_expectancy(tmp_path) -> None:
-    journal_path = tmp_path / "journal.jsonl"
+    journal_path = tmp_path / "briefing_journal.jsonl"
     rows: list[dict] = []
     for index in range(20):
         symbol = f"TST{index:02d}"

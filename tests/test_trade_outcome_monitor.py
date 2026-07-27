@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from fx_intel import journal, trade_outcome as to
+from tests.decision_fixtures import write_committed_compact_rows
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "trade_outcome_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -54,10 +55,13 @@ def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
-    path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
-        encoding="utf-8",
-    )
+    if any(journal.is_pit_eligible_entry(row) for row in rows):
+        write_committed_compact_rows(path, rows, mode="fusion")
+    else:
+        path.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _variant_rows(count: int = 20) -> list[dict]:
@@ -86,7 +90,7 @@ def _variant_rows(count: int = 20) -> list[dict]:
 
 
 def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_path) -> None:
-    journal_path = tmp_path / "journal.jsonl"
+    journal_path = tmp_path / "briefing_journal.jsonl"
     registry_path = tmp_path / "registry.json"
     monitor_path = tmp_path / "monitor.json"
     outcome_path = tmp_path / "outcomes.json"
@@ -237,7 +241,7 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
                 _entry(ts + DAY, "USDJPY", 98.8),
             ]
         )
-    journal_path = tmp_path / "journal.jsonl"
+    journal_path = tmp_path / "briefing_journal.jsonl"
     registry_path = tmp_path / "registry.json"
     _write_jsonl(journal_path, rows)
     registry_path.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")

@@ -48,11 +48,11 @@ def _label_parts(payloads: list[dict[str, Any]], batch_id: str) -> list[dict[str
         return payloads
     labeled: list[dict[str, Any]] = []
     for index, raw in enumerate(payloads, start=1):
-        payload = dict(raw)
         marker = f"fx-codex batch {batch_id[:12]} part {index}/{len(payloads)}"
-        existing = str(payload.get("content") or "")
-        payload["content"] = f"{marker}\n{existing[: 1999 - len(marker)]}" if existing else marker
-        labeled.append(payload)
+        # Keep the application payload byte-for-byte equivalent. Prepending the
+        # marker to a 2000-character content field would silently truncate it.
+        labeled.append({"content": marker})
+        labeled.append(dict(raw))
     return labeled
 
 
