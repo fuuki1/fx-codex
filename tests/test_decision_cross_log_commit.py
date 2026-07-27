@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 import json
-from pathlib import Path
+import os
 import tracemalloc
 
 import pytest
@@ -79,6 +79,8 @@ def test_full_and_compact_are_hidden_until_exact_commit(tmp_path) -> None:
         full_path,
         decision_ids=[decision_id],
         full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
@@ -114,6 +116,8 @@ def test_wrong_compact_hash_does_not_publish_either_log(tmp_path) -> None:
         full_path,
         decision_ids=[decision_id],
         full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256="0" * 64,
         mode="per_timeframe",
         committed_at=NOW,
@@ -142,6 +146,8 @@ def test_commit_mode_must_match_full_events_and_compact_filename(tmp_path) -> No
         full_path,
         decision_ids=[decision_id],
         full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
@@ -178,20 +184,132 @@ def test_commit_requires_canonical_full_wrapper_schema(tmp_path) -> None:
         full_path,
         decision_ids=[decision_id],
         full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
         compact_batch_sha256=str(compact_batch["batch_sha256"]),
         mode="per_timeframe",
         committed_at=NOW,
     )
+    original_stat = full_path.stat()
     lines = [json.loads(line) for line in full_path.read_text(encoding="utf-8").splitlines()]
     lines[0]["schema_version"] = 999
     full_path.write_text(
         "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
         encoding="utf-8",
     )
+    os.utime(
+        full_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
 
     assert decision_commit.load_commits(full_path, verify_compact=True) == {}
     assert list(decision_log.read_decision_events(full_path)) == []
     assert list(journal.read_entries(compact_path)) == []
+
+
+def test_prepared_receipt_without_full_commit_is_hidden_and_late_retry_recovers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+
+    def append_pending(decision_id: str):
+        transaction_id = decision_commit.transaction_id_for([decision_id])
+        full_batch = decision_log.append_decision_events(
+            full_path,
+            [_full_event(decision_id)],
+            transaction_id=transaction_id,
+        )
+        compact_batch = journal._append_journal_batch(  # noqa: SLF001
+            compact_path,
+            [_compact_row(decision_id)],
+            decision_transaction_id=transaction_id,
+        )
+        return full_batch, compact_batch
+
+    def commit(decision_id: str, full_batch: dict, compact_batch: dict) -> None:
+        decision_commit.append_commit(
+            full_path,
+            decision_ids=[decision_id],
+            full_batch_sha256=str(full_batch["batch_sha256"]),
+            full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+            full_batch_line_sha256=str(full_batch["line_sha256"]),
+            compact_batch_sha256=str(compact_batch["batch_sha256"]),
+            mode="per_timeframe",
+            committed_at=NOW,
+        )
+
+    full_a, compact_a = append_pending("decision-late-a")
+    original_append = decision_commit._append_locked_line  # noqa: SLF001
+
+    def fail_final_commit(handle, path, serialized):
+        if path == full_path.resolve():
+            raise OSError("simulated crash before final full commit")
+        return original_append(handle, path, serialized)
+
+    monkeypatch.setattr(decision_commit, "_append_locked_line", fail_final_commit)
+    with pytest.raises(OSError, match="simulated crash"):
+        commit("decision-late-a", full_a, compact_a)
+
+    receipt_rows = [
+        json.loads(line) for line in compact_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert receipt_rows[-1]["event_type"] == decision_commit.RECEIPT_EVENT_TYPE
+    assert list(journal.read_entries(compact_path)) == []
+
+    monkeypatch.setattr(decision_commit, "_append_locked_line", original_append)
+    full_b, compact_b = append_pending("decision-committed-b")
+    commit("decision-committed-b", full_b, compact_b)
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [
+        "decision-committed-b"
+    ]
+
+    commit("decision-late-a", full_a, compact_a)
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [
+        "decision-late-a",
+        "decision-committed-b",
+    ]
+    assert [row["decision_id"] for row in decision_log.read_decision_events(full_path)] == [
+        "decision-late-a",
+        "decision-committed-b",
+    ]
+
+
+def test_compact_reader_never_calls_full_history_commit_scan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-bounded-seeks"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+    def forbid_full_scan(*args, **kwargs):
+        raise AssertionError("compact reader must use receipt offsets, not a full scan")
+
+    monkeypatch.setattr(decision_commit, "load_commits", forbid_full_scan)
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [decision_id]
 
 
 def test_load_commits_streams_large_legacy_log_with_bounded_memory(tmp_path) -> None:
@@ -209,147 +327,6 @@ def test_load_commits_streams_large_legacy_log_with_bounded_memory(tmp_path) -> 
         tracemalloc.stop()
 
     assert peak_bytes < 4 * 1024 * 1024
-
-
-def test_load_commits_uses_durable_index_without_full_rescan(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
-    compact_path = tmp_path / "briefing_tf_journal.jsonl"
-    decision_id = "decision-indexed"
-    transaction_id = decision_commit.transaction_id_for([decision_id])
-    full_batch = decision_log.append_decision_events(
-        full_path,
-        [_full_event(decision_id)],
-        transaction_id=transaction_id,
-    )
-    compact_batch = journal._append_journal_batch(  # noqa: SLF001
-        compact_path,
-        [_compact_row(decision_id)],
-        decision_transaction_id=transaction_id,
-    )
-    decision_commit.append_commit(
-        full_path,
-        decision_ids=[decision_id],
-        full_batch_sha256=str(full_batch["batch_sha256"]),
-        compact_batch_sha256=str(compact_batch["batch_sha256"]),
-        mode="per_timeframe",
-        committed_at=NOW,
-    )
-    assert decision_commit.commit_index_path_for(full_path).is_file()
-
-    def forbid_full_rescan(path: Path):
-        raise AssertionError(f"full rescan is forbidden: {path}")
-
-    monkeypatch.setattr(decision_commit, "_stream_full_commit_state", forbid_full_rescan)
-    commits = decision_commit.load_commits(full_path, verify_compact=False)
-    assert list(commits) == [transaction_id]
-
-
-def test_stale_index_validates_only_new_suffix(tmp_path) -> None:
-    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
-    compact_path = tmp_path / "briefing_tf_journal.jsonl"
-
-    def append(identifier: str) -> str:
-        transaction_id = decision_commit.transaction_id_for([identifier])
-        full_batch = decision_log.append_decision_events(
-            full_path,
-            [_full_event(identifier)],
-            transaction_id=transaction_id,
-        )
-        compact_batch = journal._append_journal_batch(  # noqa: SLF001
-            compact_path,
-            [_compact_row(identifier)],
-            decision_transaction_id=transaction_id,
-        )
-        decision_commit.append_commit(
-            full_path,
-            decision_ids=[identifier],
-            full_batch_sha256=str(full_batch["batch_sha256"]),
-            compact_batch_sha256=str(compact_batch["batch_sha256"]),
-            mode="per_timeframe",
-            committed_at=NOW,
-        )
-        return transaction_id
-
-    first = append("decision-index-first")
-    index_path = decision_commit.commit_index_path_for(full_path)
-    first_index = index_path.read_bytes()
-    second = append("decision-index-second")
-    index_path.write_bytes(first_index)
-
-    assert set(decision_commit.load_commits(full_path, verify_compact=False)) == {
-        first,
-        second,
-    }
-
-
-def test_same_size_prefix_mutation_invalidates_durable_index(tmp_path) -> None:
-    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
-    compact_path = tmp_path / "briefing_tf_journal.jsonl"
-    decision_id = "decision-index-tamper"
-    transaction_id = decision_commit.transaction_id_for([decision_id])
-    full_batch = decision_log.append_decision_events(
-        full_path,
-        [_full_event(decision_id)],
-        transaction_id=transaction_id,
-    )
-    compact_batch = journal._append_journal_batch(  # noqa: SLF001
-        compact_path,
-        [_compact_row(decision_id)],
-        decision_transaction_id=transaction_id,
-    )
-    decision_commit.append_commit(
-        full_path,
-        decision_ids=[decision_id],
-        full_batch_sha256=str(full_batch["batch_sha256"]),
-        compact_batch_sha256=str(compact_batch["batch_sha256"]),
-        mode="per_timeframe",
-        committed_at=NOW,
-    )
-    original = full_path.read_bytes()
-    mutated = original.replace(b'"schema_version": 1', b'"schema_version": 2', 1)
-    assert len(mutated) == len(original)
-    full_path.write_bytes(mutated)
-
-    assert decision_commit.load_commits(full_path, verify_compact=False) == {}
-
-
-def test_index_refresh_failure_does_not_fail_authoritative_commit(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
-    compact_path = tmp_path / "briefing_tf_journal.jsonl"
-    decision_id = "decision-index-refresh-failure"
-    transaction_id = decision_commit.transaction_id_for([decision_id])
-    full_batch = decision_log.append_decision_events(
-        full_path,
-        [_full_event(decision_id)],
-        transaction_id=transaction_id,
-    )
-    compact_batch = journal._append_journal_batch(  # noqa: SLF001
-        compact_path,
-        [_compact_row(decision_id)],
-        decision_transaction_id=transaction_id,
-    )
-
-    def fail_refresh(path: Path, *, expected_transaction_id: str) -> None:
-        raise OSError(f"simulated index failure for {path}:{expected_transaction_id}")
-
-    monkeypatch.setattr(decision_commit, "_refresh_commit_index", fail_refresh)
-    record = decision_commit.append_commit(
-        full_path,
-        decision_ids=[decision_id],
-        full_batch_sha256=str(full_batch["batch_sha256"]),
-        compact_batch_sha256=str(compact_batch["batch_sha256"]),
-        mode="per_timeframe",
-        committed_at=NOW,
-    )
-
-    assert record["decision_transaction_id"] == transaction_id
-    assert list(decision_commit.load_commits(full_path, verify_compact=False)) == [transaction_id]
 
 
 def test_standalone_pit_event_is_never_visible(tmp_path) -> None:

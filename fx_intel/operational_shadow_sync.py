@@ -21,7 +21,7 @@ import platform
 import sqlite3
 import subprocess
 import sys
-from typing import Any, IO
+from typing import Any, cast, IO
 
 from . import decision_commit, decision_log, journal
 from .operational_migration import (
@@ -142,6 +142,8 @@ class _CompactBatch:
     transaction_id: str
     decision_ids_sha256: str
     batch_sha256: str
+    full_batch_sha256: str
+    full_commit_record_sha256: str
 
 
 def bootstrap_candidate(
@@ -655,6 +657,7 @@ def _verify_incremental_decision_commits(
             complete,
             start_offset=cursor.byte_offset,
             expected_mode=mode,
+            full_handle=locked_handles[decision_path],
         )
 
         search_start = 0
@@ -664,6 +667,8 @@ def _verify_incremental_decision_commits(
                 str(expected_record.get("decision_transaction_id") or ""),
                 str(expected_record.get("decision_ids_sha256") or ""),
                 str(expected_record.get("compact_batch_sha256") or ""),
+                str(expected_record.get("full_batch_sha256") or ""),
+                str(expected_record.get("commit_record_sha256") or ""),
             )
             match_index = next(
                 (
@@ -673,6 +678,8 @@ def _verify_incremental_decision_commits(
                         batches[index].transaction_id,
                         batches[index].decision_ids_sha256,
                         batches[index].batch_sha256,
+                        batches[index].full_batch_sha256,
+                        batches[index].full_commit_record_sha256,
                     )
                     == key
                 ),
@@ -713,10 +720,13 @@ def _compact_batches_from_suffix(
     *,
     start_offset: int,
     expected_mode: str,
+    full_handle: IO[bytes],
 ) -> list[_CompactBatch]:
-    """Return exact complete compact batches and their suffix end boundaries."""
+    """Return receipt-complete compact batches and their suffix end boundaries."""
 
-    batches: list[_CompactBatch] = []
+    verified_by_transaction: dict[str, _CompactBatch] = {}
+    pending_batches: dict[str, dict[str, object]] = {}
+    batch_conflicts: set[str] = set()
     pending_id = ""
     pending_rows: list[dict[str, object]] = []
     relative_offset = 0
@@ -732,43 +742,59 @@ def _compact_batches_from_suffix(
             pending_id = ""
             pending_rows = []
             continue
-        batch_id = str(value.get("journal_batch_id") or "")
-        if value.get("event_type") == journal.JOURNAL_BATCH_COMMIT:
-            decision_ids = [row.get("decision_id") for row in pending_rows]
-            try:
-                normalized_ids = decision_commit.normalize_decision_ids(decision_ids)
-                ids_hash = decision_commit.decision_ids_sha256(normalized_ids)
-                transaction_id = decision_commit.transaction_id_for(normalized_ids)
-            except decision_commit.DecisionCommitError:
-                normalized_ids = []
-                ids_hash = ""
-                transaction_id = ""
-            batch_hash = decision_commit.canonical_sha256(pending_rows)
-            indices = [row.get("journal_batch_index") for row in pending_rows]
-            if (
-                batch_id
-                and batch_id == pending_id
-                and value.get("journal_batch_size") == len(pending_rows)
-                and indices == list(range(len(pending_rows)))
-                and value.get("decision_transaction_id") == transaction_id
-                and value.get("decision_ids") == normalized_ids
-                and value.get("decision_ids_sha256") == ids_hash
-                and value.get("journal_batch_sha256") == batch_hash
-                and value.get("requires_cross_log_commit") is True
-                and all(
-                    row.get("decision_transaction_id") == transaction_id
-                    and row.get("mode") == expected_mode
-                    for row in pending_rows
+        if value.get("event_type") == decision_commit.RECEIPT_EVENT_TYPE:
+            receipt = decision_commit.validated_receipt(value)
+            if receipt is not None:
+                transaction_id = str(receipt["decision_transaction_id"])
+                descriptor = pending_batches.get(transaction_id)
+                descriptor_ids = (
+                    cast(Sequence[object], descriptor["decision_ids"])
+                    if descriptor is not None
+                    and isinstance(descriptor.get("decision_ids"), Sequence)
+                    and not isinstance(descriptor.get("decision_ids"), (str, bytes))
+                    else None
                 )
-            ):
-                batches.append(
-                    _CompactBatch(
+                if (
+                    descriptor is not None
+                    and descriptor_ids is not None
+                    and decision_commit.receipt_matches_compact(
+                        receipt,
+                        transaction_id=transaction_id,
+                        decision_ids=descriptor_ids,
+                        batch_sha256=str(descriptor["compact_batch_sha256"]),
+                        mode=expected_mode,
+                    )
+                    and decision_commit.receipt_matches_full_evidence(
+                        receipt,
+                        full_handle,
+                    )
+                ):
+                    verified_by_transaction[transaction_id] = _CompactBatch(
                         end_offset=start_offset + relative_offset,
                         transaction_id=transaction_id,
-                        decision_ids_sha256=ids_hash,
-                        batch_sha256=batch_hash,
+                        decision_ids_sha256=str(descriptor["decision_ids_sha256"]),
+                        batch_sha256=str(descriptor["compact_batch_sha256"]),
+                        full_batch_sha256=str(receipt["full_batch_sha256"]),
+                        full_commit_record_sha256=str(receipt["full_commit_record_sha256"]),
                     )
-                )
+            pending_id = ""
+            pending_rows = []
+            continue
+        batch_id = str(value.get("journal_batch_id") or "")
+        if value.get("event_type") == journal.JOURNAL_BATCH_COMMIT:
+            descriptor = decision_commit.compact_batch_descriptor(
+                pending_rows,
+                value,
+                expected_mode=expected_mode,
+            )
+            if descriptor is not None:
+                transaction_id = str(descriptor["decision_transaction_id"])
+                previous = pending_batches.get(transaction_id)
+                if previous is not None and previous != descriptor:
+                    batch_conflicts.add(transaction_id)
+                    pending_batches.pop(transaction_id, None)
+                elif transaction_id not in batch_conflicts:
+                    pending_batches[transaction_id] = descriptor
             pending_id = ""
             pending_rows = []
             continue
@@ -780,7 +806,10 @@ def _compact_batches_from_suffix(
             continue
         pending_id = ""
         pending_rows = []
-    return batches
+    return sorted(
+        verified_by_transaction.values(),
+        key=lambda batch: batch.end_offset,
+    )
 
 
 def _advance_cursor_for_chunk(

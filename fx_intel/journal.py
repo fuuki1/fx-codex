@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
 from collections.abc import Iterable, Mapping, Sequence
+from typing import BinaryIO
 import uuid
 
 from . import decision_commit
@@ -495,7 +496,8 @@ def _plan_execution(plan: object) -> dict[str, object]:
 
 
 def read_entries(path: str | Path):
-    """Read legacy rows and only cross-log-committed PIT append batches."""
+    """Read legacy rows and PIT batches with exact full-line-backed receipts."""
+
     target = Path(path)
     expected_mode = next(
         (
@@ -505,107 +507,117 @@ def read_entries(path: str | Path):
         ),
         "",
     )
-    commits = decision_commit.load_commits(
-        decision_commit.commit_path_for(target),
-        verify_compact=False,
-    )
-    try:
-        handle = target.open(encoding="utf-8")
-    except OSError:
-        return
+    with decision_commit.verified_compact_reader(target) as (handle, receipts):
+        if handle is None:
+            return
+        yield from _read_entries_from_handle(
+            handle,
+            expected_mode=expected_mode,
+            receipts=receipts,
+        )
+
+
+def _read_entries_from_handle(
+    handle: BinaryIO,
+    *,
+    expected_mode: str,
+    receipts: Mapping[str, Mapping[str, object]],
+):
     pending_id = ""
     pending_rows: list[dict[str, object]] = []
-    with handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(entry, dict):
-                continue
-            batch_id = str(entry.get("journal_batch_id") or "")
-            if entry.get("event_type") == JOURNAL_BATCH_COMMIT:
-                expected_size = entry.get("journal_batch_size")
-                indices = [row.get("journal_batch_index") for row in pending_rows]
-                decision_ids = [row.get("decision_id") for row in pending_rows]
-                batch_sha256 = decision_commit.canonical_sha256(pending_rows)
-                locally_complete = (
-                    batch_id
-                    and batch_id == pending_id
-                    and isinstance(expected_size, int)
-                    and expected_size == len(pending_rows)
-                    and indices == list(range(expected_size))
-                )
-                has_integrity_envelope = "journal_batch_sha256" in entry
-                if locally_complete and not has_integrity_envelope:
-                    if not any(is_pit_eligible_entry(row) for row in pending_rows):
-                        yield from pending_rows
-                elif locally_complete:
-                    marker_decision_ids = entry.get("decision_ids")
-                    try:
-                        normalized_marker_ids = (
-                            decision_commit.normalize_decision_ids(marker_decision_ids)
-                            if marker_decision_ids
-                            else []
-                        )
-                        expected_ids_hash = (
-                            decision_commit.decision_ids_sha256(normalized_marker_ids)
-                            if normalized_marker_ids
-                            else decision_commit.canonical_sha256([])
-                        )
-                        integrity_matches = (
-                            normalized_marker_ids
-                            == [
-                                str(value or "").strip()
-                                for value in decision_ids
-                                if str(value or "").strip()
-                            ]
-                            and entry.get("decision_ids_sha256") == expected_ids_hash
-                            and entry.get("journal_batch_sha256") == batch_sha256
-                        )
-                    except decision_commit.DecisionCommitError:
-                        integrity_matches = False
-                    requires_commit = bool(entry.get("requires_cross_log_commit")) or any(
-                        is_pit_eligible_entry(row) for row in pending_rows
-                    )
-                    transaction_id = str(entry.get("decision_transaction_id") or "")
-                    transaction_matches_rows = all(
-                        str(row.get("decision_transaction_id") or "") == transaction_id
-                        for row in pending_rows
-                    )
-                    commit_matches = False
-                    if integrity_matches and transaction_matches_rows:
-                        try:
-                            commit_matches = decision_commit.matching_commit(
-                                commits,
-                                transaction_id=transaction_id,
-                                decision_ids=decision_ids,
-                                batch_kind="compact",
-                                batch_sha256=batch_sha256,
-                                mode=expected_mode,
-                            )
-                        except decision_commit.DecisionCommitError:
-                            commit_matches = False
-                    if integrity_matches and (not requires_commit or commit_matches):
-                        yield from pending_rows
-                pending_id = ""
-                pending_rows = []
-                continue
-            if batch_id:
-                if batch_id != pending_id:
-                    pending_id = batch_id
-                    pending_rows = []
-                pending_rows.append(entry)
-                continue
-            # Rows written before commit-marked batching remain readable. A
-            # standalone v2 row has no proof that its full audit twin committed.
+    for raw_line in handle:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event_type") == decision_commit.RECEIPT_EVENT_TYPE:
             pending_id = ""
             pending_rows = []
-            if not is_pit_eligible_entry(entry):
-                yield entry
+            continue
+        batch_id = str(entry.get("journal_batch_id") or "")
+        if entry.get("event_type") == JOURNAL_BATCH_COMMIT:
+            expected_size = entry.get("journal_batch_size")
+            indices = [row.get("journal_batch_index") for row in pending_rows]
+            decision_ids = [row.get("decision_id") for row in pending_rows]
+            batch_sha256 = decision_commit.canonical_sha256(pending_rows)
+            locally_complete = (
+                batch_id
+                and batch_id == pending_id
+                and isinstance(expected_size, int)
+                and expected_size == len(pending_rows)
+                and indices == list(range(expected_size))
+            )
+            has_integrity_envelope = "journal_batch_sha256" in entry
+            if locally_complete and not has_integrity_envelope:
+                if not any(is_pit_eligible_entry(row) for row in pending_rows):
+                    yield from pending_rows
+            elif locally_complete:
+                marker_decision_ids = entry.get("decision_ids")
+                try:
+                    normalized_marker_ids = (
+                        decision_commit.normalize_decision_ids(marker_decision_ids)
+                        if marker_decision_ids
+                        else []
+                    )
+                    expected_ids_hash = (
+                        decision_commit.decision_ids_sha256(normalized_marker_ids)
+                        if normalized_marker_ids
+                        else decision_commit.canonical_sha256([])
+                    )
+                    integrity_matches = (
+                        normalized_marker_ids
+                        == [
+                            str(value or "").strip()
+                            for value in decision_ids
+                            if str(value or "").strip()
+                        ]
+                        and entry.get("decision_ids_sha256") == expected_ids_hash
+                        and entry.get("journal_batch_sha256") == batch_sha256
+                    )
+                except decision_commit.DecisionCommitError:
+                    integrity_matches = False
+                requires_commit = bool(entry.get("requires_cross_log_commit")) or any(
+                    is_pit_eligible_entry(row) for row in pending_rows
+                )
+                transaction_id = str(entry.get("decision_transaction_id") or "")
+                transaction_matches_rows = all(
+                    str(row.get("decision_transaction_id") or "") == transaction_id
+                    for row in pending_rows
+                )
+                receipt_matches = False
+                if integrity_matches and transaction_matches_rows:
+                    try:
+                        receipt_matches = decision_commit.receipt_matches_compact(
+                            receipts.get(transaction_id),
+                            transaction_id=transaction_id,
+                            decision_ids=decision_ids,
+                            batch_sha256=batch_sha256,
+                            mode=expected_mode,
+                        )
+                    except decision_commit.DecisionCommitError:
+                        receipt_matches = False
+                if integrity_matches and (not requires_commit or receipt_matches):
+                    yield from pending_rows
+            pending_id = ""
+            pending_rows = []
+            continue
+        if batch_id:
+            if batch_id != pending_id:
+                pending_id = batch_id
+                pending_rows = []
+            pending_rows.append(entry)
+            continue
+        # Rows written before commit-marked batching remain readable. A
+        # standalone v2 row has no proof that its full audit twin committed.
+        pending_id = ""
+        pending_rows = []
+        if not is_pit_eligible_entry(entry):
+            yield entry
 
 
 def blocked_gate_names(entry: Mapping[str, object]) -> set[str]:

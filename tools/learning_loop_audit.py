@@ -40,6 +40,7 @@ UTC = timezone.utc  # noqa: UP017
 SCHEMA_VERSION = 1
 JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 DECISION_COMMIT_EVENT = "decision_cross_log_commit"
+DECISION_RECEIPT_EVENT = "decision_cross_log_receipt"
 DECISION_LOG_FILENAME = "briefing_decisions.jsonl"
 
 # fx_intel.timeframe と同じ主ホライズン(市場オープン時間換算)と許容誤差。
@@ -186,6 +187,10 @@ def read_jsonl(path: Path) -> JsonlFile:
                     continue
                 if not isinstance(row, dict):
                     result.malformed_lines += 1
+                    continue
+                if row.get("event_type") == DECISION_RECEIPT_EVENT:
+                    pending_id = ""
+                    pending_rows = []
                     continue
                 batch_id = str(row.get("journal_batch_id") or "")
                 if row.get("event_type") == JOURNAL_BATCH_COMMIT:

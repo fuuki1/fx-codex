@@ -450,10 +450,17 @@ def finalize_decision_transaction(
         raise decision_commit.DecisionCommitError(
             "full and compact decision batches do not have identical membership"
         )
+    full_batch_line_start_offset = full_batch.get("line_start_offset")
+    if isinstance(full_batch_line_start_offset, bool) or not isinstance(
+        full_batch_line_start_offset, int
+    ):
+        raise decision_commit.DecisionCommitError("full decision batch is missing its byte offset")
     decision_commit.append_commit(
         DEFAULT_DECISION_LOG_PATH,
         decision_ids=decision_ids,
         full_batch_sha256=str(full_batch.get("batch_sha256") or ""),
+        full_batch_line_start_offset=full_batch_line_start_offset,
+        full_batch_line_sha256=str(full_batch.get("line_sha256") or ""),
         compact_batch_sha256=str(compact_batch.get("batch_sha256") or ""),
         mode=mode,
         committed_at=now,

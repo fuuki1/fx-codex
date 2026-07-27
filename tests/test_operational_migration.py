@@ -118,6 +118,8 @@ def _write_decision_jsonl(path: Path, rows: list[dict[str, object]]) -> str:
             path,
             decision_ids=decision_ids,
             full_batch_sha256=str(full_batch["batch_sha256"]),
+            full_batch_line_start_offset=int(full_batch["line_start_offset"]),
+            full_batch_line_sha256=str(full_batch["line_sha256"]),
             compact_batch_sha256=str(compact_batch["batch_sha256"]),
             mode="per_timeframe",
             committed_at=NOW,

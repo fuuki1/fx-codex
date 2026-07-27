@@ -316,12 +316,16 @@ def append_decision_events(
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(batch, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
-    with target.open("a", encoding="utf-8") as handle:
+    payload = (
+        json.dumps(batch, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    with target.open("ab", buffering=0) as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            handle.write(payload)
-            handle.flush()
+            line_start_offset = os.lseek(handle.fileno(), 0, os.SEEK_END)
+            written = handle.write(payload)
+            if written != len(payload):
+                raise OSError(f"short append to {target}: {written}/{len(payload)}")
             os.fsync(handle.fileno())
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -329,6 +333,8 @@ def append_decision_events(
         "decision_transaction_id": normalized_transaction_id or None,
         "decision_ids": decision_ids,
         "batch_sha256": batch_sha256,
+        "line_start_offset": line_start_offset,
+        "line_sha256": hashlib.sha256(payload).hexdigest(),
     }
 
 
