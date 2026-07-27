@@ -6,16 +6,23 @@
 #   FX_OPERATIONAL_PYTHON=/absolute/path/to/approved/python
 #   FX_OPERATIONAL_DB=/absolute/path/to/candidate.sqlite3
 #   FX_OPERATIONAL_EVIDENCE_DIR=/absolute/path/to/create-only/reports
+# Optional:
+#   FX_OPERATIONAL_READ_PORT=8770
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-LABELS=(com.fx-codex.operational-sync com.fx-codex.operational-replay)
+LABELS=(
+  com.fx-codex.operational-sync
+  com.fx-codex.operational-replay
+  com.fx-codex.operational-read
+)
 COMMAND="${1:-status}"
 
 OPERATIONAL_PYTHON="${FX_OPERATIONAL_PYTHON:-}"
 OPERATIONAL_DB="${FX_OPERATIONAL_DB:-}"
 EVIDENCE_DIR="${FX_OPERATIONAL_EVIDENCE_DIR:-}"
+READ_PORT="${FX_OPERATIONAL_READ_PORT:-8770}"
 
 fail() {
   print -u2 -- "拒否: $1"
@@ -38,6 +45,7 @@ validate_configuration() {
   [[ -f "$OPERATIONAL_DB" ]] || fail "候補DBがありません: $OPERATIONAL_DB"
   [[ -f "$ROOT/logs/briefing_decisions.jsonl" ]] || fail "decision rawがありません"
   [[ -f "$ROOT/logs/briefing_tf_prices.jsonl" ]] || fail "price rawがありません"
+  [[ "$READ_PORT" == <1-65535> ]] || fail "FX_OPERATIONAL_READ_PORT は1-65535で指定してください"
 }
 
 render_plist() {
@@ -49,6 +57,7 @@ render_plist() {
     -e "s|__OPERATIONAL_PYTHON__|$OPERATIONAL_PYTHON|g" \
     -e "s|__OPERATIONAL_DB__|$OPERATIONAL_DB|g" \
     -e "s|__OPERATIONAL_EVIDENCE_DIR__|$EVIDENCE_DIR|g" \
+    -e "s|__OPERATIONAL_READ_PORT__|$READ_PORT|g" \
     "$template"
 }
 

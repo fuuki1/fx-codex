@@ -184,3 +184,24 @@ def test_operational_plists_start_evidence_aware_scheduler_directly(
     arguments = [node.text or "" for node in root.iter("string")]
     assert any(value.endswith("operational_store_scheduled.py") for value in arguments)
     assert not any(value.endswith("run_exclusive.py") for value in arguments)
+
+
+def test_operational_read_plist_starts_loopback_read_api() -> None:
+    raw = (REPO_ROOT / "ops" / "launchd" / "com.fx-codex.operational-read.plist.tmpl").read_text(
+        encoding="utf-8"
+    )
+    rendered = (
+        raw.replace("__FX_ROOT__", "/Users/example/srv/fx-codex")
+        .replace("__OPERATIONAL_PYTHON__", "/approved/python")
+        .replace("__OPERATIONAL_DB__", "/data/operational.sqlite3")
+        .replace("__OPERATIONAL_READ_PORT__", "8770")
+    )
+
+    root = ET.fromstring(rendered)
+    arguments = [node.text or "" for node in root.iter("string")]
+    assert any(value.endswith("operational_read_api.py") for value in arguments)
+    assert "--db" in arguments
+    assert "--port" in arguments
+    assert "8770" in arguments
+    assert raw.count("<key>RunAtLoad</key><true/>") == 1
+    assert raw.count("<key>KeepAlive</key><true/>") == 1

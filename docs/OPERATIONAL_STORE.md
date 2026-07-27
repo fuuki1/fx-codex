@@ -257,15 +257,21 @@ The remaining cutover stages are:
 4. switch readers only after the parity evidence is reviewed;
 5. retain original raw files, manifests, and rollback path.
 
-## Optional scheduler (not installed)
+## Optional scheduler and loopback read service
 
 The optional launchd jobs are deliberately excluded from
-`scripts/install_launchd.sh` and have no `RunAtLoad`. Both call the scheduled
-command directly: it records immutable intent before attempting the canonical
-SQLite writer lease, so a collision produces a non-zero exit and a failure
-report instead of an invisible outer-lock skip. Sync runs at minutes
-03/08/.../58, after the normal five-minute producer boundary. Full replay runs
-at 04:46 in the Mac's local timezone.
+`scripts/install_launchd.sh`. The sync and replay jobs have no `RunAtLoad` and
+call the scheduled command directly: it records immutable intent before
+attempting the canonical SQLite writer lease, so a collision produces a
+non-zero exit and a failure report instead of an invisible outer-lock skip.
+Sync runs at minutes 03/08/.../58, after the normal five-minute producer
+boundary. Full replay runs at 04:46 in the Mac's local timezone.
+
+The third job is the small read API. It uses `RunAtLoad`/`KeepAlive`, binds
+inside the Python entry point to `127.0.0.1` only, opens SQLite with kernel
+read-only/query-only enforcement, and exposes bounded pages plus ETags. The
+port defaults to 8770 and can be changed with
+`FX_OPERATIONAL_READ_PORT`. It is not a production read cutover.
 
 The scheduled full replay holds shared locks on both authoritative raw files,
 then performs catch-up sync and full replay inside one SQLite writer lease,
@@ -279,12 +285,13 @@ audit plus `plutil` validation. It does not change launchd state:
 FX_OPERATIONAL_PYTHON="$PWD/runs/python314-safe-venv/bin/python" \
 FX_OPERATIONAL_DB="$PWD/runs/operational-migration/candidate.sqlite3" \
 FX_OPERATIONAL_EVIDENCE_DIR="$PWD/runs/operational-evidence" \
+FX_OPERATIONAL_READ_PORT=8770 \
   ./scripts/operational_store_launchd.sh dry-run
 ```
 
 Only after initial parity/bootstrap evidence is approved, use the same
 environment with `install`. `status` does not need the environment. A
-rollback unloads both jobs and archives their plists while retaining the
+rollback unloads all three jobs and archives their plists while retaining the
 database, raw evidence, and reports:
 
 ```bash
