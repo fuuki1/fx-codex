@@ -282,19 +282,20 @@ def _plan_execution(plan: object) -> dict[str, object]:
 def read_entries(path: str | Path):
     """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。"""
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        handle = Path(path).open(encoding="utf-8")
     except OSError:
         return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(entry, dict):
-            yield entry
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                yield entry
 
 
 def blocked_gate_names(entry: Mapping[str, object]) -> set[str]:

@@ -298,6 +298,11 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     with (
         mock.patch.object(fx_briefing, "load_webhook_url", side_effect=AssertionError),
         mock.patch.object(fx_briefing, "post_to_discord", side_effect=AssertionError),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "score_decision_events",
+            side_effect=AssertionError("historical scoring must not run in the five-minute writer"),
+        ),
     ):
         rc = _run(
             ["--per-timeframe", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
@@ -309,8 +314,8 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     assert tf_learning.exists()
     assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_LATEST_PATH.exists()
-    assert fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
-    assert fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.exists()
+    assert not fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
+    assert not fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.exists()
     decision_rows = [
         json.loads(line)
         for line in fx_briefing.DEFAULT_DECISION_LOG_PATH.read_text(encoding="utf-8").splitlines()
@@ -319,13 +324,6 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     assert {row["timeframe"] for row in decision_rows} == {"15m", "1h", "4h", "1d"}
     latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
     assert latest["event_count"] == 4
-    outcome_report = json.loads(
-        fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.read_text(encoding="utf-8")
-    )
-    assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
-    assert set(outcome_report["metrics"]) >= {"first_touch", "mfe_r", "mae_r"}
-    feedback = json.loads(fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.read_text(encoding="utf-8"))
-    assert "cells" in feedback
     out = capsys.readouterr().out
     assert "Discord送信なし" in out
 

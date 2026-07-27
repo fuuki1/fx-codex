@@ -370,6 +370,26 @@ def post_to_discord(webhook_url: str, payload: dict) -> None:
     discord_delivery.send_webhook(webhook_url, payload)
 
 
+def persist_decision_audit_batch(
+    events: list[dict[str, object]],
+    *,
+    now: datetime,
+) -> None:
+    """Persist the immutable decision audit without rescoring all history.
+
+    Complete outcome scoring is owned by decision_expectancy_monitor.  Keeping
+    the O(history) pass out of this five-minute producer prevents launchd from
+    coalescing later decision slots as the append-only log grows.
+    """
+
+    decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, events)
+    decision_log.save_latest_snapshot(
+        DEFAULT_DECISION_LATEST_PATH,
+        events,
+        now=now,
+    )
+
+
 def score_trade_outcomes_cli(
     journal_path: Path,
     *,
@@ -904,14 +924,6 @@ def _run_per_timeframe(
         learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
         if not args.no_trade_expectancy_guard:
             decision_feedback_lookup = decision_feedback_profile.expectancy_lookup
-        if not args.dry_run:
-            try:
-                decision_feedback.save_decision_feedback(
-                    decision_feedback_profile,
-                    DEFAULT_DECISION_FEEDBACK_PATH,
-                )
-            except OSError as error:
-                fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
 
     tp_sl_lookup = None
     tp_sl_learn = None
@@ -1003,9 +1015,6 @@ def _run_per_timeframe(
             print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
             return JOURNAL_WRITE_FAILURE_EXIT_CODE
         try:
-            prior_decision_events = list(
-                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-            )
             decision_events = decision_log.build_timeframe_decision_events(
                 plans_by_symbol,
                 now=now,
@@ -1022,25 +1031,7 @@ def _run_per_timeframe(
                 decision_feedback_profile=decision_feedback_profile,
                 expectancy_summaries=_expectancy_summaries,
             )
-            decision_outcome_report = decision_log.score_decision_events(
-                [*prior_decision_events, *decision_events],
-                price_entries=[*price_rows, *current_snapshot],
-                now=now,
-            )
-            decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
-            decision_log.save_latest_snapshot(
-                DEFAULT_DECISION_LATEST_PATH,
-                decision_events,
-                now=now,
-            )
-            decision_log.save_outcome_report(
-                decision_outcome_report,
-                DEFAULT_DECISION_OUTCOMES_PATH,
-            )
-            decision_feedback.save_decision_feedback(
-                decision_feedback.derive_decision_feedback(decision_outcome_report, now=now),
-                DEFAULT_DECISION_FEEDBACK_PATH,
-            )
+            persist_decision_audit_batch(decision_events, now=now)
         except OSError as error:
             fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
@@ -1635,14 +1626,6 @@ def main(argv: list[str] | None = None) -> int:
         learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
         if not args.no_trade_expectancy_guard:
             decision_feedback_adjuster = decision_feedback_profile.fusion_adjuster()
-        if not args.dry_run:
-            try:
-                decision_feedback.save_decision_feedback(
-                    decision_feedback_profile,
-                    DEFAULT_DECISION_FEEDBACK_PATH,
-                )
-            except OSError as error:
-                fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
 
     if not args.no_trade_expectancy:
         trade_outcomes = trade_outcome.evaluate_trade_outcomes(pit_journal_entries)
@@ -1873,9 +1856,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"判断ジャーナル書き込み失敗: {error}", file=sys.stderr)
                 return JOURNAL_WRITE_FAILURE_EXIT_CODE
             try:
-                prior_decision_events = list(
-                    decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-                )
                 decision_events = decision_log.build_fusion_decision_events(
                     plans,
                     now=prediction_time,
@@ -1894,26 +1874,7 @@ def main(argv: list[str] | None = None) -> int:
                     ml_artifact=ml_artifact if not args.no_ml else None,
                     promotion_state=promotion_state,
                 )
-                decision_outcome_report = decision_log.score_decision_events(
-                    [*prior_decision_events, *decision_events],
-                    now=prediction_time,
-                )
-                decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
-                decision_log.save_latest_snapshot(
-                    DEFAULT_DECISION_LATEST_PATH,
-                    decision_events,
-                    now=prediction_time,
-                )
-                decision_log.save_outcome_report(
-                    decision_outcome_report,
-                    DEFAULT_DECISION_OUTCOMES_PATH,
-                )
-                decision_feedback.save_decision_feedback(
-                    decision_feedback.derive_decision_feedback(
-                        decision_outcome_report, now=prediction_time
-                    ),
-                    DEFAULT_DECISION_FEEDBACK_PATH,
-                )
+                persist_decision_audit_batch(decision_events, now=prediction_time)
             except OSError as error:
                 fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 

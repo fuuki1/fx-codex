@@ -76,6 +76,11 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
         mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
         mock.patch.object(fx_briefing, "load_webhook_url", side_effect=AssertionError),
         mock.patch.object(fx_briefing, "post_to_discord", side_effect=AssertionError),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "score_decision_events",
+            side_effect=AssertionError("historical scoring must not run in the briefing writer"),
+        ),
     ):
         rc = fx_briefing.main(
             [
@@ -95,15 +100,13 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert learning_path.exists()
     assert decision_log_path.exists()
     assert decision_latest_path.exists()
-    assert decision_outcomes_path.exists()
-    assert decision_feedback_path.exists()
+    assert not decision_outcomes_path.exists()
+    assert not decision_feedback_path.exists()
     rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
     decision_rows = [
         json.loads(line) for line in decision_log_path.read_text().splitlines() if line.strip()
     ]
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
-    outcome_report = json.loads(decision_outcomes_path.read_text(encoding="utf-8"))
-    feedback = json.loads(decision_feedback_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
     assert rows[0]["pit_eligible"] is True
     assert (
@@ -113,8 +116,6 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     )
     assert rows[0]["ts"] == rows[0]["prediction_time"]
     assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
-    assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
-    assert "cells" in feedback
     assert "evaluated" in profile
     assert "Discord送信なし" in capsys.readouterr().out
 

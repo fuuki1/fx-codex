@@ -21,6 +21,9 @@ def test_timeframe_freshness_config_contains_only_active_gating_targets() -> Non
     prices = next(row for row in payload["targets"] if row["name"] == "tf_price_snapshot")
     assert prices["required_symbols"] == ["GBPUSD", "EURUSD", "USDJPY"]
     assert prices["required_timeframes"] == ["15m", "1h", "4h", "1d"]
+    tf_journal = next(row for row in payload["targets"] if row["name"] == "tf_journal")
+    assert tf_journal["cadence_window_seconds"] == 1800
+    assert tf_journal["minimum_cadence_ratio"] == 0.8
 
 
 def test_health_launchd_selects_timeframe_freshness_config() -> None:

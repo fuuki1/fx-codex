@@ -310,19 +310,20 @@ def read_decision_events(path: str | Path):
     """Read append-only decision events.  Corrupt lines are skipped."""
 
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        handle = Path(path).open(encoding="utf-8")
     except OSError:
         return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            yield event
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                yield event
 
 
 def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, object] | None:
@@ -459,16 +460,17 @@ def score_decision_events(
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    materialized_events = list(events)
-    event_entries = [
-        entry
-        for event in materialized_events
-        if (entry := decision_event_to_scoring_entry(event)) is not None
-    ]
-    shadow_entries = [
-        entry for event in materialized_events for entry in decision_event_to_shadow_entries(event)
-    ]
-    shadow_predictions = _shadow_prediction_inventory(materialized_events)
+    input_event_count = 0
+    event_entries: list[dict[str, object]] = []
+    shadow_entries: list[dict[str, object]] = []
+    shadow_predictions: list[dict[str, object]] = []
+    for event in events:
+        input_event_count += 1
+        entry = decision_event_to_scoring_entry(event)
+        if entry is not None:
+            event_entries.append(entry)
+        shadow_entries.extend(decision_event_to_shadow_entries(event))
+        shadow_predictions.extend(_shadow_prediction_inventory((event,)))
     normalized_prices = [_normalize_price_entry(row) for row in price_entries]
     final_entries = event_entries + normalized_prices
     all_entries = final_entries + shadow_entries
@@ -618,6 +620,7 @@ def score_decision_events(
             "generated_at": generated_at.isoformat(),
             "scoring_method": SCORING_METHOD,
             "metrics": list(SCORING_METRICS),
+            "input_decision_events": input_event_count,
             "decision_events": len(event_entries),
             "scored_outcomes": len(enriched_outcomes),
             "shadow_predictions": len(shadow_predictions),
