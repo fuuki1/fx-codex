@@ -140,7 +140,10 @@ def load_commits(
     """Load commits backed by exact full wrappers and, optionally, compact batches."""
 
     target = Path(path)
-    values: list[object] = []
+    full_batches: dict[str, dict[str, object]] = {}
+    full_conflicts: set[str] = set()
+    candidate_commits: dict[str, dict[str, object]] = {}
+    commit_conflicts: set[str] = set()
     try:
         handle = target.open(encoding="utf-8")
     except OSError:
@@ -148,10 +151,17 @@ def load_commits(
     with handle:
         for line in handle:
             try:
-                values.append(json.loads(line))
+                raw: Any = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-    commits = commits_from_values(values)
+            _accumulate_commit_value(
+                raw,
+                full_batches=full_batches,
+                full_conflicts=full_conflicts,
+                candidate_commits=candidate_commits,
+                commit_conflicts=commit_conflicts,
+            )
+    commits = _matching_full_commits(full_batches, candidate_commits)
     if not verify_compact:
         return commits
     verified_by_mode: dict[str, set[tuple[str, str, str]]] = {}
@@ -178,85 +188,125 @@ def load_commits(
 def commits_from_values(values: Sequence[object]) -> dict[str, dict[str, object]]:
     """Validate commit markers and their full wrappers in one stable prefix."""
 
-    full_batches = _verified_full_batches_from_values(values)
-    commits: dict[str, dict[str, object]] = {}
-    conflicts: set[str] = set()
+    full_batches: dict[str, dict[str, object]] = {}
+    full_conflicts: set[str] = set()
+    candidate_commits: dict[str, dict[str, object]] = {}
+    commit_conflicts: set[str] = set()
     for raw in values:
-        record = _validated_record(raw)
-        if record is None:
-            continue
+        _accumulate_commit_value(
+            raw,
+            full_batches=full_batches,
+            full_conflicts=full_conflicts,
+            candidate_commits=candidate_commits,
+            commit_conflicts=commit_conflicts,
+        )
+    return _matching_full_commits(full_batches, candidate_commits)
+
+
+def _accumulate_commit_value(
+    raw: object,
+    *,
+    full_batches: dict[str, dict[str, object]],
+    full_conflicts: set[str],
+    candidate_commits: dict[str, dict[str, object]],
+    commit_conflicts: set[str],
+) -> None:
+    full = _full_batch_descriptor(raw)
+    if full is not None:
+        transaction_id, descriptor = full
+        _accumulate_unique(
+            full_batches,
+            full_conflicts,
+            transaction_id,
+            descriptor,
+        )
+    record = _validated_record(raw)
+    if record is not None:
         transaction_id = str(record["decision_transaction_id"])
+        _accumulate_unique(
+            candidate_commits,
+            commit_conflicts,
+            transaction_id,
+            record,
+        )
+
+
+def _full_batch_descriptor(
+    raw: object,
+) -> tuple[str, dict[str, object]] | None:
+    if not isinstance(raw, dict):
+        return None
+    if (
+        raw.get("schema_version") != SCHEMA_VERSION
+        or raw.get("event_type") != DECISION_BATCH_EVENT_TYPE
+        or raw.get("requires_cross_log_commit") is not True
+    ):
+        return None
+    events = raw.get("events")
+    if (
+        not isinstance(events, list)
+        or not events
+        or not all(isinstance(event, dict) for event in events)
+    ):
+        return None
+    try:
+        decision_ids = normalize_decision_ids([event.get("decision_id") for event in events])
+        transaction_id = transaction_id_for(decision_ids)
+    except DecisionCommitError:
+        return None
+    modes = {str(event.get("mode") or "") for event in events}
+    if len(modes) != 1:
+        return None
+    mode = next(iter(modes))
+    try:
+        compact_path_for_mode(DEFAULT_COMMIT_FILENAME, mode)
+    except DecisionCommitError:
+        return None
+    descriptor: dict[str, object] = {
+        "decision_ids": decision_ids,
+        "decision_ids_sha256": decision_ids_sha256(decision_ids),
+        "full_batch_sha256": canonical_sha256(events),
+        "mode": mode,
+    }
+    if (
+        raw.get("decision_transaction_id") != transaction_id
+        or raw.get("decision_ids") != descriptor["decision_ids"]
+        or raw.get("decision_ids_sha256") != descriptor["decision_ids_sha256"]
+        or raw.get("decision_batch_sha256") != descriptor["full_batch_sha256"]
+    ):
+        return None
+    return transaction_id, descriptor
+
+
+def _accumulate_unique(
+    records: dict[str, dict[str, object]],
+    conflicts: set[str],
+    transaction_id: str,
+    value: dict[str, object],
+) -> None:
+    previous = records.get(transaction_id)
+    if previous is not None and previous != value:
+        conflicts.add(transaction_id)
+        records.pop(transaction_id, None)
+    elif transaction_id not in conflicts:
+        records[transaction_id] = value
+
+
+def _matching_full_commits(
+    full_batches: Mapping[str, Mapping[str, object]],
+    candidate_commits: Mapping[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    output: dict[str, dict[str, object]] = {}
+    for transaction_id, record in candidate_commits.items():
         full_batch = full_batches.get(transaction_id)
-        if full_batch is None or not (
+        if full_batch is not None and (
             record.get("decision_ids") == full_batch["decision_ids"]
             and record.get("decision_ids_sha256") == full_batch["decision_ids_sha256"]
             and record.get("full_batch_sha256") == full_batch["full_batch_sha256"]
             and record.get("mode") == full_batch["mode"]
         ):
-            continue
-        previous = commits.get(transaction_id)
-        if previous is not None and previous != record:
-            conflicts.add(transaction_id)
-            commits.pop(transaction_id, None)
-        elif transaction_id not in conflicts:
-            commits[transaction_id] = record
-    return commits
-
-
-def _verified_full_batches_from_values(
-    values: Sequence[object],
-) -> dict[str, dict[str, object]]:
-    batches: dict[str, dict[str, object]] = {}
-    conflicts: set[str] = set()
-    for raw in values:
-        if not isinstance(raw, dict):
-            continue
-        if (
-            raw.get("schema_version") != SCHEMA_VERSION
-            or raw.get("event_type") != DECISION_BATCH_EVENT_TYPE
-            or raw.get("requires_cross_log_commit") is not True
-        ):
-            continue
-        events = raw.get("events")
-        if (
-            not isinstance(events, list)
-            or not events
-            or not all(isinstance(event, dict) for event in events)
-        ):
-            continue
-        try:
-            decision_ids = normalize_decision_ids([event.get("decision_id") for event in events])
-            transaction_id = transaction_id_for(decision_ids)
-        except DecisionCommitError:
-            continue
-        modes = {str(event.get("mode") or "") for event in events}
-        if len(modes) != 1:
-            continue
-        mode = next(iter(modes))
-        try:
-            compact_path_for_mode(DEFAULT_COMMIT_FILENAME, mode)
-        except DecisionCommitError:
-            continue
-        descriptor: dict[str, object] = {
-            "decision_ids": decision_ids,
-            "decision_ids_sha256": decision_ids_sha256(decision_ids),
-            "full_batch_sha256": canonical_sha256(events),
-            "mode": mode,
-        }
-        if (
-            raw.get("decision_transaction_id") != transaction_id
-            or raw.get("decision_ids") != descriptor["decision_ids"]
-            or raw.get("decision_ids_sha256") != descriptor["decision_ids_sha256"]
-            or raw.get("decision_batch_sha256") != descriptor["full_batch_sha256"]
-        ):
-            continue
-        previous = batches.get(transaction_id)
-        if previous is not None and previous != descriptor:
-            conflicts.add(transaction_id)
-            batches.pop(transaction_id, None)
-        elif transaction_id not in conflicts:
-            batches[transaction_id] = descriptor
-    return batches
+            output[transaction_id] = record
+    return output
 
 
 def _verified_compact_batches(path: Path) -> set[tuple[str, str, str]]:

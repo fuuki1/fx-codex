@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 import json
+import tracemalloc
 
 from fx_intel import decision_commit, decision_log, journal
 
@@ -188,6 +189,23 @@ def test_commit_requires_canonical_full_wrapper_schema(tmp_path) -> None:
     assert decision_commit.load_commits(full_path, verify_compact=True) == {}
     assert list(decision_log.read_decision_events(full_path)) == []
     assert list(journal.read_entries(compact_path)) == []
+
+
+def test_load_commits_streams_large_legacy_log_with_bounded_memory(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    line = json.dumps({"event_type": "legacy", "payload": "x" * 8192}) + "\n"
+    with full_path.open("w", encoding="utf-8") as handle:
+        for _ in range(1024):
+            handle.write(line)
+
+    tracemalloc.start()
+    try:
+        assert decision_commit.load_commits(full_path, verify_compact=False) == {}
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak_bytes < 4 * 1024 * 1024
 
 
 def test_standalone_pit_event_is_never_visible(tmp_path) -> None:
