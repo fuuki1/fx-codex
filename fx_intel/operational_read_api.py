@@ -14,10 +14,10 @@ from .operational_read_model import (
     ReadModelError,
     ReadModelStaleError,
     canonical_response_bytes,
+    current_source_snapshot,
     decision_page,
     price_page,
     read_model_metadata,
-    require_current_source_snapshot,
     response_etag,
 )
 from .operational_store import OperationalStoreError, open_operational_reader
@@ -110,52 +110,59 @@ def make_handler(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
                         {"limit", "cursor", "symbol", "timeframe", "pit_eligible"},
                     )
                     with open_operational_reader(database) as store:
-                        require_current_source_snapshot(store)
-                        payload = decision_page(
-                            store,
-                            limit=_limit(query),
-                            cursor=_one(query, "cursor"),
-                            symbol=_one(query, "symbol"),
-                            timeframe=_one(query, "timeframe"),
-                            pit_eligible=_optional_bool(query, "pit_eligible"),
-                        )
+                        with current_source_snapshot(store):
+                            payload = decision_page(
+                                store,
+                                limit=_limit(query),
+                                cursor=_one(query, "cursor"),
+                                symbol=_one(query, "symbol"),
+                                timeframe=_one(query, "timeframe"),
+                                pit_eligible=_optional_bool(query, "pit_eligible"),
+                            )
+                            self._json_payload(payload)
+                    return
                 elif parsed.path == "/v1/prices":
                     _require_only(
                         query,
                         {"limit", "cursor", "symbol", "timeframe"},
                     )
                     with open_operational_reader(database) as store:
-                        require_current_source_snapshot(store)
-                        payload = price_page(
-                            store,
-                            limit=_limit(query),
-                            cursor=_one(query, "cursor"),
-                            symbol=_one(query, "symbol"),
-                            timeframe=_one(query, "timeframe"),
-                        )
+                        with current_source_snapshot(store):
+                            payload = price_page(
+                                store,
+                                limit=_limit(query),
+                                cursor=_one(query, "cursor"),
+                                symbol=_one(query, "symbol"),
+                                timeframe=_one(query, "timeframe"),
+                            )
+                            self._json_payload(payload)
+                    return
                 elif parsed.path == "/v1/meta":
                     _require_only(query, set())
                     with open_operational_reader(database) as store:
-                        require_current_source_snapshot(store)
-                        payload = {
-                            "schema_version": 1,
-                            "kind": "metadata",
-                            "metadata": read_model_metadata(store),
-                        }
+                        with current_source_snapshot(store):
+                            payload = {
+                                "schema_version": 1,
+                                "kind": "metadata",
+                                "metadata": read_model_metadata(store),
+                            }
+                            self._json_payload(payload)
+                    return
                 elif parsed.path == "/healthz":
                     _require_only(query, set())
                     with open_operational_reader(database) as store:
-                        require_current_source_snapshot(store)
-                        metadata = read_model_metadata(store)
-                    payload = {
-                        "ok": True,
-                        "schema_version": metadata["schema_version"],
-                        "query_only": metadata["query_only"],
-                    }
+                        with current_source_snapshot(store):
+                            metadata = read_model_metadata(store)
+                            payload = {
+                                "ok": True,
+                                "schema_version": metadata["schema_version"],
+                                "query_only": metadata["query_only"],
+                            }
+                            self._json_payload(payload)
+                    return
                 else:
                     self._json_error(HTTPStatus.NOT_FOUND, "route not found")
                     return
-                self._json_payload(payload)
             except ReadModelError as error:
                 self._json_error(HTTPStatus.BAD_REQUEST, str(error))
             except (ReadModelStaleError, OperationalStoreError, OSError) as error:

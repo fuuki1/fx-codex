@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, UTC
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 from urllib.error import HTTPError
@@ -391,3 +393,92 @@ def test_http_api_returns_503_when_raw_source_advances_before_sync(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_http_api_holds_raw_snapshot_until_response_is_sent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _database(tmp_path)
+    source_path = tmp_path / "decisions.jsonl"
+    serialization_started = threading.Event()
+    release_response = threading.Event()
+    writer_attempting = threading.Event()
+    writer_done = threading.Event()
+    original_canonical_response_bytes = read_api.canonical_response_bytes
+
+    def paused_canonical_response_bytes(payload: object) -> bytes:
+        if (
+            isinstance(payload, dict)
+            and payload.get("kind") == "decisions"
+            and not serialization_started.is_set()
+        ):
+            serialization_started.set()
+            if not release_response.wait(timeout=2):
+                raise TimeoutError("test did not release response serialization")
+        return original_canonical_response_bytes(payload)
+
+    monkeypatch.setattr(
+        read_api,
+        "canonical_response_bytes",
+        paused_canonical_response_bytes,
+    )
+    server = read_api.OperationalReadHTTPServer(
+        ("127.0.0.1", 0),
+        read_api.make_handler(database),
+    )
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    response_result: dict[str, object] = {}
+
+    def request_snapshot() -> None:
+        try:
+            with urlopen(f"{base}/v1/decisions?limit=2", timeout=3) as response:
+                response_result["status"] = response.status
+                response_result["payload"] = json.loads(response.read())
+        except BaseException as error:
+            response_result["error"] = error
+
+    def append_raw_source() -> None:
+        with source_path.open("a+b", buffering=0) as handle:
+            writer_attempting.set()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.write(b'{"event_type":"raced_suffix"}\n')
+                os.fsync(handle.fileno())
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        writer_done.set()
+
+    request_thread = threading.Thread(target=request_snapshot, daemon=True)
+    writer_thread = threading.Thread(target=append_raw_source, daemon=True)
+    try:
+        request_thread.start()
+        assert serialization_started.wait(timeout=2)
+        writer_thread.start()
+        assert writer_attempting.wait(timeout=2)
+        assert not writer_done.wait(timeout=0.2)
+
+        release_response.set()
+        request_thread.join(timeout=2)
+        writer_thread.join(timeout=2)
+        assert not request_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert "error" not in response_result
+        assert response_result["status"] == 200
+        payload = response_result["payload"]
+        assert isinstance(payload, dict)
+        assert payload["page"]["returned"] == 2
+        assert writer_done.is_set()
+
+        with pytest.raises(HTTPError) as stale:
+            urlopen(f"{base}/v1/decisions?limit=2", timeout=2)
+        assert stale.value.code == 503
+    finally:
+        release_response.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        request_thread.join(timeout=2)
+        writer_thread.join(timeout=2)

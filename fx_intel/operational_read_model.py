@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
 import fcntl
@@ -15,7 +17,7 @@ import os
 from pathlib import Path
 import re
 import secrets
-from typing import Any
+from typing import Any, BinaryIO
 
 from .operational_store import OperationalStore
 
@@ -35,8 +37,9 @@ class ReadModelStaleError(RuntimeError):
     """Raw evidence has moved beyond the last verified operational snapshot."""
 
 
-def require_current_source_snapshot(store: OperationalStore) -> None:
-    """Fail closed unless every raw source still equals its verified cursor state."""
+@contextmanager
+def current_source_snapshot(store: OperationalStore) -> Iterator[None]:
+    """Hold every raw source stable while a read-model response is constructed."""
 
     rows = store.connection.execute("""
         SELECT source_name, source_path, device_id, inode, byte_offset,
@@ -48,57 +51,82 @@ def require_current_source_snapshot(store: OperationalStore) -> None:
     names = {str(row["source_name"]) for row in rows}
     if not {"decisions", "prices"}.issubset(names):
         raise ReadModelStaleError("required source cursors are not bootstrapped")
-    for row in rows:
-        path = Path(str(row["source_path"]))
-        try:
-            handle = path.open("rb")
-        except OSError as error:
-            raise ReadModelStaleError(f"raw source is unavailable: {row['source_name']}") from error
-        with handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: str(Path(str(row["source_path"])).resolve()),
+    )
+    resolved_paths = [Path(str(row["source_path"])).resolve() for row in ordered_rows]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise ReadModelStaleError("multiple source cursors reference the same raw source")
+
+    locked_handles: list[tuple[Any, BinaryIO]] = []
+    try:
+        for row, path in zip(ordered_rows, resolved_paths, strict=True):
             try:
-                observed = os.fstat(handle.fileno())
-                expected_identity = (int(row["device_id"]), int(row["inode"]))
-                if (observed.st_dev, observed.st_ino) != expected_identity:
-                    raise ReadModelStaleError(f"raw source identity changed: {row['source_name']}")
-                if observed.st_size != int(
-                    row["source_size_at_sync"]
-                ) or observed.st_mtime_ns != int(row["source_mtime_ns"]):
+                opened_handle = path.open("rb")
+            except OSError as error:
+                raise ReadModelStaleError(
+                    f"raw source is unavailable: {row['source_name']}"
+                ) from error
+            try:
+                fcntl.flock(opened_handle.fileno(), fcntl.LOCK_SH)
+            except BaseException:
+                opened_handle.close()
+                raise
+            locked_handles.append((row, opened_handle))
+
+        for row, locked_handle in locked_handles:
+            observed = os.fstat(locked_handle.fileno())
+            expected_identity = (int(row["device_id"]), int(row["inode"]))
+            if (observed.st_dev, observed.st_ino) != expected_identity:
+                raise ReadModelStaleError(f"raw source identity changed: {row['source_name']}")
+            if observed.st_size != int(row["source_size_at_sync"]) or observed.st_mtime_ns != int(
+                row["source_mtime_ns"]
+            ):
+                raise ReadModelStaleError(
+                    f"raw source advanced beyond read model: {row['source_name']}"
+                )
+            byte_offset = int(row["byte_offset"])
+            if byte_offset:
+                line_start = int(row["last_line_start_offset"])
+                if line_start < 0 or line_start >= byte_offset:
                     raise ReadModelStaleError(
-                        f"raw source advanced beyond read model: {row['source_name']}"
+                        f"raw source boundary is invalid: {row['source_name']}"
                     )
-                byte_offset = int(row["byte_offset"])
-                if byte_offset:
-                    line_start = int(row["last_line_start_offset"])
-                    if line_start < 0 or line_start >= byte_offset:
-                        raise ReadModelStaleError(
-                            f"raw source boundary is invalid: {row['source_name']}"
-                        )
-                    handle.seek(line_start)
-                    line = handle.read(byte_offset - line_start)
-                    if not line.endswith(b"\n") or hashlib.sha256(line).hexdigest() != str(
-                        row["last_line_sha256"]
-                    ):
-                        raise ReadModelStaleError(
-                            f"raw source boundary changed: {row['source_name']}"
-                        )
-                after = os.fstat(handle.fileno())
-                if (
-                    observed.st_size,
-                    observed.st_mtime_ns,
-                    observed.st_dev,
-                    observed.st_ino,
-                ) != (
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_dev,
-                    after.st_ino,
+                locked_handle.seek(line_start)
+                line = locked_handle.read(byte_offset - line_start)
+                if not line.endswith(b"\n") or hashlib.sha256(line).hexdigest() != str(
+                    row["last_line_sha256"]
                 ):
-                    raise ReadModelStaleError(
-                        f"raw source changed during read: {row['source_name']}"
-                    )
+                    raise ReadModelStaleError(f"raw source boundary changed: {row['source_name']}")
+            after = os.fstat(locked_handle.fileno())
+            if (
+                observed.st_size,
+                observed.st_mtime_ns,
+                observed.st_dev,
+                observed.st_ino,
+            ) != (
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_dev,
+                after.st_ino,
+            ):
+                raise ReadModelStaleError(f"raw source changed during read: {row['source_name']}")
+
+        yield
+    finally:
+        for _row, release_handle in reversed(locked_handles):
+            try:
+                fcntl.flock(release_handle.fileno(), fcntl.LOCK_UN)
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                release_handle.close()
+
+
+def require_current_source_snapshot(store: OperationalStore) -> None:
+    """Fail closed unless every raw source still equals its verified cursor state."""
+
+    with current_source_snapshot(store):
+        pass
 
 
 @dataclass(frozen=True)
@@ -661,6 +689,7 @@ __all__ = [
     "ReadModelError",
     "ReadModelStaleError",
     "canonical_response_bytes",
+    "current_source_snapshot",
     "decision_page",
     "price_page",
     "read_model_metadata",

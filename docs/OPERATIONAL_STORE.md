@@ -229,7 +229,9 @@ Signatures use a process-local random secret, so a traversal restarts after an
 API process restart.
 
 Every API route first locks and verifies all raw source identities, sizes,
-mtimes, and cursor-boundary line hashes against the SQLite cursors. Any
+mtimes, and cursor-boundary line hashes against the SQLite cursors. It holds
+those shared locks through SQLite page construction, canonical serialization,
+and response-body transmission. Any
 unsynchronized append, source replacement, or failed incremental sync returns
 HTTP 503 instead of serving a stale projection. Normal service resumes only
 after one successful atomic sync advances every affected cursor.
