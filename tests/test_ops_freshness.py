@@ -92,6 +92,28 @@ def _write_coverage_config(root: Path) -> Path:
     return path
 
 
+def _write_cadence_config(root: Path) -> Path:
+    config = {
+        "schema": 1,
+        "cooldown_seconds": 21600,
+        "targets": [
+            {
+                "name": "tf_journal",
+                "path": "logs/prices.jsonl",
+                "kind": "jsonl",
+                "expected_interval_seconds": 300,
+                "warn_after_seconds": 900,
+                "critical_after_seconds": 2700,
+                "cadence_window_seconds": 1800,
+                "minimum_cadence_ratio": 0.8,
+            }
+        ],
+    }
+    path = root / "cadence_config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
 def _run(monitor, root: Path, config: Path, sender=None, now: datetime = NOW):
     return monitor.run_monitor(
         root,
@@ -199,6 +221,61 @@ def test_incomplete_latest_capture_slot_is_critical(monitor, tmp_path):
     assert target["expected_coverage"] == 4
     assert target["observed_coverage"] == 3
     assert target["missing_coverage"] == ["EURUSD:1h"]
+
+
+def test_recent_cadence_counts_unique_decision_cycles(monitor, tmp_path):
+    config = _write_cadence_config(tmp_path)
+    rows = [
+        {
+            "ts": (NOW - timedelta(minutes=offset)).isoformat(),
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+        for offset in (25, 20, 15, 10, 5, 0)
+        for symbol in ("USDJPY", "EURUSD")
+        for timeframe in ("15m", "1h", "4h", "1d")
+    ]
+    _touch_jsonl(
+        tmp_path,
+        age_seconds=60,
+        content="\n".join(json.dumps(row) for row in rows),
+    )
+
+    report = _run(monitor, tmp_path, config, _Sender())
+    target = report["targets"][0]
+
+    assert target["status"] == "ok"
+    assert target["expected_cadence"] == 6
+    assert target["observed_cadence"] == 6
+    assert target["cadence_coverage_ratio"] == 1.0
+
+
+def test_recent_cadence_detects_fresh_but_intermittent_writer(monitor, tmp_path):
+    config = _write_cadence_config(tmp_path)
+    rows = [
+        {
+            "ts": (NOW - timedelta(minutes=minutes) + timedelta(seconds=retry_seconds)).isoformat(),
+            "symbol": "USDJPY",
+        }
+        for minutes in (25, 5)
+        for retry_seconds in (0, 5, 10)
+    ]
+    _touch_jsonl(
+        tmp_path,
+        age_seconds=60,
+        content="\n".join(json.dumps(row) for row in rows),
+    )
+
+    sender = _Sender()
+    report = _run(monitor, tmp_path, config, sender)
+    target = report["targets"][0]
+
+    assert report["overall"] == "critical"
+    assert target["reason"] == "cadence_coverage_low"
+    assert target["expected_cadence"] == 6
+    assert target["observed_cadence"] == 2
+    assert target["cadence_coverage_ratio"] == pytest.approx(2 / 6, abs=0.001)
+    assert "直近周期: 2/6 (33%)" in sender.sent[0]["embeds"][0]["description"]
 
 
 def test_warn_only_target_never_goes_critical(monitor, tmp_path):

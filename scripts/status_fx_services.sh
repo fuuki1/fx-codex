@@ -70,7 +70,16 @@ if not isinstance(targets, list) or not all(isinstance(t, dict) for t in targets
 for t in targets:
     age = t.get("age_seconds")
     age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "?"
-    print(f"  [{t.get('status'):8}] {t.get('name'):20} age={age_s:>8}  {t.get('reason') or ''}")
+    cadence = ""
+    if isinstance(t.get("expected_cadence"), int):
+        cadence = (
+            f" cadence={t.get('observed_cadence', 0)}/{t['expected_cadence']}"
+            f"({float(t.get('cadence_coverage_ratio') or 0.0):.0%})"
+        )
+    print(
+        f"  [{t.get('status'):8}] {t.get('name'):20} age={age_s:>8}"
+        f"{cadence}  {t.get('reason') or ''}"
+    )
 try:
     monitored = datetime.fromisoformat(str(report.get("monitor_timestamp")))
     if monitored.tzinfo is None:

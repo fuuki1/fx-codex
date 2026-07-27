@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 import json
 import os
 from pathlib import Path
@@ -36,6 +36,7 @@ DEFAULT_CONFIG_PATH = "ops/freshness_targets.json"
 DEFAULT_STATE_PATH = "logs/freshness_state.json"
 DEFAULT_REPORT_PATH = "logs/freshness_report.json"
 DEFAULT_COOLDOWN_SECONDS = 6 * 3600
+DEFAULT_JSONL_TAIL_BYTES = 1024 * 1024
 
 STATUS_OK = "ok"
 STATUS_WARNING = "warning"
@@ -63,6 +64,9 @@ class TargetConfig:
     manual_action_ja: str = ""
     required_symbols: tuple[str, ...] = ()
     required_timeframes: tuple[str, ...] = ()
+    cadence_window_seconds: float | None = None
+    minimum_cadence_ratio: float = 1.0
+    recent_tail_bytes: int = DEFAULT_JSONL_TAIL_BYTES
 
 
 @dataclass
@@ -82,6 +86,9 @@ class TargetResult:
     expected_coverage: int | None = None
     observed_coverage: int | None = None
     missing_coverage: tuple[str, ...] = ()
+    expected_cadence: int | None = None
+    observed_cadence: int | None = None
+    cadence_coverage_ratio: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -98,6 +105,9 @@ class TargetResult:
             "expected_coverage": self.expected_coverage,
             "observed_coverage": self.observed_coverage,
             "missing_coverage": list(self.missing_coverage),
+            "expected_cadence": self.expected_cadence,
+            "observed_cadence": self.observed_cadence,
+            "cadence_coverage_ratio": self.cadence_coverage_ratio,
         }
 
 
@@ -171,6 +181,19 @@ def load_config(path: str | Path) -> tuple[list[TargetConfig], float]:
                 required_timeframes=tuple(
                     str(value) for value in row.get("required_timeframes", [])
                 ),
+                cadence_window_seconds=(
+                    max(0.0, float(row["cadence_window_seconds"]))
+                    if row.get("cadence_window_seconds") is not None
+                    else None
+                ),
+                minimum_cadence_ratio=min(
+                    1.0,
+                    max(0.0, float(row.get("minimum_cadence_ratio", 1.0))),
+                ),
+                recent_tail_bytes=max(
+                    65536,
+                    int(row.get("recent_tail_bytes", DEFAULT_JSONL_TAIL_BYTES)),
+                ),
             )
         )
     return targets, cooldown
@@ -206,7 +229,10 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
 
     # JSONLの末尾行が壊れていたら書込み途中クラッシュや破損の兆候(鮮度より優先)
     if target.kind == "jsonl":
-        recent_lines = _read_recent_nonempty_lines(file_path)
+        recent_lines = _read_recent_nonempty_lines(
+            file_path,
+            chunk=target.recent_tail_bytes,
+        )
         tail = recent_lines[-1] if recent_lines else None
         if tail is not None:
             try:
@@ -216,6 +242,8 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
                 result.reason = "jsonl_corrupt_tail"
         if target.required_symbols and target.required_timeframes:
             _apply_capture_coverage(result, recent_lines, target)
+        if target.cadence_window_seconds and result.status != STATUS_CRITICAL:
+            _apply_cadence_coverage(result, recent_lines, target, now)
     return result
 
 
@@ -273,6 +301,52 @@ def _apply_capture_coverage(
     if missing:
         result.status = STATUS_CRITICAL
         result.reason = "coverage_incomplete"
+
+
+def _apply_cadence_coverage(
+    result: TargetResult,
+    lines: list[str],
+    target: TargetConfig,
+    now: datetime,
+) -> None:
+    """Detect intermittent writer overruns that a latest-mtime check misses."""
+
+    window_seconds = float(target.cadence_window_seconds or 0.0)
+    interval_seconds = float(target.expected_interval_seconds)
+    if window_seconds <= 0.0 or interval_seconds <= 0.0:
+        return
+
+    expected = max(1, int(window_seconds // interval_seconds))
+    cutoff = now - timedelta(seconds=window_seconds)
+    observed_slots: set[int] = set()
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, Mapping):
+            continue
+        value = row.get("ts")
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            continue
+        parsed = parsed.astimezone(UTC)
+        if cutoff < parsed <= now:
+            observed_slots.add(int(parsed.timestamp() // interval_seconds))
+
+    observed = len(observed_slots)
+    ratio = min(1.0, observed / expected)
+    result.expected_cadence = expected
+    result.observed_cadence = observed
+    result.cadence_coverage_ratio = round(ratio, 3)
+    if ratio < target.minimum_cadence_ratio:
+        result.status = STATUS_CRITICAL
+        result.reason = "cadence_coverage_low"
 
 
 def evaluate(
@@ -381,6 +455,12 @@ def _build_notification(
         lines.append("データ収集の鮮度が正常へ回復しました")
     else:
         lines.append(f"理由: {result.reason}")
+        if result.expected_cadence is not None:
+            lines.append(
+                "直近周期: "
+                f"{result.observed_cadence or 0}/{result.expected_cadence}"
+                f" ({float(result.cadence_coverage_ratio or 0.0):.0%})"
+            )
         lines.append(f"連続検知: {state.consecutive_failures}回目")
         if result.manual_action_ja:
             lines.append(f"手動対応: {result.manual_action_ja}")

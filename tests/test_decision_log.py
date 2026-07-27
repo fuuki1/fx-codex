@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, UTC
 import json
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from fx_intel import decision_log, learning, maximization, tf_learning, tp_sl_learning
+from fx_intel import decision_log, journal, learning, maximization, tf_learning, tp_sl_learning
 from fx_intel.briefing import TradePlan
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -156,6 +158,32 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
     assert rows[0]["decision_id"] == event["decision_id"]
     assert payload["event_count"] == 1
     assert payload["events"][0]["decision"]["direction"] == "long"
+
+
+def test_jsonl_readers_stream_without_read_text(tmp_path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    path.write_text(
+        "\n".join(
+            (
+                json.dumps({"decision_id": "d1"}),
+                "{broken",
+                json.dumps({"decision_id": "d2"}),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with mock.patch.object(
+        Path,
+        "read_text",
+        side_effect=AssertionError("the full audit log must not be materialized"),
+    ):
+        decision_rows = list(decision_log.read_decision_events(path))
+        journal_rows = list(journal.read_entries(path))
+
+    assert [row["decision_id"] for row in decision_rows] == ["d1", "d2"]
+    assert [row["decision_id"] for row in journal_rows] == ["d1", "d2"]
 
 
 def test_score_decision_events_uses_tp_sl_mfe_mae(tmp_path) -> None:

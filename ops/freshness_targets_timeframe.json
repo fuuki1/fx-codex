@@ -21,7 +21,10 @@
       "expected_interval_seconds": 300,
       "warn_after_seconds": 900,
       "critical_after_seconds": 2700,
-      "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を再起動"
+      "cadence_window_seconds": 1800,
+      "minimum_cadence_ratio": 0.8,
+      "recent_tail_bytes": 1048576,
+      "manual_action_ja": "logs/launchd/briefing.err.log と実行時間を確認し、5分枠を超える全履歴再採点・外部取得・ロック競合を調査"
     }
   ]
 }
