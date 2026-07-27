@@ -40,6 +40,17 @@ an explicit, repeatedly parity-verified reader cutover.
   crashed producer leaves it orphaned and a later transaction commits, sync
   records the orphan as an explicit rejection and continues from the later
   commit instead of permanently stalling the contiguous cursor.
+- Compact journal readers use
+  `briefing_decision_commit_index.json`, a small atomically replaced derived
+  read model maintained after the full-log commit is fsynced. The index pins
+  the full log's path, device, inode, byte cursor, mtime, and final-line hash,
+  and retains only commit records already matched to canonical full wrappers.
+  Fresh processes validate the pinned boundary and parse only the new suffix;
+  a stale, corrupt, replaced, truncated, or same-size rewritten source falls
+  back to the streaming full verifier. A crash between the authoritative
+  commit and index refresh therefore costs one slower read but cannot publish
+  uncommitted data. The index is never evidence authority and daily full replay
+  still verifies the complete raw logs.
 - A cursor can advance only in the same transaction as a contiguous SHA-256
   chunk manifest. Malformed complete lines advance only after an append-only
   rejection record is committed. An incomplete trailing line is left unread.
@@ -274,6 +285,12 @@ readers and writers are active.
 - schema v4 adds global and symbol/timeframe page indexes for newest-first
   keyset scans. The read model uses the immutable base tables and does not add a
   second mutable cache.
+
+The commit index is separate from SQLite's query model: it removes the 1 GiB
+full-decision scan from legacy compact readers during the shadow period. It is
+rebuildable from raw evidence and may be removed without losing decisions; the
+next read falls back to streaming verification and the next committed writer
+refreshes it.
 
 The remaining cutover stages are:
 

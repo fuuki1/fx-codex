@@ -12,18 +12,25 @@ from datetime import datetime, UTC
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from .state_io import atomic_write_json
 
 SCHEMA_VERSION = 1
 COMMIT_EVENT_TYPE = "decision_cross_log_commit"
 DECISION_BATCH_EVENT_TYPE = "decision_batch"
 DEFAULT_COMMIT_FILENAME = "briefing_decisions.jsonl"
+COMMIT_INDEX_SCHEMA_VERSION = 1
+COMMIT_INDEX_KIND = "decision-commit-index"
+DEFAULT_COMMIT_INDEX_FILENAME = "briefing_decision_commit_index.json"
 COMPACT_FILENAMES = {
     "fusion": "briefing_journal.jsonl",
     "per_timeframe": "briefing_tf_journal.jsonl",
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 class DecisionCommitError(RuntimeError):
@@ -37,6 +44,15 @@ def commit_path_for(log_path: str | Path) -> Path:
     if target.name in {"briefing_journal.jsonl", "briefing_tf_journal.jsonl"}:
         return target.parent / DEFAULT_COMMIT_FILENAME
     return target
+
+
+def commit_index_path_for(log_path: str | Path) -> Path:
+    """Return the small derived index used by compact journal readers."""
+
+    target = commit_path_for(log_path)
+    if target.name == DEFAULT_COMMIT_FILENAME:
+        return target.parent / DEFAULT_COMMIT_INDEX_FILENAME
+    return target.parent / f".{target.name}.commit-index.json"
 
 
 def compact_path_for_mode(commit_path: str | Path, mode: str) -> Path:
@@ -129,6 +145,12 @@ def append_commit(
             os.fsync(handle.fileno())
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    try:
+        _refresh_commit_index(target, expected_transaction_id=transaction_id)
+    except Exception:
+        _LOGGER.exception(
+            "decision commit index refresh failed; full-log fallback remains authoritative"
+        )
     return record
 
 
@@ -140,30 +162,68 @@ def load_commits(
     """Load commits backed by exact full wrappers and, optionally, compact batches."""
 
     target = Path(path)
+    if not target.is_file():
+        return {}
+    indexed = _load_indexed_commits(target)
+    if indexed is None:
+        commits, _, _, _, _ = _stream_full_commit_state(target)
+    else:
+        commits, _, _, _, _ = indexed
+    return _verify_compact_commits(target, commits) if verify_compact else commits
+
+
+def _stream_full_commit_state(
+    target: Path,
+) -> tuple[dict[str, dict[str, object]], os.stat_result, int, int, str]:
     full_batches: dict[str, dict[str, object]] = {}
     full_conflicts: set[str] = set()
     candidate_commits: dict[str, dict[str, object]] = {}
     commit_conflicts: set[str] = set()
     try:
-        handle = target.open(encoding="utf-8")
+        handle = target.open("rb")
     except OSError:
-        return {}
+        raise DecisionCommitError(f"decision log is unavailable: {target}")
+    byte_offset = 0
+    last_line_start = 0
+    last_line_sha256 = hashlib.sha256(b"").hexdigest()
     with handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        before = os.fstat(handle.fileno())
         for line in handle:
+            line_start = byte_offset
+            if not line.endswith(b"\n"):
+                break
+            byte_offset += len(line)
             try:
                 raw: Any = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            _accumulate_commit_value(
-                raw,
-                full_batches=full_batches,
-                full_conflicts=full_conflicts,
-                candidate_commits=candidate_commits,
-                commit_conflicts=commit_conflicts,
-            )
+                raw = None
+            if raw is not None:
+                _accumulate_commit_value(
+                    raw,
+                    full_batches=full_batches,
+                    full_conflicts=full_conflicts,
+                    candidate_commits=candidate_commits,
+                    commit_conflicts=commit_conflicts,
+                )
+            last_line_start = line_start
+            last_line_sha256 = hashlib.sha256(line).hexdigest()
+        after = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise DecisionCommitError(f"decision log changed while indexing: {target}")
     commits = _matching_full_commits(full_batches, candidate_commits)
-    if not verify_compact:
-        return commits
+    return commits, after, byte_offset, last_line_start, last_line_sha256
+
+
+def _verify_compact_commits(
+    target: Path,
+    commits: Mapping[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
     verified_by_mode: dict[str, set[tuple[str, str, str]]] = {}
     output: dict[str, dict[str, object]] = {}
     for transaction_id, record in commits.items():
@@ -183,6 +243,216 @@ def load_commits(
         if key in verified_by_mode[mode]:
             output[transaction_id] = record
     return output
+
+
+def _load_indexed_commits(
+    target: Path,
+) -> tuple[dict[str, dict[str, object]], os.stat_result, int, int, str] | None:
+    loaded = _read_commit_index(commit_index_path_for(target), target=target)
+    if loaded is None:
+        return None
+    payload, cached_commits = loaded
+    try:
+        handle = target.open("rb")
+    except OSError:
+        return None
+    with handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        stat = os.fstat(handle.fileno())
+        byte_offset = cast(int, payload["byte_offset"])
+        if (
+            stat.st_dev != cast(int, payload["device_id"])
+            or stat.st_ino != cast(int, payload["inode"])
+            or stat.st_size < byte_offset
+            or (
+                stat.st_size == byte_offset
+                and stat.st_mtime_ns != cast(int, payload["source_mtime_ns"])
+            )
+        ):
+            return None
+        if not _index_boundary_matches(handle, payload):
+            return None
+        handle.seek(byte_offset)
+        suffix = handle.read()
+        after = os.fstat(handle.fileno())
+        if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return None
+        if suffix and not suffix.endswith(b"\n"):
+            return None
+
+    suffix_values: list[object] = []
+    for line in suffix.splitlines():
+        try:
+            suffix_values.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            suffix_values.append(None)
+    if _suffix_conflicts_with_cache(suffix_values, cached_commits):
+        return None
+    suffix_commits = commits_from_values(suffix_values)
+    commits = dict(cached_commits)
+    for transaction_id, record in suffix_commits.items():
+        previous = commits.get(transaction_id)
+        if previous is not None and previous != record:
+            return None
+        commits[transaction_id] = record
+
+    end_offset = byte_offset + len(suffix)
+    if suffix:
+        relative_start = suffix.rfind(b"\n", 0, len(suffix) - 1) + 1
+        last_line_start = byte_offset + relative_start
+        last_line_sha256 = hashlib.sha256(suffix[relative_start:]).hexdigest()
+    else:
+        last_line_start = cast(int, payload["last_line_start_offset"])
+        last_line_sha256 = str(payload["last_line_sha256"])
+    return commits, after, end_offset, last_line_start, last_line_sha256
+
+
+def _read_commit_index(
+    index_path: Path,
+    *,
+    target: Path,
+) -> tuple[dict[str, object], dict[str, dict[str, object]]] | None:
+    try:
+        with index_path.open(encoding="utf-8") as handle:
+            payload: Any = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        payload.get("schema_version") != COMMIT_INDEX_SCHEMA_VERSION
+        or payload.get("index_kind") != COMMIT_INDEX_KIND
+        or Path(str(payload.get("source_path") or "")).resolve() != target.resolve()
+    ):
+        return None
+    stored_hash = payload.get("index_record_sha256")
+    unsigned = {key: value for key, value in payload.items() if key != "index_record_sha256"}
+    if stored_hash != canonical_sha256(unsigned):
+        return None
+    integer_fields = (
+        "device_id",
+        "inode",
+        "byte_offset",
+        "last_line_start_offset",
+        "source_mtime_ns",
+    )
+    if any(
+        isinstance(payload.get(field), bool)
+        or not isinstance(payload.get(field), int)
+        or int(payload[field]) < 0
+        for field in integer_fields
+    ):
+        return None
+    if int(payload["last_line_start_offset"]) > int(payload["byte_offset"]):
+        return None
+    try:
+        _required_sha256(payload.get("last_line_sha256"), "last_line_sha256")
+    except DecisionCommitError:
+        return None
+    raw_commits = payload.get("commits")
+    if not isinstance(raw_commits, list) or payload.get("commit_count") != len(raw_commits):
+        return None
+    commits: dict[str, dict[str, object]] = {}
+    conflicts: set[str] = set()
+    for raw in raw_commits:
+        record = _validated_record(raw)
+        if record is None:
+            return None
+        transaction_id = str(record["decision_transaction_id"])
+        _accumulate_unique(commits, conflicts, transaction_id, record)
+    if conflicts or len(commits) != len(raw_commits):
+        return None
+    return payload, commits
+
+
+def _index_boundary_matches(handle: Any, payload: Mapping[str, object]) -> bool:
+    byte_offset = cast(int, payload["byte_offset"])
+    last_line_start = cast(int, payload["last_line_start_offset"])
+    if byte_offset == 0:
+        return (
+            last_line_start == 0
+            and payload.get("last_line_sha256") == hashlib.sha256(b"").hexdigest()
+        )
+    length = byte_offset - last_line_start
+    if length <= 0:
+        return False
+    handle.seek(last_line_start)
+    line = handle.read(length)
+    return (
+        len(line) == length
+        and line.endswith(b"\n")
+        and hashlib.sha256(line).hexdigest() == payload.get("last_line_sha256")
+    )
+
+
+def _suffix_conflicts_with_cache(
+    values: Sequence[object],
+    cached_commits: Mapping[str, Mapping[str, object]],
+) -> bool:
+    for raw in values:
+        full = _full_batch_descriptor(raw)
+        if full is not None:
+            transaction_id, descriptor = full
+            cached = cached_commits.get(transaction_id)
+            if cached is not None and not (
+                cached.get("decision_ids") == descriptor["decision_ids"]
+                and cached.get("decision_ids_sha256") == descriptor["decision_ids_sha256"]
+                and cached.get("full_batch_sha256") == descriptor["full_batch_sha256"]
+                and cached.get("mode") == descriptor["mode"]
+            ):
+                return True
+        record = _validated_record(raw)
+        if record is not None:
+            transaction_id = str(record["decision_transaction_id"])
+            cached = cached_commits.get(transaction_id)
+            if cached is not None and cached != record:
+                return True
+    return False
+
+
+def _refresh_commit_index(
+    target: Path,
+    *,
+    expected_transaction_id: str,
+) -> None:
+    index_path = commit_index_path_for(target)
+    lock_path = Path(f"{index_path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        indexed = _load_indexed_commits(target)
+        if indexed is None:
+            indexed = _stream_full_commit_state(target)
+        commits, stat, byte_offset, last_line_start, last_line_sha256 = indexed
+        if expected_transaction_id not in commits:
+            raise DecisionCommitError(
+                "new commit is not backed by an exact canonical full decision wrapper"
+            )
+        payload: dict[str, object] = {
+            "schema_version": COMMIT_INDEX_SCHEMA_VERSION,
+            "index_kind": COMMIT_INDEX_KIND,
+            "source_path": str(target.resolve()),
+            "device_id": stat.st_dev,
+            "inode": stat.st_ino,
+            "byte_offset": byte_offset,
+            "last_line_start_offset": last_line_start,
+            "last_line_sha256": last_line_sha256,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "commit_count": len(commits),
+            "commits": [commits[key] for key in sorted(commits)],
+        }
+        payload["index_record_sha256"] = canonical_sha256(payload)
+        atomic_write_json(index_path, payload)
+        directory_fd = os.open(index_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def commits_from_values(values: Sequence[object]) -> dict[str, dict[str, object]]:
@@ -239,7 +509,6 @@ def _full_batch_descriptor(
     if (
         raw.get("schema_version") != SCHEMA_VERSION
         or raw.get("event_type") != DECISION_BATCH_EVENT_TYPE
-        or raw.get("requires_cross_log_commit") is not True
     ):
         return None
     events = raw.get("events")
@@ -447,12 +716,15 @@ def _required_sha256(value: object, name: str) -> str:
 
 __all__ = [
     "COMMIT_EVENT_TYPE",
+    "COMMIT_INDEX_KIND",
     "COMPACT_FILENAMES",
     "DEFAULT_COMMIT_FILENAME",
+    "DEFAULT_COMMIT_INDEX_FILENAME",
     "DecisionCommitError",
     "append_commit",
     "canonical_sha256",
     "compact_path_for_mode",
+    "commit_index_path_for",
     "commit_path_for",
     "commits_from_values",
     "decision_ids_sha256",
