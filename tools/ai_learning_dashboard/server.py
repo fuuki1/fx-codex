@@ -47,6 +47,7 @@ TF_LEARNING_FILE = "briefing_tf_learning.json"
 TF_PRICES_FILE = "briefing_tf_prices.jsonl"
 HORIZON_JOURNAL_FILE = "briefing_horizon_forecasts.jsonl"
 HORIZON_LEARNING_FILE = "briefing_horizon_learning.json"
+JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 TF_PRICES_STALE_MINUTES = 15
 _TIMEFRAME_ORDER = {"15m": 0, "1h": 1, "4h": 2, "1d": 3}
 _HORIZON_ORDER = {
@@ -168,6 +169,8 @@ def _read_journal(path: Path) -> list[dict[str, Any]]:
     except OSError:
         return []
     rows: list[dict[str, Any]] = []
+    pending_id = ""
+    pending_rows: list[dict[str, Any]] = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -176,8 +179,32 @@ def _read_journal(path: Path) -> list[dict[str, Any]]:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, dict):
-            rows.append(payload)
+        if not isinstance(payload, dict):
+            continue
+        batch_id = str(payload.get("journal_batch_id") or "")
+        if payload.get("event_type") == JOURNAL_BATCH_COMMIT:
+            expected_size = payload.get("journal_batch_size")
+            indices = [row.get("journal_batch_index") for row in pending_rows]
+            if (
+                batch_id
+                and batch_id == pending_id
+                and isinstance(expected_size, int)
+                and expected_size == len(pending_rows)
+                and indices == list(range(expected_size))
+            ):
+                rows.extend(pending_rows)
+            pending_id = ""
+            pending_rows = []
+            continue
+        if batch_id:
+            if batch_id != pending_id:
+                pending_id = batch_id
+                pending_rows = []
+            pending_rows.append(payload)
+            continue
+        pending_id = ""
+        pending_rows = []
+        rows.append(payload)
     return rows
 
 

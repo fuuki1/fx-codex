@@ -26,6 +26,11 @@ MAX_EMBEDS = 10
 MAX_CONTENT = 2000
 MAX_FIELD = 1024
 MAX_EMBED_CHARS = 5800
+# Discord documents 25 fields per embed, but its webhook backend currently
+# returns HTTP 500 for a valid multi-embed payload whose aggregate field count
+# exceeds 25. Keep a conservative per-message cap; this preserves every embed
+# by moving the overflow to the next message.
+MAX_FIELDS_PER_MESSAGE = 25
 
 _DIRECTION_COLOR = {
     "long": COLOR_LONG,
@@ -283,7 +288,7 @@ def _symbol_embed(
         "title": f"{symbol} — 統合判断",
         "description": _summary_line(symbol, plans, analysis),
         "color": _symbol_color(plans),
-        "fields": fields[:25],
+        "fields": fields,
     }
 
 
@@ -309,66 +314,113 @@ def _embed_chars(embed: Mapping[str, object]) -> int:
             if isinstance(field, Mapping):
                 count += len(str(field.get("name", "")))
                 count += len(str(field.get("value", "")))
+    footer = embed.get("footer")
+    if isinstance(footer, Mapping):
+        count += len(str(footer.get("text", "")))
+    author = embed.get("author")
+    if isinstance(author, Mapping):
+        count += len(str(author.get("name", "")))
     return count
 
 
-def _shrink(embed: Mapping[str, object], budget: int) -> dict:
-    result = deepcopy(dict(embed))
-    used = len(str(result.get("title", ""))) + len(str(result.get("description", "")))
-    fields = result.get("fields")
-    if not isinstance(fields, list):
-        return result
-    kept: list[dict[str, object]] = []
+def _embed_field_count(embed: Mapping[str, object]) -> int:
+    fields = embed.get("fields")
+    if not isinstance(fields, Sequence) or isinstance(fields, (str, bytes)):
+        return 0
+    return sum(1 for field in fields if isinstance(field, Mapping))
+
+
+def _field_fragments(field: Mapping[str, object]) -> list[dict[str, object]]:
+    """Split an overlong field value without silently discarding its text."""
+
+    name = str(field.get("name", ""))
+    if len(name) > 256:
+        raise ValueError("Discord embed field name exceeds 256 characters")
+    value = str(field.get("value", ""))
+    chunks = [value[index : index + MAX_FIELD] for index in range(0, len(value), MAX_FIELD)]
+    if not chunks:
+        chunks = [""]
+    fragments: list[dict[str, object]] = []
+    for index, chunk in enumerate(chunks):
+        fragment_name = name
+        if index:
+            fragment_name = _clip(f"{name}（続き {index + 1}）", 256)
+        fragments.append(
+            {
+                "name": fragment_name,
+                "value": chunk,
+                "inline": bool(field.get("inline", False)),
+            }
+        )
+    return fragments
+
+
+def _continuation_embed(embed: Mapping[str, object], index: int) -> dict[str, object]:
+    continuation: dict[str, object] = {
+        "title": _clip(f"{embed.get('title', '')}（続き {index}）", 256),
+        "fields": [],
+    }
+    if "color" in embed:
+        continuation["color"] = embed["color"]
+    return continuation
+
+
+def _fragment_embed(embed: Mapping[str, object]) -> list[dict]:
+    """Split one embed into valid fragments while retaining all field values."""
+
+    original = deepcopy(dict(embed))
+    raw_fields = original.pop("fields", [])
+    fields: list[dict[str, object]] = []
+    if isinstance(raw_fields, Sequence) and not isinstance(raw_fields, (str, bytes)):
+        for field in raw_fields:
+            if isinstance(field, Mapping):
+                fields.extend(_field_fragments(field))
+    original["fields"] = []
+    if _embed_chars(original) > MAX_EMBED_CHARS:
+        raise ValueError("Discord embed metadata exceeds the safe character budget")
+
+    fragments: list[dict] = [original]
     for field in fields:
-        if not isinstance(field, Mapping):
-            continue
-        name = _clip(field.get("name", ""), 256)
-        available = min(MAX_FIELD, max(24, budget - used - len(name)))
-        if budget - used - len(name) <= 8:
-            break
-        value = _clip(field.get("value", ""), available)
-        kept.append({"name": name, "value": value, "inline": field.get("inline", False)})
-        used += len(name) + len(value)
-    result["fields"] = kept[:25]
-    return result
-
-
-def _fit(embeds: Sequence[Mapping[str, object]]) -> list[dict]:
-    visible = list(embeds[:MAX_EMBEDS])
-    if not visible:
-        return []
-    macro = _shrink(visible[0], 2200)
-    remaining = max(900, MAX_EMBED_CHARS - _embed_chars(macro))
-    per_symbol = max(350, remaining // max(1, len(visible) - 1))
-    return [macro, *[_shrink(embed, per_symbol) for embed in visible[1:]]]
+        current = fragments[-1]
+        projected_chars = _embed_chars(current) + len(str(field["name"])) + len(str(field["value"]))
+        if (
+            _embed_field_count(current) >= MAX_FIELDS_PER_MESSAGE
+            or projected_chars > MAX_EMBED_CHARS
+        ):
+            current = _continuation_embed(embed, len(fragments) + 1)
+            fragments.append(current)
+        current_fields = current.get("fields")
+        assert isinstance(current_fields, list)
+        current_fields.append(field)
+    return fragments
 
 
 def _batch_embeds(embeds: Sequence[Mapping[str, object]]) -> list[list[dict]]:
     """内容を削らず、Discordの1メッセージ上限(embed合計文字数・個数)ごとに分ける。
 
-    `_fit`(縮小して1通に収める)と異なり、embedは丸ごと保持したまま複数メッセージへ
-    振り分ける。単体で上限を超えるembedだけは、Discordが受理できるよう`_shrink`で
-    上限内へ抑える(この1件のみ情報が削れる)。
+    各field valueを1024文字ごと、各embedを25 field/文字数上限ごとに分割した上で、
+    embedを複数メッセージへ振り分ける。送信内容は切り捨てない。
     """
 
     batches: list[list[dict]] = []
     current: list[dict] = []
     used = 0
+    fields_used = 0
     for embed in embeds:
-        row = (
-            _shrink(embed, MAX_EMBED_CHARS)
-            if _embed_chars(embed) > MAX_EMBED_CHARS
-            else dict(embed)
-        )
-        size = _embed_chars(row)
-        over_char_budget = current and used + size > MAX_EMBED_CHARS
-        over_count_budget = len(current) >= MAX_EMBEDS
-        if over_char_budget or over_count_budget:
-            batches.append(current)
-            current = []
-            used = 0
-        current.append(row)
-        used += size
+        for row in _fragment_embed(embed):
+            size = _embed_chars(row)
+            field_count = _embed_field_count(row)
+            over_char_budget = current and used + size > MAX_EMBED_CHARS
+            over_count_budget = len(current) >= MAX_EMBEDS
+            over_field_budget = current and fields_used + field_count > MAX_FIELDS_PER_MESSAGE
+            if over_char_budget or over_count_budget or over_field_budget:
+                batches.append(current)
+                current = []
+                used = 0
+                fields_used = 0
+            current.append(row)
+            used += size
+            fields_used += field_count
     if current:
         batches.append(current)
     return batches
@@ -382,24 +434,20 @@ def split_timeframe_payloads(payload: Mapping[str, object]) -> list[dict]:
     embedが上限内に収まる通常時は1件のリストを返す(既存挙動と同じ送信結果)。
     """
 
-    username = payload.get("username")
     content = payload.get("content")
     embeds = payload.get("embeds")
     embed_list = list(embeds) if isinstance(embeds, Sequence) else []
     if not embed_list:
-        single: dict[str, object] = {}
-        if username is not None:
-            single["username"] = username
+        single = {key: value for key, value in payload.items() if key != "embeds"}
         if content is not None:
             single["content"] = content
         return [single]
 
     batches = _batch_embeds(embed_list)
     payloads: list[dict] = []
+    passthrough = {key: value for key, value in payload.items() if key not in {"content", "embeds"}}
     for index, batch in enumerate(batches):
-        message: dict[str, object] = {"embeds": batch}
-        if username is not None:
-            message["username"] = username
+        message: dict[str, object] = {**passthrough, "embeds": batch}
         if index == 0 and content is not None:
             message["content"] = content
         payloads.append(message)
@@ -517,5 +565,5 @@ def build_timeframe_discord_payload(
     return {
         "username": "fx-codex 統合デスク",
         "content": _clip(content, MAX_CONTENT),
-        "embeds": _fit(embeds),
+        "embeds": embeds,
     }

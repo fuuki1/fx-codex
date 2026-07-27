@@ -258,7 +258,7 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
         rc = _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
     assert rc == fx_briefing.NOTIFICATION_FAILURE_EXIT_CODE
     assert tf_journal.exists()
-    rows = [json.loads(line) for line in tf_journal.read_text().splitlines() if line.strip()]
+    rows = list(fx_briefing.journal.read_entries(tf_journal))
     timeframes = {row["timeframe"] for row in rows}
     assert timeframes == {"15m", "1h", "4h", "1d"}
     context_ids = {row["input_context_id"] for row in rows}
@@ -271,17 +271,14 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
     assert horizons == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
 
 
-def test_per_timeframe_journal_failure_stops_later_writers(patched_paths, capsys) -> None:
+def test_per_timeframe_journal_failure_keeps_authoritative_full_decisions(
+    patched_paths, capsys
+) -> None:
     with (
         mock.patch.object(
             fx_briefing.journal,
             "append_timeframe_plans",
             side_effect=OSError("read-only"),
-        ),
-        mock.patch.object(
-            fx_briefing.decision_log,
-            "append_decision_events",
-            side_effect=AssertionError("must not run"),
         ),
     ):
         rc = _run(
@@ -290,6 +287,31 @@ def test_per_timeframe_journal_failure_stops_later_writers(patched_paths, capsys
         )
 
     assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
+    assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
+    assert "ジャーナル書き込み失敗" in capsys.readouterr().err
+
+
+def test_per_timeframe_full_failure_prevents_compact_learning_rows(patched_paths, capsys) -> None:
+    tf_journal, _ = patched_paths
+    with (
+        mock.patch.object(
+            fx_briefing,
+            "persist_decision_audit_batch",
+            side_effect=OSError("read-only"),
+        ),
+        mock.patch.object(
+            fx_briefing.journal,
+            "append_timeframe_plans",
+            side_effect=AssertionError("compact writer must not run"),
+        ),
+    ):
+        rc = _run(
+            ["--per-timeframe", "--no-discord", "--no-macro", "--symbols", "USDJPY"],
+            capsys,
+        )
+
+    assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
+    assert not tf_journal.exists()
     assert "ジャーナル書き込み失敗" in capsys.readouterr().err
 
 
@@ -341,6 +363,17 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
             json.dumps(
                 {
                     "ts": ts.isoformat(),
+                    "prediction_time": ts.isoformat(),
+                    "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+                    "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+                    "pit_eligible": True,
+                    "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+                    "decision_id": f"decision:USDJPY:1h:{ts.isoformat()}",
+                    "mode": "per_timeframe",
+                    "producer": fx_briefing.journal.TIMEFRAME_PRODUCER,
+                    "producer_version": fx_briefing.journal.TIMEFRAME_PRODUCER_VERSION,
+                    "input_context_id": f"context:{ts.isoformat()}",
+                    "source_record_ids": [f"source:{ts.isoformat()}"],
                     "symbol": "USDJPY",
                     "timeframe": "1h",
                     "horizon_hours": 1.0,
@@ -377,6 +410,17 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
             json.dumps(
                 {
                     "ts": ts.isoformat(),
+                    "prediction_time": ts.isoformat(),
+                    "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+                    "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+                    "pit_eligible": True,
+                    "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+                    "decision_id": f"decision:USDJPY:1h:{ts.isoformat()}",
+                    "mode": "per_timeframe",
+                    "producer": fx_briefing.journal.TIMEFRAME_PRODUCER,
+                    "producer_version": fx_briefing.journal.TIMEFRAME_PRODUCER_VERSION,
+                    "input_context_id": f"context:{ts.isoformat()}",
+                    "source_record_ids": [f"source:{ts.isoformat()}"],
                     "symbol": "USDJPY",
                     "timeframe": "1h",
                     "horizon_hours": 1.0,

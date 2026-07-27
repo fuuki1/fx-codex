@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime, UTC
 
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
-from fx_intel.tf_briefing import build_timeframe_discord_payload
+from fx_intel.tf_briefing import (
+    build_timeframe_discord_payload,
+    split_timeframe_payloads,
+)
 from fx_intel.timeframe import PRIMARY_HORIZON_HOURS, TimeframePlan
 
 NOW = datetime(2026, 7, 15, 7, 10, tzinfo=UTC)
@@ -128,10 +131,18 @@ def test_discord_payload_stays_within_platform_limits() -> None:
         now=NOW,
     )
 
-    assert len(payload["content"]) <= 2000
-    assert len(payload["embeds"]) <= 10
-    assert _total_embed_chars(payload) <= 6000
-    for embed in payload["embeds"]:
-        assert len(embed.get("fields", [])) <= 25
-        for field in embed.get("fields", []):
-            assert len(field["value"]) <= 1024
+    messages = split_timeframe_payloads(payload)
+
+    assert len(messages) > 1
+    assert len(messages[0]["content"]) <= 2000
+    assert all("content" not in message for message in messages[1:])
+    titles = [str(embed.get("title", "")) for message in messages for embed in message["embeds"]]
+    assert all(any(f"PAIR{index} — 統合判断" in title for title in titles) for index in range(12))
+    for message in messages:
+        assert len(message["embeds"]) <= 10
+        assert _total_embed_chars(message) <= 6000
+        assert sum(len(embed.get("fields", [])) for embed in message["embeds"]) <= 25
+        for embed in message["embeds"]:
+            assert len(embed.get("fields", [])) <= 25
+            for field in embed.get("fields", []):
+                assert len(field["value"]) <= 1024

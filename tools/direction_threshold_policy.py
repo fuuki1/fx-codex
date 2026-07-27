@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fx_intel import direction_threshold as threshold  # noqa: E402
+from fx_intel import direction_threshold as threshold, journal  # noqa: E402
 
 DEFAULT_OUTCOMES = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_POLICY = PROJECT_ROOT / "logs" / "direction_threshold_policy.json"
@@ -23,6 +23,12 @@ def _outcomes(path: Path) -> list[dict[str, object]]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SystemExit(f"outcome reportを読めません: {error}") from error
+    if not isinstance(payload, dict):
+        raise SystemExit("outcome reportの形式が不正です")
+    if payload.get("pit_contract") != journal.DECISION_JOURNAL_PIT_CONTRACT:
+        raise SystemExit("outcome reportは現行PIT契約で採点されていません")
+    if payload.get("pit_required") is not True:
+        raise SystemExit("outcome reportはPIT必須モードで採点されていません")
     raw = payload.get("outcomes") if isinstance(payload, dict) else None
     return [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
 

@@ -37,6 +37,7 @@ from pathlib import Path
 UTC = timezone.utc  # noqa: UP017
 
 SCHEMA_VERSION = 1
+JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 
 # fx_intel.timeframe と同じ主ホライズン(市場オープン時間換算)と許容誤差。
 PRIMARY_HORIZON_HOURS: dict[str, float] = {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
@@ -166,6 +167,8 @@ def read_jsonl(path: Path) -> JsonlFile:
     if not path.exists():
         return result
     result.exists = True
+    pending_id = ""
+    pending_rows: list[dict] = []
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -177,10 +180,33 @@ def read_jsonl(path: Path) -> JsonlFile:
                 except json.JSONDecodeError:
                     result.malformed_lines += 1
                     continue
-                if isinstance(row, dict):
-                    result.rows.append(row)
-                else:
+                if not isinstance(row, dict):
                     result.malformed_lines += 1
+                    continue
+                batch_id = str(row.get("journal_batch_id") or "")
+                if row.get("event_type") == JOURNAL_BATCH_COMMIT:
+                    expected_size = row.get("journal_batch_size")
+                    indices = [item.get("journal_batch_index") for item in pending_rows]
+                    if (
+                        batch_id
+                        and batch_id == pending_id
+                        and isinstance(expected_size, int)
+                        and expected_size == len(pending_rows)
+                        and indices == list(range(expected_size))
+                    ):
+                        result.rows.extend(pending_rows)
+                    pending_id = ""
+                    pending_rows = []
+                    continue
+                if batch_id:
+                    if batch_id != pending_id:
+                        pending_id = batch_id
+                        pending_rows = []
+                    pending_rows.append(row)
+                    continue
+                pending_id = ""
+                pending_rows = []
+                result.rows.append(row)
     except OSError:
         result.exists = False
     return result

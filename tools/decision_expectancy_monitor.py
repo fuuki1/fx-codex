@@ -56,6 +56,7 @@ def run_decision_expectancy_monitor(
         decision_log.read_decision_events(decision_log_path),
         price_entries=price_rows,
         now=generated_at,
+        require_pit=True,
     )
     profile = decision_feedback.derive_decision_feedback(outcome_report, now=generated_at)
     monitor = decision_feedback.build_monitoring_snapshot(
@@ -75,6 +76,12 @@ def run_decision_expectancy_monitor(
         "monitor_json_path": str(monitor_json_path),
         "decision_event_count": (
             int(input_event_count) if isinstance(input_event_count, (int, float)) else 0
+        ),
+        "pit_eligible_decision_events": int(
+            outcome_report.get("pit_eligible_decision_events", 0) or 0
+        ),
+        "pit_ineligible_decision_events": int(
+            outcome_report.get("pit_ineligible_decision_events", 0) or 0
         ),
         "price_row_count": len(price_rows),
         "require_sample_ok": require_sample_ok,

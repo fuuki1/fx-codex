@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
 import time
 from typing import Any
 
@@ -18,10 +24,137 @@ RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 # 既定4試行で優に2分を超える。呼び出し元(鮮度監視)はlaunchdの300秒周期で回るため、
 # 通知1件が周期を食い潰すと監視レポートの更新間隔が伸びる。
 DEFAULT_BUDGET_SECONDS = 45.0
+OUTBOX_SCHEMA = 1
+MAX_PENDING_BATCHES = 100
 
 
 class DiscordDeliveryError(RuntimeError):
     """Webhook delivery failed after bounded retries."""
+
+
+def _batch_id(payloads: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(
+        payloads,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _label_parts(payloads: list[dict[str, Any]], batch_id: str) -> list[dict[str, Any]]:
+    if len(payloads) <= 1:
+        return payloads
+    labeled: list[dict[str, Any]] = []
+    for index, raw in enumerate(payloads, start=1):
+        payload = dict(raw)
+        marker = f"fx-codex batch {batch_id[:12]} part {index}/{len(payloads)}"
+        existing = str(payload.get("content") or "")
+        payload["content"] = f"{marker}\n{existing[: 1999 - len(marker)]}" if existing else marker
+        labeled.append(payload)
+    return labeled
+
+
+def _load_outbox(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"schema": OUTBOX_SCHEMA, "batches": []}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise DiscordDeliveryError(f"Discord outboxを読めません: {type(error).__name__}") from error
+    if not isinstance(payload, dict) or payload.get("schema") != OUTBOX_SCHEMA:
+        raise DiscordDeliveryError("Discord outboxのschemaが不正です")
+    batches = payload.get("batches")
+    if not isinstance(batches, list):
+        raise DiscordDeliveryError("Discord outboxのbatchesが不正です")
+    return payload
+
+
+def _save_outbox(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, ensure_ascii=False, indent=2, allow_nan=False)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def send_webhook_batch(
+    webhook_url: str,
+    payloads: list[dict[str, Any]],
+    *,
+    outbox_path: str | Path,
+) -> None:
+    """Durably resume a multi-message webhook batch after partial delivery.
+
+    Discord has no transactional multi-message webhook operation. This outbox
+    therefore provides ordered at-least-once delivery: completed parts are
+    checkpointed, failed parts remain pending, and each multi-part message is
+    visibly labeled with a stable batch/part identifier.
+    """
+
+    if not payloads:
+        return
+    outbox = Path(outbox_path)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = outbox.with_suffix(outbox.suffix + ".lock")
+    with lock_path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _load_outbox(outbox)
+        batches = state["batches"]
+        assert isinstance(batches, list)
+        identifier = _batch_id(payloads)
+        if not any(
+            isinstance(batch, Mapping) and batch.get("batch_id") == identifier for batch in batches
+        ):
+            if len(batches) >= MAX_PENDING_BATCHES:
+                raise DiscordDeliveryError("Discord outboxが上限に達しました")
+            batches.append(
+                {
+                    "batch_id": identifier,
+                    "payloads": _label_parts(payloads, identifier),
+                    "next_part": 0,
+                }
+            )
+            _save_outbox(outbox, state)
+
+        while batches:
+            batch = batches[0]
+            if not isinstance(batch, dict):
+                raise DiscordDeliveryError("Discord outbox batchの形式が不正です")
+            stored_payloads = batch.get("payloads")
+            next_part = batch.get("next_part")
+            if not isinstance(stored_payloads, list) or not isinstance(next_part, int):
+                raise DiscordDeliveryError("Discord outbox checkpointの形式が不正です")
+            while next_part < len(stored_payloads):
+                payload = stored_payloads[next_part]
+                if not isinstance(payload, Mapping):
+                    raise DiscordDeliveryError("Discord outbox payloadの形式が不正です")
+                send_webhook(webhook_url, payload)
+                next_part += 1
+                batch["next_part"] = next_part
+                _save_outbox(outbox, state)
+            batches.pop(0)
+            _save_outbox(outbox, state)
 
 
 def _retry_after_seconds(response: requests.Response, attempt: int) -> float:

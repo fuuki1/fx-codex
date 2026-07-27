@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 
 import requests
 
@@ -172,3 +173,62 @@ def test_rejects_non_positive_budget():
         except ValueError:
             continue
         raise AssertionError(f"budget_seconds={bad} must be rejected")
+
+
+def test_batch_outbox_resumes_after_partial_delivery(monkeypatch, tmp_path):
+    outbox = tmp_path / "discord_outbox.json"
+    payloads = [{"content": "first"}, {"content": "second"}]
+    calls: list[dict] = []
+
+    def fail_second(_url, payload):
+        calls.append(dict(payload))
+        if len(calls) == 2:
+            raise discord_delivery.DiscordDeliveryError("simulated")
+
+    monkeypatch.setattr(discord_delivery, "send_webhook", fail_second)
+    try:
+        discord_delivery.send_webhook_batch(
+            "https://discord.com/api/webhooks/redacted",
+            payloads,
+            outbox_path=outbox,
+        )
+    except discord_delivery.DiscordDeliveryError:
+        pass
+    else:
+        raise AssertionError("second part must fail")
+
+    state = json.loads(outbox.read_text(encoding="utf-8"))
+    assert state["batches"][0]["next_part"] == 1
+    assert "part 1/2" in calls[0]["content"]
+    assert "part 2/2" in calls[1]["content"]
+
+    resumed: list[dict] = []
+    monkeypatch.setattr(
+        discord_delivery,
+        "send_webhook",
+        lambda _url, payload: resumed.append(dict(payload)),
+    )
+    discord_delivery.send_webhook_batch(
+        "https://discord.com/api/webhooks/redacted",
+        payloads,
+        outbox_path=outbox,
+    )
+
+    assert len(resumed) == 1
+    assert "part 2/2" in resumed[0]["content"]
+    assert json.loads(outbox.read_text(encoding="utf-8"))["batches"] == []
+
+
+def test_batch_outbox_rejects_corrupt_state(tmp_path):
+    outbox = tmp_path / "discord_outbox.json"
+    outbox.write_text("{broken", encoding="utf-8")
+    try:
+        discord_delivery.send_webhook_batch(
+            "https://discord.com/api/webhooks/redacted",
+            [{"content": "x"}],
+            outbox_path=outbox,
+        )
+    except discord_delivery.DiscordDeliveryError as error:
+        assert "outbox" in str(error)
+    else:
+        raise AssertionError("corrupt outbox must fail closed")

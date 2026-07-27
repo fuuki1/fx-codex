@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import journal
+
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "decision_expectancy_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 
@@ -30,6 +32,15 @@ def _decision_event(ts: datetime, index: int) -> dict:
         "run_id": "test-run",
         "ts": ts.isoformat(),
         "mode": "per_timeframe",
+        "prediction_time": ts.isoformat(),
+        "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+        "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+        "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "producer": journal.TIMEFRAME_PRODUCER,
+        "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": f"context-{index}",
+        "source_record_ids": [f"source-{index}"],
         "symbol": "USDJPY",
         "timeframe": "1h",
         "horizon_hours": 1.0,

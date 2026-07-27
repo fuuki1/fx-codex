@@ -108,19 +108,29 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     ]
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
-    assert rows[0]["pit_eligible"] is True
+    # This fixture deliberately supplies no macro/news/quote source records.
+    # The writer must retain the row for diagnostics but fail closed for PIT.
+    assert rows[0]["pit_eligible"] is False
+    assert rows[0]["source_record_ids"] == []
     assert (
         datetime.fromisoformat(rows[0]["source_cutoff"])
         <= datetime.fromisoformat(rows[0]["max_feature_available_time"])
         <= datetime.fromisoformat(rows[0]["prediction_time"])
     )
     assert rows[0]["ts"] == rows[0]["prediction_time"]
-    assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
+    assert decision_rows
+    assert decision_rows[0]["pit_eligible"] is False
+    assert decision_rows[0]["source_record_ids"] == []
+    assert rows[0]["decision_id"] == decision_rows[0]["decision_id"]
+    assert rows[0]["input_context_id"] == decision_rows[0]["input_context_id"]
+    assert rows[0]["source_record_ids"] == decision_rows[0]["source_record_ids"]
+    assert rows[0]["prediction_time"] == decision_rows[0]["prediction_time"]
+    assert decision_rows[0]["learning_context"]["promotion"]["stages"]
     assert "evaluated" in profile
     assert "Discord送信なし" in capsys.readouterr().out
 
 
-def test_fusion_journal_failure_stops_full_decision_writer(tmp_path, capsys) -> None:
+def test_fusion_journal_failure_keeps_authoritative_full_decision(tmp_path, capsys) -> None:
     journal_path = tmp_path / "briefing_journal.jsonl"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
@@ -132,11 +142,6 @@ def test_fusion_journal_failure_stops_full_decision_writer(tmp_path, capsys) -> 
             fx_briefing.journal,
             "append_plans",
             side_effect=OSError("read-only"),
-        ),
-        mock.patch.object(
-            fx_briefing.decision_log,
-            "append_decision_events",
-            side_effect=AssertionError("must not run"),
         ),
     ):
         rc = fx_briefing.main(
@@ -154,6 +159,45 @@ def test_fusion_journal_failure_stops_full_decision_writer(tmp_path, capsys) -> 
         )
 
     assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
+    assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
+    assert "ジャーナル書き込み失敗" in capsys.readouterr().err
+
+
+def test_fusion_full_decision_failure_prevents_compact_learning_row(tmp_path, capsys) -> None:
+    journal_path = tmp_path / "briefing_journal.jsonl"
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
+        mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
+        mock.patch("fx_intel.calendar.fetch_calendar", return_value=([], [])),
+        mock.patch("fx_intel.news.fetch_news_for_symbols", return_value=([], [])),
+        mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
+        mock.patch.object(
+            fx_briefing,
+            "persist_decision_audit_batch",
+            side_effect=OSError("read-only"),
+        ),
+        mock.patch.object(
+            fx_briefing.journal,
+            "append_plans",
+            side_effect=AssertionError("compact writer must not run"),
+        ),
+    ):
+        rc = fx_briefing.main(
+            [
+                "--no-discord",
+                "--no-macro",
+                "--no-ml",
+                "--no-learning",
+                "--no-trade-expectancy",
+                "--no-export-events",
+                "--no-event-archive",
+                "--symbols",
+                "USDJPY",
+            ]
+        )
+
+    assert rc == fx_briefing.JOURNAL_WRITE_FAILURE_EXIT_CODE
+    assert not journal_path.exists()
     assert "ジャーナル書き込み失敗" in capsys.readouterr().err
 
 
@@ -223,6 +267,13 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
                         prediction_time - timedelta(seconds=1)
                     ).isoformat(),
                     "pit_eligible": True,
+                    "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+                    "decision_id": f"decision:{prediction_time.isoformat()}",
+                    "mode": "fusion",
+                    "producer": fx_briefing.journal.FUSION_PRODUCER,
+                    "producer_version": fx_briefing.journal.FUSION_PRODUCER_VERSION,
+                    "input_context_id": f"context:{prediction_time.isoformat()}",
+                    "source_record_ids": [f"source:{prediction_time.isoformat()}"],
                     "symbol": "USDJPY",
                     "direction": "long",
                     "conviction": 20,
@@ -307,7 +358,7 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert registry["candidates"][candidate_id]["stage"] == "auto_paused"
     # 今回追記されたプラン行(履歴20行の後)には停止済みポリシーを適用しない
-    rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
+    rows = list(fx_briefing.journal.read_entries(journal_path))
     new_rows = rows[20:]
     assert new_rows, "今回のプランがジャーナルへ追記されていること"
     assert any(row["direction"] in ("long", "short") for row in new_rows)

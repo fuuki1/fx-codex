@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from fx_intel import trade_outcome as to
+from fx_intel import journal, trade_outcome as to
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "trade_outcome_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -32,6 +32,13 @@ def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict
         "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
         "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
         "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": f"decision:{symbol}:{ts.isoformat()}",
+        "mode": "fusion",
+        "producer": journal.FUSION_PRODUCER,
+        "producer_version": journal.FUSION_PRODUCER_VERSION,
+        "input_context_id": f"context:{symbol}:{ts.isoformat()}",
+        "source_record_ids": [f"source:{symbol}:{ts.isoformat()}"],
         "symbol": symbol,
         "direction": "neutral",
         "conviction": 0,
@@ -188,13 +195,13 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
         "approval",
     )
     registry = to.update_improvement_registry(
-        None, [candidate], now=NOW, data_contract="fusion-pit-v1"
+        None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
     )
     registry = to.update_improvement_registry(
         registry,
         [candidate],
         now=NOW + timedelta(hours=1),
-        data_contract="fusion-pit-v1",
+        data_contract=journal.FUSION_PIT_DATA_CONTRACT,
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,

@@ -24,6 +24,7 @@ from fx_intel.calendar import (
 from fx_intel.market import is_market_open, open_hours_between
 from fx_intel.news import NewsItem, dedupe_and_sort, parse_rss, tag_currencies
 from fx_intel.journal import (
+    DECISION_JOURNAL_PIT_CONTRACT,
     DirectionalStats,
     PointInTimeError,
     append_plans,
@@ -743,6 +744,8 @@ def test_journal_records_and_validates_pit_provenance(tmp_path) -> None:
         "JPY": CurrencySentiment("JPY", score=-0.3),
     }
     plan = briefing.build_trade_plan("USDJPY", bullish_tech(), currencies, [], [], now=NOW)
+    plan.input_context_id = "context-1"
+    plan.input_context = {"liquidity": {"quote": {"source_record_id": "USDJPY:quote:1"}}}
     source_cutoff = NOW - timedelta(minutes=2)
     feature_available = NOW - timedelta(seconds=1)
 
@@ -752,21 +755,28 @@ def test_journal_records_and_validates_pit_provenance(tmp_path) -> None:
         now=NOW,
         source_cutoff=source_cutoff,
         max_feature_available_time=feature_available,
+        decision_ids=["decision-1"],
     )
 
     entry = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert entry["prediction_time"] == NOW.isoformat()
     assert entry["source_cutoff"] == source_cutoff.isoformat()
     assert entry["max_feature_available_time"] == feature_available.isoformat()
+    assert entry["pit_contract"] == DECISION_JOURNAL_PIT_CONTRACT
+    assert entry["decision_id"] == "decision-1"
+    assert entry["mode"] == "fusion"
+    assert entry["producer"] == "fusion_raw"
+    assert entry["source_record_ids"] == ["USDJPY:quote:1"]
     assert is_pit_eligible_entry(entry)
 
-    with pytest.raises(PointInTimeError, match="PIT ordering"):
+    with pytest.raises(PointInTimeError, match="prediction_time"):
         append_plans(
             path,
             [plan],
             now=NOW,
             source_cutoff=source_cutoff,
             max_feature_available_time=NOW + timedelta(seconds=1),
+            decision_ids=["decision-2"],
         )
 
 

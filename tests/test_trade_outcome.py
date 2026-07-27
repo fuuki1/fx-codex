@@ -94,6 +94,16 @@ def _write_jsonl(path, rows: list[dict]) -> None:
                 "source_cutoff": (prediction - timedelta(minutes=2)).isoformat(),
                 "max_feature_available_time": (prediction - timedelta(seconds=1)).isoformat(),
                 "pit_eligible": True,
+                "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+                "decision_id": (
+                    f"decision:{row['symbol']}:{prediction.isoformat()}:"
+                    f"{row.get('direction', 'neutral')}"
+                ),
+                "mode": "fusion",
+                "producer": journal.FUSION_PRODUCER,
+                "producer_version": journal.FUSION_PRODUCER_VERSION,
+                "input_context_id": f"context:{row['symbol']}:{prediction.isoformat()}",
+                "source_record_ids": [f"source:{row['symbol']}:{prediction.isoformat()}"],
             }
         )
         eligible_rows.append(row)

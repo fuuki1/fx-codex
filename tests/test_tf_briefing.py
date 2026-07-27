@@ -8,6 +8,7 @@ from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.tf_briefing import (
     MAX_EMBED_CHARS,
     MAX_EMBEDS,
+    MAX_FIELDS_PER_MESSAGE,
     _embed_chars,
     build_timeframe_discord_payload,
     split_timeframe_payloads,
@@ -63,12 +64,50 @@ def test_split_caps_embed_count_per_message() -> None:
         assert len(message["embeds"]) <= MAX_EMBEDS
 
 
+def test_split_caps_aggregate_field_count_per_message() -> None:
+    def embed_with_fields(name: str, count: int) -> dict:
+        return {
+            "title": name,
+            "fields": [{"name": f"f{i}", "value": "x"} for i in range(count)],
+        }
+
+    # This shape is within Discord's documented per-embed limit, but the live
+    # webhook backend returned HTTP 500 when all 28 fields were sent together.
+    payload = {
+        "content": "briefing",
+        "embeds": [
+            embed_with_fields("macro", 8),
+            embed_with_fields("USDJPY", 10),
+            embed_with_fields("EURUSD", 10),
+        ],
+    }
+    messages = split_timeframe_payloads(payload)
+
+    assert len(messages) == 2
+    assert sum(len(message["embeds"]) for message in messages) == 3
+    for message in messages:
+        total_fields = sum(len(embed.get("fields", [])) for embed in message["embeds"])
+        assert total_fields <= MAX_FIELDS_PER_MESSAGE
+
+
 def test_split_shrinks_single_oversized_embed() -> None:
     payload = {"embeds": [_embed("huge", MAX_EMBED_CHARS + 4000)]}
     messages = split_timeframe_payloads(payload)
-    assert len(messages) == 1
-    # 単体で上限超過のembedはshrinkで上限内へ抑えられる
-    assert _embed_chars(messages[0]["embeds"][0]) <= MAX_EMBED_CHARS
+    fragments = [embed for message in messages for embed in message["embeds"]]
+    assert all(_embed_chars(embed) <= MAX_EMBED_CHARS for embed in fragments)
+    values = [str(field["value"]) for embed in fragments for field in embed.get("fields", [])]
+    assert "".join(values) == "x" * (MAX_EMBED_CHARS + 3999)
+
+
+def test_split_preserves_passthrough_keys() -> None:
+    payload = {
+        "content": "briefing",
+        "allowed_mentions": {"parse": []},
+        "embeds": [_embed("a", 3000), _embed("b", 3000)],
+    }
+    messages = split_timeframe_payloads(payload)
+    assert len(messages) == 2
+    assert all(message["allowed_mentions"] == {"parse": []} for message in messages)
 
 
 def _plan(timeframe, horizon, direction, conviction, close=156.0):
@@ -170,11 +209,13 @@ def test_learning_note_appears_in_header() -> None:
     assert "60%" in header_fields
 
 
-def test_embeds_capped_at_ten() -> None:
-    # 12ペア分渡しても embed は10で頭打ち(Discord上限)
+def test_builder_keeps_all_embeds_and_splitter_caps_each_message_at_ten() -> None:
     many = {f"PAIR{i}": _plans() for i in range(12)}
     payload = build_timeframe_discord_payload(many, _analysis(), [], ["USD"], now=NOW)
-    assert len(payload["embeds"]) == 10
+    assert len(payload["embeds"]) == 13
+    messages = split_timeframe_payloads(payload)
+    assert sum(len(message["embeds"]) for message in messages) == 13
+    assert all(len(message["embeds"]) <= MAX_EMBEDS for message in messages)
 
 
 def test_directional_field_shows_sl_tp() -> None:

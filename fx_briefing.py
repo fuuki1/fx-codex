@@ -139,6 +139,7 @@ DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
+DEFAULT_DISCORD_OUTBOX_PATH = PROJECT_ROOT / "logs" / "discord_delivery_outbox.json"
 JOURNAL_WRITE_FAILURE_EXIT_CODE = 4
 NOTIFICATION_FAILURE_EXIT_CODE = 5
 DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
@@ -369,8 +370,43 @@ def load_strategy_params() -> tuple[int, int, float, str | None]:
 def post_to_discord(webhook_url: str, payload: dict) -> None:
     """Send each payload only after enforcing Discord's per-message limits."""
 
-    for message in tf_briefing.split_timeframe_payloads(payload):
-        discord_delivery.send_webhook(webhook_url, message)
+    try:
+        messages = tf_briefing.split_timeframe_payloads(payload)
+    except (TypeError, ValueError) as error:
+        raise discord_delivery.DiscordDeliveryError(
+            f"Discord通知payloadが上限へ適合しません: {type(error).__name__}"
+        ) from error
+    discord_delivery.send_webhook_batch(
+        webhook_url,
+        messages,
+        outbox_path=DEFAULT_DISCORD_OUTBOX_PATH,
+    )
+
+
+def attach_decision_pit_metadata(
+    events: list[dict[str, object]],
+    plans: list[object],
+    *,
+    prediction_time: datetime,
+    source_cutoff: datetime,
+    max_feature_available_time: datetime,
+    mode: str,
+) -> None:
+    """Attach the same canonical PIT envelope written to the compact journal."""
+
+    if len(events) != len(plans):
+        raise journal.PointInTimeError("decision events and plans must have equal length")
+    for event, plan in zip(events, plans, strict=True):
+        event.update(
+            journal.pit_metadata_for_plan(
+                plan,
+                prediction_time=prediction_time,
+                source_cutoff=source_cutoff,
+                max_feature_available_time=max_feature_available_time,
+                decision_id=str(event.get("decision_id") or ""),
+                mode=mode,
+            )
+        )
 
 
 def persist_decision_audit_batch(
@@ -764,6 +800,17 @@ def append_note(base: str, addition: str) -> str:
     return (base + "\n" + addition).strip()
 
 
+def load_pit_decision_outcome_report(path: Path) -> dict[str, object]:
+    """Load only reports scored from complete decision PIT envelopes."""
+
+    report = decision_feedback.load_decision_outcome_report(path)
+    if report.get("pit_contract") != journal.DECISION_JOURNAL_PIT_CONTRACT:
+        return {}
+    if report.get("pit_required") is not True:
+        return {}
+    return report
+
+
 def _run_horizon_track(
     *,
     args,
@@ -877,6 +924,9 @@ def _run_per_timeframe(
     ジャーナル・学習ファイルを分ける(スキーマも採点ホライズンも異なるため)。
     """
     journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
+    pit_journal_entries = [
+        entry for entry in journal_entries if journal.is_pit_eligible_entry(entry)
+    ]
 
     # 採点用の将来価格系列を組む。判断ジャーナル(源A)に加え、通知停止中も
     # fx_tf_snapshot.py で継続できる価格専用系列と、今回の現在価格を
@@ -902,7 +952,9 @@ def _run_per_timeframe(
             price_history.append_snapshot_entries(DEFAULT_TF_PRICES_PATH, current_snapshot)
         except (OSError, price_history.PriceHistoryWriteError) as error:
             fetch_warnings.append(f"時間足別価格スナップショット書き込み失敗: {error}")
-    scoring_entries = journal_entries + price_rows + current_snapshot
+    # Legacy/incomplete decision rows remain readable for diagnostics, but only rows
+    # carrying the complete PIT identity/provenance contract may affect learning.
+    scoring_entries = pit_journal_entries + price_rows + current_snapshot
 
     # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
     tf_learn = tf_learning.TimeframeLearning()
@@ -921,7 +973,7 @@ def _run_per_timeframe(
     decision_feedback_lookup = None
     if not args.no_learning and not args.no_trade_expectancy:
         decision_feedback_profile = decision_feedback.derive_decision_feedback(
-            decision_feedback.load_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
+            load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
             now=now,
         )
         learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
@@ -1003,7 +1055,7 @@ def _run_per_timeframe(
     # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意。
     # 将来価格は採点と同じ結合系列(判断+価格スナップショット)から取る
     aux_reports_by_symbol: dict[str, dict[str, str]] = {}
-    if not args.no_learning and journal_entries:
+    if not args.no_learning and pit_journal_entries:
         for tf in timeframe.DEFAULT_TIMEFRAMES:
             line = tf_learning.auxiliary_horizon_report_ja(scoring_entries, tf)
             if line:
@@ -1012,31 +1064,48 @@ def _run_per_timeframe(
     # ジャーナル: 今回の時間足別判断を専用ジャーナルへ追記
     if not args.no_journal and not args.dry_run:
         all_plans = [plan for plans in plans_by_symbol.values() for plan in plans]
+        max_feature_available_time = datetime.now(UTC)
+        prediction_time = datetime.now(UTC)
+        decision_events = decision_log.build_timeframe_decision_events(
+            plans_by_symbol,
+            now=prediction_time,
+            analysis=analysis,
+            tech_map=tech_map,
+            news_items=items,
+            events_48h=events_48h,
+            fetch_warnings=fetch_warnings,
+            calendar_ok=calendar_ok,
+            macro_snapshot=macro_snapshot,
+            timeframe_learning=tf_learn if not args.no_learning else None,
+            tp_sl_learning=tp_sl_learn,
+            maximization_profile=max_profile,
+            decision_feedback_profile=decision_feedback_profile,
+            expectancy_summaries=_expectancy_summaries,
+        )
         try:
-            journal.append_timeframe_plans(DEFAULT_TF_JOURNAL_PATH, all_plans, now=now)
-        except OSError as error:
+            attach_decision_pit_metadata(
+                decision_events,
+                list(all_plans),
+                prediction_time=prediction_time,
+                source_cutoff=now,
+                max_feature_available_time=max_feature_available_time,
+                mode="per_timeframe",
+            )
+            # The complete append-only audit is authoritative. Persist it before
+            # exposing the compact rows to learning so a full-log failure can
+            # never leave PIT-eligible compact evidence without its audit twin.
+            persist_decision_audit_batch(decision_events, now=prediction_time)
+            journal.append_timeframe_plans(
+                DEFAULT_TF_JOURNAL_PATH,
+                all_plans,
+                now=prediction_time,
+                source_cutoff=now,
+                max_feature_available_time=max_feature_available_time,
+                decision_ids=[str(event["decision_id"]) for event in decision_events],
+            )
+        except (OSError, journal.PointInTimeError) as error:
             print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
             return JOURNAL_WRITE_FAILURE_EXIT_CODE
-        try:
-            decision_events = decision_log.build_timeframe_decision_events(
-                plans_by_symbol,
-                now=now,
-                analysis=analysis,
-                tech_map=tech_map,
-                news_items=items,
-                events_48h=events_48h,
-                fetch_warnings=fetch_warnings,
-                calendar_ok=calendar_ok,
-                macro_snapshot=macro_snapshot,
-                timeframe_learning=tf_learn if not args.no_learning else None,
-                tp_sl_learning=tp_sl_learn,
-                maximization_profile=max_profile,
-                decision_feedback_profile=decision_feedback_profile,
-                expectancy_summaries=_expectancy_summaries,
-            )
-            persist_decision_audit_batch(decision_events, now=now)
-        except OSError as error:
-            fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
     if args.signal_board:
         data_quality = signal_board.assess_data_quality(
@@ -1449,7 +1518,7 @@ def main(argv: list[str] | None = None) -> int:
     threshold_report = (
         {}
         if args.horizon_only
-        else decision_feedback.load_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH)
+        else load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH)
     )
     raw_threshold_outcomes = threshold_report.get("outcomes")
     threshold_outcomes = (
@@ -1617,9 +1686,7 @@ def main(argv: list[str] | None = None) -> int:
     expectancy_adjuster = None
     decision_feedback_adjuster = None
     decision_feedback_profile = decision_feedback.DecisionFeedbackProfile()
-    decision_outcome_history = decision_feedback.load_decision_outcome_report(
-        DEFAULT_DECISION_OUTCOMES_PATH
-    )
+    decision_outcome_history = load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH)
     trade_expectancy_summary: dict[str, object] = {}
     if not args.no_learning and not args.no_trade_expectancy:
         decision_feedback_profile = decision_feedback.derive_decision_feedback(
@@ -1679,7 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
             # 負のままなら見送り継続(fail-closedは維持)。改善候補レジストリと
             # 期待値レポートは従来どおり実績のみ(trade_expectancy_summary)を使う
             guard_evidence_outcomes = trade_outcome.evaluate_trade_outcomes(
-                journal_entries, include_guard_counterfactuals=True
+                pit_journal_entries, include_guard_counterfactuals=True
             )
             guard_evidence_summary = trade_outcome.summarize_expectancy(guard_evidence_outcomes)
             guard_note = trade_outcome.format_guard_evidence_note_ja(guard_evidence_summary)
@@ -1847,39 +1914,47 @@ def main(argv: list[str] | None = None) -> int:
         )
         journal_note = journal.format_stats_ja(stats)
         if not args.dry_run:
+            decision_events = decision_log.build_fusion_decision_events(
+                plans,
+                now=prediction_time,
+                analysis=analysis,
+                tech_map=tech_map,
+                news_items=items,
+                events_48h=events_48h,
+                fetch_warnings=fetch_warnings,
+                calendar_ok=calendar_ok,
+                macro_snapshot=macro_snapshot,
+                learning_profile=profile if not args.no_learning else None,
+                trade_expectancy_summary=(
+                    trade_expectancy_summary if not args.no_trade_expectancy else None
+                ),
+                decision_feedback_profile=decision_feedback_profile,
+                ml_artifact=ml_artifact if not args.no_ml else None,
+                promotion_state=promotion_state,
+            )
             try:
+                attach_decision_pit_metadata(
+                    decision_events,
+                    list(plans),
+                    prediction_time=prediction_time,
+                    source_cutoff=now,
+                    max_feature_available_time=feature_available_time,
+                    mode="fusion",
+                )
+                # See the per-timeframe path above: full audit first, then the
+                # commit-marked compact batch consumed by learning.
+                persist_decision_audit_batch(decision_events, now=prediction_time)
                 journal.append_plans(
                     DEFAULT_JOURNAL_PATH,
                     plans,
                     now=prediction_time,
                     source_cutoff=now,
                     max_feature_available_time=feature_available_time,
+                    decision_ids=[str(event["decision_id"]) for event in decision_events],
                 )
             except (OSError, journal.PointInTimeError) as error:
                 print(f"判断ジャーナル書き込み失敗: {error}", file=sys.stderr)
                 return JOURNAL_WRITE_FAILURE_EXIT_CODE
-            try:
-                decision_events = decision_log.build_fusion_decision_events(
-                    plans,
-                    now=prediction_time,
-                    analysis=analysis,
-                    tech_map=tech_map,
-                    news_items=items,
-                    events_48h=events_48h,
-                    fetch_warnings=fetch_warnings,
-                    calendar_ok=calendar_ok,
-                    macro_snapshot=macro_snapshot,
-                    learning_profile=profile if not args.no_learning else None,
-                    trade_expectancy_summary=(
-                        trade_expectancy_summary if not args.no_trade_expectancy else None
-                    ),
-                    decision_feedback_profile=decision_feedback_profile,
-                    ml_artifact=ml_artifact if not args.no_ml else None,
-                    promotion_state=promotion_state,
-                )
-                persist_decision_audit_batch(decision_events, now=prediction_time)
-            except OSError as error:
-                fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
     if ml_artifact.model is not None:
         learning_note = append_note(learning_note, ml_artifact.summary_ja())

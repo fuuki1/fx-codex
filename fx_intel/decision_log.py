@@ -16,7 +16,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 
+from . import journal
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
 from .shadow_learning import (
@@ -312,10 +314,30 @@ def save_latest_snapshot(
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
+    serialized = json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, allow_nan=False)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def read_decision_events(path: str | Path):
@@ -468,16 +490,23 @@ def score_decision_events(
     *,
     price_entries: Iterable[Mapping[str, object]] = (),
     now: datetime | None = None,
+    require_pit: bool = False,
 ) -> dict[str, object]:
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
     input_event_count = 0
+    pit_eligible_count = 0
     event_entries: list[dict[str, object]] = []
     shadow_entries: list[dict[str, object]] = []
     shadow_predictions: list[dict[str, object]] = []
     for event in events:
         input_event_count += 1
+        eligible = journal.is_pit_eligible_entry(event)
+        if eligible:
+            pit_eligible_count += 1
+        if require_pit and not eligible:
+            continue
         entry = decision_event_to_scoring_entry(event)
         if entry is not None:
             event_entries.append(entry)
@@ -630,9 +659,13 @@ def score_decision_events(
         {
             "schema": SCHEMA_VERSION,
             "generated_at": generated_at.isoformat(),
+            "pit_contract": (journal.DECISION_JOURNAL_PIT_CONTRACT if require_pit else None),
+            "pit_required": require_pit,
             "scoring_method": SCORING_METHOD,
             "metrics": list(SCORING_METRICS),
             "input_decision_events": input_event_count,
+            "pit_eligible_decision_events": pit_eligible_count,
+            "pit_ineligible_decision_events": input_event_count - pit_eligible_count,
             "decision_events": len(event_entries),
             "scored_outcomes": len(enriched_outcomes),
             "shadow_predictions": len(shadow_predictions),
