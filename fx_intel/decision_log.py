@@ -455,6 +455,11 @@ def decision_events_from_batch(
 ) -> list[dict[str, object]]:
     """Validate one full-batch wrapper and enforce cross-log visibility."""
 
+    if (
+        batch.get("schema_version") != SCHEMA_VERSION
+        or batch.get("event_type") != DECISION_BATCH_EVENT_TYPE
+    ):
+        return []
     raw_events = batch.get("events")
     if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes)):
         return []
@@ -480,13 +485,21 @@ def decision_events_from_batch(
     if not requires_commit:
         return events
     transaction_id = str(batch.get("decision_transaction_id") or "")
-    if not decision_commit.matching_commit(
-        commits,
-        transaction_id=transaction_id,
-        decision_ids=decision_ids,
-        batch_kind="full",
-        batch_sha256=batch_sha256,
-    ):
+    modes = {str(event.get("mode") or "") for event in events}
+    if len(modes) != 1:
+        return []
+    try:
+        commit_matches = decision_commit.matching_commit(
+            commits,
+            transaction_id=transaction_id,
+            decision_ids=decision_ids,
+            batch_kind="full",
+            batch_sha256=batch_sha256,
+            mode=next(iter(modes)),
+        )
+    except decision_commit.DecisionCommitError:
+        commit_matches = False
+    if not commit_matches:
         return []
     return events
 

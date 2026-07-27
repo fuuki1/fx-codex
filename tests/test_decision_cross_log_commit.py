@@ -119,6 +119,42 @@ def test_wrong_compact_hash_does_not_publish_either_log(tmp_path) -> None:
     assert list(journal.read_entries(compact_path)) == []
 
 
+def test_commit_mode_must_match_full_events_and_compact_filename(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "decision-mode"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    full_batch = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+    lines = [json.loads(line) for line in full_path.read_text(encoding="utf-8").splitlines()]
+    lines[-1]["mode"] = "fusion"
+    unsigned = {key: value for key, value in lines[-1].items() if key != "commit_record_sha256"}
+    lines[-1]["commit_record_sha256"] = decision_commit.canonical_sha256(unsigned)
+    full_path.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+
+    assert list(decision_log.read_decision_events(full_path)) == []
+    assert list(journal.read_entries(compact_path)) == []
+
+
 def test_standalone_pit_event_is_never_visible(tmp_path) -> None:
     full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
     full_path.write_text(

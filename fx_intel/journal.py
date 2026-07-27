@@ -497,6 +497,14 @@ def _plan_execution(plan: object) -> dict[str, object]:
 def read_entries(path: str | Path):
     """Read legacy rows and only cross-log-committed PIT append batches."""
     target = Path(path)
+    expected_mode = next(
+        (
+            mode
+            for mode, filename in decision_commit.COMPACT_FILENAMES.items()
+            if filename == target.name
+        ),
+        "",
+    )
     commits = decision_commit.load_commits(
         decision_commit.commit_path_for(target),
         verify_compact=False,
@@ -577,6 +585,7 @@ def read_entries(path: str | Path):
                                 decision_ids=decision_ids,
                                 batch_kind="compact",
                                 batch_sha256=batch_sha256,
+                                mode=expected_mode,
                             )
                         except decision_commit.DecisionCommitError:
                             commit_matches = False

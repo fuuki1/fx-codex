@@ -284,6 +284,8 @@ def _decision_commits(path: Path) -> dict[str, dict]:
             rows.append(row)
             if row.get("event_type") != "decision_batch":
                 continue
+            if row.get("schema_version") != SCHEMA_VERSION:
+                continue
             events = row.get("events")
             if (
                 not isinstance(events, list)
@@ -325,6 +327,8 @@ def _decision_commits(path: Path) -> dict[str, dict]:
     }.get(path.name)
     for row in rows:
         if row.get("event_type") != DECISION_COMMIT_EVENT:
+            continue
+        if row.get("schema_version") != SCHEMA_VERSION:
             continue
         decision_ids = _normalized_decision_ids(row.get("decision_ids"))
         if decision_ids is None:

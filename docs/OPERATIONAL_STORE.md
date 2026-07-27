@@ -44,11 +44,15 @@ an explicit, repeatedly parity-verified reader cutover.
   chunk manifest. Malformed complete lines advance only after an append-only
   rejection record is committed. An incomplete trailing line is left unread.
 - Incremental decision sync holds shared locks on the full log and every
-  referenced compact journal through SQLite projection and cursor commit. It
-  compares the full declaration with compact batch IDs and hashes before any
-  PIT row can be inserted. A commit just beyond the configured byte window is
-  read with a bounded transaction look-ahead so the cursor cannot wait forever
-  at the full-batch/commit boundary.
+  canonical compact journal through SQLite projection and cursor commit. The
+  full log and each compact journal have independent durable byte cursors
+  bootstrapped from the parity-pinned prefixes. Sync parses only their bounded
+  new suffixes, compares full declarations with compact transaction IDs,
+  modes, and batch hashes, then advances every participating cursor in the
+  same SQLite transaction. It never rescans full history; that work belongs to
+  the daily replay. A commit just beyond the configured byte window is read
+  with a bounded transaction look-ahead so the cursor cannot wait forever at
+  the full-batch/commit boundary.
 - The two-source scheduled sync is one SQLite transaction. If either source
   fails, neither cursor advances.
 - `audit` checks SQLite/FK integrity plus chunk continuity, the final
@@ -108,10 +112,13 @@ runs/python314-safe-venv/bin/python tools/operational_store_benchmark.py \
   --output runs/operational-migration/benchmark.json
 ```
 
-Migration and parity also discover every compact journal referenced by a valid
-cross-log marker, pin its path/size/SHA-256 in the report, and verify it again
-after the scan. A compact append, replacement, missing file, or hash mismatch
-invalidates the candidate even when the full decision log itself is unchanged.
+Migration and parity also pin every existing canonical compact journal, plus
+every journal referenced by a valid cross-log marker, by path/size/SHA-256 and
+verify it again after the scan. Pinning existing files even before their first
+cross-log marker gives incremental sync an exact compact EOF origin; it never
+needs to search historical compact rows when the first new commit arrives. A
+compact append, replacement, missing file, or hash mismatch invalidates the
+candidate even when the full decision log itself is unchanged.
 
 After exact parity has been independently reported, bootstrap the active raw
 EOF exactly once. The bootstrap refuses a changed database hash, a non-zero WAL,
@@ -257,7 +264,8 @@ readers and writers are active.
 - `work_checkpoints(job_name)` records monotonic high-water marks and the exact
   source-manifest hash.
 - `source_cursors(source_name)` records the next unread byte and immutable file
-  identity.
+  identity for the full decision log, every canonical compact journal, and the
+  price log.
 - `source_chunks(source_name, start_offset, end_offset)` proves every consumed
   range and prevents gaps or cursor-only advancement.
 - `ingest_rejections(source_name, line_start_offset)` records the hash and

@@ -205,6 +205,12 @@ def commits_from_values(values: Sequence[object]) -> dict[str, dict[str, object]
 
 def _verified_compact_batches(path: Path) -> set[tuple[str, str, str]]:
     verified: set[tuple[str, str, str]] = set()
+    expected_mode = next(
+        (mode for mode, filename in COMPACT_FILENAMES.items() if filename == path.name),
+        "",
+    )
+    if not expected_mode:
+        return verified
     pending_id = ""
     pending_rows: list[dict[str, object]] = []
     try:
@@ -225,8 +231,10 @@ def _verified_compact_batches(path: Path) -> set[tuple[str, str, str]]:
                 decision_ids = [row.get("decision_id") for row in pending_rows]
                 try:
                     decision_ids_hash = decision_ids_sha256(decision_ids)
+                    expected_transaction_id = transaction_id_for(decision_ids)
                 except DecisionCommitError:
                     decision_ids_hash = ""
+                    expected_transaction_id = ""
                 batch_hash = canonical_sha256(pending_rows)
                 transaction_id = str(raw.get("decision_transaction_id") or "")
                 if (
@@ -237,9 +245,12 @@ def _verified_compact_batches(path: Path) -> set[tuple[str, str, str]]:
                     and raw.get("decision_ids") == decision_ids
                     and raw.get("decision_ids_sha256") == decision_ids_hash
                     and raw.get("journal_batch_sha256") == batch_hash
-                    and transaction_id
+                    and transaction_id == expected_transaction_id
+                    and raw.get("requires_cross_log_commit") is True
                     and all(
-                        row.get("decision_transaction_id") == transaction_id for row in pending_rows
+                        row.get("decision_transaction_id") == transaction_id
+                        and row.get("mode") == expected_mode
+                        for row in pending_rows
                     )
                 ):
                     verified.add((transaction_id, decision_ids_hash, batch_hash))
@@ -264,11 +275,14 @@ def matching_commit(
     decision_ids: Sequence[object],
     batch_kind: str,
     batch_sha256: str,
+    mode: str,
 ) -> bool:
-    """Verify exact transaction membership and one full/compact batch digest."""
+    """Verify exact transaction membership, mode, and one batch digest."""
 
     if batch_kind not in {"full", "compact"}:
         raise ValueError("batch_kind must be full or compact")
+    normalized_mode = str(mode)
+    compact_path_for_mode(DEFAULT_COMMIT_FILENAME, normalized_mode)
     normalized_ids = normalize_decision_ids(decision_ids)
     expected_transaction = transaction_id_for(normalized_ids)
     if transaction_id != expected_transaction:
@@ -279,6 +293,7 @@ def matching_commit(
     return (
         record.get("decision_ids") == normalized_ids
         and record.get("decision_ids_sha256") == decision_ids_sha256(normalized_ids)
+        and record.get("mode") == normalized_mode
         and record.get(f"{batch_kind}_batch_sha256") == batch_sha256
     )
 

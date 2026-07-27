@@ -117,7 +117,7 @@ def test_maximization_monitor_writes_profile_monitor_and_candidates(monitor, tmp
 
 
 def test_maximization_monitor_cli_quiet_returns_exit_code(monitor, tmp_path) -> None:
-    journal_path = tmp_path / "journal.jsonl"
+    journal_path = tmp_path / "briefing_tf_journal.jsonl"
     prices_path = tmp_path / "prices.jsonl"
     decisions, prices = _losing_rows()
     write_committed_compact_rows(journal_path, decisions, mode="per_timeframe")

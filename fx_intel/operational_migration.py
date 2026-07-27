@@ -326,12 +326,21 @@ def fingerprint_source(path: str | Path, expected_sha256: str) -> SourceFingerpr
 def fingerprint_decision_support_sources(
     decision_path: str | Path,
 ) -> tuple[SourceFingerprint, ...]:
-    """Pin every compact journal referenced by the stable full decision log."""
+    """Pin every existing canonical compact journal and every referenced one.
 
-    sources: list[SourceFingerprint] = []
-    for path in decision_commit.referenced_compact_paths(decision_path):
-        sources.append(_pin_source(path))
-    return tuple(sources)
+    Existing compact files are pinned even when the current full prefix has no
+    cross-log commits.  Their verified EOFs become the incremental verifier's
+    durable origins, so the first post-bootstrap commit never requires an
+    unbounded scan through historical compact rows.
+    """
+
+    target = Path(decision_path).resolve()
+    paths = set(decision_commit.referenced_compact_paths(target))
+    for filename in decision_commit.COMPACT_FILENAMES.values():
+        candidate = target.parent / filename
+        if candidate.is_file():
+            paths.add(candidate)
+    return tuple(_pin_source(path) for path in sorted(paths))
 
 
 def _pin_source(path: str | Path) -> SourceFingerprint:

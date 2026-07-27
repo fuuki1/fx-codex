@@ -95,6 +95,7 @@ def test_audit_and_dashboard_require_cross_log_commit(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("schema_version", 999),
         ("decision_transaction_id", "0" * 64),
         ("decision_ids_sha256", "1" * 64),
         ("full_batch_sha256", "2" * 64),

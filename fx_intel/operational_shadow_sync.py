@@ -40,6 +40,7 @@ from .operational_store import (
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 DEFAULT_MAX_BYTES = 16 * 1024 * 1024
 DECISION_COMMIT_LOOKAHEAD_SLACK = 64 * 1024
+DECISION_SUPPORT_CURSOR_PREFIX = "decision_support:"
 
 
 class ShadowSyncError(RuntimeError):
@@ -127,6 +128,22 @@ class SourceSyncResult:
         }
 
 
+@dataclass(frozen=True)
+class _SupportAdvance:
+    cursor: SourceCursor
+    raw: bytes
+    source_size: int
+    source_mtime_ns: int
+
+
+@dataclass(frozen=True)
+class _CompactBatch:
+    end_offset: int
+    transaction_id: str
+    decision_ids_sha256: str
+    batch_sha256: str
+
+
 def bootstrap_candidate(
     *,
     database_path: str | Path,
@@ -193,6 +210,14 @@ def bootstrap_candidate(
                 snapshot=decision_snapshot,
                 captured_at=captured_at,
             )
+            for snapshot in decision_support_snapshots:
+                _bootstrap_snapshot(
+                    store,
+                    source_name=_decision_support_cursor_name(Path(snapshot.path)),
+                    source_kind="decisions",
+                    snapshot=snapshot,
+                    captured_at=captured_at,
+                )
             _bootstrap_snapshot(
                 store,
                 source_name="prices",
@@ -326,21 +351,11 @@ def sync_one_source(
     _verify_cursor_contract(cursor, source_kind=source_kind, source_path=path)
 
     lock_paths = [path]
+    support_cursors: dict[Path, SourceCursor] = {}
     if source_kind == "decisions":
-        lock_paths.extend(_decision_support_paths(path))
+        support_cursors = _decision_support_cursors(store, path)
+        lock_paths.extend(support_cursors)
     with _lock_source_files(*lock_paths) as locked:
-        verified_commits = None
-        if source_kind == "decisions":
-            declared_commits = decision_commit.load_commits(
-                path,
-                verify_compact=False,
-            )
-            verified_commits = decision_commit.load_commits(
-                path,
-                verify_compact=True,
-            )
-            if declared_commits != verified_commits:
-                raise ShadowSyncError("decision cross-log commit failed compact batch verification")
         return _sync_one_locked_source(
             store,
             cursor=cursor,
@@ -349,7 +364,8 @@ def sync_one_source(
             path=path,
             handle=locked[path],
             max_bytes=max_bytes,
-            verified_commits=verified_commits,
+            support_cursors=support_cursors,
+            locked_handles=locked,
         )
 
 
@@ -362,13 +378,28 @@ def _sync_one_locked_source(
     path: Path,
     handle: IO[bytes],
     max_bytes: int,
-    verified_commits: Mapping[str, Mapping[str, object]] | None,
+    support_cursors: Mapping[Path, SourceCursor],
+    locked_handles: Mapping[Path, IO[bytes]],
 ) -> SourceSyncResult:
     before = os.fstat(handle.fileno())
     _verify_source_identity(cursor, before)
     _verify_previous_boundary(handle, cursor)
+    for support_path, support_cursor in support_cursors.items():
+        support_handle = locked_handles[support_path]
+        _verify_source_identity(support_cursor, os.fstat(support_handle.fileno()))
+        _verify_previous_boundary(support_handle, support_cursor)
     available = before.st_size - cursor.byte_offset
     if available == 0:
+        advanced_support = [
+            support_path.name
+            for support_path, support_cursor in support_cursors.items()
+            if os.fstat(locked_handles[support_path].fileno()).st_size != support_cursor.byte_offset
+        ]
+        if advanced_support:
+            raise ShadowSyncError(
+                "compact decision source advanced without a full decision suffix: "
+                f"{sorted(advanced_support)}"
+            )
         return _no_change_result(cursor, before.st_size)
     handle.seek(cursor.byte_offset)
     requested = min(available, max_bytes)
@@ -428,6 +459,16 @@ def _sync_one_locked_source(
     if after.st_size < cursor.byte_offset + len(consumed):
         raise SourceRotationDetected(f"source truncated while reading: {path}")
     captured_at = datetime.now(UTC)
+    verified_commits: Mapping[str, Mapping[str, object]] | None = None
+    support_advances: tuple[_SupportAdvance, ...] = ()
+    if source_kind == "decisions":
+        verified_commits, support_advances = _verify_incremental_decision_commits(
+            consumed,
+            decision_path=path,
+            support_cursors=support_cursors,
+            locked_handles=locked_handles,
+            max_bytes=max_bytes,
+        )
     parsed, rejections, pit_ineligible = _project_lines(
         consumed,
         source_kind=source_kind,
@@ -468,19 +509,20 @@ def _sync_one_locked_source(
                 reason=rejection[3],
                 observed_at=captured_at,
             )
-        end_offset = cursor.byte_offset + len(consumed)
-        final_line_relative_start = consumed.rfind(b"\n", 0, len(consumed) - 1) + 1
-        final_line_start = cursor.byte_offset + final_line_relative_start
-        final_line = consumed[final_line_relative_start:]
-        store.advance_source_cursor(
-            source_name=source_name,
-            expected_offset=cursor.byte_offset,
-            end_offset=end_offset,
-            chunk_sha256=hashlib.sha256(consumed).hexdigest(),
-            last_line_start_offset=final_line_start,
-            last_line_sha256=hashlib.sha256(final_line).hexdigest(),
-            row_count=consumed.count(b"\n"),
-            source_size_at_sync=after.st_size,
+        for support_advance in support_advances:
+            _advance_cursor_for_chunk(
+                store,
+                cursor=support_advance.cursor,
+                raw=support_advance.raw,
+                source_size=support_advance.source_size,
+                source_mtime_ns=support_advance.source_mtime_ns,
+                captured_at=captured_at,
+            )
+        _advance_cursor_for_chunk(
+            store,
+            cursor=cursor,
+            raw=consumed,
+            source_size=after.st_size,
             source_mtime_ns=after.st_mtime_ns,
             captured_at=captured_at,
         )
@@ -504,15 +546,268 @@ def _sync_one_locked_source(
     )
 
 
-def _decision_support_paths(path: Path) -> tuple[Path, ...]:
-    """Resolve every compact file that can validate a full-log commit."""
+def _decision_support_cursors(
+    store: OperationalStore,
+    path: Path,
+) -> dict[Path, SourceCursor]:
+    """Resolve compact evidence from durable cursors without scanning raw history."""
 
-    paths = set(decision_commit.referenced_compact_paths(path))
-    for name in decision_commit.COMPACT_FILENAMES.values():
-        candidate = path.parent / name
-        if candidate.is_file():
-            paths.add(candidate)
-    return tuple(sorted(path.resolve() for path in paths))
+    rows = store.connection.execute(
+        """
+        SELECT source_name
+        FROM source_cursors
+        WHERE source_name LIKE ?
+        ORDER BY source_name
+        """,
+        (f"{DECISION_SUPPORT_CURSOR_PREFIX}%",),
+    ).fetchall()
+    cursors: dict[Path, SourceCursor] = {}
+    for row in rows:
+        source_name = str(row["source_name"])
+        cursor = store.source_cursor(source_name)
+        if cursor is None:
+            raise ShadowSyncError(f"decision support cursor disappeared: {source_name}")
+        support_path = Path(cursor.source_path).resolve()
+        expected_name = _decision_support_cursor_name(support_path)
+        if source_name != expected_name:
+            raise ShadowSyncError(
+                f"decision support cursor name differs: {source_name} != {expected_name}"
+            )
+        if support_path.parent != path.parent:
+            raise ShadowSyncError(
+                f"decision support source is outside the decision log directory: {support_path}"
+            )
+        if support_path.name not in decision_commit.COMPACT_FILENAMES.values():
+            raise ShadowSyncError(f"unsupported decision support source: {support_path}")
+        _verify_cursor_contract(
+            cursor,
+            source_kind="decisions",
+            source_path=support_path,
+        )
+        cursors[support_path] = cursor
+
+    existing = {
+        (path.parent / filename).resolve()
+        for filename in decision_commit.COMPACT_FILENAMES.values()
+        if (path.parent / filename).is_file()
+    }
+    if set(cursors) != existing:
+        raise ShadowSyncError(
+            "decision support cursors differ from canonical compact sources: "
+            f"{sorted(str(value) for value in cursors)} != "
+            f"{sorted(str(value) for value in existing)}"
+        )
+    return cursors
+
+
+def _decision_support_cursor_name(path: Path) -> str:
+    return f"{DECISION_SUPPORT_CURSOR_PREFIX}{path.name}"
+
+
+def _verify_incremental_decision_commits(
+    raw: bytes,
+    *,
+    decision_path: Path,
+    support_cursors: Mapping[Path, SourceCursor],
+    locked_handles: Mapping[Path, IO[bytes]],
+    max_bytes: int,
+) -> tuple[dict[str, dict[str, object]], tuple[_SupportAdvance, ...]]:
+    """Verify only new full commits against compact suffixes after durable cursors."""
+
+    values: list[object] = []
+    for line in raw.splitlines():
+        try:
+            values.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            values.append(None)
+    commits = decision_commit.commits_from_values(values)
+    expected_by_mode: dict[str, list[Mapping[str, object]]] = {}
+    for commit_record in commits.values():
+        mode = str(commit_record.get("mode") or "")
+        try:
+            support_path = decision_commit.compact_path_for_mode(decision_path, mode).resolve()
+        except decision_commit.DecisionCommitError as error:
+            raise ShadowSyncError(str(error)) from error
+        if support_path not in support_cursors:
+            raise ShadowSyncError(
+                f"decision commit has no bootstrapped compact cursor: {support_path}"
+            )
+        expected_by_mode.setdefault(mode, []).append(commit_record)
+
+    advances: list[_SupportAdvance] = []
+    for mode, expected in expected_by_mode.items():
+        support_path = decision_commit.compact_path_for_mode(decision_path, mode).resolve()
+        cursor = support_cursors[support_path]
+        handle = locked_handles[support_path]
+        before = os.fstat(handle.fileno())
+        _verify_source_identity(cursor, before)
+        _verify_previous_boundary(handle, cursor)
+        available = before.st_size - cursor.byte_offset
+        capture_limit = max_bytes + DECISION_COMMIT_LOOKAHEAD_SLACK
+        requested = min(available, capture_limit)
+        handle.seek(cursor.byte_offset)
+        captured = handle.read(requested)
+        if len(captured) != requested:
+            raise SourceRotationDetected(f"compact source shortened while reading: {support_path}")
+        newline = captured.rfind(b"\n")
+        complete = captured[: newline + 1] if newline >= 0 else b""
+        batches = _compact_batches_from_suffix(
+            complete,
+            start_offset=cursor.byte_offset,
+            expected_mode=mode,
+        )
+
+        search_start = 0
+        matched_end = 0
+        for expected_record in expected:
+            key = (
+                str(expected_record.get("decision_transaction_id") or ""),
+                str(expected_record.get("decision_ids_sha256") or ""),
+                str(expected_record.get("compact_batch_sha256") or ""),
+            )
+            match_index = next(
+                (
+                    index
+                    for index in range(search_start, len(batches))
+                    if (
+                        batches[index].transaction_id,
+                        batches[index].decision_ids_sha256,
+                        batches[index].batch_sha256,
+                    )
+                    == key
+                ),
+                None,
+            )
+            if match_index is None:
+                raise ShadowSyncError(
+                    "decision cross-log commit failed compact batch verification in suffix: "
+                    f"{support_path.name}:{key[0]}"
+                )
+            matched_end = batches[match_index].end_offset
+            search_start = match_index + 1
+
+        consumed_length = matched_end - cursor.byte_offset
+        if consumed_length <= 0:
+            raise ShadowSyncError(
+                f"decision compact suffix did not advance for committed mode: {mode}"
+            )
+        consumed = complete[:consumed_length]
+        after = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise SourceRotationDetected(f"compact source identity changed: {support_path}")
+        if after.st_size < matched_end:
+            raise SourceRotationDetected(f"compact source truncated while reading: {support_path}")
+        advances.append(
+            _SupportAdvance(
+                cursor=cursor,
+                raw=consumed,
+                source_size=after.st_size,
+                source_mtime_ns=after.st_mtime_ns,
+            )
+        )
+    return commits, tuple(advances)
+
+
+def _compact_batches_from_suffix(
+    raw: bytes,
+    *,
+    start_offset: int,
+    expected_mode: str,
+) -> list[_CompactBatch]:
+    """Return exact complete compact batches and their suffix end boundaries."""
+
+    batches: list[_CompactBatch] = []
+    pending_id = ""
+    pending_rows: list[dict[str, object]] = []
+    relative_offset = 0
+    for line in raw.splitlines(keepends=True):
+        relative_offset += len(line)
+        try:
+            value: Any = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pending_id = ""
+            pending_rows = []
+            continue
+        if not isinstance(value, dict):
+            pending_id = ""
+            pending_rows = []
+            continue
+        batch_id = str(value.get("journal_batch_id") or "")
+        if value.get("event_type") == journal.JOURNAL_BATCH_COMMIT:
+            decision_ids = [row.get("decision_id") for row in pending_rows]
+            try:
+                normalized_ids = decision_commit.normalize_decision_ids(decision_ids)
+                ids_hash = decision_commit.decision_ids_sha256(normalized_ids)
+                transaction_id = decision_commit.transaction_id_for(normalized_ids)
+            except decision_commit.DecisionCommitError:
+                normalized_ids = []
+                ids_hash = ""
+                transaction_id = ""
+            batch_hash = decision_commit.canonical_sha256(pending_rows)
+            indices = [row.get("journal_batch_index") for row in pending_rows]
+            if (
+                batch_id
+                and batch_id == pending_id
+                and value.get("journal_batch_size") == len(pending_rows)
+                and indices == list(range(len(pending_rows)))
+                and value.get("decision_transaction_id") == transaction_id
+                and value.get("decision_ids") == normalized_ids
+                and value.get("decision_ids_sha256") == ids_hash
+                and value.get("journal_batch_sha256") == batch_hash
+                and value.get("requires_cross_log_commit") is True
+                and all(
+                    row.get("decision_transaction_id") == transaction_id
+                    and row.get("mode") == expected_mode
+                    for row in pending_rows
+                )
+            ):
+                batches.append(
+                    _CompactBatch(
+                        end_offset=start_offset + relative_offset,
+                        transaction_id=transaction_id,
+                        decision_ids_sha256=ids_hash,
+                        batch_sha256=batch_hash,
+                    )
+                )
+            pending_id = ""
+            pending_rows = []
+            continue
+        if batch_id:
+            if batch_id != pending_id:
+                pending_id = batch_id
+                pending_rows = []
+            pending_rows.append(value)
+            continue
+        pending_id = ""
+        pending_rows = []
+    return batches
+
+
+def _advance_cursor_for_chunk(
+    store: OperationalStore,
+    *,
+    cursor: SourceCursor,
+    raw: bytes,
+    source_size: int,
+    source_mtime_ns: int,
+    captured_at: datetime,
+) -> None:
+    if not raw or not raw.endswith(b"\n"):
+        raise ShadowSyncError(f"cursor chunk is not newline-complete: {cursor.source_name}")
+    final_line_relative_start = raw.rfind(b"\n", 0, len(raw) - 1) + 1
+    final_line = raw[final_line_relative_start:]
+    store.advance_source_cursor(
+        source_name=cursor.source_name,
+        expected_offset=cursor.byte_offset,
+        end_offset=cursor.byte_offset + len(raw),
+        chunk_sha256=hashlib.sha256(raw).hexdigest(),
+        last_line_start_offset=cursor.byte_offset + final_line_relative_start,
+        last_line_sha256=hashlib.sha256(final_line).hexdigest(),
+        row_count=raw.count(b"\n"),
+        source_size_at_sync=source_size,
+        source_mtime_ns=source_mtime_ns,
+        captured_at=captured_at,
+    )
 
 
 @contextmanager
@@ -769,6 +1064,11 @@ def _verified_decision_support_snapshots(
     expected_names = _referenced_compact_names_in_prefix(
         decision_path,
         decision_snapshot.bytes,
+    )
+    expected_names.update(
+        filename
+        for filename in decision_commit.COMPACT_FILENAMES.values()
+        if (decision_path.parent / filename).is_file()
     )
     if not isinstance(reported, Sequence) or isinstance(reported, (str, bytes)):
         if expected_names:

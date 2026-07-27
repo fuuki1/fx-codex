@@ -187,12 +187,24 @@ def _create_bootstrapped_candidate(
     return database, decisions, prices, parity_path
 
 
-def test_bootstrap_then_append_sync_and_retry_is_noop(tmp_path: Path) -> None:
+def test_bootstrap_then_append_sync_and_retry_is_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    with store.open_operational_reader(database) as opened:
+        compact_cursor_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}briefing_tf_journal.jsonl"
+        )
+        assert compact_cursor_before is not None
     _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
     with prices.open("ab") as handle:
         handle.write(_line(_price("price-2", minutes=15)))
 
+    def forbid_full_history_scan(*args, **kwargs):
+        raise AssertionError("incremental sync must not call load_commits")
+
+    monkeypatch.setattr(decision_commit, "load_commits", forbid_full_history_scan)
     result = shadow.sync_sources(
         database_path=database,
         decision_path=decisions,
@@ -216,9 +228,18 @@ def test_bootstrap_then_append_sync_and_retry_is_noop(tmp_path: Path) -> None:
         assert audit.audit_events == 2
         assert audit.predictions == 2
         assert audit.price_points == 2
-        assert audit.source_cursors == 2
-        assert audit.source_chunks == 4
+        assert audit.source_cursors == 3
+        assert audit.source_chunks == 6
         assert audit.ingest_rejections == 0
+        compact_cursor_after = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}briefing_tf_journal.jsonl"
+        )
+        assert compact_cursor_after is not None
+        assert compact_cursor_after.byte_offset > compact_cursor_before.byte_offset
+        assert (
+            compact_cursor_after.byte_offset
+            == (tmp_path / "briefing_tf_journal.jsonl").stat().st_size
+        )
 
 
 def test_bootstrap_verified_snapshot_prefix_onto_live_append_only_sources(
@@ -373,8 +394,13 @@ def test_two_source_sync_rolls_back_decision_advance_when_price_fails(
     database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
     with store.open_operational_reader(database) as opened:
         initial_cursor = opened.source_cursor("decisions")
+        initial_support_cursor = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}briefing_tf_journal.jsonl"
+        )
         assert initial_cursor is not None
+        assert initial_support_cursor is not None
         initial_offset = initial_cursor.byte_offset
+        initial_support_offset = initial_support_cursor.byte_offset
     _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
     prices.write_bytes(b"")
 
@@ -388,8 +414,13 @@ def test_two_source_sync_rolls_back_decision_advance_when_price_fails(
 
     with store.open_operational_reader(database) as opened:
         cursor = opened.source_cursor("decisions")
+        support_cursor = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}briefing_tf_journal.jsonl"
+        )
         assert cursor is not None
+        assert support_cursor is not None
         assert cursor.byte_offset == initial_offset
+        assert support_cursor.byte_offset == initial_support_offset
         assert opened.audit().audit_events == 1
 
 
