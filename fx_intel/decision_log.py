@@ -11,8 +11,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, UTC
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
@@ -263,13 +265,23 @@ def build_fusion_decision_events(
 
 
 def append_decision_events(path: str | Path, events: Iterable[Mapping[str, object]]) -> None:
-    """Append audit events as JSONL.  One line is one immutable decision event."""
+    """Durably append one locked audit batch; one line is one immutable event."""
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(
+        json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n"
+        for event in events
+    )
     with target.open("a", encoding="utf-8") as handle:
-        for event in events:
-            handle.write(json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if payload:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def save_latest_snapshot(
