@@ -43,14 +43,16 @@ an explicit, repeatedly parity-verified reader cutover.
   and verify the referenced compact batch and two full lines.
   They therefore fail closed on a missing, forged, conflicting, replaced,
   truncated, or metadata-preserving rewritten record without rescanning the
-  1 GiB full log. A retry after the final full `fsync` detects and returns the
-  already-durable transaction without appending a timestamp-dependent second
-  commit; multiple distinct valid commit receipts for one transaction fail
-  closed. A crash before the final full commit leaves only an invisible
-  prepared receipt. A later wrapper invalidates that older pending transaction,
-  so later valid work can progress while every reader and replay consistently
-  retains the older wrapper as an explicit orphan instead of resurrecting it
-  after its operational cursor has advanced.
+  1 GiB full log. Full readers bind visibility to the receipt's exact wrapper
+  byte offset and line hash, so a whole-operation retry cannot publish both the
+  pre-crash and retried wrappers. A retry after the final full `fsync` detects
+  and returns the already-durable transaction without appending a
+  timestamp-dependent second commit; multiple distinct valid commit receipts
+  for one transaction fail closed. A crash before the final full commit leaves
+  only an invisible prepared receipt. A later wrapper invalidates that older
+  pending transaction, so later valid work can progress while every reader and
+  replay consistently retains the older wrapper as an explicit orphan instead
+  of resurrecting it after its operational cursor has advanced.
 - A cursor can advance only in the same transaction as a contiguous SHA-256
   chunk manifest. Malformed complete lines advance only after an append-only
   rejection record is committed. An incomplete trailing line is left unread.
@@ -226,6 +228,12 @@ reuse with changed filters or an invalid HMAC signature returns HTTP 400.
 Signatures use a process-local random secret, so a traversal restarts after an
 API process restart.
 
+Every API route first locks and verifies all raw source identities, sizes,
+mtimes, and cursor-boundary line hashes against the SQLite cursors. Any
+unsynchronized append, source replacement, or failed incremental sync returns
+HTTP 503 instead of serving a stale projection. Normal service resumes only
+after one successful atomic sync advances every affected cursor.
+
 Decision items retain only the compact explanation needed by the UI:
 final/analysis direction, analysis and composite scores, direction threshold,
 primary abstention gate, quote availability, and cost-adjusted expected R.
@@ -239,7 +247,8 @@ GET/HEAD and return HTTP 304 with no body. The API opens a new SQLite URI
 `mode=ro` connection and also enables `query_only`; turning the pragma off
 still cannot mutate operational state. It caps concurrent workers at 16,
 applies a 10-second socket timeout, and closes each response connection. It has
-no launchd entry and is not yet the production dashboard reader.
+an optional loopback-only launchd entry and is not yet the production dashboard
+reader.
 
 Before any reader switch, compare the active dashboard's recent decision rows
 with the independent API. The comparator normalizes UTC representations and

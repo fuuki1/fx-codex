@@ -101,6 +101,49 @@ def test_full_and_compact_are_hidden_until_exact_commit(tmp_path) -> None:
     ]
 
 
+def test_receipt_publishes_only_the_exact_retried_full_wrapper(tmp_path) -> None:
+    full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision_id = "same-wrapper-retry"
+    transaction_id = decision_commit.transaction_id_for([decision_id])
+    decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    retried_full = decision_log.append_decision_events(
+        full_path,
+        [_full_event(decision_id)],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [_compact_row(decision_id)],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        full_path,
+        decision_ids=[decision_id],
+        full_batch_sha256=str(retried_full["batch_sha256"]),
+        full_batch_line_start_offset=int(retried_full["line_start_offset"]),
+        full_batch_line_sha256=str(retried_full["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+    source_lines = list(decision_log.iter_decision_source(full_path))
+    assert source_lines[0].error == "superseded_decision_batch"
+    assert [row["decision_id"] for row in source_lines[1].events] == [decision_id]
+    assert [row["decision_id"] for row in decision_log.read_decision_events(full_path)] == [
+        decision_id
+    ]
+    assert [row["decision_id"] for row in journal.read_entries(compact_path)] == [decision_id]
+
+
 def test_wrong_compact_hash_does_not_publish_either_log(tmp_path) -> None:
     full_path = tmp_path / decision_commit.DEFAULT_COMMIT_FILENAME
     compact_path = tmp_path / "briefing_tf_journal.jsonl"

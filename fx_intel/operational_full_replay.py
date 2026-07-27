@@ -368,9 +368,12 @@ def _replay_consumed_prefix(
             verify_compact=True,
         )
         commits = {
-            transaction_id: record
+            transaction_id: verified_commits[transaction_id]
             for transaction_id, record in prefix_commits.items()
-            if verified_commits.get(transaction_id) == record
+            if decision_commit.commit_records_equal(
+                verified_commits.get(transaction_id),
+                record,
+            )
         }
     handle.seek(0)
     while handle.tell() < cursor.byte_offset:
@@ -403,10 +406,20 @@ def _replay_consumed_prefix(
                         decision_log.decision_events_from_batch(
                             parsed,
                             commits=commits,
+                            line_start_offset=line_start,
+                            line_sha256=hashlib.sha256(line).hexdigest(),
                         )
                     )
                     if not events:
-                        raise OperationalMigrationError("uncommitted_or_invalid_decision_batch")
+                        logical_events = decision_log.decision_events_from_batch(
+                            parsed,
+                            commits=commits,
+                        )
+                        raise OperationalMigrationError(
+                            "superseded_decision_batch"
+                            if logical_events
+                            else "uncommitted_or_invalid_decision_batch"
+                        )
                 elif journal.is_pit_eligible_entry(parsed):
                     raise OperationalMigrationError("uncommitted_pit_event")
                 else:

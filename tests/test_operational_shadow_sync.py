@@ -12,6 +12,7 @@ from fx_intel import decision_commit, decision_log, journal
 from fx_intel import operational_contracts as contracts
 from fx_intel import operational_full_replay as full_replay
 from fx_intel import operational_migration as migration
+from fx_intel import operational_read_model as read_model
 from fx_intel import operational_scheduler as scheduler
 from fx_intel import operational_shadow_sync as shadow
 from fx_intel import operational_store as store
@@ -245,6 +246,161 @@ def test_bootstrap_then_append_sync_and_retry_is_noop(
             compact_cursor_after.byte_offset
             == (tmp_path / "briefing_tf_journal.jsonl").stat().st_size
         )
+
+
+def test_duplicate_full_wrapper_bootstrap_and_replay_use_only_receipt_offset(
+    tmp_path: Path,
+) -> None:
+    decisions = tmp_path / "decisions.jsonl"
+    prices = tmp_path / "prices.jsonl"
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    database = tmp_path / "candidate.sqlite3"
+    parity_path = tmp_path / "parity.json"
+    decision = _decision("same-wrapper-retry")
+    transaction_id = decision_commit.transaction_id_for([str(decision["decision_id"])])
+    decision_log.append_decision_events(
+        decisions,
+        [decision],
+        transaction_id=transaction_id,
+    )
+    retried_full = decision_log.append_decision_events(
+        decisions,
+        [decision],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [decision],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        decisions,
+        decision_ids=[str(decision["decision_id"])],
+        full_batch_sha256=str(retried_full["batch_sha256"]),
+        full_batch_line_start_offset=int(retried_full["line_start_offset"]),
+        full_batch_line_sha256=str(retried_full["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+    _write_jsonl(prices, [_price("price-1")])
+
+    with store.open_operational_writer(database, writer_id="migration") as opened:
+        imported = migration.migrate_jsonl_candidate(
+            opened,
+            decision_path=decisions,
+            decision_sha256=store.file_sha256(decisions),
+            price_path=prices,
+            price_sha256=store.file_sha256(prices),
+            run_id="duplicate-wrapper-migration",
+            now=NOW,
+        )
+        opened.checkpoint("TRUNCATE")
+        audit = opened.audit()
+    parity = {
+        "schema_version": 1,
+        "parity_verdict": "parity_verified",
+        "database_sha256": store.file_sha256(database),
+        "database": {
+            "path": str(database.resolve()),
+            "rows": audit.to_dict()["rows"],
+        },
+        "sources": {
+            "decisions": {
+                "path": str(decisions.resolve()),
+                "bytes": decisions.stat().st_size,
+                "sha256": store.file_sha256(decisions),
+            },
+            "decision_support": [source.to_dict() for source in imported.decision_support_sources],
+            "prices": {
+                "path": str(prices.resolve()),
+                "bytes": prices.stat().st_size,
+                "sha256": store.file_sha256(prices),
+            },
+        },
+        "migration_verdict": imported.verdict,
+    }
+    parity_path.write_text(json.dumps(parity), encoding="utf-8")
+    shadow.bootstrap_candidate(
+        database_path=database,
+        parity_report_path=parity_path,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="duplicate-wrapper-bootstrap",
+    )
+    replay = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="duplicate-wrapper-replay",
+    )
+
+    assert imported.decisions.inserted == 1
+    assert imported.decisions.excluded == 1
+    assert imported.verdict == "parity_with_exclusions"
+    assert audit.audit_events == 1
+    assert audit.predictions == 1
+    assert replay["verdict"] == "full_replay_verified"
+    assert replay["sources"]["decisions"]["bootstrap_exclusions"] == 1
+
+
+def test_duplicate_full_wrapper_incremental_sync_records_superseded_rejection(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    decision = _decision("same-wrapper-incremental-retry", minutes=15)
+    transaction_id = decision_commit.transaction_id_for([str(decision["decision_id"])])
+    decision_log.append_decision_events(
+        decisions,
+        [decision],
+        transaction_id=transaction_id,
+    )
+    retried_full = decision_log.append_decision_events(
+        decisions,
+        [decision],
+        transaction_id=transaction_id,
+    )
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        [decision],
+        decision_transaction_id=transaction_id,
+    )
+    decision_commit.append_commit(
+        decisions,
+        decision_ids=[str(decision["decision_id"])],
+        full_batch_sha256=str(retried_full["batch_sha256"]),
+        full_batch_line_start_offset=int(retried_full["line_start_offset"]),
+        full_batch_line_sha256=str(retried_full["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=int(compact_batch["line_start_offset"]),
+        compact_batch_byte_length=int(compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+        mode="per_timeframe",
+        committed_at=NOW,
+    )
+
+    synced = shadow.sync_sources(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="duplicate-wrapper-incremental-sync",
+    )
+    replay = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="duplicate-wrapper-incremental-replay",
+    )
+
+    assert synced["quality_failure"] is True
+    assert synced["sources"]["decisions"]["rejections"] == 1
+    assert synced["sources"]["decisions"]["predictions_inserted"] == 1
+    assert replay["verdict"] == "full_replay_verified"
+    assert replay["sources"]["decisions"]["incremental_rejections"] == 1
 
 
 def test_bootstrap_verified_snapshot_prefix_onto_live_append_only_sources(
@@ -650,6 +806,67 @@ def test_crashed_receipt_cannot_be_resurrected_after_later_sync(
     assert audit.audit_events == 2
     assert audit.predictions == 2
     assert audit.ingest_rejections == 1
+
+
+def test_post_cursor_conflicting_commit_fails_sync_and_read_api_snapshot(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    original_receipt = json.loads(compact_path.read_text(encoding="utf-8").splitlines()[-1])
+    original_commit = json.loads(decisions.read_text(encoding="utf-8").splitlines()[-1])
+    conflicting_commit = {
+        **original_commit,
+        "committed_at": (NOW + timedelta(seconds=1)).isoformat(),
+    }
+    conflicting_commit["commit_record_sha256"] = decision_commit.canonical_sha256(
+        {key: value for key, value in conflicting_commit.items() if key != "commit_record_sha256"}
+    )
+    commit_payload = decision_commit._serialized_json_line(conflicting_commit)  # noqa: SLF001
+    conflicting_receipt = {
+        **original_receipt,
+        "committed_at": conflicting_commit["committed_at"],
+        "full_commit_record_sha256": conflicting_commit["commit_record_sha256"],
+        "full_commit_line_start_offset": decisions.stat().st_size,
+        "full_commit_line_sha256": hashlib.sha256(commit_payload).hexdigest(),
+    }
+    conflicting_receipt["receipt_record_sha256"] = decision_commit.canonical_sha256(
+        {key: value for key, value in conflicting_receipt.items() if key != "receipt_record_sha256"}
+    )
+    with compact_path.open("ab") as handle:
+        handle.write(decision_commit._serialized_json_line(conflicting_receipt))  # noqa: SLF001
+    with decisions.open("ab") as handle:
+        handle.write(commit_payload)
+
+    with store.open_operational_reader(database) as opened:
+        decision_before = opened.source_cursor("decisions")
+        compact_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact_path.name}"
+        )
+        audit_before = opened.audit()
+        with pytest.raises(read_model.ReadModelStaleError, match="advanced"):
+            read_model.require_current_source_snapshot(opened)
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="unpaired or conflicting full commit",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-post-cursor-conflict",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_before
+        assert (
+            opened.source_cursor(f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact_path.name}")
+            == compact_before
+        )
+        assert opened.audit() == audit_before
+        with pytest.raises(read_model.ReadModelStaleError, match="advanced"):
+            read_model.require_current_source_snapshot(opened)
 
 
 def test_decision_sync_reads_commit_just_beyond_max_bytes(tmp_path: Path) -> None:

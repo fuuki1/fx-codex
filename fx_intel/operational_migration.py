@@ -255,6 +255,8 @@ def migrate_jsonl_candidate(
         limitations.append("pit_ineligible_decisions_retained_for_audit")
     if decisions.malformed_json or decisions.structurally_invalid:
         limitations.append("decision_source_contains_invalid_rows")
+    if decisions.exclusion_reasons.get("superseded_decision_batch"):
+        limitations.append("decision_source_contains_superseded_batches")
     if prices.malformed_json or prices.structurally_invalid or prices.excluded:
         limitations.append("price_source_contains_excluded_rows")
     if database.audit_events != decisions.audit_events_inserted:
@@ -580,6 +582,10 @@ def import_decision_jsonl(
             continue
         if source_line.error == "non_object_json":
             metrics.non_object_json += 1
+            metrics.exclusion_reasons[source_line.error] += 1
+            continue
+        if source_line.error == "superseded_decision_batch":
+            metrics.excluded += 1
             metrics.exclusion_reasons[source_line.error] += 1
             continue
         if source_line.error:

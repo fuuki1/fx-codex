@@ -28,6 +28,8 @@ COMPACT_FILENAMES = {
     "fusion": "briefing_journal.jsonl",
     "per_timeframe": "briefing_tf_journal.jsonl",
 }
+_VERIFIED_FULL_BATCH_OFFSET = "_verified_full_batch_line_start_offset"
+_VERIFIED_FULL_BATCH_SHA256 = "_verified_full_batch_line_sha256"
 
 
 class DecisionCommitError(RuntimeError):
@@ -304,7 +306,15 @@ def load_commits(
                 )
         receipt = verified_by_mode[mode].get(transaction_id)
         if receipt_matches_commit(receipt, record):
-            output[transaction_id] = record
+            assert receipt is not None
+            output[transaction_id] = bind_commit_to_full_line(
+                record,
+                line_start_offset=cast(
+                    int,
+                    receipt["full_batch_line_start_offset"],
+                ),
+                line_sha256=str(receipt["full_batch_line_sha256"]),
+            )
     return output
 
 
@@ -1006,6 +1016,8 @@ def matching_commit(
     batch_kind: str,
     batch_sha256: str,
     mode: str,
+    line_start_offset: int | None = None,
+    line_sha256: str | None = None,
 ) -> bool:
     """Verify exact transaction membership, mode, and one batch digest."""
 
@@ -1020,11 +1032,61 @@ def matching_commit(
     record = commits.get(transaction_id)
     if not isinstance(record, Mapping):
         return False
-    return (
+    logical_match = (
         record.get("decision_ids") == normalized_ids
         and record.get("decision_ids_sha256") == decision_ids_sha256(normalized_ids)
         and record.get("mode") == normalized_mode
         and record.get(f"{batch_kind}_batch_sha256") == batch_sha256
+    )
+    if not logical_match or line_start_offset is None or line_sha256 is None:
+        return logical_match
+    return (
+        record.get(_VERIFIED_FULL_BATCH_OFFSET) == line_start_offset
+        and record.get(_VERIFIED_FULL_BATCH_SHA256) == line_sha256
+    )
+
+
+def bind_commit_to_full_line(
+    record: Mapping[str, object],
+    *,
+    line_start_offset: int,
+    line_sha256: str,
+) -> dict[str, object]:
+    """Attach non-serialized receipt proof for one exact physical wrapper."""
+
+    validated = _validated_record(record)
+    if validated is None:
+        raise DecisionCommitError("cannot bind an invalid commit record")
+    if (
+        isinstance(line_start_offset, bool)
+        or not isinstance(line_start_offset, int)
+        or line_start_offset < 0
+    ):
+        raise DecisionCommitError("verified full batch offset must be non-negative")
+    normalized_sha256 = _required_sha256(
+        line_sha256,
+        "verified_full_batch_line_sha256",
+    )
+    return {
+        **record,
+        _VERIFIED_FULL_BATCH_OFFSET: line_start_offset,
+        _VERIFIED_FULL_BATCH_SHA256: normalized_sha256,
+    }
+
+
+def commit_records_equal(
+    left: Mapping[str, object] | None,
+    right: Mapping[str, object] | None,
+) -> bool:
+    """Compare the canonical serialized commit while ignoring bound evidence."""
+
+    validated_left = _validated_record(left)
+    validated_right = _validated_record(right)
+    return (
+        validated_left is not None
+        and validated_right is not None
+        and validated_left.get("commit_record_sha256")
+        == validated_right.get("commit_record_sha256")
     )
 
 
@@ -1052,7 +1114,16 @@ def _validated_record(value: object) -> dict[str, object] | None:
     ):
         return None
     stored_hash = value.get("commit_record_sha256")
-    unsigned = {key: item for key, item in value.items() if key != "commit_record_sha256"}
+    unsigned = {
+        key: item
+        for key, item in value.items()
+        if key
+        not in {
+            "commit_record_sha256",
+            _VERIFIED_FULL_BATCH_OFFSET,
+            _VERIFIED_FULL_BATCH_SHA256,
+        }
+    }
     try:
         expected_hash = canonical_sha256(unsigned)
     except (TypeError, ValueError):
@@ -1080,10 +1151,12 @@ __all__ = [
     "DecisionCommitError",
     "RECEIPT_EVENT_TYPE",
     "append_commit",
+    "bind_commit_to_full_line",
     "canonical_sha256",
     "compact_batch_descriptor",
     "compact_path_for_mode",
     "commit_path_for",
+    "commit_records_equal",
     "commits_from_values",
     "decision_ids_sha256",
     "load_compact_receipts",
@@ -1092,6 +1165,7 @@ __all__ = [
     "normalize_decision_ids",
     "receipt_matches_commit",
     "receipt_matches_compact",
+    "receipt_matches_compact_evidence",
     "receipt_matches_full_evidence",
     "referenced_compact_paths",
     "transaction_id_for",

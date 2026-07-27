@@ -12,10 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from .operational_read_model import (
     ReadModelError,
+    ReadModelStaleError,
     canonical_response_bytes,
     decision_page,
     price_page,
     read_model_metadata,
+    require_current_source_snapshot,
     response_etag,
 )
 from .operational_store import OperationalStoreError, open_operational_reader
@@ -108,6 +110,7 @@ def make_handler(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
                         {"limit", "cursor", "symbol", "timeframe", "pit_eligible"},
                     )
                     with open_operational_reader(database) as store:
+                        require_current_source_snapshot(store)
                         payload = decision_page(
                             store,
                             limit=_limit(query),
@@ -122,6 +125,7 @@ def make_handler(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
                         {"limit", "cursor", "symbol", "timeframe"},
                     )
                     with open_operational_reader(database) as store:
+                        require_current_source_snapshot(store)
                         payload = price_page(
                             store,
                             limit=_limit(query),
@@ -132,6 +136,7 @@ def make_handler(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
                 elif parsed.path == "/v1/meta":
                     _require_only(query, set())
                     with open_operational_reader(database) as store:
+                        require_current_source_snapshot(store)
                         payload = {
                             "schema_version": 1,
                             "kind": "metadata",
@@ -140,6 +145,7 @@ def make_handler(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
                 elif parsed.path == "/healthz":
                     _require_only(query, set())
                     with open_operational_reader(database) as store:
+                        require_current_source_snapshot(store)
                         metadata = read_model_metadata(store)
                     payload = {
                         "ok": True,
@@ -152,7 +158,7 @@ def make_handler(database_path: str | Path) -> type[BaseHTTPRequestHandler]:
                 self._json_payload(payload)
             except ReadModelError as error:
                 self._json_error(HTTPStatus.BAD_REQUEST, str(error))
-            except (OperationalStoreError, OSError) as error:
+            except (ReadModelStaleError, OperationalStoreError, OSError) as error:
                 self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
 
         def do_HEAD(self) -> None:  # noqa: N802

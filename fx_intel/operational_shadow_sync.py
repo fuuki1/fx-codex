@@ -144,6 +144,8 @@ class _CompactBatch:
     batch_sha256: str
     full_batch_sha256: str
     full_commit_record_sha256: str
+    full_batch_line_start_offset: int
+    full_batch_line_sha256: str
 
 
 def bootstrap_candidate(
@@ -623,6 +625,16 @@ def _verify_incremental_decision_commits(
         except (json.JSONDecodeError, UnicodeDecodeError):
             values.append(None)
     commits = decision_commit.commits_from_values(values)
+    for value in values:
+        if (
+            isinstance(value, Mapping)
+            and value.get("event_type") == decision_commit.COMMIT_EVENT_TYPE
+        ):
+            transaction_id = str(value.get("decision_transaction_id") or "")
+            if commits.get(transaction_id) != value:
+                raise ShadowSyncError(
+                    "decision suffix contains an unpaired or conflicting full commit"
+                )
     expected_by_mode: dict[str, list[Mapping[str, object]]] = {}
     for commit_record in commits.values():
         mode = str(commit_record.get("mode") or "")
@@ -637,6 +649,7 @@ def _verify_incremental_decision_commits(
         expected_by_mode.setdefault(mode, []).append(commit_record)
 
     advances: list[_SupportAdvance] = []
+    verified_commits: dict[str, dict[str, object]] = {}
     for mode, expected in expected_by_mode.items():
         support_path = decision_commit.compact_path_for_mode(decision_path, mode).resolve()
         cursor = support_cursors[support_path]
@@ -690,7 +703,13 @@ def _verify_incremental_decision_commits(
                     "decision cross-log commit failed compact batch verification in suffix: "
                     f"{support_path.name}:{key[0]}"
                 )
-            matched_end = batches[match_index].end_offset
+            matched_batch = batches[match_index]
+            matched_end = matched_batch.end_offset
+            verified_commits[key[0]] = decision_commit.bind_commit_to_full_line(
+                expected_record,
+                line_start_offset=matched_batch.full_batch_line_start_offset,
+                line_sha256=matched_batch.full_batch_line_sha256,
+            )
             search_start = match_index + 1
 
         consumed_length = matched_end - cursor.byte_offset
@@ -712,7 +731,7 @@ def _verify_incremental_decision_commits(
                 source_mtime_ns=after.st_mtime_ns,
             )
         )
-    return commits, tuple(advances)
+    return verified_commits, tuple(advances)
 
 
 def _compact_batches_from_suffix(
@@ -796,6 +815,11 @@ def _compact_batches_from_suffix(
                         batch_sha256=str(descriptor["compact_batch_sha256"]),
                         full_batch_sha256=str(receipt["full_batch_sha256"]),
                         full_commit_record_sha256=str(receipt["full_commit_record_sha256"]),
+                        full_batch_line_start_offset=cast(
+                            int,
+                            receipt["full_batch_line_start_offset"],
+                        ),
+                        full_batch_line_sha256=str(receipt["full_batch_line_sha256"]),
                     )
                     verified_previous = verified_by_transaction.get(transaction_id)
                     if (
@@ -1255,9 +1279,13 @@ def _project_lines(
     prefix_commits = decision_commit.commits_from_values([row[4] for row in parsed_lines])
     commits = (
         {
-            transaction_id: record
+            transaction_id: verified_commits[transaction_id]
             for transaction_id, record in prefix_commits.items()
-            if verified_commits is not None and verified_commits.get(transaction_id) == record
+            if verified_commits is not None
+            and decision_commit.commit_records_equal(
+                verified_commits.get(transaction_id),
+                record,
+            )
         }
         if source_kind == "decisions"
         else {}
@@ -1272,9 +1300,19 @@ def _project_lines(
                     events = decision_log.decision_events_from_batch(
                         payload,
                         commits=commits,
+                        line_start_offset=line_start,
+                        line_sha256=line_hash,
                     )
                     if not events:
-                        raise OperationalMigrationError("uncommitted_or_invalid_decision_batch")
+                        logical_events = decision_log.decision_events_from_batch(
+                            payload,
+                            commits=commits,
+                        )
+                        raise OperationalMigrationError(
+                            "superseded_decision_batch"
+                            if logical_events
+                            else "uncommitted_or_invalid_decision_batch"
+                        )
                 elif journal.is_pit_eligible_entry(payload):
                     raise OperationalMigrationError("uncommitted_pit_event")
                 else:

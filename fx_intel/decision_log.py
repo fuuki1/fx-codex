@@ -413,11 +413,17 @@ def iter_decision_source(
     target = Path(path)
     commits = decision_commit.load_commits(commit_path or decision_commit.commit_path_for(target))
     try:
-        handle = target.open(encoding="utf-8")
+        handle = target.open("rb")
     except OSError:
         return
     with handle:
-        for line_number, line in enumerate(handle, start=1):
+        line_number = 0
+        while True:
+            line_start_offset = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            line_number += 1
             if not line.strip():
                 yield DecisionSourceLine(line_number=line_number, error="blank_line")
                 continue
@@ -430,11 +436,24 @@ def iter_decision_source(
                 yield DecisionSourceLine(line_number=line_number, error="non_object_json")
                 continue
             if event.get("event_type") == DECISION_BATCH_EVENT_TYPE:
-                batch_events = decision_events_from_batch(event, commits=commits)
+                batch_events = decision_events_from_batch(
+                    event,
+                    commits=commits,
+                    line_start_offset=line_start_offset,
+                    line_sha256=hashlib.sha256(line).hexdigest(),
+                )
                 if not batch_events:
+                    logical_events = decision_events_from_batch(
+                        event,
+                        commits=commits,
+                    )
                     yield DecisionSourceLine(
                         line_number=line_number,
-                        error="uncommitted_or_invalid_decision_batch",
+                        error=(
+                            "superseded_decision_batch"
+                            if logical_events
+                            else "uncommitted_or_invalid_decision_batch"
+                        ),
                     )
                 else:
                     yield DecisionSourceLine(
@@ -458,6 +477,8 @@ def decision_events_from_batch(
     batch: Mapping[str, object],
     *,
     commits: Mapping[str, Mapping[str, object]],
+    line_start_offset: int | None = None,
+    line_sha256: str | None = None,
 ) -> list[dict[str, object]]:
     """Validate one full-batch wrapper and enforce cross-log visibility."""
 
@@ -502,6 +523,8 @@ def decision_events_from_batch(
             batch_kind="full",
             batch_sha256=batch_sha256,
             mode=next(iter(modes)),
+            line_start_offset=line_start_offset,
+            line_sha256=line_sha256,
         )
     except decision_commit.DecisionCommitError:
         commit_matches = False

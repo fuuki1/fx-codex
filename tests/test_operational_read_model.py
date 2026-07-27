@@ -82,16 +82,19 @@ def _database(tmp_path: Path) -> Path:
             ("decisions", "decisions"),
             ("prices", "prices"),
         ):
+            source_path = tmp_path / f"{source_name}.jsonl"
+            source_path.write_bytes(b"")
+            source_stat = source_path.stat()
             opened.bootstrap_source_cursor(
                 source_name=source_name,
                 source_kind=source_kind,
-                source_path=str(tmp_path / f"{source_name}.jsonl"),
-                device_id=1,
-                inode=1 if source_name == "decisions" else 2,
+                source_path=str(source_path),
+                device_id=source_stat.st_dev,
+                inode=source_stat.st_ino,
                 byte_offset=0,
                 last_line_start_offset=0,
                 last_line_sha256=empty_hash,
-                source_mtime_ns=0,
+                source_mtime_ns=source_stat.st_mtime_ns,
                 source_sha256=empty_hash,
                 row_count=0,
                 captured_at=NOW,
@@ -358,6 +361,32 @@ def test_http_api_returns_etag_304_and_validates_query(tmp_path: Path) -> None:
         assert invalid.value.code == 400
         error = json.loads(invalid.value.read())
         assert error["status"] == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_api_returns_503_when_raw_source_advances_before_sync(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with (tmp_path / "decisions.jsonl").open("ab") as handle:
+        handle.write(b'{"event_type":"unexpected_suffix"}\n')
+    server = read_api.OperationalReadHTTPServer(
+        ("127.0.0.1", 0),
+        read_api.make_handler(database),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        for route in ("/healthz", "/v1/decisions?limit=2"):
+            with pytest.raises(HTTPError) as stale:
+                urlopen(f"{base}{route}", timeout=2)
+            assert stale.value.code == 503
+            error = json.loads(stale.value.read())
+            assert "advanced beyond read model" in error["error"]
     finally:
         server.shutdown()
         server.server_close()
