@@ -5,21 +5,35 @@
 
 ## 起動
 
+Mac mini上で、Tailscale経由の別端末から閲覧できるように起動します。
+
 ```bash
 cd /Users/fuuki/srv/fx-codex
-python3 tools/ai_learning_dashboard/server.py --host 127.0.0.1 --port 8765
+python3 tools/ai_learning_dashboard/server.py --host 0.0.0.0 --port 8788
 ```
 
 別のログディレクトリを見る場合:
 
 ```bash
-python3 tools/ai_learning_dashboard/server.py --log-dir /path/to/fx-codex/logs
+python3 tools/ai_learning_dashboard/server.py --host 0.0.0.0 --port 8788 --log-dir /path/to/fx-codex/logs
 ```
 
 ブラウザで開く:
 
 ```text
-http://127.0.0.1:8765/
+Mac mini自身: http://127.0.0.1:8788/
+Tailscale接続端末: http://100.118.242.40:8788/
+```
+
+`127.0.0.1`で起動するとMac mini自身からしか接続できません。外部公開用の起動設定では
+`0.0.0.0`を指定し、macOSファイアウォールとTailscale ACLで接続元を制限してください。
+インターネットへ直接ポート転送しないでください。
+
+疎通確認:
+
+```bash
+curl --fail --show-error http://127.0.0.1:8788/
+curl --fail --show-error http://100.118.242.40:8788/
 ```
 
 期待値・改善候補監視パネルを更新するには、別ターミナルや cron で監視ランナーを実行します。
