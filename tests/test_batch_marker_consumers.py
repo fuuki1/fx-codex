@@ -6,6 +6,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 from fx_intel import journal
 from tests.decision_fixtures import write_committed_compact_rows
 from tools import learning_loop_audit
@@ -88,3 +90,85 @@ def test_audit_and_dashboard_require_cross_log_commit(tmp_path) -> None:
     decision_path.write_text(wrapper_only + "\n", encoding="utf-8")
     assert learning_loop_audit.read_jsonl(path).rows == []
     assert _dashboard_server()._read_journal(path) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("decision_transaction_id", "0" * 64),
+        ("decision_ids_sha256", "1" * 64),
+        ("full_batch_sha256", "2" * 64),
+        ("mode", "fusion"),
+    ],
+)
+def test_audit_rejects_semantically_invalid_cross_log_commit(
+    tmp_path,
+    field,
+    value,
+) -> None:
+    path = tmp_path / "briefing_tf_journal.jsonl"
+    timestamp = "2026-07-27T07:00:00+00:00"
+    row = {
+        "ts": timestamp,
+        "prediction_time": timestamp,
+        "source_cutoff": timestamp,
+        "max_feature_available_time": timestamp,
+        "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": "committed",
+        "mode": "per_timeframe",
+        "producer": journal.TIMEFRAME_PRODUCER,
+        "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": "context",
+        "source_record_ids": ["source"],
+        "symbol": "USDJPY",
+        "timeframe": "1h",
+        "direction": "long",
+        "close": 150.0,
+    }
+    write_committed_compact_rows(path, [row], mode="per_timeframe")
+    decision_path = tmp_path / "briefing_decisions.jsonl"
+    lines = [json.loads(line) for line in decision_path.read_text(encoding="utf-8").splitlines()]
+    commit = lines[-1]
+    commit[field] = value
+    unsigned = {key: item for key, item in commit.items() if key != "commit_record_sha256"}
+    commit["commit_record_sha256"] = learning_loop_audit._canonical_sha256(unsigned)  # noqa: SLF001
+    decision_path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in lines) + "\n",
+        encoding="utf-8",
+    )
+
+    assert learning_loop_audit.read_jsonl(path).rows == []
+
+
+def test_audit_rejects_full_batch_hash_mismatch(tmp_path) -> None:
+    path = tmp_path / "briefing_tf_journal.jsonl"
+    timestamp = "2026-07-27T07:00:00+00:00"
+    row = {
+        "ts": timestamp,
+        "prediction_time": timestamp,
+        "source_cutoff": timestamp,
+        "max_feature_available_time": timestamp,
+        "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": "committed",
+        "mode": "per_timeframe",
+        "producer": journal.TIMEFRAME_PRODUCER,
+        "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": "context",
+        "source_record_ids": ["source"],
+        "symbol": "USDJPY",
+        "timeframe": "1h",
+        "direction": "long",
+        "close": 150.0,
+    }
+    write_committed_compact_rows(path, [row], mode="per_timeframe")
+    decision_path = tmp_path / "briefing_decisions.jsonl"
+    lines = [json.loads(line) for line in decision_path.read_text(encoding="utf-8").splitlines()]
+    lines[0]["decision_batch_sha256"] = "f" * 64
+    decision_path.write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in lines) + "\n",
+        encoding="utf-8",
+    )
+
+    assert learning_loop_audit.read_jsonl(path).rows == []

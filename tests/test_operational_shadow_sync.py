@@ -339,6 +339,34 @@ def test_bootstrap_rejects_compact_source_changed_after_parity(tmp_path: Path) -
         )
 
 
+def test_incremental_sync_rejects_compact_hash_drift(tmp_path: Path) -> None:
+    database, decisions, _, _ = _create_bootstrapped_candidate(tmp_path)
+    _append_decision_batch(
+        decisions,
+        [_decision("decision-after-bootstrap", minutes=15)],
+    )
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    compact.write_bytes(compact.read_bytes().replace(b"neutral", b"longxxx"))
+
+    with store.open_operational_writer(database, writer_id="compact-drift") as opened:
+        before = opened.source_cursor("decisions")
+        assert before is not None
+        with pytest.raises(
+            shadow.ShadowSyncError,
+            match="compact batch verification",
+        ):
+            shadow.sync_one_source(
+                opened,
+                source_name="decisions",
+                source_kind="decisions",
+                source_path=decisions,
+            )
+        after = opened.source_cursor("decisions")
+        assert after is not None
+        assert after.byte_offset == before.byte_offset
+        assert opened.audit().predictions == 1
+
+
 def test_two_source_sync_rolls_back_decision_advance_when_price_fails(
     tmp_path: Path,
 ) -> None:
@@ -485,6 +513,30 @@ def test_orphaned_pending_decision_does_not_block_later_commit(tmp_path: Path) -
     assert recovered.predictions_inserted == 1
     assert audit.audit_events == 2
     assert audit.predictions == 2
+
+
+def test_decision_sync_reads_commit_just_beyond_max_bytes(tmp_path: Path) -> None:
+    database, decisions, _, _ = _create_bootstrapped_candidate(tmp_path)
+    initial_size = decisions.stat().st_size
+    _append_decision_batch(
+        decisions,
+        [_decision("decision-boundary", minutes=15)],
+    )
+    suffix = decisions.read_bytes()[initial_size:]
+    full_batch_line_size = len(suffix.splitlines(keepends=True)[0])
+
+    with store.open_operational_writer(database, writer_id="boundary") as opened:
+        result = shadow.sync_one_source(
+            opened,
+            source_name="decisions",
+            source_kind="decisions",
+            source_path=decisions,
+            max_bytes=full_batch_line_size,
+        )
+
+    assert result.status == "advanced"
+    assert result.predictions_inserted == 1
+    assert result.end_offset == decisions.stat().st_size
 
 
 def test_previous_line_tamper_fails_closed(tmp_path: Path) -> None:

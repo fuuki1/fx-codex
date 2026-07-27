@@ -8,7 +8,8 @@ chunk record in the same transaction as its rows and cursor movement.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, UTC
 import fcntl
@@ -20,7 +21,7 @@ import platform
 import sqlite3
 import subprocess
 import sys
-from typing import Any
+from typing import Any, IO
 
 from . import decision_commit, decision_log, journal
 from .operational_migration import (
@@ -38,6 +39,7 @@ from .operational_store import (
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 DEFAULT_MAX_BYTES = 16 * 1024 * 1024
+DECISION_COMMIT_LOOKAHEAD_SLACK = 64 * 1024
 
 
 class ShadowSyncError(RuntimeError):
@@ -323,55 +325,115 @@ def sync_one_source(
         raise ShadowSyncError(f"source cursor is not bootstrapped: {source_name}")
     _verify_cursor_contract(cursor, source_kind=source_kind, source_path=path)
 
-    with path.open("rb") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-        before = os.fstat(handle.fileno())
-        _verify_source_identity(cursor, before)
-        _verify_previous_boundary(handle, cursor)
-        available = before.st_size - cursor.byte_offset
-        if available == 0:
-            return _no_change_result(cursor, before.st_size)
-        handle.seek(cursor.byte_offset)
-        requested = min(available, max_bytes)
-        raw = handle.read(requested)
-        if len(raw) != requested:
-            raise SourceRotationDetected(f"source shortened while reading: {path}")
-        newline = raw.rfind(b"\n")
-        if newline < 0:
-            if requested == max_bytes and available >= max_bytes:
-                raise ShadowSyncError(f"complete JSONL line exceeds max_bytes={max_bytes}: {path}")
-            return _partial_only_result(cursor, before.st_size, len(raw))
-        complete_candidate = raw[: newline + 1]
-        partial_tail = len(raw) - len(complete_candidate)
+    lock_paths = [path]
+    if source_kind == "decisions":
+        lock_paths.extend(_decision_support_paths(path))
+    with _lock_source_files(*lock_paths) as locked:
+        verified_commits = None
         if source_kind == "decisions":
-            consumed = _committed_decision_prefix(complete_candidate)
-            partial_tail += len(complete_candidate) - len(consumed)
-        else:
-            consumed = complete_candidate
-        if not consumed:
-            status = (
-                "waiting_for_decision_commit"
-                if source_kind == "decisions" and complete_candidate
-                else "waiting_for_complete_line"
+            declared_commits = decision_commit.load_commits(
+                path,
+                verify_compact=False,
             )
-            return _partial_only_result(
-                cursor,
-                before.st_size,
-                partial_tail,
-                status=status,
+            verified_commits = decision_commit.load_commits(
+                path,
+                verify_compact=True,
             )
-        after = os.fstat(handle.fileno())
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            raise SourceRotationDetected(f"source identity changed while reading: {path}")
-        if after.st_size < cursor.byte_offset + len(consumed):
-            raise SourceRotationDetected(f"source truncated while reading: {path}")
+            if declared_commits != verified_commits:
+                raise ShadowSyncError("decision cross-log commit failed compact batch verification")
+        return _sync_one_locked_source(
+            store,
+            cursor=cursor,
+            source_name=source_name,
+            source_kind=source_kind,
+            path=path,
+            handle=locked[path],
+            max_bytes=max_bytes,
+            verified_commits=verified_commits,
+        )
 
+
+def _sync_one_locked_source(
+    store: OperationalStore,
+    *,
+    cursor: SourceCursor,
+    source_name: str,
+    source_kind: str,
+    path: Path,
+    handle: IO[bytes],
+    max_bytes: int,
+    verified_commits: Mapping[str, Mapping[str, object]] | None,
+) -> SourceSyncResult:
+    before = os.fstat(handle.fileno())
+    _verify_source_identity(cursor, before)
+    _verify_previous_boundary(handle, cursor)
+    available = before.st_size - cursor.byte_offset
+    if available == 0:
+        return _no_change_result(cursor, before.st_size)
+    handle.seek(cursor.byte_offset)
+    requested = min(available, max_bytes)
+    raw = handle.read(requested)
+    if len(raw) != requested:
+        raise SourceRotationDetected(f"source shortened while reading: {path}")
+    newline = raw.rfind(b"\n")
+    if newline < 0:
+        if requested == max_bytes and available >= max_bytes:
+            raise ShadowSyncError(f"complete JSONL line exceeds max_bytes={max_bytes}: {path}")
+        return _partial_only_result(cursor, before.st_size, len(raw))
+    complete_candidate = raw[: newline + 1]
+    partial_tail = len(raw) - len(complete_candidate)
+    if source_kind == "decisions":
+        consumed = _committed_decision_prefix(complete_candidate)
+        partial_tail += len(complete_candidate) - len(consumed)
+        if not consumed and requested < available:
+            lookahead_budget = max_bytes + DECISION_COMMIT_LOOKAHEAD_SLACK
+            captured = raw
+            while not consumed and len(captured) < available and lookahead_budget > 0:
+                extra = handle.readline(lookahead_budget + 1)
+                if len(extra) > lookahead_budget:
+                    raise ShadowSyncError(
+                        "decision commit lookahead exceeded the bounded transaction window"
+                    )
+                captured += extra
+                lookahead_budget -= len(extra)
+                newline = captured.rfind(b"\n")
+                if newline >= 0:
+                    complete_candidate = captured[: newline + 1]
+                    consumed = _committed_decision_prefix(complete_candidate)
+                if not extra or (not extra.endswith(b"\n") and len(captured) >= available):
+                    break
+            if not consumed and len(captured) < available and lookahead_budget <= 0:
+                raise ShadowSyncError(
+                    "decision commit remains beyond the bounded transaction window"
+                )
+            partial_tail = len(captured) - len(complete_candidate)
+            partial_tail += len(complete_candidate) - len(consumed)
+    else:
+        consumed = complete_candidate
+    if not consumed:
+        status = (
+            "waiting_for_decision_commit"
+            if source_kind == "decisions" and complete_candidate
+            else "waiting_for_complete_line"
+        )
+        return _partial_only_result(
+            cursor,
+            before.st_size,
+            partial_tail,
+            status=status,
+        )
+    after = os.fstat(handle.fileno())
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise SourceRotationDetected(f"source identity changed while reading: {path}")
+    if after.st_size < cursor.byte_offset + len(consumed):
+        raise SourceRotationDetected(f"source truncated while reading: {path}")
     captured_at = datetime.now(UTC)
     parsed, rejections, pit_ineligible = _project_lines(
         consumed,
         source_kind=source_kind,
         start_offset=cursor.byte_offset,
         imported_at=captured_at,
+        verified_commits=verified_commits,
     )
     inserted = 0
     identical = 0
@@ -440,6 +502,40 @@ def sync_one_source(
         chunk_sha256=hashlib.sha256(consumed).hexdigest(),
         status=status,
     )
+
+
+def _decision_support_paths(path: Path) -> tuple[Path, ...]:
+    """Resolve every compact file that can validate a full-log commit."""
+
+    paths = set(decision_commit.referenced_compact_paths(path))
+    for name in decision_commit.COMPACT_FILENAMES.values():
+        candidate = path.parent / name
+        if candidate.is_file():
+            paths.add(candidate)
+    return tuple(sorted(path.resolve() for path in paths))
+
+
+@contextmanager
+def _lock_source_files(*paths: Path) -> Iterator[dict[Path, IO[bytes]]]:
+    """Hold stable shared locks through projection and cursor commit."""
+
+    handles: dict[Path, IO[bytes]] = {}
+    try:
+        for path in sorted({value.resolve() for value in paths}):
+            handle = path.open("rb")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            except BaseException:
+                handle.close()
+                raise
+            handles[path] = handle
+        yield handles
+    finally:
+        for locked_handle in reversed(list(handles.values())):
+            try:
+                fcntl.flock(locked_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                locked_handle.close()
 
 
 def fingerprint_complete_source(
@@ -755,6 +851,7 @@ def _project_lines(
     source_kind: str,
     start_offset: int,
     imported_at: datetime,
+    verified_commits: Mapping[str, Mapping[str, object]] | None,
 ) -> tuple[list[Any], list[tuple[int, int, str, str]], int]:
     parsed_records: list[Any] = []
     rejections: list[tuple[int, int, str, str]] = []
@@ -779,7 +876,16 @@ def _project_lines(
             continue
         parsed_lines.append((line, line_start, line_end, line_hash, payload))
 
-    commits = decision_commit.commits_from_values([row[4] for row in parsed_lines])
+    prefix_commits = decision_commit.commits_from_values([row[4] for row in parsed_lines])
+    commits = (
+        {
+            transaction_id: record
+            for transaction_id, record in prefix_commits.items()
+            if verified_commits is not None and verified_commits.get(transaction_id) == record
+        }
+        if source_kind == "decisions"
+        else {}
+    )
     for _line, line_start, line_end, line_hash, payload in parsed_lines:
         try:
             if source_kind == "decisions":

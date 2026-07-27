@@ -209,7 +209,7 @@ def read_jsonl(path: Path) -> JsonlFile:
                         decision_ids = [item.get("decision_id") for item in pending_rows]
                         transaction_id = str(row.get("decision_transaction_id") or "")
                         commit = commits.get(transaction_id)
-                        if (
+                        integrity_matches = (
                             row.get("decision_ids") == decision_ids
                             and row.get("decision_ids_sha256") == _canonical_sha256(decision_ids)
                             and row.get("journal_batch_sha256") == _canonical_sha256(pending_rows)
@@ -217,8 +217,18 @@ def read_jsonl(path: Path) -> JsonlFile:
                                 item.get("decision_transaction_id") == transaction_id
                                 for item in pending_rows
                             )
+                        )
+                        requires_commit = bool(row.get("requires_cross_log_commit")) or any(
+                            item.get("pit_eligible") is True for item in pending_rows
+                        )
+                        if integrity_matches and not requires_commit:
+                            result.rows.extend(pending_rows)
+                        elif (
+                            integrity_matches
                             and commit is not None
+                            and transaction_id == _canonical_sha256(decision_ids)
                             and commit.get("decision_ids") == decision_ids
+                            and commit.get("decision_ids_sha256") == _canonical_sha256(decision_ids)
                             and commit.get("compact_batch_sha256")
                             == row.get("journal_batch_sha256")
                         ):
@@ -253,6 +263,8 @@ def _canonical_sha256(value: object) -> str:
 
 
 def _decision_commits(path: Path) -> dict[str, dict]:
+    full_batches: dict[str, dict] = {}
+    batch_conflicts: set[str] = set()
     commits: dict[str, dict] = {}
     conflicts: set[str] = set()
     decision_path = path.parent / DECISION_LOG_FILENAME
@@ -260,26 +272,97 @@ def _decision_commits(path: Path) -> dict[str, dict]:
         handle = decision_path.open(encoding="utf-8")
     except OSError:
         return commits
+    rows: list[dict] = []
     with handle:
         for line in handle:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(row, dict) or row.get("event_type") != DECISION_COMMIT_EVENT:
+            if not isinstance(row, dict):
                 continue
-            transaction_id = str(row.get("decision_transaction_id") or "")
-            stored_hash = row.get("commit_record_sha256")
-            unsigned = {key: value for key, value in row.items() if key != "commit_record_sha256"}
-            if not transaction_id or stored_hash != _canonical_sha256(unsigned):
+            rows.append(row)
+            if row.get("event_type") != "decision_batch":
                 continue
-            previous = commits.get(transaction_id)
-            if previous is not None and previous != row:
-                conflicts.add(transaction_id)
-                commits.pop(transaction_id, None)
-            elif transaction_id not in conflicts:
-                commits[transaction_id] = row
+            events = row.get("events")
+            if (
+                not isinstance(events, list)
+                or not events
+                or not all(isinstance(event, dict) for event in events)
+            ):
+                continue
+            decision_ids = _normalized_decision_ids([event.get("decision_id") for event in events])
+            if decision_ids is None:
+                continue
+            transaction_id = _canonical_sha256(decision_ids)
+            modes = {str(event.get("mode") or "") for event in events}
+            full_batch_sha256 = _canonical_sha256(events)
+            if (
+                len(modes) != 1
+                or not modes.issubset({"fusion", "per_timeframe"})
+                or row.get("decision_transaction_id") != transaction_id
+                or row.get("decision_ids") != decision_ids
+                or row.get("decision_ids_sha256") != _canonical_sha256(decision_ids)
+                or row.get("decision_batch_sha256") != full_batch_sha256
+            ):
+                continue
+            descriptor = {
+                "decision_ids": decision_ids,
+                "decision_ids_sha256": _canonical_sha256(decision_ids),
+                "full_batch_sha256": full_batch_sha256,
+                "mode": next(iter(modes)),
+            }
+            previous_batch = full_batches.get(transaction_id)
+            if previous_batch is not None and previous_batch != descriptor:
+                batch_conflicts.add(transaction_id)
+                full_batches.pop(transaction_id, None)
+            elif transaction_id not in batch_conflicts:
+                full_batches[transaction_id] = descriptor
+
+    expected_mode = {
+        "briefing_journal.jsonl": "fusion",
+        "briefing_tf_journal.jsonl": "per_timeframe",
+    }.get(path.name)
+    for row in rows:
+        if row.get("event_type") != DECISION_COMMIT_EVENT:
+            continue
+        decision_ids = _normalized_decision_ids(row.get("decision_ids"))
+        if decision_ids is None:
+            continue
+        transaction_id = _canonical_sha256(decision_ids)
+        batch = full_batches.get(transaction_id)
+        if batch is None:
+            continue
+        mode = str(row.get("mode") or "")
+        if expected_mode is not None and mode != expected_mode:
+            continue
+        if (
+            row.get("decision_transaction_id") != transaction_id
+            or row.get("decision_ids_sha256") != _canonical_sha256(decision_ids)
+            or row.get("full_batch_sha256") != batch.get("full_batch_sha256")
+            or mode != batch.get("mode")
+        ):
+            continue
+        stored_hash = row.get("commit_record_sha256")
+        unsigned = {key: value for key, value in row.items() if key != "commit_record_sha256"}
+        if stored_hash != _canonical_sha256(unsigned):
+            continue
+        previous = commits.get(transaction_id)
+        if previous is not None and previous != row:
+            conflicts.add(transaction_id)
+            commits.pop(transaction_id, None)
+        elif transaction_id not in conflicts:
+            commits[transaction_id] = row
     return commits
+
+
+def _normalized_decision_ids(value: object) -> list[str] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    decision_ids = [str(item or "").strip() for item in value]
+    if any(not item for item in decision_ids) or len(set(decision_ids)) != len(decision_ids):
+        return None
+    return decision_ids
 
 
 def read_json(path: Path) -> dict | None:

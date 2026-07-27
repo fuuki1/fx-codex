@@ -43,6 +43,12 @@ an explicit, repeatedly parity-verified reader cutover.
 - A cursor can advance only in the same transaction as a contiguous SHA-256
   chunk manifest. Malformed complete lines advance only after an append-only
   rejection record is committed. An incomplete trailing line is left unread.
+- Incremental decision sync holds shared locks on the full log and every
+  referenced compact journal through SQLite projection and cursor commit. It
+  compares the full declaration with compact batch IDs and hashes before any
+  PIT row can be inserted. A commit just beyond the configured byte window is
+  read with a bounded transaction look-ahead so the cursor cannot wait forever
+  at the full-batch/commit boundary.
 - The two-source scheduled sync is one SQLite transaction. If either source
   fails, neither cursor advances.
 - `audit` checks SQLite/FK integrity plus chunk continuity, the final
