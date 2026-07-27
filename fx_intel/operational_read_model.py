@@ -44,7 +44,7 @@ def current_source_snapshot(store: OperationalStore) -> Iterator[None]:
     rows = store.connection.execute("""
         SELECT source_name, source_path, device_id, inode, byte_offset,
                last_line_start_offset, last_line_sha256,
-               source_size_at_sync, source_mtime_ns
+               source_size_at_sync, source_mtime_ns, source_ctime_ns
         FROM source_cursors
         ORDER BY source_name
         """).fetchall()
@@ -85,6 +85,10 @@ def current_source_snapshot(store: OperationalStore) -> Iterator[None]:
             ):
                 raise ReadModelStaleError(
                     f"raw source advanced beyond read model: {row['source_name']}"
+                )
+            if observed.st_ctime_ns != int(row["source_ctime_ns"]):
+                raise ReadModelStaleError(
+                    f"raw source metadata changed beyond read model: {row['source_name']}"
                 )
             byte_offset = int(row["byte_offset"])
             if byte_offset:

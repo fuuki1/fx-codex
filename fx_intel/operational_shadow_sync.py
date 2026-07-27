@@ -66,6 +66,7 @@ class CompleteSourceSnapshot:
     inode: int
     bytes: int
     mtime_ns: int
+    ctime_ns: int
     sha256: str
     row_count: int
     last_line_start_offset: int
@@ -78,6 +79,7 @@ class CompleteSourceSnapshot:
             "inode": self.inode,
             "bytes": self.bytes,
             "mtime_ns": self.mtime_ns,
+            "ctime_ns": self.ctime_ns,
             "sha256": self.sha256,
             "row_count": self.row_count,
             "last_line_start_offset": self.last_line_start_offset,
@@ -134,6 +136,7 @@ class _SupportAdvance:
     raw: bytes
     source_size: int
     source_mtime_ns: int
+    source_ctime_ns: int
 
 
 @dataclass(frozen=True)
@@ -520,6 +523,7 @@ def _sync_one_locked_source(
                 raw=support_advance.raw,
                 source_size=support_advance.source_size,
                 source_mtime_ns=support_advance.source_mtime_ns,
+                source_ctime_ns=support_advance.source_ctime_ns,
                 captured_at=captured_at,
             )
         _advance_cursor_for_chunk(
@@ -528,6 +532,7 @@ def _sync_one_locked_source(
             raw=consumed,
             source_size=after.st_size,
             source_mtime_ns=after.st_mtime_ns,
+            source_ctime_ns=after.st_ctime_ns,
             captured_at=captured_at,
         )
     status = "quality_failure" if rejections or pit_ineligible else "advanced"
@@ -729,6 +734,7 @@ def _verify_incremental_decision_commits(
                 raw=consumed,
                 source_size=after.st_size,
                 source_mtime_ns=after.st_mtime_ns,
+                source_ctime_ns=after.st_ctime_ns,
             )
         )
     return verified_commits, tuple(advances)
@@ -890,6 +896,7 @@ def _advance_cursor_for_chunk(
     raw: bytes,
     source_size: int,
     source_mtime_ns: int,
+    source_ctime_ns: int,
     captured_at: datetime,
 ) -> None:
     if not raw or not raw.endswith(b"\n"):
@@ -906,6 +913,7 @@ def _advance_cursor_for_chunk(
         row_count=raw.count(b"\n"),
         source_size_at_sync=source_size,
         source_mtime_ns=source_mtime_ns,
+        source_ctime_ns=source_ctime_ns,
         captured_at=captured_at,
     )
 
@@ -1010,6 +1018,7 @@ def fingerprint_complete_source(
         inode=after.st_ino,
         bytes=total,
         mtime_ns=after.st_mtime_ns,
+        ctime_ns=after.st_ctime_ns,
         sha256=actual_hash,
         row_count=row_count,
         last_line_start_offset=last_line_start,
@@ -1090,6 +1099,7 @@ def fingerprint_complete_prefix(
         inode=after.st_ino,
         bytes=expected_bytes,
         mtime_ns=after.st_mtime_ns,
+        ctime_ns=after.st_ctime_ns,
         sha256=actual_hash,
         row_count=row_count,
         last_line_start_offset=last_line_start,
@@ -1239,6 +1249,7 @@ def _bootstrap_snapshot(
         last_line_start_offset=snapshot.last_line_start_offset,
         last_line_sha256=snapshot.last_line_sha256,
         source_mtime_ns=snapshot.mtime_ns,
+        source_ctime_ns=snapshot.ctime_ns,
         source_sha256=snapshot.sha256,
         row_count=snapshot.row_count,
         captured_at=captured_at,
@@ -1389,6 +1400,11 @@ def _verify_cursor_contract(
         raise ShadowSyncError(
             f"source path differs for {cursor.source_name}: "
             f"{cursor.source_path} != {source_path}"
+        )
+    if cursor.source_ctime_ns <= 0:
+        raise ShadowSyncError(
+            f"source cursor lacks inode-change-time provenance: {cursor.source_name}; "
+            "rebuild from a SHA-256 verified snapshot"
         )
 
 

@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 import sqlite3
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 APPLICATION_ID = 0x46584344  # "FXCD"
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 1_000
@@ -130,6 +130,7 @@ class SourceCursor:
     last_line_sha256: str
     source_size_at_sync: int
     source_mtime_ns: int
+    source_ctime_ns: int
     updated_at_ns: int
     writer_id: str
 
@@ -350,6 +351,7 @@ CREATE TABLE IF NOT EXISTS source_cursors (
     last_line_sha256 TEXT NOT NULL,
     source_size_at_sync INTEGER NOT NULL CHECK (source_size_at_sync >= byte_offset),
     source_mtime_ns INTEGER NOT NULL CHECK (source_mtime_ns >= 0),
+    source_ctime_ns INTEGER NOT NULL CHECK (source_ctime_ns >= 0),
     updated_at_ns INTEGER NOT NULL,
     writer_id TEXT NOT NULL,
     CHECK (last_line_start_offset <= byte_offset)
@@ -1083,7 +1085,8 @@ class OperationalStore:
             """
             SELECT source_name, source_kind, source_path, device_id, inode,
                    byte_offset, last_line_start_offset, last_line_sha256,
-                   source_size_at_sync, source_mtime_ns, updated_at_ns, writer_id
+                   source_size_at_sync, source_mtime_ns, source_ctime_ns,
+                   updated_at_ns, writer_id
             FROM source_cursors
             WHERE source_name = ?
             """,
@@ -1102,6 +1105,7 @@ class OperationalStore:
             last_line_sha256=str(row["last_line_sha256"]),
             source_size_at_sync=int(row["source_size_at_sync"]),
             source_mtime_ns=int(row["source_mtime_ns"]),
+            source_ctime_ns=int(row["source_ctime_ns"]),
             updated_at_ns=int(row["updated_at_ns"]),
             writer_id=str(row["writer_id"]),
         )
@@ -1118,6 +1122,7 @@ class OperationalStore:
         last_line_start_offset: int,
         last_line_sha256: str,
         source_mtime_ns: int,
+        source_ctime_ns: int,
         source_sha256: str,
         row_count: int,
         captured_at: datetime | None = None,
@@ -1133,6 +1138,7 @@ class OperationalStore:
         _nonnegative(byte_offset, "byte_offset")
         _nonnegative(last_line_start_offset, "last_line_start_offset")
         _nonnegative(source_mtime_ns, "source_mtime_ns")
+        _nonnegative(source_ctime_ns, "source_ctime_ns")
         _nonnegative(row_count, "row_count")
         if last_line_start_offset > byte_offset:
             raise InvalidOperationalRecord("last_line_start_offset exceeds byte_offset")
@@ -1147,8 +1153,9 @@ class OperationalStore:
                 INSERT INTO source_cursors(
                     source_name, source_kind, source_path, device_id, inode,
                     byte_offset, last_line_start_offset, last_line_sha256,
-                    source_size_at_sync, source_mtime_ns, updated_at_ns, writer_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_size_at_sync, source_mtime_ns, source_ctime_ns,
+                    updated_at_ns, writer_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -1161,6 +1168,7 @@ class OperationalStore:
                     last_line_sha256,
                     byte_offset,
                     source_mtime_ns,
+                    source_ctime_ns,
                     captured_ns,
                     writer_id,
                 ),
@@ -1197,6 +1205,7 @@ class OperationalStore:
         row_count: int,
         source_size_at_sync: int,
         source_mtime_ns: int,
+        source_ctime_ns: int,
         captured_at: datetime | None = None,
     ) -> None:
         """Atomically append a chunk proof and move its cursor forward."""
@@ -1209,6 +1218,7 @@ class OperationalStore:
         _nonnegative(row_count, "row_count")
         _nonnegative(source_size_at_sync, "source_size_at_sync")
         _nonnegative(source_mtime_ns, "source_mtime_ns")
+        _nonnegative(source_ctime_ns, "source_ctime_ns")
         if end_offset <= expected_offset:
             raise InvalidOperationalRecord("end_offset must advance the source cursor")
         if last_line_start_offset < expected_offset or last_line_start_offset >= end_offset:
@@ -1255,6 +1265,7 @@ class OperationalStore:
                     last_line_sha256 = ?,
                     source_size_at_sync = ?,
                     source_mtime_ns = ?,
+                    source_ctime_ns = ?,
                     updated_at_ns = ?,
                     writer_id = ?
                 WHERE source_name = ? AND byte_offset = ?
@@ -1265,6 +1276,7 @@ class OperationalStore:
                     last_line_sha256,
                     source_size_at_sync,
                     source_mtime_ns,
+                    source_ctime_ns,
                     captured_ns,
                     writer_id,
                     name,
@@ -1607,6 +1619,16 @@ def _connect(
     return connection
 
 
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _initialize(connection: sqlite3.Connection) -> None:
     current = int(connection.execute("PRAGMA user_version").fetchone()[0])
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
@@ -1622,6 +1644,17 @@ def _initialize(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute(f"PRAGMA wal_autocheckpoint={DEFAULT_WAL_AUTOCHECKPOINT_PAGES}")
     with _immediate_transaction(connection):
+        if 0 < current < 5 and _table_exists(connection, "source_cursors"):
+            cursor_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(source_cursors)").fetchall()
+            }
+            if "source_ctime_ns" not in cursor_columns:
+                connection.execute("""
+                    ALTER TABLE source_cursors
+                    ADD COLUMN source_ctime_ns INTEGER NOT NULL DEFAULT 0
+                    CHECK (source_ctime_ns >= 0)
+                    """)
         for statement in _SCHEMA_SQL.split(";"):
             normalized = statement.strip()
             if normalized:
@@ -1636,7 +1669,7 @@ def _initialize(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
             INSERT INTO store_metadata(key, value, updated_at_ns)
-            VALUES ('schema_contract', 'fx-operational-store-v4', ?)
+            VALUES ('schema_contract', 'fx-operational-store-v5', ?)
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at_ns = excluded.updated_at_ns

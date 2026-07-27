@@ -100,7 +100,7 @@ def test_initializes_strict_wal_store_with_full_sync(tmp_path: Path) -> None:
             "SELECT sql FROM sqlite_schema WHERE name = 'predictions'"
         ).fetchone()[0]
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert audit.journal_mode == "wal"
     assert audit.synchronous == 2  # SQLITE_SYNC_FULL
     assert audit.integrity_check == "ok"
@@ -111,7 +111,7 @@ def test_initializes_strict_wal_store_with_full_sync(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA application_id").fetchone()[0] == store.APPLICATION_ID
 
 
-def test_writer_migrates_schema_v1_candidate_to_v4(tmp_path: Path) -> None:
+def test_writer_migrates_schema_v1_candidate_to_v5(tmp_path: Path) -> None:
     path = tmp_path / "operational.sqlite3"
     with store.open_operational_writer(path, writer_id="test-writer"):
         pass
@@ -122,11 +122,11 @@ def test_writer_migrates_schema_v1_candidate_to_v4(tmp_path: Path) -> None:
     with store.open_operational_writer(path, writer_id="migration-writer") as opened:
         audit = opened.audit()
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert audit.audit_events == 0
 
 
-def test_writer_migrates_schema_v2_candidate_to_v4(tmp_path: Path) -> None:
+def test_writer_migrates_schema_v2_candidate_to_v5(tmp_path: Path) -> None:
     path = tmp_path / "operational.sqlite3"
     with store.open_operational_writer(path, writer_id="test-writer"):
         pass
@@ -149,13 +149,13 @@ def test_writer_migrates_schema_v2_candidate_to_v4(tmp_path: Path) -> None:
     with store.open_operational_writer(path, writer_id="migration-writer") as opened:
         audit = opened.audit()
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert audit.source_cursors == 0
     assert audit.source_chunks == 0
     assert audit.ingest_rejections == 0
 
 
-def test_writer_migrates_schema_v3_candidate_to_v4_page_indexes(
+def test_writer_migrates_schema_v3_candidate_to_v5_page_indexes(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "operational.sqlite3"
@@ -177,12 +177,57 @@ def test_writer_migrates_schema_v3_candidate_to_v4_page_indexes(
                 """).fetchall()}
         audit = opened.audit()
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert {
         "audit_events_page_idx",
         "price_points_page_idx",
         "price_points_symbol_page_idx",
     } <= indexes
+
+
+def test_writer_migrates_schema_v4_cursor_ctime_column_to_v5(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "operational.sqlite3"
+    with store.open_operational_writer(path, writer_id="test-writer"):
+        pass
+    with sqlite3.connect(path) as connection:
+        for trigger in (
+            "source_cursors_no_delete",
+            "source_cursors_forward_only",
+            "source_cursors_chunk_required",
+            "source_chunks_contiguous",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("ALTER TABLE source_cursors RENAME TO source_cursors_v5")
+        connection.execute("""
+            CREATE TABLE source_cursors (
+                source_name TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                device_id INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                last_line_start_offset INTEGER NOT NULL,
+                last_line_sha256 TEXT NOT NULL,
+                source_size_at_sync INTEGER NOT NULL,
+                source_mtime_ns INTEGER NOT NULL,
+                updated_at_ns INTEGER NOT NULL,
+                writer_id TEXT NOT NULL
+            ) STRICT
+            """)
+        connection.execute("DROP TABLE source_cursors_v5")
+        connection.execute("PRAGMA user_version=4")
+
+    with store.open_operational_writer(path, writer_id="migration-writer") as opened:
+        audit = opened.audit()
+        columns = {
+            str(row[1])
+            for row in opened.connection.execute("PRAGMA table_info(source_cursors)").fetchall()
+        }
+
+    assert audit.schema_version == 5
+    assert "source_ctime_ns" in columns
 
 
 def test_source_cursor_cannot_advance_without_matching_chunk(tmp_path: Path) -> None:
@@ -199,6 +244,7 @@ def test_source_cursor_cannot_advance_without_matching_chunk(tmp_path: Path) -> 
             last_line_start_offset=0,
             last_line_sha256=empty_hash,
             source_mtime_ns=0,
+            source_ctime_ns=0,
             source_sha256=empty_hash,
             row_count=0,
             captured_at=NOW,

@@ -198,7 +198,7 @@ The full replay holds the operational single-writer lease and shared raw-file
 locks while it:
 
 - re-hashes every manifest chunk and recomputes its complete-line count and
-  final-line boundary;
+  final-line boundary, including every compact decision-support cursor;
 - re-projects every decision and price through the current adapters;
 - verifies each PIT decision's cross-log marker against the locked compact
   journal batch before accepting the full batch;
@@ -206,7 +206,8 @@ locks while it:
   PIT eligibility, due times, OHLC fields, populations, and incremental
   rejection entries;
 - fails on raw/DB payload drift, missing or unexpected populations, an
-  unconsumed complete suffix, or an incomplete source tail.
+  unconsumed complete suffix, or an incomplete source tail in authoritative
+  or compact support logs.
 
 `full_replay_verified` means projection integrity is exact. Known legacy
 exclusions and PIT-ineligible decisions remain separately visible as
@@ -229,7 +230,8 @@ Signatures use a process-local random secret, so a traversal restarts after an
 API process restart.
 
 Every API route first locks and verifies all raw source identities, sizes,
-mtimes, and cursor-boundary line hashes against the SQLite cursors. It holds
+mtimes, non-resettable inode change times, and cursor-boundary line hashes
+against the SQLite cursors. It holds
 those shared locks through SQLite page construction, canonical serialization,
 and response-body transmission. Any
 unsynchronized append, source replacement, or failed incremental sync returns

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, UTC
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -126,9 +127,17 @@ def _append_decision_batch(path: Path, rows: list[dict[str, object]]) -> None:
     )
 
 
-def _write_decision_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_decision_jsonl(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    compact_prefix_rows: list[object] | None = None,
+) -> None:
     path.write_bytes(b"")
-    (path.parent / "briefing_tf_journal.jsonl").write_bytes(b"")
+    _write_jsonl(
+        path.parent / "briefing_tf_journal.jsonl",
+        compact_prefix_rows or [],
+    )
     _append_decision_batch(path, rows)
 
 
@@ -137,6 +146,7 @@ def _create_bootstrapped_candidate(
     *,
     decision_rows: list[object] | None = None,
     price_rows: list[object] | None = None,
+    compact_prefix_rows: list[object] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     decisions = tmp_path / "decisions.jsonl"
     prices = tmp_path / "prices.jsonl"
@@ -145,6 +155,7 @@ def _create_bootstrapped_candidate(
     _write_decision_jsonl(
         decisions,
         [dict(row) for row in (decision_rows or [_decision("decision-1")])],
+        compact_prefix_rows=compact_prefix_rows,
     )
     _write_jsonl(prices, price_rows or [_price("price-1")])
     with store.open_operational_writer(database, writer_id="migration") as opened:
@@ -1229,6 +1240,88 @@ def test_full_replay_detects_incomplete_source_tail(tmp_path: Path) -> None:
     decision_report = report["sources"]["decisions"]
     assert decision_report["incomplete_tail_bytes"] == len(b'{"partial":')
     assert decision_report["violations"]["incomplete_source_tail"] == 1
+
+
+def test_full_replay_detects_unconsumed_compact_suffix(tmp_path: Path) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    with compact.open("ab") as handle:
+        handle.write(b'{"receipt_record_sha256":NaN}\n')
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="compact decision source advanced without a full decision suffix",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-unpaired-compact",
+        )
+
+    report = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="full-replay",
+    )
+
+    assert report["verdict"] == "full_replay_failed"
+    support = report["sources"]["decision_support"][0]
+    assert support["unconsumed_complete_lines"] == 1
+    assert support["violations"]["unconsumed_complete_lines"] == 1
+
+
+def test_full_replay_detects_incomplete_compact_tail(tmp_path: Path) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    partial = b'{"receipt_record_sha256":'
+    with compact.open("ab") as handle:
+        handle.write(partial)
+
+    report = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="full-replay",
+    )
+
+    assert report["verdict"] == "full_replay_failed"
+    support = report["sources"]["decision_support"][0]
+    assert support["incomplete_tail_bytes"] == len(partial)
+    assert support["violations"]["incomplete_source_tail"] == 1
+
+
+def test_full_replay_rehashes_compact_manifest_and_api_checks_ctime(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(
+        tmp_path,
+        compact_prefix_rows=[{"legacy_padding": "AAAAAAAA"}],
+    )
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    original_stat = compact.stat()
+    compact.write_bytes(compact.read_bytes().replace(b"AAAAAAAA", b"BBBBBBBB", 1))
+    os.utime(
+        compact,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+
+    with store.open_operational_reader(database) as opened:
+        with pytest.raises(read_model.ReadModelStaleError, match="metadata changed"):
+            read_model.require_current_source_snapshot(opened)
+
+    report = full_replay.run_full_replay(
+        database_path=database,
+        decision_path=decisions,
+        price_path=prices,
+        writer_id="full-replay",
+    )
+
+    assert report["verdict"] == "full_replay_failed"
+    support = report["sources"]["decision_support"][0]
+    assert support["violations"]["chunk_sha256_mismatch"] == 1
+    assert support["violations"]["source_ctime_mismatch"] == 1
 
 
 def test_full_replay_verifies_incremental_rejection_ledger(tmp_path: Path) -> None:

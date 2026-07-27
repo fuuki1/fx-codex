@@ -20,7 +20,7 @@ from .operational_migration import (
     decision_records_from_event,
     price_record_from_row,
 )
-from .operational_shadow_sync import runtime_provenance
+from .operational_shadow_sync import DECISION_SUPPORT_CURSOR_PREFIX, runtime_provenance
 from .operational_store import (
     InvalidOperationalRecord,
     OperationalStore,
@@ -44,6 +44,7 @@ class SourceReplayMetrics:
     cursor_offset: int
     source_size: int
     source_mtime_ns: int = 0
+    source_ctime_ns: int = 0
     replay_completed_at: str = ""
     chunk_count: int = 0
     chunk_bytes: int = 0
@@ -73,6 +74,7 @@ class SourceReplayMetrics:
             "cursor_offset": self.cursor_offset,
             "source_size": self.source_size,
             "source_mtime_ns": self.source_mtime_ns,
+            "source_ctime_ns": self.source_ctime_ns,
             "replay_completed_at": self.replay_completed_at,
             "chunk_count": self.chunk_count,
             "chunk_bytes": self.chunk_bytes,
@@ -130,11 +132,14 @@ def full_replay_with_store(
         raise FullReplayError(
             f"leased database differs from replay target: {store.path} != {database}"
         )
-    decision_support_paths = decision_commit.referenced_compact_paths(decision_path)
+    decision_support_cursors = _decision_support_cursors(
+        store,
+        decision_path=Path(decision_path).resolve(),
+    )
     with lock_replay_sources(
         decision_path,
         price_path,
-        *decision_support_paths,
+        *decision_support_cursors,
     ):
         decisions = replay_source(
             store,
@@ -148,11 +153,20 @@ def full_replay_with_store(
             source_kind="prices",
             source_path=price_path,
         )
+        decision_support = [
+            replay_decision_support_source(
+                store,
+                cursor=cursor,
+                source_path=path,
+            )
+            for path, cursor in decision_support_cursors.items()
+        ]
         checkpoint = store.checkpoint("TRUNCATE")
         audit = store.audit()
     total_violations = (
         decisions.violation_count
         + prices.violation_count
+        + sum(metrics.violation_count for metrics in decision_support)
         + audit.foreign_key_violations
         + audit.source_manifest_violations
         + (0 if audit.integrity_check == "ok" else 1)
@@ -189,6 +203,7 @@ def full_replay_with_store(
         },
         "sources": {
             "decisions": decisions.to_dict(),
+            "decision_support": [metrics.to_dict() for metrics in decision_support],
             "prices": prices.to_dict(),
         },
     }
@@ -266,6 +281,8 @@ def replay_source(
         _verify_identity(cursor, before)
         metrics.source_size = before.st_size
         metrics.source_mtime_ns = before.st_mtime_ns
+        metrics.source_ctime_ns = before.st_ctime_ns
+        _verify_cursor_metadata(cursor, before, metrics)
         _verify_chunks(handle, chunks, metrics)
         _replay_consumed_prefix(
             store,
@@ -291,16 +308,146 @@ def replay_source(
             before.st_ino,
             before.st_size,
             before.st_mtime_ns,
+            before.st_ctime_ns,
         ) != (
             after.st_dev,
             after.st_ino,
             after.st_size,
             after.st_mtime_ns,
+            after.st_ctime_ns,
         ):
             raise FullReplayError(f"source changed during full replay: {path}")
         metrics.replay_completed_at = datetime.now(UTC).isoformat()
     _verify_population_counts(store, metrics)
     return metrics
+
+
+def replay_decision_support_source(
+    store: OperationalStore,
+    *,
+    cursor: SourceCursor,
+    source_path: str | Path,
+) -> SourceReplayMetrics:
+    """Re-hash every compact manifest chunk and reject any unconsumed tail."""
+
+    path = Path(source_path).resolve()
+    if cursor.source_kind != "decisions":
+        raise FullReplayError(
+            f"source kind differs for {cursor.source_name}: " f"{cursor.source_kind} != decisions"
+        )
+    if Path(cursor.source_path).resolve() != path:
+        raise FullReplayError(
+            f"source path differs for {cursor.source_name}: " f"{cursor.source_path} != {path}"
+        )
+    metrics = SourceReplayMetrics(
+        source_name=cursor.source_name,
+        source_kind="decision_support",
+        path=str(path),
+        device_id=cursor.device_id,
+        inode=cursor.inode,
+        cursor_offset=cursor.byte_offset,
+        source_size=0,
+    )
+    chunks = store.connection.execute(
+        """
+        SELECT start_offset, end_offset, chunk_sha256, last_line_start_offset,
+               last_line_sha256, row_count, capture_kind
+        FROM source_chunks
+        WHERE source_name = ?
+        ORDER BY start_offset, end_offset
+        """,
+        (cursor.source_name,),
+    ).fetchall()
+    if not chunks:
+        raise FullReplayError(f"source has no chunk manifest: {cursor.source_name}")
+    with path.open("rb") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        before = os.fstat(handle.fileno())
+        _verify_identity(cursor, before)
+        metrics.source_size = before.st_size
+        metrics.source_mtime_ns = before.st_mtime_ns
+        metrics.source_ctime_ns = before.st_ctime_ns
+        _verify_cursor_metadata(cursor, before, metrics)
+        _verify_chunks(handle, chunks, metrics)
+        metrics.replay_lines = metrics.chunk_rows
+        complete_suffix, incomplete_tail = _suffix_state(
+            handle,
+            start=cursor.byte_offset,
+            end=before.st_size,
+        )
+        metrics.unconsumed_complete_lines = complete_suffix
+        metrics.incomplete_tail_bytes = incomplete_tail
+        if complete_suffix:
+            metrics.violations["unconsumed_complete_lines"] += complete_suffix
+        if incomplete_tail:
+            metrics.violations["incomplete_source_tail"] += 1
+        after = os.fstat(handle.fileno())
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise FullReplayError(f"source changed during full replay: {path}")
+        metrics.replay_completed_at = datetime.now(UTC).isoformat()
+    return metrics
+
+
+def _decision_support_cursors(
+    store: OperationalStore,
+    *,
+    decision_path: Path,
+) -> dict[Path, SourceCursor]:
+    rows = store.connection.execute(
+        """
+        SELECT source_name
+        FROM source_cursors
+        WHERE source_name LIKE ?
+        ORDER BY source_name
+        """,
+        (f"{DECISION_SUPPORT_CURSOR_PREFIX}%",),
+    ).fetchall()
+    cursors: dict[Path, SourceCursor] = {}
+    for row in rows:
+        source_name = str(row["source_name"])
+        cursor = store.source_cursor(source_name)
+        if cursor is None:
+            raise FullReplayError(f"decision support cursor disappeared: {source_name}")
+        support_path = Path(cursor.source_path).resolve()
+        expected_name = f"{DECISION_SUPPORT_CURSOR_PREFIX}{support_path.name}"
+        if source_name != expected_name:
+            raise FullReplayError(
+                f"decision support cursor name differs: {source_name} != {expected_name}"
+            )
+        if support_path.parent != decision_path.parent:
+            raise FullReplayError(
+                f"decision support source is outside decision directory: {support_path}"
+            )
+        if support_path.name not in decision_commit.COMPACT_FILENAMES.values():
+            raise FullReplayError(f"unsupported decision support source: {support_path}")
+        if support_path in cursors:
+            raise FullReplayError(f"duplicate decision support source cursor: {support_path}")
+        cursors[support_path] = cursor
+
+    existing = {
+        (decision_path.parent / filename).resolve()
+        for filename in decision_commit.COMPACT_FILENAMES.values()
+        if (decision_path.parent / filename).is_file()
+    }
+    if set(cursors) != existing:
+        raise FullReplayError(
+            "decision support cursors differ from canonical compact sources: "
+            f"{sorted(str(value) for value in cursors)} != "
+            f"{sorted(str(value) for value in existing)}"
+        )
+    return dict(sorted(cursors.items(), key=lambda item: str(item[0])))
 
 
 def _verify_chunks(
@@ -809,6 +956,19 @@ def _verify_identity(cursor: SourceCursor, stat: os.stat_result) -> None:
         raise FullReplayError(
             f"source truncated: {cursor.source_name} " f"{stat.st_size} < {cursor.byte_offset}"
         )
+
+
+def _verify_cursor_metadata(
+    cursor: SourceCursor,
+    stat: os.stat_result,
+    metrics: SourceReplayMetrics,
+) -> None:
+    if stat.st_size != cursor.source_size_at_sync:
+        metrics.violations["source_size_at_sync_mismatch"] += 1
+    if stat.st_mtime_ns != cursor.source_mtime_ns:
+        metrics.violations["source_mtime_mismatch"] += 1
+    if stat.st_ctime_ns != cursor.source_ctime_ns:
+        metrics.violations["source_ctime_mismatch"] += 1
 
 
 def _canonical_payload(payload: Mapping[str, object]) -> str:

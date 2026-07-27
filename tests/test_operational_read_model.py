@@ -97,6 +97,7 @@ def _database(tmp_path: Path) -> Path:
                 last_line_start_offset=0,
                 last_line_sha256=empty_hash,
                 source_mtime_ns=source_stat.st_mtime_ns,
+                source_ctime_ns=source_stat.st_ctime_ns,
                 source_sha256=empty_hash,
                 row_count=0,
                 captured_at=NOW,
