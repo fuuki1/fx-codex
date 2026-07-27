@@ -545,8 +545,8 @@ def test_incremental_sync_rejects_compact_hash_drift(tmp_path: Path) -> None:
         before = opened.source_cursor("decisions")
         assert before is not None
         with pytest.raises(
-            shadow.ShadowSyncError,
-            match="compact batch verification",
+            shadow.SourceManifestMismatch,
+            match="source chunk SHA-256 changed: decision_support:",
         ):
             shadow.sync_one_source(
                 opened,
@@ -1322,6 +1322,154 @@ def test_full_replay_rehashes_compact_manifest_and_api_checks_ctime(
     support = report["sources"]["decision_support"][0]
     assert support["violations"]["chunk_sha256_mismatch"] == 1
     assert support["violations"]["source_ctime_mismatch"] == 1
+
+
+def test_sync_cannot_launder_full_prefix_tamper_with_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    original_stat = decisions.stat()
+    decisions.write_bytes(decisions.read_bytes().replace(b"neutral", b"longxxx", 1))
+    os.utime(
+        decisions,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    with store.open_operational_reader(database) as opened:
+        cursor_before = opened.source_cursor("decisions")
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.SourceManifestMismatch,
+        match="source chunk SHA-256 changed: decisions",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-laundered-full-prefix",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == cursor_before
+        assert opened.audit() == audit_before
+        with pytest.raises(read_model.ReadModelStaleError):
+            read_model.require_current_source_snapshot(opened)
+
+
+def test_sync_cannot_launder_compact_prefix_tamper_with_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(
+        tmp_path,
+        compact_prefix_rows=[{"legacy_padding": "AAAAAAAA"}],
+    )
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    original_stat = compact.stat()
+    compact.write_bytes(compact.read_bytes().replace(b"AAAAAAAA", b"BBBBBBBB", 1))
+    os.utime(
+        compact,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    support_name = f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}"
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(support_name)
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.SourceManifestMismatch,
+        match="source chunk SHA-256 changed: decision_support:",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-laundered-compact-prefix",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert opened.source_cursor(support_name) == support_cursor_before
+        assert opened.audit() == audit_before
+        with pytest.raises(read_model.ReadModelStaleError):
+            read_model.require_current_source_snapshot(opened)
+
+
+def test_sync_cannot_consume_invalid_compact_tail_with_later_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(tmp_path)
+    compact = tmp_path / "briefing_tf_journal.jsonl"
+    with compact.open("ab") as handle:
+        handle.write(b'{"receipt_record_sha256":NaN}\n')
+    with store.open_operational_reader(database) as opened:
+        decision_cursor_before = opened.source_cursor("decisions")
+        support_cursor_before = opened.source_cursor(
+            f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}"
+        )
+        audit_before = opened.audit()
+    _append_decision_batch(decisions, [_decision("decision-2", minutes=15)])
+
+    with pytest.raises(
+        shadow.ShadowSyncError,
+        match="non-finite compact JSON constant",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-invalid-compact-tail",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("decisions") == decision_cursor_before
+        assert (
+            opened.source_cursor(f"{shadow.DECISION_SUPPORT_CURSOR_PREFIX}{compact.name}")
+            == support_cursor_before
+        )
+        assert opened.audit() == audit_before
+
+
+def test_sync_cannot_launder_price_prefix_tamper_with_valid_append(
+    tmp_path: Path,
+) -> None:
+    database, decisions, prices, _ = _create_bootstrapped_candidate(
+        tmp_path,
+        price_rows=[
+            _price("price-0"),
+            _price("price-1", minutes=1),
+        ],
+    )
+    original_stat = prices.stat()
+    prices.write_bytes(prices.read_bytes().replace(b"150.0", b"151.0", 1))
+    os.utime(
+        prices,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    with store.open_operational_reader(database) as opened:
+        cursor_before = opened.source_cursor("prices")
+        audit_before = opened.audit()
+    with prices.open("ab") as handle:
+        handle.write(_line(_price("price-2", minutes=15)))
+
+    with pytest.raises(
+        shadow.SourceManifestMismatch,
+        match="source chunk SHA-256 changed: prices",
+    ):
+        shadow.sync_sources(
+            database_path=database,
+            decision_path=decisions,
+            price_path=prices,
+            writer_id="reject-laundered-price-prefix",
+        )
+
+    with store.open_operational_reader(database) as opened:
+        assert opened.source_cursor("prices") == cursor_before
+        assert opened.audit() == audit_before
+        with pytest.raises(read_model.ReadModelStaleError):
+            read_model.require_current_source_snapshot(opened)
 
 
 def test_full_replay_verifies_incremental_rejection_ledger(tmp_path: Path) -> None:

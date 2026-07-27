@@ -59,6 +59,10 @@ class SourceBoundaryMismatch(ShadowSyncError):
     """Previously consumed source bytes no longer match the durable boundary."""
 
 
+class SourceManifestMismatch(ShadowSyncError):
+    """A consumed raw prefix no longer matches its durable SHA-256 chunks."""
+
+
 @dataclass(frozen=True)
 class CompleteSourceSnapshot:
     path: str
@@ -391,10 +395,18 @@ def _sync_one_locked_source(
     before = os.fstat(handle.fileno())
     _verify_source_identity(cursor, before)
     _verify_previous_boundary(handle, cursor)
+    _verify_source_state_before_growth(store, cursor, handle, before)
     for support_path, support_cursor in support_cursors.items():
         support_handle = locked_handles[support_path]
-        _verify_source_identity(support_cursor, os.fstat(support_handle.fileno()))
+        support_stat = os.fstat(support_handle.fileno())
+        _verify_source_identity(support_cursor, support_stat)
         _verify_previous_boundary(support_handle, support_cursor)
+        _verify_source_state_before_growth(
+            store,
+            support_cursor,
+            support_handle,
+            support_stat,
+        )
     available = before.st_size - cursor.byte_offset
     if available == 0:
         advanced_support = [
@@ -762,81 +774,79 @@ def _compact_batches_from_suffix(
         line_start_offset = start_offset + relative_offset
         relative_offset += len(line)
         try:
-            value: Any = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pending_id = ""
-            pending_rows = []
-            pending_start_offset = None
-            pending_payload.clear()
-            continue
+            value: Any = json.loads(
+                line,
+                parse_constant=_reject_nonfinite_json_constant,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ShadowSyncError(
+                f"malformed compact decision suffix at byte {line_start_offset}"
+            ) from error
         if not isinstance(value, dict):
-            pending_id = ""
-            pending_rows = []
-            pending_start_offset = None
-            pending_payload.clear()
-            continue
+            raise ShadowSyncError(f"non-object compact decision suffix at byte {line_start_offset}")
         if value.get("event_type") == decision_commit.RECEIPT_EVENT_TYPE:
             receipt = decision_commit.validated_receipt(value)
-            if receipt is not None:
-                transaction_id = str(receipt["decision_transaction_id"])
-                descriptor = pending_batches.get(transaction_id)
-                descriptor_ids = (
-                    cast(Sequence[object], descriptor["decision_ids"])
-                    if descriptor is not None
-                    and isinstance(descriptor.get("decision_ids"), Sequence)
-                    and not isinstance(descriptor.get("decision_ids"), (str, bytes))
-                    else None
+            if receipt is None:
+                raise ShadowSyncError(f"invalid compact receipt at byte {line_start_offset}")
+            transaction_id = str(receipt["decision_transaction_id"])
+            descriptor = pending_batches.get(transaction_id)
+            descriptor_ids = (
+                cast(Sequence[object], descriptor["decision_ids"])
+                if descriptor is not None
+                and isinstance(descriptor.get("decision_ids"), Sequence)
+                and not isinstance(descriptor.get("decision_ids"), (str, bytes))
+                else None
+            )
+            if (
+                descriptor is not None
+                and descriptor_ids is not None
+                and decision_commit.receipt_matches_compact(
+                    receipt,
+                    transaction_id=transaction_id,
+                    decision_ids=descriptor_ids,
+                    batch_sha256=str(descriptor["compact_batch_sha256"]),
+                    mode=expected_mode,
                 )
+                and decision_commit.receipt_matches_compact_evidence(
+                    receipt,
+                    line_start_offset=cast(
+                        int,
+                        descriptor["compact_batch_line_start_offset"],
+                    ),
+                    byte_length=cast(
+                        int,
+                        descriptor["compact_batch_byte_length"],
+                    ),
+                    payload_sha256=str(descriptor["compact_batch_payload_sha256"]),
+                )
+                and decision_commit.receipt_matches_full_evidence(
+                    receipt,
+                    full_handle,
+                )
+            ):
+                candidate = _CompactBatch(
+                    end_offset=start_offset + relative_offset,
+                    transaction_id=transaction_id,
+                    decision_ids_sha256=str(descriptor["decision_ids_sha256"]),
+                    batch_sha256=str(descriptor["compact_batch_sha256"]),
+                    full_batch_sha256=str(receipt["full_batch_sha256"]),
+                    full_commit_record_sha256=str(receipt["full_commit_record_sha256"]),
+                    full_batch_line_start_offset=cast(
+                        int,
+                        receipt["full_batch_line_start_offset"],
+                    ),
+                    full_batch_line_sha256=str(receipt["full_batch_line_sha256"]),
+                )
+                verified_previous = verified_by_transaction.get(transaction_id)
                 if (
-                    descriptor is not None
-                    and descriptor_ids is not None
-                    and decision_commit.receipt_matches_compact(
-                        receipt,
-                        transaction_id=transaction_id,
-                        decision_ids=descriptor_ids,
-                        batch_sha256=str(descriptor["compact_batch_sha256"]),
-                        mode=expected_mode,
-                    )
-                    and decision_commit.receipt_matches_compact_evidence(
-                        receipt,
-                        line_start_offset=cast(
-                            int,
-                            descriptor["compact_batch_line_start_offset"],
-                        ),
-                        byte_length=cast(
-                            int,
-                            descriptor["compact_batch_byte_length"],
-                        ),
-                        payload_sha256=str(descriptor["compact_batch_payload_sha256"]),
-                    )
-                    and decision_commit.receipt_matches_full_evidence(
-                        receipt,
-                        full_handle,
-                    )
+                    verified_previous is not None
+                    and verified_previous.full_commit_record_sha256
+                    != candidate.full_commit_record_sha256
                 ):
-                    candidate = _CompactBatch(
-                        end_offset=start_offset + relative_offset,
-                        transaction_id=transaction_id,
-                        decision_ids_sha256=str(descriptor["decision_ids_sha256"]),
-                        batch_sha256=str(descriptor["compact_batch_sha256"]),
-                        full_batch_sha256=str(receipt["full_batch_sha256"]),
-                        full_commit_record_sha256=str(receipt["full_commit_record_sha256"]),
-                        full_batch_line_start_offset=cast(
-                            int,
-                            receipt["full_batch_line_start_offset"],
-                        ),
-                        full_batch_line_sha256=str(receipt["full_batch_line_sha256"]),
-                    )
-                    verified_previous = verified_by_transaction.get(transaction_id)
-                    if (
-                        verified_previous is not None
-                        and verified_previous.full_commit_record_sha256
-                        != candidate.full_commit_record_sha256
-                    ):
-                        verified_conflicts.add(transaction_id)
-                        verified_by_transaction.pop(transaction_id, None)
-                    elif transaction_id not in verified_conflicts:
-                        verified_by_transaction[transaction_id] = candidate
+                    verified_conflicts.add(transaction_id)
+                    verified_by_transaction.pop(transaction_id, None)
+                elif transaction_id not in verified_conflicts:
+                    verified_by_transaction[transaction_id] = candidate
             pending_id = ""
             pending_rows = []
             pending_start_offset = None
@@ -849,22 +859,23 @@ def _compact_batches_from_suffix(
                 value,
                 expected_mode=expected_mode,
             )
-            if descriptor is not None and pending_start_offset is not None:
-                exact_payload = bytes(pending_payload) + line
-                descriptor.update(
-                    {
-                        "compact_batch_line_start_offset": pending_start_offset,
-                        "compact_batch_byte_length": len(exact_payload),
-                        "compact_batch_payload_sha256": hashlib.sha256(exact_payload).hexdigest(),
-                    }
-                )
-                transaction_id = str(descriptor["decision_transaction_id"])
-                batch_previous = pending_batches.get(transaction_id)
-                if batch_previous is not None and batch_previous != descriptor:
-                    batch_conflicts.add(transaction_id)
-                    pending_batches.pop(transaction_id, None)
-                elif transaction_id not in batch_conflicts:
-                    pending_batches[transaction_id] = descriptor
+            if descriptor is None or pending_start_offset is None:
+                raise ShadowSyncError(f"invalid compact batch marker at byte {line_start_offset}")
+            exact_payload = bytes(pending_payload) + line
+            descriptor.update(
+                {
+                    "compact_batch_line_start_offset": pending_start_offset,
+                    "compact_batch_byte_length": len(exact_payload),
+                    "compact_batch_payload_sha256": hashlib.sha256(exact_payload).hexdigest(),
+                }
+            )
+            transaction_id = str(descriptor["decision_transaction_id"])
+            batch_previous = pending_batches.get(transaction_id)
+            if batch_previous is not None and batch_previous != descriptor:
+                batch_conflicts.add(transaction_id)
+                pending_batches.pop(transaction_id, None)
+            elif transaction_id not in batch_conflicts:
+                pending_batches[transaction_id] = descriptor
             pending_id = ""
             pending_rows = []
             pending_start_offset = None
@@ -1408,6 +1419,76 @@ def _verify_cursor_contract(
         )
 
 
+def _verify_source_state_before_growth(
+    store: OperationalStore,
+    cursor: SourceCursor,
+    handle: IO[bytes],
+    stat: os.stat_result,
+) -> None:
+    """Reject metadata-only changes or re-hash the prefix before an append."""
+
+    if stat.st_size < cursor.source_size_at_sync:
+        raise SourceRotationDetected(
+            f"source shortened since last sync for {cursor.source_name}: "
+            f"{stat.st_size} < {cursor.source_size_at_sync}"
+        )
+    if stat.st_size == cursor.source_size_at_sync:
+        if stat.st_mtime_ns != cursor.source_mtime_ns or stat.st_ctime_ns != cursor.source_ctime_ns:
+            raise SourceManifestMismatch(
+                f"source metadata changed without append: {cursor.source_name}"
+            )
+        return
+    _verify_consumed_chunk_hashes(store, cursor, handle)
+
+
+def _verify_consumed_chunk_hashes(
+    store: OperationalStore,
+    cursor: SourceCursor,
+    handle: IO[bytes],
+) -> None:
+    """Re-hash all durable chunks before a newer suffix can replace ctime."""
+
+    chunks = store.connection.execute(
+        """
+        SELECT start_offset, end_offset, chunk_sha256
+        FROM source_chunks
+        WHERE source_name = ?
+        ORDER BY start_offset, end_offset
+        """,
+        (cursor.source_name,),
+    ).fetchall()
+    if not chunks:
+        raise SourceManifestMismatch(f"source has no chunk manifest: {cursor.source_name}")
+    expected_start = 0
+    for chunk in chunks:
+        start = int(chunk["start_offset"])
+        end = int(chunk["end_offset"])
+        if start != expected_start or end < start or end > cursor.byte_offset:
+            raise SourceManifestMismatch(
+                f"source chunk range is not contiguous: {cursor.source_name}"
+            )
+        handle.seek(start)
+        remaining = end - start
+        digest = hashlib.sha256()
+        while remaining:
+            block = handle.read(min(1024 * 1024, remaining))
+            if not block:
+                raise SourceManifestMismatch(
+                    f"source ended inside a durable chunk: {cursor.source_name}"
+                )
+            digest.update(block)
+            remaining -= len(block)
+        if digest.hexdigest() != str(chunk["chunk_sha256"]):
+            raise SourceManifestMismatch(
+                f"source chunk SHA-256 changed: {cursor.source_name}:{start}-{end}"
+            )
+        expected_start = end
+    if expected_start != cursor.byte_offset:
+        raise SourceManifestMismatch(
+            f"source chunks do not cover the durable cursor: {cursor.source_name}"
+        )
+
+
 def _verify_source_identity(cursor: SourceCursor, stat: os.stat_result) -> None:
     if (stat.st_dev, stat.st_ino) != (cursor.device_id, cursor.inode):
         raise SourceRotationDetected(
@@ -1418,6 +1499,10 @@ def _verify_source_identity(cursor: SourceCursor, stat: os.stat_result) -> None:
         raise SourceRotationDetected(
             f"source truncated for {cursor.source_name}: " f"{stat.st_size} < {cursor.byte_offset}"
         )
+
+
+def _reject_nonfinite_json_constant(value: str) -> object:
+    raise ShadowSyncError(f"non-finite compact JSON constant is inadmissible: {value}")
 
 
 def _verify_previous_boundary(handle: Any, cursor: SourceCursor) -> None:

@@ -194,6 +194,12 @@ PIT-ineligible decision. Integrity/identity failures return exit 2 and do not
 advance that source. A no-change run returns exit 0 without creating a chunk.
 Reports are create-only; use a unique path for every scheduled run.
 
+Before any cursor advances beyond its last observed file size, sync re-hashes
+every already-consumed SHA-256 chunk for that source. A same-length historical
+rewrite therefore cannot be hidden by a later valid append and a refreshed
+ctime. No-change polls remain constant-time and compare the pinned inode,
+size, mtime, ctime, and final-line boundary without scanning full history.
+
 The full replay holds the operational single-writer lease and shared raw-file
 locks while it:
 
