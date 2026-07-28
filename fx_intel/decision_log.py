@@ -14,6 +14,7 @@ from datetime import datetime, UTC
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -1578,7 +1579,36 @@ def _json_ready_dict(value: Mapping[str, object]) -> dict[str, object]:
     return {str(key): _json_ready(item) for key, item in value.items()}
 
 
+def _is_plain_json(value: object) -> bool:
+    """True when *value* is already JSON-native and needs no conversion.
+
+    Rows read back from a journal are ``json.loads`` output, so the recursive
+    walk below can never find a dataclass or a datetime in them. Detecting that
+    up front with exact ``type()`` checks avoids the per-node ``is_dataclass``
+    and ABC ``isinstance`` lookups, which dominate the scoring pass on logs with
+    thousands of price rows. ``bool``/``int`` are matched exactly so subclasses
+    (and anything else custom) still take the conversion path.
+    """
+
+    kind = type(value)
+    if kind in (str, int, bool, type(None)):
+        return True
+    if kind is float:
+        # NaN/Infinity are not JSON compliant; json_safe folds them to None, so
+        # they must not take the fast path.
+        return math.isfinite(value)  # type: ignore[arg-type]
+    if kind is dict:
+        items: Mapping[object, object] = value  # type: ignore[assignment]
+        return all(type(key) is str and _is_plain_json(item) for key, item in items.items())
+    if kind is list:
+        entries: Sequence[object] = value  # type: ignore[assignment]
+        return all(_is_plain_json(item) for item in entries)
+    return False
+
+
 def _json_ready(value: object) -> object:
+    if _is_plain_json(value):
+        return value
     if is_dataclass(value) and not isinstance(value, type):
         return _json_ready(asdict(value))
     if isinstance(value, Mapping):
