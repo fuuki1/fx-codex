@@ -30,7 +30,6 @@ DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fx_backtester.calibration import wilson_interval  # noqa: E402
 from fx_intel.effective_samples import summarize_effective_samples  # noqa: E402
 from fx_intel.evaluation_labels import (  # noqa: E402
     KNOWN_EXECUTABLE_COST_MODEL_IDS,
@@ -990,9 +989,28 @@ def _journal_activity(entries: list[dict[str, Any]], *, buckets: int = 48) -> di
 
 # 的中率セルは少数サンプルで極端な値(0%/83%)を出しやすい。区間を併記して
 # 「まだ何も言えない」ことを読み手に伝えるため、hits/evaluated から Wilson
-# score 区間を求める。区間の実装は fx_backtester.calibration が正準で、
-# ここでは再定義せずそれを呼ぶ(二重定義による契約ずれを避ける)。
+# score 区間を求める。
+#
+# 正準実装は fx_backtester.calibration.wilson_interval だが、そちらは pandas /
+# numpy に依存する。ダッシュボードは重い依存を持たない方針(_open_hours_between
+# などと同様)なので、式だけをここに写す。test_dashboard_wilson_matches_canonical
+# が両者の一致を固定しているため、写し違いは CI で検出される。
 _WIDE_INTERVAL_POINTS = 0.30
+_WILSON_Z = 1.96
+
+
+def _wilson_interval(successes: int, observations: int) -> tuple[float, float]:
+    """fx_backtester.calibration.wilson_interval と同一の Wilson score 区間。"""
+    rate = successes / observations
+    z2 = _WILSON_Z**2
+    denominator = 1.0 + z2 / observations
+    centre = (rate + z2 / (2.0 * observations)) / denominator
+    margin = (
+        _WILSON_Z
+        * math.sqrt(rate * (1.0 - rate) / observations + z2 / (4.0 * observations**2))
+        / denominator
+    )
+    return max(0.0, centre - margin), min(1.0, centre + margin)
 
 
 def _interval_fields(hits: int, evaluated: int) -> dict[str, Any]:
@@ -1002,7 +1020,7 @@ def _interval_fields(hits: int, evaluated: int) -> dict[str, Any]:
     """
     if evaluated < 1 or not 0 <= hits <= evaluated:
         return {"ci_low": None, "ci_high": None, "ci_wide": None}
-    low, high = wilson_interval(hits, evaluated)
+    low, high = _wilson_interval(hits, evaluated)
     return {
         "ci_low": round(low, 4),
         "ci_high": round(high, 4),

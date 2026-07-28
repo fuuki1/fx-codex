@@ -1225,3 +1225,28 @@ def test_timeframe_summary_exposes_intervals(server, tmp_path) -> None:
     assert symbols["USDJPY"]["ci_low"] < 0.5
     # 全体サマリにも伝播する
     assert state["tf_learning"]["ci_wide"] is True
+
+
+def test_dashboard_wilson_matches_canonical(server) -> None:
+    """ダッシュボードの Wilson 区間が正準実装と一致すること。
+
+    ダッシュボードは pandas/numpy を持ち込まない方針のため
+    fx_backtester.calibration.wilson_interval を import せず式を写している。
+    写し違い・将来のドリフトをここで検出する。
+    """
+    from fx_backtester.calibration import wilson_interval
+
+    for hits, evaluated in [
+        (0, 1),
+        (1, 1),
+        (0, 4),
+        (1, 4),
+        (5, 6),
+        (7, 10),
+        (10, 24),
+        (500, 1000),
+        (3733, 8450),
+    ]:
+        expected = wilson_interval(hits, evaluated)
+        actual = server._wilson_interval(hits, evaluated)
+        assert actual == pytest.approx(expected), f"{hits}/{evaluated}"
