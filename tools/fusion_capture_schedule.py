@@ -31,27 +31,45 @@ def _aware_timestamp(value: object) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _is_decision_row(row: dict[str, object]) -> bool:
+    """判断行だけを対象にする(commit receipt等の制御行を除外)。
+
+    decision_commit がバッチ確定時に追記する receipt 行は `ts` を持たず
+    `committed_at` を持つ。判断の最終時刻を求める用途では制御行を読み飛ばす。
+    """
+
+    if "ts" not in row:
+        return False
+    return not str(row.get("event_type") or "").endswith("_commit")
+
+
 def latest_journal_timestamp(journal: Path) -> datetime | None:
-    """最終非空行のaware UTC時刻を返す。未作成・空ファイルはNone。"""
+    """最終「判断行」のaware UTC時刻を返す。未作成・空ファイルはNone。
+
+    末尾には commit receipt が来るため、後ろから判断行を探す。
+    判断行が1件も無い場合は None(=未取得扱い)を返す。
+    """
     if not journal.exists():
         return None
     try:
-        last_line: str | None = None
+        rows: list[dict[str, object]] = []
         with journal.open(encoding="utf-8") as handle:
             for line in handle:
-                if line.strip():
-                    last_line = line
+                if not line.strip():
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise FusionCaptureScheduleError("journalに不正なJSON行があります") from error
+                if not isinstance(parsed, dict):
+                    raise FusionCaptureScheduleError("journal行がobjectではありません")
+                rows.append(parsed)
     except (OSError, UnicodeError) as error:
         raise FusionCaptureScheduleError(f"journalを読めません: {error}") from error
-    if last_line is None:
-        return None
-    try:
-        row = json.loads(last_line)
-    except json.JSONDecodeError as error:
-        raise FusionCaptureScheduleError("journal最終行が不正なJSONです") from error
-    if not isinstance(row, dict):
-        raise FusionCaptureScheduleError("journal最終行がobjectではありません")
-    return _aware_timestamp(row.get("ts"))
+    for row in reversed(rows):
+        if _is_decision_row(row):
+            return _aware_timestamp(row.get("ts"))
+    return None
 
 
 def capture_is_due(
