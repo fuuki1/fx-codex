@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from tools.decision_store_admin import (  # noqa: E402
     DEFAULT_PATH,
     NEWS_SIDECAR_SUFFIX,
+    _events_of_line,
     _load_news_sidecar,
     restore_event,
 )
@@ -83,14 +84,18 @@ def _iter_events(path: Path) -> Iterator[dict[str, object]]:
             if not stripped:
                 continue
             try:
-                event = json.loads(stripped)
+                parsed = json.loads(stripped)
             except json.JSONDecodeError:
                 yield {"__corrupt__": True}
                 continue
-            if isinstance(event, dict):
-                yield event
-            else:
+            # 現行の判断ログは 1行 = 1バッチ。バッチを1イベントとして数えると
+            # backup と正規化ログの件数が食い違い、無損失なbackfillでも
+            # parity_failed になる。
+            events = _events_of_line(parsed)
+            if events is None:
                 yield {"__corrupt__": True}
+                continue
+            yield from events
 
 
 def _key(event: Mapping[str, object]) -> str:

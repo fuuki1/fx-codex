@@ -74,12 +74,13 @@ def test_backfill_keeps_sidecar_rows_written_by_the_live_writer(tmp_path: Path) 
     # 新たに畳んだのは legacy の1件だけで、既存分は二重計上しない。
     assert report.news_items_deduplicated == 1
 
+    # 判断ログは 1行 = 1バッチなので、行をそのままイベントとして読まない。
     for line in path.read_text(encoding="utf-8").splitlines():
-        event = json.loads(line)
-        context = event["market_context"]
-        assert "news_items" not in context, f"{event['decision_id']} が正規化されていない"
-        for ref in context["news_item_refs"]:
-            assert ref in known, "参照がサイドカーで解決できない"
+        for event in admin._events_of_line(json.loads(line)) or []:  # noqa: SLF001
+            context = event["market_context"]
+            assert "news_items" not in context, f"{event['decision_id']} が正規化されていない"
+            for ref in context["news_item_refs"]:
+                assert ref in known, "参照がサイドカーで解決できない"
 
 
 def test_reconcile_fails_closed_on_unavailable_log(tmp_path: Path) -> None:
@@ -292,3 +293,44 @@ def test_reconcile_cli_exit_codes(tmp_path: Path) -> None:
     dirty = tmp_path / "dirty.jsonl"
     _write(dirty, [_event("d-2", [_news("cpi")])])
     assert admin.main(["--path", str(dirty), "reconcile"]) == 1
+
+
+def test_audit_sees_events_inside_batch_lines(tmp_path: Path) -> None:
+    """判断ログは 1行 = 1バッチ。行をイベントとして読むと検出0になる。"""
+
+    from fx_intel import decision_log
+
+    path = tmp_path / "briefing_decisions.jsonl"
+    decision_log.append_decision_events(
+        path,
+        [_event(f"d-{index}", [_news("cpi")]) for index in range(3)],
+        normalize_news=False,
+    )
+
+    report = admin.audit_store(path)
+
+    assert report.total_lines == 1, "1バッチ=1行"
+    assert report.valid_events == 3, "バッチ内の3イベントを数えること"
+    assert report.news_item_rows == 3
+
+
+def test_backfill_rewrites_batch_hash_so_readers_keep_seeing_events(tmp_path: Path) -> None:
+    """バッチ行を畳んだら decision_batch_sha256 を再計算しなければならない。
+
+    再計算しないと reader の再導出と食い違い、バッチ全体が恒久的に不可視になる。
+    """
+
+    from fx_intel import decision_commit, decision_log
+
+    path = tmp_path / "briefing_decisions.jsonl"
+    decision_log.append_decision_events(
+        path,
+        [_event(f"d-{index}", [_news("cpi"), _news("nfp")]) for index in range(4)],
+        normalize_news=False,
+    )
+
+    admin.backfill_store(path, apply=True)
+
+    line = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert line["decision_batch_sha256"] == decision_commit.canonical_sha256(line["events"])
+    assert len(list(decision_log.read_decision_events(path))) == 4

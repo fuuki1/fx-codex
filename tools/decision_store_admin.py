@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from fx_intel import decision_commit, decision_log  # noqa: E402
 from fx_intel.decision_log import (  # noqa: E402
     NEWS_NORMALIZED_KEY,
     NEWS_SIDECAR_SUFFIX,
@@ -158,6 +159,44 @@ def _iter_lines(path: Path) -> Iterator[str]:
                 yield stripped
 
 
+def _events_of_line(value: object) -> list[dict[str, object]] | None:
+    """1行が運ぶ判断イベントを返す。``None`` は壊れた行を意味する。
+
+    判断ログには2つの物理形式がある。旧形式は1行=1イベント、現行形式は
+    1行=1バッチ(``{"event_type": "decision_batch", "events": [...]}``)で、
+    バッチ側の ``market_context`` はイベントの中にしか無い。行をそのまま
+    イベントとして扱うと、バッチ形式のログは「畳むものが無い」と誤報告される。
+    """
+
+    if not isinstance(value, dict):
+        return None
+    if value.get("event_type") != decision_log.DECISION_BATCH_EVENT_TYPE:
+        return [value]
+    raw_events = value.get("events")
+    if not isinstance(raw_events, list):
+        return None
+    events = [event for event in raw_events if isinstance(event, dict)]
+    if len(events) != len(raw_events):
+        return None
+    return events
+
+
+def _rewrap_line(value: Mapping[str, object], events: list[dict[str, object]]) -> object:
+    """畳んだイベントを元の物理形式へ戻す。
+
+    バッチ行は ``decision_batch_sha256`` を events から導出し、reader が同じ
+    導出を再実行して照合する。イベントを差し替えたらこのハッシュも
+    必ず再計算しなければ、バッチ全体が恒久的に不可視になる。
+    """
+
+    if value.get("event_type") != decision_log.DECISION_BATCH_EVENT_TYPE:
+        return events[0] if events else dict(value)
+    rewrapped = dict(value)
+    rewrapped["events"] = events
+    rewrapped["decision_batch_sha256"] = decision_commit.canonical_sha256(events)
+    return rewrapped
+
+
 def _news_items_of(event: Mapping[str, object]) -> list[dict[str, object]]:
     context = event.get("market_context")
     if not isinstance(context, Mapping):
@@ -186,22 +225,24 @@ def audit_store(path: str | Path) -> AuditReport:
         total_lines += 1
         total_bytes += len(line.encode("utf-8")) + 1  # 改行分
         try:
-            event = json.loads(line)
+            parsed = json.loads(line)
         except json.JSONDecodeError:
             corrupt_lines += 1
             continue
-        if not isinstance(event, dict):
+        events = _events_of_line(parsed)
+        if events is None:
             corrupt_lines += 1
             continue
-        valid_events += 1
-        if event.get(NEWS_NORMALIZED_KEY) is True:
-            already_normalized += 1
-        items = _news_items_of(event)
-        if items:
-            news_items_bytes += len(json.dumps(items, ensure_ascii=False).encode("utf-8"))
-            news_item_rows += len(items)
-            for item in items:
-                unique.add(news_content_hash(item))
+        for event in events:
+            valid_events += 1
+            if event.get(NEWS_NORMALIZED_KEY) is True:
+                already_normalized += 1
+            items = _news_items_of(event)
+            if items:
+                news_items_bytes += len(json.dumps(items, ensure_ascii=False).encode("utf-8"))
+                news_item_rows += len(items)
+                for item in items:
+                    unique.add(news_content_hash(item))
     return AuditReport(
         path=str(target),
         total_lines=total_lines,
@@ -280,17 +321,22 @@ def backfill_store(
     if target.is_file():
         for line in _iter_lines(target):
             try:
-                event = json.loads(line)
+                parsed = json.loads(line)
             except json.JSONDecodeError:
                 quarantine_lines.append(line)
                 continue
-            if not isinstance(event, dict):
+            events = _events_of_line(parsed)
+            if events is None:
                 quarantine_lines.append(line)
                 continue
-            normalized, _added = _normalize_event(event, news_index)
-            if normalized is not event:
-                events_rewritten += 1
-            rewritten_lines.append(json.dumps(normalized, ensure_ascii=False, sort_keys=True))
+            folded: list[dict[str, object]] = []
+            for event in events:
+                normalized, _added = _normalize_event(event, news_index)
+                if normalized is not event:
+                    events_rewritten += 1
+                folded.append(normalized)
+            rewritten = _rewrap_line(parsed, folded)
+            rewritten_lines.append(json.dumps(rewritten, ensure_ascii=False, sort_keys=True))
 
     rewritten_blob = "".join(f"{line}\n" for line in rewritten_lines)
     rewritten_bytes = len(rewritten_blob.encode("utf-8"))
@@ -405,34 +451,36 @@ def reconcile_store(path: str | Path) -> ReconcileReport:
     if target.is_file():
         for line in _iter_lines(target):
             try:
-                event = json.loads(line)
+                parsed = json.loads(line)
             except json.JSONDecodeError:
                 corrupt += 1
                 continue
-            if not isinstance(event, dict):
+            line_events = _events_of_line(parsed)
+            if line_events is None:
                 corrupt += 1
                 continue
-            checked += 1
-            context = event.get("market_context")
-            context_map = context if isinstance(context, Mapping) else {}
-            if event.get(NEWS_NORMALIZED_KEY) is not True:
-                # backfill対象だった(news_items全文を持つ)のに未正規化なら残存ドリフト。
-                if _news_items_of(event):
-                    unnormalized += 1
-                continue
-            normalized += 1
-            refs = context_map.get("news_item_refs")
-            refs = refs if isinstance(refs, list) else []
-            if context_map.get("news_count") != len(refs):
-                count_mismatch += 1
-            for digest in refs:
-                row = news_index.get(str(digest))
-                if row is None:
-                    missing_refs += 1
+            for event in line_events:
+                checked += 1
+                context = event.get("market_context")
+                context_map = context if isinstance(context, Mapping) else {}
+                if event.get(NEWS_NORMALIZED_KEY) is not True:
+                    # backfill対象だった(news_items全文を持つ)のに未正規化なら残存ドリフト。
+                    if _news_items_of(event):
+                        unnormalized += 1
                     continue
-                restored = {key: value for key, value in row.items() if key != "news_item_hash"}
-                if news_content_hash(restored) != str(digest):
-                    tampered += 1
+                normalized += 1
+                refs = context_map.get("news_item_refs")
+                refs = refs if isinstance(refs, list) else []
+                if context_map.get("news_count") != len(refs):
+                    count_mismatch += 1
+                for digest in refs:
+                    row = news_index.get(str(digest))
+                    if row is None:
+                        missing_refs += 1
+                        continue
+                    restored = {key: value for key, value in row.items() if key != "news_item_hash"}
+                    if news_content_hash(restored) != str(digest):
+                        tampered += 1
 
     # 読めない・空・欠損したログを「無損失」と認証してはいけない。検証対象が
     # 1件も無い状態は成功ではなく、検証不能としてfail closedにする。
