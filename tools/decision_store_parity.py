@@ -114,7 +114,10 @@ def verify_parity(
 
     corrupt = 0
     restore_failures = 0
-    restored_by_key: dict[str, str] = {}
+    # 同一 decision_id が複数回現れる場合(writer retry 等)に潰さないよう、
+    # キーごとに復元結果を*多重集合*として保持する。dictへ上書きすると
+    # 「backupに2行・正規化ログに1行」の欠落を parity_verified と誤判定する。
+    restored_by_key: dict[str, list[str]] = {}
     normalized_events = 0
     for event in _iter_events(normalized):
         if event.get("__corrupt__"):
@@ -126,28 +129,38 @@ def verify_parity(
         except KeyError:
             restore_failures += 1
             continue
-        restored_by_key[_key(restored)] = _canonical(restored)
+        restored_by_key.setdefault(_key(restored), []).append(_canonical(restored))
 
     backup_events = 0
     matched = 0
     mismatched = 0
     missing = 0
-    seen_keys: set[str] = set()
     for event in _iter_events(backup):
         if event.get("__corrupt__"):
             corrupt += 1
             continue
         backup_events += 1
-        key = _key(event)
-        seen_keys.add(key)
-        restored_blob = restored_by_key.get(key)
-        if restored_blob is None:
+        # backup 側も正規化済みでありうる。writer が先に畳んだ行は backfill 前から
+        # 参照形式で、そのまま比較すると無損失な backfill を mismatch と誤判定する。
+        # 双方を同じ表現(復元後)へ揃えてから突合する。
+        try:
+            backup_restored = restore_event(event, news_index)
+        except KeyError:
+            restore_failures += 1
+            continue
+        candidates = restored_by_key.get(_key(backup_restored))
+        if not candidates:
             missing += 1
-        elif restored_blob == _canonical(event):
+            continue
+        blob = _canonical(backup_restored)
+        if blob in candidates:
+            candidates.remove(blob)
             matched += 1
         else:
+            # 同じキーで内容が違う行しか残っていない。1件消費して mismatch とする。
+            candidates.pop()
             mismatched += 1
-    extra = sum(1 for key in restored_by_key if key not in seen_keys)
+    extra = sum(len(blobs) for blobs in restored_by_key.values())
 
     ok = (
         backup_events > 0

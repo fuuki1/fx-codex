@@ -264,6 +264,7 @@ def backfill_store(
         backup_dir = target.parent / f"decision_store_admin-{stamp}-{suffix}"
     backup_path = backup_dir / f"{target.name}.original"
     quarantine_path = backup_dir / f"{target.name}.quarantine"
+    sidecar_backup_path = backup_dir / f"{target.stem}{NEWS_SIDECAR_SUFFIX}.original"
     report_path = backup_dir / "backfill_report.json"
     sidecar_path = news_sidecar_path(target)
 
@@ -297,6 +298,11 @@ def backfill_store(
     if apply and target.is_file():
         backup_dir.mkdir(parents=True, exist_ok=False)
         shutil.copy2(target, backup_path)
+        # サイドカーも置換対象なので必ず退避する。読めなかった行は索引に載らず、
+        # 置換で消える。判断ログだけを退避していると、参照されたニュースが
+        # 復元不能になる runtime evidence の消失になる。
+        if sidecar_path.is_file():
+            shutil.copy2(sidecar_path, sidecar_backup_path)
         if quarantine_lines:
             _atomic_text(quarantine_path, "".join(f"{q}\n" for q in quarantine_lines))
         _atomic_text(
@@ -428,7 +434,10 @@ def reconcile_store(path: str | Path) -> ReconcileReport:
                 if news_content_hash(restored) != str(digest):
                     tampered += 1
 
-    drift = unnormalized + missing_refs + tampered + count_mismatch
+    # 読めない・空・欠損したログを「無損失」と認証してはいけない。検証対象が
+    # 1件も無い状態は成功ではなく、検証不能としてfail closedにする。
+    unavailable = 1 if checked == 0 else 0
+    drift = unnormalized + missing_refs + tampered + count_mismatch + corrupt + unavailable
     return ReconcileReport(
         path=str(target),
         news_sidecar_path=str(sidecar_path),
