@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+import os
 
 from fx_intel import trade_outcome
 from fx_intel.price_history import append_snapshot_entries, snapshot_entries
 from fx_intel.price_path_adapter import (
     ADAPTER_OHLC_SCOPE,
+    ADAPTER_WRITER_ID,
     ADAPTER_TIMEFRAME,
     BAR_SECONDS,
     build_closed_bars,
@@ -195,3 +197,48 @@ def test_truncated_trailing_line_does_not_lose_earlier_ticks() -> None:
     good = json.dumps(_tick(0, 150.0), ensure_ascii=False)
     ticks = list(iter_ticks([good, '{"instrument": "USDJPY", "quality_st']))
     assert len(ticks) == 1
+
+
+def test_rerun_from_a_different_process_does_not_conflict(tmp_path) -> None:
+    """別 process が同じバーを再生成しても追記が失敗しないこと。
+
+    実機の全量 run が exit 74 で全拒否された原因。`_same_snapshot` は
+    writer_id の不一致を内容比較より先に「競合する writer」と判定するため、
+    writer_id に PID を含めると再実行のたびに別 writer になり、既に書いた
+    バーを再生成した時点で追記全体が fail-closed に当たる。
+    """
+    prices = tmp_path / "prices.jsonl"
+    ticks = _ticks(
+        [
+            _tick(0, 150.0),
+            _tick(60, 151.0),
+            _tick(BAR_SECONDS, 152.0),
+            _tick(BAR_SECONDS + 60, 152.5),
+        ]
+    )
+    bars = build_closed_bars(ticks, as_of=BASE + timedelta(hours=1))
+    assert len(bars) == 2
+
+    # 1回目: 一部だけ書く(--limit 相当)
+    first = append_snapshot_entries(prices, build_rows(bars[-1:], run_id="run-A"))
+    assert first == 1
+
+    # 2回目: 別 run_id で全量。既に書いたバーを含むが、内容は同一なので
+    # 重複としてスキップされ、新しいバーだけが追記されるべき。
+    second = append_snapshot_entries(prices, build_rows(bars, run_id="run-B"))
+    assert second == 1, "既存バーの再生成が競合扱いされている"
+
+    written = [json.loads(line) for line in prices.read_text().splitlines() if line.strip()]
+    assert len(written) == 2
+
+
+def test_writer_id_is_stable_across_runs() -> None:
+    """writer_id に PID 等の実行ごとに変わる値を混ぜない。"""
+    ticks = _ticks([_tick(0, 150.0)])
+    bars = build_closed_bars(ticks, as_of=BASE + timedelta(hours=1))
+
+    a = build_rows(bars, run_id="x")[0]
+    b = build_rows(bars, run_id="y")[0]
+
+    assert a["writer_id"] == b["writer_id"] == ADAPTER_WRITER_ID
+    assert str(os.getpid()) not in str(a["writer_id"])

@@ -57,6 +57,13 @@ ADAPTER_OHLC_SCOPE = "lower_timeframe_closed_bar"
 # 既存 15m/1h/4h/1d と自然キーで衝突しないための専用 timeframe 名。
 ADAPTER_TIMEFRAME = "5m_datafeed"
 ADAPTER_SOURCE = "dukascopy_datafeed"
+# 同じ tick から同じバーを再生成した場合、内容は完全に一致する。
+# ところが `_same_snapshot` は writer_id が異なると内容を見る前に「競合する
+# writer」と判定する。writer_id に PID を含めると再実行のたびに別 writer に
+# なり、既に書いた行を再生成した時点で fail-closed に当たって全量が拒否される
+# (実機で exit 74 になった原因)。このアダプタは「どの process が動かしても
+# 同一の論理 writer」なので、PID を含めない固定 ID を名乗る。
+ADAPTER_WRITER_ID = "price_path_adapter"
 # capture_slot の量子化単位と一致させる(これより細かいと 1 スロットで衝突する)。
 BAR_SECONDS = SNAPSHOT_CADENCE_SECONDS
 USABLE_QUALITY_STATE = "usable"
@@ -258,8 +265,13 @@ def build_rows(
     bars: Sequence[ClosedBar],
     *,
     run_id: str,
-    writer_id: str,
+    writer_id: str = ADAPTER_WRITER_ID,
 ) -> list[dict[str, object]]:
+    """確定足を追記可能な行へ変換する。
+
+    writer_id は既定で固定値。process ごとに変えると、同じバーの再生成が
+    `_same_snapshot` で「別 writer による競合」と判定され追記全体が失敗する。
+    """
     return [bar.to_row(run_id=run_id, writer_id=writer_id) for bar in bars]
 
 

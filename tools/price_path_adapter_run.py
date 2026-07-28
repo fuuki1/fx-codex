@@ -31,7 +31,6 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
-import socket
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +43,7 @@ from fx_intel.price_history import (  # noqa: E402
 )
 from fx_intel.price_path_adapter import (  # noqa: E402
     ADAPTER_TIMEFRAME,
+    ADAPTER_WRITER_ID,
     PricePathAdapterError,
     build_closed_bars,
     build_rows,
@@ -64,7 +64,12 @@ def _run_id(now: datetime) -> str:
 
 
 def _writer_id() -> str:
-    return f"{socket.gethostname().split('.')[0]}:{os.getpid()}"
+    """このアダプタの論理 writer ID。
+
+    PID を含めてはいけない。`_same_snapshot` は writer_id 不一致を内容比較より
+    先に「競合」と判定するため、process ごとに変えると再実行が必ず失敗する。
+    """
+    return ADAPTER_WRITER_ID
 
 
 def main(argv: list[str] | None = None) -> int:
