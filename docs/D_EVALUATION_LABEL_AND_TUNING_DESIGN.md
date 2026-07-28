@@ -330,7 +330,7 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   gross黒字を使った代替昇格・ガード解除は行わない。
 - canonical outcomeは `prediction_time` と `holding_end_time` を保存する。
   `effective_samples.summarize_effective_samples()` は5分の最小間隔、保有区間の重複、
-  同一symbol、同じ符号の共通通貨エクスポージャー、FX市場日を使い、
+  同一symbol、共通通貨エクスポージャー(符号は問わない)、FX市場日を使い、
   raw/effective/overlap/cluster/market-day件数を決定論的に返す。
 - canonical gross/net集計の `sample_ok` はraw件数ではなくeffective件数で判定し、
   時刻欠損・naive時刻・競合duplicateがある場合はfail-closedにする。
