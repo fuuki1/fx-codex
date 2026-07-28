@@ -123,8 +123,12 @@ def _parse_ts(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _is_pit_eligible_fusion_row(entry: dict[str, Any]) -> bool:
-    """Mirror fx_intel.journal's fail-closed fusion learning provenance contract."""
+def _is_pit_eligible_row(entry: dict[str, Any]) -> bool:
+    """Mirror fx_intel.journal's fail-closed learning provenance contract.
+
+    融合・時間足別のどちらの判断行にも同じ契約を適用する。判定は行が持つ
+    PIT封筒だけを見るため mode 非依存であり、封筒を欠く行は False になる。
+    """
     if entry.get("pit_eligible") is not True:
         return False
 
@@ -643,7 +647,10 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         parsed.append((ts, entry))
         if close is not None and symbol:
             prices.setdefault((symbol, timeframe), []).append((ts, close))
-            if not timeframe and _is_pit_eligible_fusion_row(entry):
+            # PIT適格行の価格系列。時間足別も適格になり得るため mode で絞らない。
+            # ここを融合限定にすると、適格な時間足別行が空系列を引いて
+            # 常に pending になる(採点が止まる)。
+            if _is_pit_eligible_row(entry):
                 pit_prices.setdefault((symbol, timeframe), []).append((ts, close))
     for series in prices.values():
         series.sort(key=lambda row: row[0])
@@ -663,7 +670,10 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         direction = str(entry.get("direction") or "").strip().lower()
         symbol = str(entry.get("symbol") or "")
         timeframe = str(entry.get("timeframe") or "").strip().lower()
-        pit_eligible = _is_pit_eligible_fusion_row(entry) if not timeframe else False
+        # 時間足別の行も PIT 封筒を持つため、mode で決め打ちせず行の内容で判定する。
+        # 旧実装は時間足別を常に False にしており、封筒配線後に read API と
+        # dual-read 差分(drift_detected)を生んでいた。
+        pit_eligible = _is_pit_eligible_row(entry)
         ts_text = ts.isoformat()
         display_base = {
             "ts": ts_text,

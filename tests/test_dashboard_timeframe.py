@@ -1008,3 +1008,80 @@ def test_flat_does_not_inflate_hit_rate_denominator(server) -> None:
     assert cell == {"evaluated": 1, "hits": 1, "flat": 1}
     # 的中率は flat を含まない 1/1
     assert result["hit_rate"] == 1.0
+
+
+def _pit_envelope(ts, *, source_cutoff=None):
+    """判断行に付く PIT 封筒(fx_intel.journal.pit_metadata_for_plan 相当)。"""
+
+    cutoff = source_cutoff or ts
+    return {
+        "pit_eligible": True,
+        "pit_contract": "decision-journal-pit-v2",
+        "producer": "timeframe_raw",
+        "producer_version": "timeframe-journal-v2",
+        "prediction_time": ts.isoformat(),
+        "source_cutoff": cutoff.isoformat(),
+        "max_feature_available_time": ts.isoformat(),
+        "input_context_id": "context:sha256:" + "a" * 64,
+        "source_record_ids": ["us10y:2026-07-24"],
+    }
+
+
+def test_timeframe_rows_with_pit_envelope_are_eligible(server) -> None:
+    """時間足別の判断行も PIT 適格として扱う。
+
+    2026-07-28 の実機で、read API は pit_eligible=True、dashboard は False を
+    返し dual-read が drift_detected になった回帰。raw journal の実値は True で、
+    dashboard 側が mode で決め打ちしていたのが誤りだった。
+    """
+
+    row = {**_row(START, "1h", 1.0, "long", 156.0), **_pit_envelope(START)}
+    assert server._is_pit_eligible_row(row) is True
+
+    fusion = {**_row(START, "", 24.0, "long", 156.0), **_pit_envelope(START)}
+    fusion["producer"] = "fusion_raw"
+    assert server._is_pit_eligible_row(fusion) is True
+
+
+def test_rows_without_envelope_stay_ineligible(server) -> None:
+    """封筒を持たない旧行は fail-closed のまま(適格化してはいけない)。"""
+
+    assert server._is_pit_eligible_row(_row(START, "1h", 1.0, "long", 156.0)) is False
+    assert server._is_pit_eligible_row(_row(START, "", 24.0, "long", 156.0)) is False
+
+
+def test_pit_eligible_timeframe_rows_are_still_scored(server) -> None:
+    """適格な時間足別行が pending へ落ちず、従来どおり採点されること。
+
+    pit_prices を融合限定のままにすると、適格な時間足別行が空系列を引いて
+    常に pending になる。採点が止まらないことを固定する。
+    """
+
+    entries = [
+        {**_row(START, "1h", 1.0, "long", 156.0), **_pit_envelope(START)},
+        {
+            **_row(START + timedelta(hours=1), "1h", 1.0, "long", 156.4),
+            **_pit_envelope(START + timedelta(hours=1)),
+        },
+    ]
+    result = server._evaluate_journal(entries)
+    assert result["evaluated"] == 1
+    assert result["hits"] == 1
+    assert result["by_timeframe"]["1h"] == {"evaluated": 1, "hits": 1, "flat": 0}
+
+
+def test_display_decisions_expose_timeframe_pit_eligibility(server) -> None:
+    """dual-read が比較する display 行の pit_eligible が True になること。"""
+
+    entries = [
+        {**_row(START, "1h", 1.0, "long", 156.0), **_pit_envelope(START)},
+        {
+            **_row(START + timedelta(hours=1), "1h", 1.0, "long", 156.4),
+            **_pit_envelope(START + timedelta(hours=1)),
+        },
+    ]
+    result = server._evaluate_journal(entries)
+    by_tf = result["recent_decisions_by_timeframe"]
+    rows = by_tf.get("1h") or []
+    assert rows, "1h の display 行が無い"
+    assert all(r["pit_eligible"] is True for r in rows)
