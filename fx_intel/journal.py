@@ -84,6 +84,10 @@ def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
 # (含めると反実仮想の根拠が汚染される)。
 GUARD_COUNTERFACTUAL_GATE = "expectancy_guard"
 SHADOW_FUSION_PRODUCER = "fusion_raw"
+# 時間足別判断のシャドー producer。融合判断は fusion_raw、時間足別判断は
+# timeframe_raw を凍結記録する(fx_intel.timeframe が build_shadow_predictions で生成)。
+# 反実仮想の再構成は、その行自身の判断経路と同じ producer から行う。
+SHADOW_TIMEFRAME_PRODUCER = "timeframe_raw"
 # 合成行に立てるマーカー。採点側(learning / trade_outcome)はこのキーで
 # 「実際の推奨」と「ガード見送り中のシャドー計画」を区別して集計に注記する。
 COUNTERFACTUAL_ENTRY_KEY = "counterfactual_guard"
@@ -319,8 +323,9 @@ def counterfactual_guard_entries(
     期待値ガードは自分がブロックした判断の結果を観測できないため、放置すると
     根拠サンプルが増えず永久ブロックに陥る(学習飢餓)。この関数は、ゲート前の
     分析方向(analysis_direction)と判断時に凍結記録済みのシャドーSL/TP
-    (shadow_predictionsのfusion_raw)から「ガードが無ければ推奨していた計画」を
-    合成し、既存の採点エンジンへそのまま流せる行として返す。
+    (融合判断は fusion_raw、時間足別判断は timeframe_raw)から「ガードが
+    無ければ推奨していた計画」を合成し、既存の採点エンジンへそのまま流せる行として返す。
+    どちらの経路も同じ contract で採点し、その行自身の経路の producer からのみ再構成する。
 
     PIT安全性: 合成に使う値はすべて判断時点で記録済みのもの(分析方向・
     分析確信度・凍結SL/TP)に限る。事後の再計算・推定は行わず、必要な記録が
@@ -335,7 +340,7 @@ def counterfactual_guard_entries(
         direction = entry.get("analysis_direction")
         if direction not in ("long", "short"):
             continue
-        prediction = _fusion_shadow_prediction(entry)
+        prediction = _guard_shadow_prediction(entry)
         if prediction is None:
             continue
         if prediction.get("direction") != direction:
@@ -364,14 +369,26 @@ def counterfactual_guard_entries(
     return output
 
 
-def _fusion_shadow_prediction(entry: Mapping[str, object]) -> Mapping[str, object] | None:
+def _guard_shadow_producer(entry: Mapping[str, object]) -> str:
+    """その行の判断経路に対応するシャドー producer を返す。
+
+    時間足別判断(timeframe フィールドあり)は timeframe_raw を、融合判断は
+    fusion_raw を凍結記録する。反実仮想は必ずその行自身の経路の producer から
+    再構成する(別経路のシャドーを混ぜない)。
+    """
+    timeframe = str(entry.get("timeframe", "")).strip()
+    return SHADOW_TIMEFRAME_PRODUCER if timeframe else SHADOW_FUSION_PRODUCER
+
+
+def _guard_shadow_prediction(entry: Mapping[str, object]) -> Mapping[str, object] | None:
     predictions = entry.get("shadow_predictions")
     if not isinstance(predictions, (list, tuple)):
         return None
+    producer = _guard_shadow_producer(entry)
     for row in predictions:
         if (
             isinstance(row, Mapping)
-            and str(row.get("producer", "")) == SHADOW_FUSION_PRODUCER
+            and str(row.get("producer", "")) == producer
             and row.get("eligible_for_scoring") is True
         ):
             return row

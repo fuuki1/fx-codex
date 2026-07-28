@@ -105,6 +105,82 @@ def test_counterfactual_synthesis_restores_frozen_plan() -> None:
     assert journal.COUNTERFACTUAL_ENTRY_KEY not in entry
 
 
+def _tf_guard_blocked_row(
+    ts: datetime,
+    *,
+    symbol: str = "USDJPY",
+    close: float = 100.0,
+    direction: str = "long",
+    conviction: int = 55,
+    atr: float = 1.0,
+    timeframe: str = "1h",
+    producer: str = "timeframe_raw",
+    **overrides: object,
+) -> dict:
+    """時間足別判断のガード見送り行。shadow producer は timeframe_raw。"""
+    sign = 1.0 if direction == "long" else -1.0
+    risk = atr * SHADOW_RISK
+    row = _row(ts, symbol=symbol, close=close, atr=atr)
+    row.update(
+        {
+            "timeframe": timeframe,
+            "direction": "neutral",
+            "conviction": 0,
+            "analysis_direction": direction,
+            "analysis_conviction": conviction,
+            "gate_trace": [
+                {"gate": "expectancy_guard", "status": "blocked"},
+                {"gate": "liquidity", "status": "observed"},
+            ],
+            "shadow_predictions": [
+                {
+                    "producer": producer,
+                    "direction": direction,
+                    "eligible_for_scoring": True,
+                    "stop": close - sign * risk,
+                    "target1": close + sign * risk,
+                    "target2": close + sign * risk * 2.0,
+                    "target_policy": {"policy_id": "shadow-default-atr-v1"},
+                }
+            ],
+        }
+    )
+    row.update(overrides)
+    return row
+
+
+def test_counterfactual_synthesis_restores_timeframe_plan() -> None:
+    # 時間足別判断(timeframe あり)は timeframe_raw シャドーから再構成する。
+    # 融合路(fusion_raw)しか見ていなかった欠陥の回帰テスト。
+    entry = _tf_guard_blocked_row(MONDAY + 8 * HOUR, timeframe="1h")
+    synthesized = journal.counterfactual_guard_entries([entry])
+
+    assert len(synthesized) == 1
+    synth = synthesized[0]
+    assert synth["direction"] == "long"
+    assert synth["conviction"] == 55
+    assert synth["timeframe"] == "1h"
+    assert synth["stop"] == 97.5
+    assert synth["target1"] == 102.5
+    assert synth["target2"] == 105.0
+    assert synth[journal.COUNTERFACTUAL_ENTRY_KEY] is True
+    # 元の行は破壊しない
+    assert entry["direction"] == "neutral"
+    assert journal.COUNTERFACTUAL_ENTRY_KEY not in entry
+
+
+def test_counterfactual_uses_path_matching_producer() -> None:
+    # 各行は自分の経路の producer からのみ再構成する(別経路のシャドーは使わない)。
+    # 時間足別行に fusion_raw しか無い/融合行に timeframe_raw しか無い場合は
+    # fail-closed で対象外になる。
+    tf_wrong = _tf_guard_blocked_row(MONDAY + 8 * HOUR, timeframe="1h", producer="fusion_raw")
+    assert journal.counterfactual_guard_entries([tf_wrong]) == []
+
+    fusion_wrong = _guard_blocked_row(MONDAY + 8 * HOUR)
+    fusion_wrong["shadow_predictions"][0]["producer"] = "timeframe_raw"
+    assert journal.counterfactual_guard_entries([fusion_wrong]) == []
+
+
 def test_counterfactual_requires_guard_only_block() -> None:
     # event_window等のデータ・リスク由来ゲートが併発した行は、ガードが無くても
     # 見送っていた行なので反実仮想に含めない
