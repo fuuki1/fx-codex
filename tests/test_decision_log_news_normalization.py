@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import multiprocessing
 from pathlib import Path
 
 from fx_intel import decision_log
@@ -106,6 +108,101 @@ def test_events_without_news_are_written_unchanged(tmp_path: Path) -> None:
     written = _lines(log)[0]
     assert written == bare
     assert not decision_log.news_sidecar_path(log).exists()
+
+
+def _append_shared_batch(log_path: str) -> None:
+    """別プロセスから同一ニュースを書く(サイドカー排他の反証用)。"""
+
+    shared = [_news(0), _news(1)]
+    decision_log.append_decision_events(Path(log_path), [_event("d", shared)], normalize_news=True)
+
+
+def test_concurrent_processes_do_not_duplicate_sidecar_rows(tmp_path: Path) -> None:
+    """読取り→追記の間にロックが途切れると、同じニュースが二重追記される。"""
+
+    log = tmp_path / "decisions.jsonl"
+    context = multiprocessing.get_context("spawn")
+    workers = [context.Process(target=_append_shared_batch, args=(str(log),)) for _ in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=60)
+
+    assert [worker.exitcode for worker in workers] == [0, 0, 0, 0]
+    sidecar = _lines(decision_log.news_sidecar_path(log))
+    hashes = [row["news_item_hash"] for row in sidecar]
+    # 4プロセスが同じ2件を書いても、サイドカーは各1回だけ持つ。
+    assert sorted(hashes) == sorted(set(hashes))
+    assert len(hashes) == 2
+
+
+def test_concurrent_threads_do_not_duplicate_sidecar_rows(tmp_path: Path) -> None:
+    log = tmp_path / "decisions.jsonl"
+    shared = [_news(0), _news(1)]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(
+            pool.map(
+                lambda index: decision_log.append_decision_events(
+                    log, [_event(f"d-{index}", shared)]
+                ),
+                range(4),
+            )
+        )
+
+    hashes = [row["news_item_hash"] for row in _lines(decision_log.news_sidecar_path(log))]
+    assert sorted(hashes) == sorted(set(hashes))
+    assert len(hashes) == 2
+    # 判断行は4件すべて残り、参照はサイドカーで解決できる。
+    known = set(hashes)
+    written = _lines(log)
+    assert len(written) == 4
+    for row in written:
+        for ref in row["market_context"]["news_item_refs"]:
+            assert ref in known
+
+
+def test_sidecar_scan_happens_under_the_lock(tmp_path: Path) -> None:
+    """既存ハッシュの走査はロック取得後でなければならない。
+
+    読取りを先に済ませてから施錠する実装では、2つのwriterが同じニュースを
+    「未登録」と観測してから順に追記でき、exactly-once契約が壊れる。ここでは
+    施錠時点を記録して、走査がその後に起きることを直接検証する。
+    """
+
+    log = tmp_path / "decisions.jsonl"
+    sidecar = decision_log.news_sidecar_path(log)
+    sidecar.write_text(
+        json.dumps({"news_item_hash": "seed", "title": "seed"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    events: list[str] = []
+    real_flock = decision_log.fcntl.flock
+
+    def tracking_flock(fileno: int, operation: int) -> None:
+        if operation == decision_log.fcntl.LOCK_EX:
+            events.append("lock")
+        real_flock(fileno, operation)
+
+    original_loads = decision_log.json.loads
+
+    def tracking_loads(text: str, *args: object, **kwargs: object) -> object:
+        # サイドカー既存行の解釈は走査の一部。
+        if '"news_item_hash"' in text:
+            events.append("scan")
+        return original_loads(text, *args, **kwargs)
+
+    decision_log.fcntl.flock = tracking_flock  # type: ignore[assignment]
+    decision_log.json.loads = tracking_loads  # type: ignore[assignment]
+    try:
+        decision_log.append_decision_events(log, [_event("d", [_news(0)])])
+    finally:
+        decision_log.fcntl.flock = real_flock  # type: ignore[assignment]
+        decision_log.json.loads = original_loads  # type: ignore[assignment]
+
+    assert "scan" in events, "既存サイドカー行が走査されていない"
+    assert events.index("lock") < events.index("scan")
 
 
 def test_hash_is_stable_regardless_of_key_order(tmp_path: Path) -> None:

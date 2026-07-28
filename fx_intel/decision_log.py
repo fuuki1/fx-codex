@@ -337,14 +337,26 @@ def news_sidecar_path(path: str | Path) -> Path:
 
 
 def _append_news_sidecar(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
-    """Append only news items this sidecar has not recorded yet."""
+    """Append only news items this sidecar has not recorded yet.
+
+    The existing hashes are scanned *while holding the exclusive lock*. Reading
+    first and locking afterwards would let two concurrent writers each observe
+    the same item as absent and then append it in turn, which breaks the
+    exactly-once contract this sidecar exists to provide. Competing writers are
+    a documented operational risk here, so the whole read-decide-append cycle is
+    serialized.
+    """
 
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    known: set[str] = set()
-    if path.exists():
-        with path.open("r", encoding="utf-8") as handle:
+    # "a+" creates the file when absent and still permits reading, so the lock
+    # can be taken before the first byte is examined.
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            known: set[str] = set()
             for line in handle:
                 stripped = line.strip()
                 if not stripped:
@@ -355,21 +367,20 @@ def _append_news_sidecar(path: Path, rows: Sequence[Mapping[str, object]]) -> No
                     # A damaged sidecar line must not abort the decision write;
                     # the worst case is re-appending one already-known item.
                     continue
-    pending: list[Mapping[str, object]] = []
-    for row in rows:
-        digest = str(row.get("news_item_hash", ""))
-        if not digest or digest in known:
-            continue
-        known.add(digest)
-        pending.append(row)
-    if not pending:
-        return
-    payload = "".join(
-        json.dumps(_json_ready(row), ensure_ascii=False, allow_nan=False) + "\n" for row in pending
-    )
-    with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
+            pending: list[Mapping[str, object]] = []
+            for row in rows:
+                digest = str(row.get("news_item_hash", ""))
+                if not digest or digest in known:
+                    continue
+                known.add(digest)
+                pending.append(row)
+            if not pending:
+                return
+            payload = "".join(
+                json.dumps(_json_ready(row), ensure_ascii=False, allow_nan=False) + "\n"
+                for row in pending
+            )
+            handle.seek(0, os.SEEK_END)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
