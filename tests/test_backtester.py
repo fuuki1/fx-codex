@@ -10,7 +10,6 @@ from fx_backtester.cli import (
     _add_common_arguments,
     _build_config,
     _build_strategy_from_args,
-    _webhook_secret,
     main,
 )
 from fx_backtester.analysis import monthly_target_summary
@@ -30,7 +29,6 @@ from fx_backtester.strategies.filters import (
     NoTradeFilterConfig,
     RegimeFilterConfig,
 )
-from fx_backtester.tradingview import append_tradingview_alert, parse_tradingview_alert
 from fx_backtester.validation import ProductValidationError, validate_backtest_inputs
 from fx_backtester.walk_forward import WalkForwardConfig, WalkForwardValidator
 
@@ -1129,71 +1127,6 @@ def test_cli_append_options_override_default_lists() -> None:
     assert config.execution.slippage_time_multipliers == {12: 4.0}
     assert isinstance(strategy, FilteredStrategy)
     assert strategy.no_trade.blocked_entry_hours == (10,)
-
-
-def test_tradingview_json_alert_is_normalized_and_written(tmp_path) -> None:
-    body = json.dumps(
-        {
-            "secret": "shared",
-            "exchange": "OANDA",
-            "ticker": "OANDA:EURUSD",
-            "time": "2026-06-30T12:00:00Z",
-            "interval": "60",
-            "action": "buy",
-            "price": "1.075",
-            "contracts": "10000",
-            "order_id": "ma-cross-long",
-        }
-    ).encode("utf-8")
-
-    alert = parse_tradingview_alert(
-        body,
-        "application/json",
-        secret="shared",
-        received_at_utc="2026-06-30T12:00:01+00:00",
-    )
-    output = append_tradingview_alert(tmp_path / "alerts.jsonl", alert)
-
-    assert alert["source"] == "tradingview"
-    assert alert["symbol"] == "EURUSD"
-    assert alert["side"] == "buy"
-    assert alert["price"] == 1.075
-    assert alert["quantity"] == 10000.0
-    assert "secret" not in alert["raw"]
-    stored = json.loads(output.read_text(encoding="utf-8"))
-    assert stored["order_id"] == "ma-cross-long"
-
-
-def test_tradingview_alert_rejects_wrong_secret() -> None:
-    body = json.dumps({"secret": "wrong", "ticker": "EURUSD"}).encode("utf-8")
-
-    try:
-        parse_tradingview_alert(body, "application/json", secret="shared")
-    except PermissionError as error:
-        assert "invalid TradingView webhook secret" in str(error)
-    else:
-        raise AssertionError("Expected wrong TradingView secret to be rejected")
-
-
-def test_tradingview_text_alert_is_accepted() -> None:
-    alert = parse_tradingview_alert(
-        b"manual alert text",
-        "text/plain",
-        received_at_utc="2026-06-30T12:00:01+00:00",
-    )
-
-    assert alert["message"] == "manual alert text"
-    assert alert["raw"] == {"message": "manual alert text"}
-
-
-def test_webhook_secret_can_come_from_environment(monkeypatch) -> None:
-    monkeypatch.setenv("TRADINGVIEW_WEBHOOK_SECRET", "shared")
-
-    secret = _webhook_secret(
-        argparse.Namespace(secret=None, secret_env="TRADINGVIEW_WEBHOOK_SECRET")
-    )
-
-    assert secret == "shared"
 
 
 def test_time_varying_spread_and_slippage_multiplier() -> None:

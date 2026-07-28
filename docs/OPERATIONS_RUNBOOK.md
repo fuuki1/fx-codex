@@ -59,9 +59,9 @@ Discord通知失敗だけは専用終了コード5で識別し、launchdへ失�
 時間足別の出力は`logs/fx_integrated_briefing.log`、融合判断とschedule判定は
 `logs/fx_fusion_capture.log`で確認する。
 
-`--signal-board`と`fx_briefing_loop.sh`は開発・一時確認専用である。Mac miniの正規サービス、
-cron、旧plistのいずれかが動いている間は起動しない。`--no-price-write`でも判断ジャーナルは
-更新するので、briefing writerと共存できない。`--dry-run`もsource cache/event exportを更新し得るため、
+`--signal-board --dry-run`は開発・一時確認専用である。旧常駐loopは削除済みだが、
+別checkout・cron・既存processに残っていれば競合writerとして扱う。状態更新を伴う手動実行は
+briefing writerと共存できない。`--dry-run`もsource cache/event exportを更新し得るため、
 zero-write確認は正規runtimeと分離したcopyで行う。
 
 - LaunchAgent(gui/$UID)として動く。**Mac miniは自動ログイン運用が前提**
