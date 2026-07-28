@@ -11,9 +11,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, UTC
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 
 from . import journal
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
@@ -28,6 +31,14 @@ from .shadow_learning import (
 
 SCHEMA_VERSION = 1
 EVENT_TYPE = "chart_decision"
+# One run builds one market_context and embeds it into every decision of that
+# run, so a single news batch is duplicated once per symbol/timeframe. Folding
+# the full text into content-hash references at write time keeps the audit log
+# from growing by the square of its own inputs. The reference contract is shared
+# with tools/decision_store_admin.py so backfilled history and newly written
+# events are indistinguishable, and `restore` reverses either one.
+NEWS_SIDECAR_SUFFIX = "_news.jsonl"
+NEWS_NORMALIZED_KEY = "news_items_normalized"
 SCORING_METHOD = "tp_sl_mfe_mae_first_touch"
 SCORING_METRICS = (
     "first_touch",
@@ -263,14 +274,150 @@ def build_fusion_decision_events(
     return events
 
 
-def append_decision_events(path: str | Path, events: Iterable[Mapping[str, object]]) -> None:
-    """Append audit events as JSONL.  One line is one immutable decision event."""
+def news_content_hash(item: Mapping[str, object]) -> str:
+    """Stable content hash; key order never changes the identity of one item."""
+
+    encoded = json.dumps(
+        dict(item),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def normalize_news_items(
+    event: Mapping[str, object],
+) -> tuple[Mapping[str, object], list[dict[str, object]]]:
+    """Fold one event's full news text into content-hash references.
+
+    Returns the event and the news rows it newly referenced. Every other field —
+    decision, accounting, PIT and shadow metadata — is untouched. An
+    already-normalized event is returned unchanged, so re-running is a no-op.
+
+    When there is nothing to fold, the *original* object is returned rather than
+    a copy: copying here would consume a mapping whose serialization is going to
+    fail, and swallow the error that must reach the caller before any write.
+    """
+
+    if event.get(NEWS_NORMALIZED_KEY) is True:
+        return event, []
+    context = event.get("market_context")
+    if not isinstance(context, Mapping):
+        return event, []
+    items = context.get("news_items")
+    if not isinstance(items, list):
+        return event, []
+
+    refs: list[str] = []
+    rows: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        digest = news_content_hash(item)
+        refs.append(digest)
+        rows.append({"news_item_hash": digest, **dict(item)})
+
+    new_context = dict(context)
+    new_context.pop("news_items", None)
+    new_context["news_item_refs"] = refs
+    new_context["news_count"] = len(refs)
+    rewritten = dict(event)
+    rewritten["market_context"] = new_context
+    rewritten[NEWS_NORMALIZED_KEY] = True
+    return rewritten, rows
+
+
+def news_sidecar_path(path: str | Path) -> Path:
+    """Return the sidecar that holds each referenced news item exactly once."""
+
+    target = Path(path)
+    return target.with_name(f"{target.stem}{NEWS_SIDECAR_SUFFIX}")
+
+
+def _append_news_sidecar(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    """Append only news items this sidecar has not recorded yet."""
+
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    known: set[str] = set()
+    if path.exists():
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    known.add(str(json.loads(stripped).get("news_item_hash", "")))
+                except json.JSONDecodeError:
+                    # A damaged sidecar line must not abort the decision write;
+                    # the worst case is re-appending one already-known item.
+                    continue
+    pending: list[Mapping[str, object]] = []
+    for row in rows:
+        digest = str(row.get("news_item_hash", ""))
+        if not digest or digest in known:
+            continue
+        known.add(digest)
+        pending.append(row)
+    if not pending:
+        return
+    payload = "".join(
+        json.dumps(_json_ready(row), ensure_ascii=False, allow_nan=False) + "\n" for row in pending
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def append_decision_events(
+    path: str | Path,
+    events: Iterable[Mapping[str, object]],
+    *,
+    normalize_news: bool = True,
+) -> None:
+    """Durably append one locked audit batch; one line is one immutable event.
+
+    News text is folded into hash references before the decision line is
+    written, and the referenced items are persisted to the sidecar first — so a
+    crash between the two writes can only leave an unreferenced news row, never
+    a decision whose references cannot be resolved.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    prepared: list[Mapping[str, object]] = []
+    news_rows: list[dict[str, object]] = []
+    for event in events:
+        if normalize_news:
+            rewritten, rows = normalize_news_items(event)
+            prepared.append(rewritten)
+            news_rows.extend(rows)
+        else:
+            prepared.append(event)
+    if normalize_news:
+        _append_news_sidecar(news_sidecar_path(target), news_rows)
+
+    payload = "".join(
+        json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n"
+        for event in prepared
+    )
     with target.open("a", encoding="utf-8") as handle:
-        for event in events:
-            handle.write(json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if payload:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def save_latest_snapshot(
@@ -301,29 +448,55 @@ def save_latest_snapshot(
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
+    serialized = json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, allow_nan=False)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def read_decision_events(path: str | Path):
-    """Read append-only decision events.  Corrupt lines are skipped."""
+    """Stream append-only decision events. Corrupt lines are skipped.
+
+    A production audit log can exceed one gigabyte. Reading it with
+    ``read_text().splitlines()`` duplicates the complete corpus in memory before
+    scoring begins, so consumers must receive one decoded event at a time.
+    """
 
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        handle = Path(path).open(encoding="utf-8")
     except OSError:
         return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            yield event
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                yield event
 
 
 def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, object] | None:
@@ -487,18 +660,30 @@ def score_decision_events(
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    input_events = list(events)
-    pit_eligible_events = [event for event in input_events if journal.is_pit_eligible_entry(event)]
-    materialized_events = pit_eligible_events if require_pit else input_events
-    event_entries = [
-        entry
-        for event in materialized_events
-        if (entry := decision_event_to_scoring_entry(event)) is not None
-    ]
-    shadow_entries = [
-        entry for event in materialized_events for entry in decision_event_to_shadow_entries(event)
-    ]
-    shadow_predictions = _shadow_prediction_inventory(materialized_events)
+    # Project each full audit event during a single pass. The historical
+    # implementation retained the raw events, a second PIT-filtered list, and
+    # all derived projections simultaneously. On a 1 GB audit log that caused
+    # multi-gigabyte RSS and increased contention with the five-minute writer.
+    input_event_count = 0
+    pit_eligible_count = 0
+    event_entries: list[dict[str, object]] = []
+    shadow_entries: list[dict[str, object]] = []
+    shadow_prediction_events: list[Mapping[str, object]] = []
+    for event in events:
+        input_event_count += 1
+        eligible = journal.is_pit_eligible_entry(event)
+        if eligible:
+            pit_eligible_count += 1
+        if require_pit and not eligible:
+            continue
+        entry = decision_event_to_scoring_entry(event)
+        if entry is not None:
+            event_entries.append(entry)
+        shadow_entries.extend(decision_event_to_shadow_entries(event))
+        inventory_view = _shadow_inventory_view(event)
+        if inventory_view is not None:
+            shadow_prediction_events.append(inventory_view)
+    shadow_predictions = _shadow_prediction_inventory(shadow_prediction_events)
     normalized_prices = [_normalize_price_entry(row) for row in price_entries]
     final_entries = event_entries + normalized_prices
     all_entries = final_entries + shadow_entries
@@ -648,9 +833,9 @@ def score_decision_events(
             "generated_at": generated_at.isoformat(),
             "pit_contract": (journal.DECISION_JOURNAL_PIT_CONTRACT if require_pit else None),
             "pit_required": require_pit,
-            "input_decision_events": len(input_events),
-            "pit_eligible_decision_events": len(pit_eligible_events),
-            "pit_ineligible_decision_events": len(input_events) - len(pit_eligible_events),
+            "input_decision_events": input_event_count,
+            "pit_eligible_decision_events": pit_eligible_count,
+            "pit_ineligible_decision_events": input_event_count - pit_eligible_count,
             "scoring_method": SCORING_METHOD,
             "metrics": list(SCORING_METRICS),
             "decision_events": len(event_entries),
@@ -670,6 +855,26 @@ def score_decision_events(
             "learning_observations": learning_observations,
         }
     )
+
+
+def _shadow_inventory_view(event: Mapping[str, object]) -> dict[str, object] | None:
+    """Retain only the event fields consumed by shadow inventory reporting."""
+
+    decision = event.get("decision")
+    if not isinstance(decision, Mapping):
+        return None
+    predictions = decision.get("shadow_predictions")
+    if not isinstance(predictions, list) or not predictions:
+        return None
+    return {
+        "decision": {"shadow_predictions": predictions},
+        "decision_id": event.get("decision_id"),
+        "run_id": event.get("run_id"),
+        "ts": event.get("ts"),
+        "symbol": event.get("symbol"),
+        "mode": event.get("mode"),
+        "timeframe": event.get("timeframe"),
+    }
 
 
 def _shadow_prediction_inventory(
@@ -821,6 +1026,8 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "direction": getattr(plan, "direction", ""),
         "direction_ja": getattr(plan, "direction_ja", ""),
         "conviction": _int_or_none(getattr(plan, "conviction", None)),
+        "analysis_direction": getattr(plan, "analysis_direction", ""),
+        "analysis_conviction": _int_or_none(getattr(plan, "analysis_conviction", None)),
         "tf_score": _number_or_none(getattr(plan, "tf_score", None)),
         "news_score": _number_or_none(getattr(plan, "news_score", None)),
         "composite": _number_or_none(getattr(plan, "composite", None)),
@@ -913,6 +1120,8 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "direction": getattr(plan, "direction", ""),
         "direction_ja": getattr(plan, "direction_ja", ""),
         "conviction": _int_or_none(getattr(plan, "conviction", None)),
+        "analysis_direction": getattr(plan, "analysis_direction", ""),
+        "analysis_conviction": _int_or_none(getattr(plan, "analysis_conviction", None)),
         "composite": _number_or_none(getattr(plan, "composite", None)),
         "tech_score": _number_or_none(getattr(plan, "tech_score", None)),
         "news_score": _number_or_none(getattr(plan, "news_score", None)),
