@@ -908,12 +908,24 @@ def _shadow_prediction_inventory(
 
 
 def save_outcome_report(report: Mapping[str, object], path: str | Path) -> None:
-    """Save the TP/SL/MFE/MAE scoring report for the complete decision log."""
+    """Save the TP/SL/MFE/MAE scoring report for the complete decision log.
+
+    The report embeds one row per scored outcome, so on a production-sized log
+    it reaches hundreds of megabytes and is re-read by the five-minute briefing.
+    It is machine-read only — every consumer uses ``json.load``, none parses it
+    by line — so it is written compactly. ``indent=2`` cost roughly 27% of the
+    file in pure whitespace.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(_json_ready(report), ensure_ascii=False, indent=2, allow_nan=False),
+        json.dumps(
+            _json_ready(report),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
 
