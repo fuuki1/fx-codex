@@ -10,7 +10,10 @@ import json
 import math
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+from .effective_samples import EffectiveSampleSummary, summarize_effective_samples
+from .evaluation_labels import canonical_net_label_contract_flags
+
+SCHEMA_VERSION = 2
 DEFAULT_THRESHOLD = 0.15
 # Phase D4 only permits stricter challengers. Lowering the threshold increases
 # signal frequency and requires a separate future governance design.
@@ -43,7 +46,12 @@ class ThresholdPolicy:
     generated_at: str = ""
     train_end: str = ""
     test_end: str = ""
+    raw_samples: int = 0
+    effective_input_samples: int = 0
     effective_samples: int = 0
+    overlap_ratio: float | None = None
+    cluster_count: int = 0
+    market_days: int = 0
     oos_mean_net_r: float | None = None
     oos_net_r_lcb: float | None = None
     dsr: float | None = None
@@ -73,7 +81,12 @@ class ThresholdPolicy:
             generated_at=str(payload.get("generated_at", "")),
             train_end=str(payload.get("train_end", "")),
             test_end=str(payload.get("test_end", "")),
+            raw_samples=_int(payload.get("raw_samples")),
+            effective_input_samples=_int(payload.get("effective_input_samples")),
             effective_samples=_int(payload.get("effective_samples")),
+            overlap_ratio=_float(payload.get("overlap_ratio")),
+            cluster_count=_int(payload.get("cluster_count")),
+            market_days=_int(payload.get("market_days")),
             oos_mean_net_r=_float(payload.get("oos_mean_net_r")),
             oos_net_r_lcb=_float(payload.get("oos_net_r_lcb")),
             dsr=_float(payload.get("dsr")),
@@ -135,12 +148,17 @@ def evaluate_threshold_candidates(
     min_test_samples: int = DEFAULT_MIN_TEST_SAMPLES,
 ) -> ThresholdPolicy:
     now = _utc(now or datetime.now(UTC))
-    rows = _eligible_rows(outcomes)
+    rows, effective = _eligible_rows(outcomes)
     if not rows:
         return ThresholdPolicy(
             policy_id=_policy_id(now, DEFAULT_THRESHOLD, "empty"),
             stage="shadow",
             generated_at=now.isoformat(),
+            raw_samples=effective.raw_samples,
+            effective_input_samples=effective.effective_samples,
+            overlap_ratio=effective.overlap_ratio,
+            cluster_count=effective.cluster_count,
+            market_days=effective.market_days,
         )
     versions = {row[3] for row in rows}
     cost_models = {row[4] for row in rows}
@@ -196,7 +214,12 @@ def evaluate_threshold_candidates(
         generated_at=now.isoformat(),
         train_end=rows[tune_start - 1][0].isoformat(),
         test_end=rows[-1][0].isoformat(),
+        raw_samples=effective.raw_samples,
+        effective_input_samples=effective.effective_samples,
         effective_samples=len(test_returns),
+        overlap_ratio=effective.overlap_ratio,
+        cluster_count=effective.cluster_count,
+        market_days=effective.market_days,
         oos_mean_net_r=round(mean, 6) if mean is not None else None,
         oos_net_r_lcb=round(lcb, 6) if lcb is not None else None,
         dsr=round(dsr, 6) if dsr is not None else None,
@@ -240,7 +263,7 @@ def auto_pause_policy(
     if policy.stage != ACTIVE_STAGE:
         return policy
     try:
-        rows = _eligible_rows(outcomes)
+        rows, _effective = _eligible_rows(outcomes)
         matching = [
             row for row in rows if row[3] == policy.label_version and row[4] == policy.cost_model_id
         ]
@@ -261,21 +284,48 @@ def auto_pause_policy(
 
 def _eligible_rows(
     outcomes: Sequence[Mapping[str, object]],
-) -> list[tuple[datetime, float, float, str, str, str]]:
-    rows: list[tuple[datetime, float, float, str, str, str]] = []
+) -> tuple[
+    list[tuple[datetime, float, float, str, str, str]],
+    EffectiveSampleSummary,
+]:
+    records: list[Mapping[str, object]] = []
+    rows_by_key: dict[str, tuple[datetime, float, float, str, str, str]] = {}
     for outcome in outcomes:
-        if not bool(outcome.get("net_label_eligible", outcome.get("tradable", False))):
+        contract_flags = canonical_net_label_contract_flags(outcome)
+        if contract_flags:
+            if (
+                outcome.get("net_label_eligible") is True
+                or outcome.get("realized_net_r") is not None
+            ):
+                raise ValueError("invalid canonical net label: " + ",".join(contract_flags))
             continue
-        ts = _parse_ts(outcome.get("ts"))
+        ts = _parse_ts(outcome.get("prediction_time"))
         composite = _float(outcome.get("composite"))
         net_r = _float(outcome.get("realized_net_r"))
         version = str(outcome.get("label_version", "")).strip()
         cost_model = str(outcome.get("cost_model_id", "")).strip()
-        decision_id = str(outcome.get("decision_id", ""))
+        decision_id = str(outcome.get("decision_id", "")).strip()
         if ts is None or composite is None or net_r is None or not version or not cost_model:
-            continue
-        rows.append((ts, composite, net_r, version, cost_model, decision_id))
-    return rows
+            raise ValueError("canonical net labelのthreshold入力が不完全")
+        key = f"{decision_id}+{version}"
+        row = (ts, composite, net_r, version, cost_model, decision_id)
+        existing = rows_by_key.get(key)
+        if existing is not None and existing != row:
+            raise ValueError(f"threshold入力のcanonical keyが競合: {key}")
+        rows_by_key[key] = row
+        records.append(outcome)
+
+    effective = summarize_effective_samples(records, min_samples=1)
+    if effective.invalid_samples:
+        reasons = ",".join(f"{name}={count}" for name, count in effective.invalid_reasons.items())
+        raise ValueError(f"canonical net labelのeffective sample metadata不正: {reasons}")
+    return (
+        sorted(
+            (rows_by_key[key] for key in effective.selected_keys),
+            key=lambda row: (row[0], row[5]),
+        ),
+        effective,
+    )
 
 
 def _returns_for(

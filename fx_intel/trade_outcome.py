@@ -14,10 +14,26 @@ from bisect import bisect_left
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
+import hashlib
 import json
 import math
 from pathlib import Path
 
+from .effective_samples import (
+    DEFAULT_MIN_EFFECTIVE_SAMPLES,
+    EffectiveSampleConflict,
+    select_effective_samples,
+    summarize_effective_samples,
+)
+from .evaluation_labels import (
+    DEFAULT_COST_STATUS,
+    KNOWN_EXECUTABLE_COST_MODEL_IDS,
+    KNOWN_NET_LABEL_PROVENANCES,
+    KNOWN_NET_LABEL_VERSIONS,
+    CostModelResult,
+    canonical_net_label_contract_flags,
+    cost_model_contract_flags,
+)
 from .journal import (
     COUNTERFACTUAL_ENTRY_KEY,
     DEFAULT_HORIZON_HOURS,
@@ -29,7 +45,7 @@ from .market import WEEKEND_CLOSURE, WeekendOpenHours, open_hours_between
 MIN_PATH_POINTS = 3
 MIN_PATH_COVERAGE = 0.50
 MIN_PATH_QUALITY = 0.35
-MIN_EXPECTANCY_SAMPLES = 20
+MIN_EXPECTANCY_SAMPLES = DEFAULT_MIN_EFFECTIVE_SAMPLES
 MIN_GROUP_EXPECTANCY_SAMPLES = 12
 CLOSE_ONLY_QUALITY_CAP = 0.70
 PARTIAL_OHLC_QUALITY_CAP = 0.85
@@ -42,10 +58,19 @@ EXPECTANCY_WEAK_FACTOR = 0.75
 # ガード見送り中のシャドー計画を採点した反実仮想アウトカムに付く品質フラグ。
 # quality_summary の flags 集計にそのまま現れ、根拠に占める反実仮想の量を監査できる
 COUNTERFACTUAL_QUALITY_FLAG = "expectancy_guard_counterfactual"
+NONCANONICAL_COST_QUALITY_FLAG = "noncanonical_cost_estimate_ignored"
 MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R = 0.05
 DEFAULT_TP1_R_CANDIDATES = (0.75, 1.0, 1.25)
 DEFAULT_TP2_R_CANDIDATES = (1.5, 2.0, 2.5)
-IMPROVEMENT_REGISTRY_SCHEMA = 1
+IMPROVEMENT_REGISTRY_SCHEMA = 2
+PROSPECTIVE_EVIDENCE_SCHEMA = 1
+PROSPECTIVE_VALID_DAYS = 90
+PROSPECTIVE_MIN_EFFECTIVE_SAMPLES = MIN_EXPECTANCY_SAMPLES
+PROSPECTIVE_MIN_NET_COVERAGE = 0.95
+PROSPECTIVE_MIN_DSR = 0.95
+PROSPECTIVE_MAX_DRAWDOWN_R = 5.0
+PROSPECTIVE_COST_STRESS_R = 0.05
+PROSPECTIVE_MAX_CONCENTRATION = 0.75
 EXPECTANCY_CANDIDATE_ACTION_TYPES = {
     "collect_samples",
     "improve_path_quality",
@@ -58,8 +83,7 @@ STATUS_OK = "ok"
 STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
 CONFIDENCE_BINS = ((0, 25), (25, 50), (50, 75), (75, 101))
-READY_SEEN_BY_PRIORITY = {"high": 2, "medium": 3, "low": 5}
-APPROVAL_PRESERVED_STAGES = {"approved", "rejected", "auto_paused"}
+APPROVAL_PRESERVED_STAGES = {"approved", "rejected", "auto_paused", "expired"}
 TRUSTED_POST_PREDICTION_OHLC_SCOPES = {
     "closed_bar_after_prediction",
     "lower_timeframe_closed_bar",
@@ -82,6 +106,666 @@ class PricePathPoint:
 
 
 @dataclass(frozen=True)
+class ExecutableQuoteBar:
+    """One completed provider-neutral executable bid/ask bar."""
+
+    ts: datetime
+    bid_open: float
+    bid_high: float
+    bid_low: float
+    bid_close: float
+    ask_open: float
+    ask_high: float
+    ask_low: float
+    ask_close: float
+    quote_source: str
+    source_record_id: str
+    path_quality: float
+    bar_start: datetime | None = None
+    available_time: datetime | None = None
+    closed: bool = True
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class CanonicalTradeRequest:
+    """All point-in-time inputs required to create a canonical net-R label."""
+
+    decision_id: str
+    label_version: str
+    label_provenance: str
+    symbol: str
+    mode: str
+    timeframe: str
+    horizon_hours: float
+    direction: str
+    prediction_time: datetime
+    entry_mid: float | None
+    entry_bid: float | None
+    entry_ask: float | None
+    quote_observed_at: datetime
+    quote_available_at: datetime
+    quote_source: str
+    source_record_id: str
+    stop: float | None
+    target1: float | None
+    target2: float | None
+    planned_risk_distance: float | None
+    path: tuple[ExecutableQuoteBar, ...]
+    cost_model: CostModelResult | None
+    max_entry_quote_age_seconds: float = 300.0
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class CanonicalTradeOutcome:
+    """Deterministic result keyed by ``decision_id + label_version``."""
+
+    decision_id: str
+    label_version: str
+    label_provenance: str
+    symbol: str
+    mode: str
+    timeframe: str
+    horizon_hours: float
+    direction: str
+    prediction_time: str | None = None
+    holding_end_time: str | None = None
+    first_touch: str = "unavailable"
+    first_touch_ts: str | None = None
+    entry_bid: float | None = None
+    entry_ask: float | None = None
+    entry_executable: float | None = None
+    planned_risk_distance: float | None = None
+    exit_executable: float | None = None
+    exit_mid: float | None = None
+    gross_realized_r: float | None = None
+    quote_realized_r: float | None = None
+    planned_payoff_r: float | None = None
+    slippage_r: float | None = None
+    commission_r: float | None = None
+    financing_r: float | None = None
+    entry_spread_r: float | None = None
+    additional_cost_r: float | None = None
+    execution_cost_r: float | None = None
+    realized_net_r: float | None = None
+    cost_model_id: str = "missing"
+    cost_model_version: str = ""
+    cost_status: str = "missing"
+    entry_quote_source: str = ""
+    spread_source: str = ""
+    slippage_model_id: str = ""
+    commission_model_id: str = ""
+    cost_quality_flags: tuple[str, ...] = field(default_factory=tuple)
+    net_label_eligible: bool = False
+    path_quality: float | None = None
+    path_source: str = "executable_bid_ask"
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def outcome_key(self) -> tuple[str, str]:
+        return self.decision_id, self.label_version
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "decision_id": self.decision_id,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "symbol": self.symbol,
+            "mode": self.mode,
+            "timeframe": self.timeframe,
+            "horizon_hours": self.horizon_hours,
+            "direction": self.direction,
+            "prediction_time": self.prediction_time,
+            "holding_end_time": self.holding_end_time,
+            "first_touch": self.first_touch,
+            "first_touch_ts": self.first_touch_ts,
+            "entry_bid": self.entry_bid,
+            "entry_ask": self.entry_ask,
+            "entry_executable": self.entry_executable,
+            "planned_risk_distance": self.planned_risk_distance,
+            "exit_executable": self.exit_executable,
+            "exit_mid": self.exit_mid,
+            "gross_realized_r": self.gross_realized_r,
+            "quote_realized_r": self.quote_realized_r,
+            "planned_payoff_r": self.planned_payoff_r,
+            "slippage_r": self.slippage_r,
+            "commission_r": self.commission_r,
+            "financing_r": self.financing_r,
+            "entry_spread_r": self.entry_spread_r,
+            "additional_cost_r": self.additional_cost_r,
+            "execution_cost_r": self.execution_cost_r,
+            "realized_net_r": self.realized_net_r,
+            "cost_model_id": self.cost_model_id,
+            "cost_model_version": self.cost_model_version,
+            "cost_status": self.cost_status,
+            "entry_quote_source": self.entry_quote_source,
+            "spread_source": self.spread_source,
+            "slippage_model_id": self.slippage_model_id,
+            "commission_model_id": self.commission_model_id,
+            "cost_quality_flags": list(self.cost_quality_flags),
+            "net_label_eligible": self.net_label_eligible,
+            "path_quality": self.path_quality,
+            "path_source": self.path_source,
+            "quality_flags": list(self.quality_flags),
+        }
+
+
+class CanonicalOutcomeConflict(ValueError):
+    """Raised when the same canonical key has different scored values."""
+
+
+def assert_canonical_outcome_idempotent(
+    existing: CanonicalTradeOutcome,
+    candidate: CanonicalTradeOutcome,
+) -> None:
+    """Accept identical replay and hard-fail a conflicting canonical key."""
+
+    if existing.outcome_key != candidate.outcome_key:
+        return
+    if existing != candidate:
+        decision_id, label_version = existing.outcome_key
+        raise CanonicalOutcomeConflict(
+            f"conflicting canonical outcome for {decision_id} + {label_version}"
+        )
+
+
+def score_canonical_outcome(request: CanonicalTradeRequest) -> CanonicalTradeOutcome:
+    """Score executable quotes using one planned-risk denominator.
+
+    Long uses ask entry/bid exit and short uses bid entry/ask exit. Spread is
+    therefore embedded in ``quote_realized_r`` and is never deducted again.
+    Invalid or incomplete inputs return an ineligible outcome rather than a
+    fabricated zero.
+    """
+
+    flags = _canonical_request_flags(request)
+    if flags:
+        return _unavailable_canonical_outcome(request, flags)
+
+    assert request.entry_mid is not None
+    assert request.entry_bid is not None
+    assert request.entry_ask is not None
+    assert request.stop is not None
+    assert request.target1 is not None
+    assert request.target2 is not None
+    assert request.planned_risk_distance is not None
+    assert request.cost_model is not None
+
+    entry_executable = request.entry_ask if request.direction == "long" else request.entry_bid
+    touch, touch_bar, exit_executable, exit_mid, touch_flags = _canonical_exit(request)
+    risk = request.planned_risk_distance
+    quote_realized_r = _signed_move(request.direction, entry_executable, exit_executable) / risk
+    gross_realized_r = _signed_move(request.direction, request.entry_mid, exit_mid) / risk
+    planned_payoff_r = _canonical_planned_payoff(request, touch, entry_executable)
+    additional_cost_r = request.cost_model.total_cost_r
+    entry_spread_r = (request.entry_ask - request.entry_bid) / risk
+    realized_net_r = quote_realized_r - additional_cost_r
+    execution_cost_r = gross_realized_r - realized_net_r
+    path_quality = min(bar.path_quality for bar in request.path)
+    all_flags = tuple(
+        dict.fromkeys(
+            (
+                *request.cost_model.quality_flags,
+                *(flag for bar in request.path for flag in bar.quality_flags),
+                *touch_flags,
+            )
+        )
+    )
+    return CanonicalTradeOutcome(
+        decision_id=request.decision_id,
+        label_version=request.label_version,
+        label_provenance=request.label_provenance,
+        symbol=request.symbol,
+        mode=request.mode,
+        timeframe=request.timeframe,
+        horizon_hours=request.horizon_hours,
+        direction=request.direction,
+        prediction_time=request.prediction_time.astimezone(UTC).isoformat(),
+        holding_end_time=touch_bar.ts.astimezone(UTC).isoformat(),
+        first_touch=touch,
+        first_touch_ts=touch_bar.ts.astimezone(UTC).isoformat(),
+        entry_bid=request.entry_bid,
+        entry_ask=request.entry_ask,
+        entry_executable=entry_executable,
+        planned_risk_distance=request.planned_risk_distance,
+        exit_executable=exit_executable,
+        exit_mid=exit_mid,
+        gross_realized_r=_canonical_round(gross_realized_r),
+        quote_realized_r=_canonical_round(quote_realized_r),
+        planned_payoff_r=_canonical_round(planned_payoff_r),
+        slippage_r=_canonical_round(request.cost_model.slippage_r),
+        commission_r=_canonical_round(request.cost_model.commission_r),
+        financing_r=_canonical_round(request.cost_model.financing_r),
+        entry_spread_r=_canonical_round(entry_spread_r),
+        additional_cost_r=_canonical_round(additional_cost_r),
+        execution_cost_r=_canonical_round(execution_cost_r),
+        realized_net_r=_canonical_round(realized_net_r),
+        cost_model_id=request.cost_model.cost_model_id,
+        cost_model_version=request.cost_model.cost_model_version,
+        cost_status=request.cost_model.cost_status,
+        entry_quote_source=request.cost_model.entry_quote_source,
+        spread_source=request.cost_model.spread_source,
+        slippage_model_id=request.cost_model.slippage_model_id,
+        commission_model_id=request.cost_model.commission_model_id,
+        cost_quality_flags=request.cost_model.quality_flags,
+        net_label_eligible=True,
+        path_quality=_canonical_round(path_quality),
+        quality_flags=all_flags,
+    )
+
+
+def aggregate_canonical_expectancy(
+    outcomes: Sequence[CanonicalTradeOutcome],
+    *,
+    min_samples: int = MIN_EXPECTANCY_SAMPLES,
+) -> dict[str, object]:
+    """Aggregate canonical gross/net R while gating on effective net samples."""
+
+    gross_values = [
+        float(outcome.gross_realized_r)
+        for outcome in outcomes
+        if outcome.gross_realized_r is not None
+    ]
+    valid_net_records = [
+        outcome.to_dict()
+        for outcome in outcomes
+        if not canonical_net_label_contract_flags(outcome.to_dict())
+    ]
+    effective = summarize_effective_samples(valid_net_records, min_samples=min_samples)
+    selected_keys = set(effective.selected_keys)
+    effective_net_values = [
+        value
+        for record in valid_net_records
+        if f"{record['decision_id']}+{record['label_version']}" in selected_keys
+        and (value := _float(record.get("realized_net_r"))) is not None
+    ]
+    return {
+        **effective.to_dict(),
+        "raw_samples": len(outcomes),
+        "effective_input_samples": effective.raw_samples,
+        "gross_samples": len(gross_values),
+        "net_label_samples": len(valid_net_records),
+        "net_label_coverage": (
+            len(valid_net_records) / len(gross_values) if gross_values else None
+        ),
+        "gross_expectancy_r": _canonical_round(_mean(gross_values)),
+        "net_expectancy_r": _canonical_round(_mean(effective_net_values)),
+        "gross_profit_factor": _canonical_profit_factor(gross_values),
+        "net_profit_factor": _canonical_profit_factor(effective_net_values),
+    }
+
+
+def _canonical_profit_factor(values: Sequence[float]) -> float | None:
+    gains = sum(value for value in values if value > 0)
+    losses = abs(sum(value for value in values if value < 0))
+    if losses > 0:
+        return _canonical_round(gains / losses)
+    return None if gains <= 0 else float("inf")
+
+
+def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
+    flags: list[str] = list(request.quality_flags)
+    if not request.decision_id.strip():
+        flags.append("missing_decision_id")
+    if request.label_version not in KNOWN_NET_LABEL_VERSIONS:
+        flags.append("unknown_label_version")
+    if request.label_provenance not in KNOWN_NET_LABEL_PROVENANCES:
+        flags.append("unknown_label_provenance")
+    if request.direction not in {"long", "short"}:
+        flags.append("invalid_direction")
+    if not request.symbol.strip() or not request.mode.strip() or not request.timeframe.strip():
+        flags.append("missing_decision_context")
+    if not _aware_datetime(request.prediction_time):
+        flags.append("invalid_prediction_time")
+    if not _aware_datetime(request.quote_observed_at):
+        flags.append("invalid_quote_time")
+    if not _aware_datetime(request.quote_available_at):
+        flags.append("invalid_quote_available_time")
+    elif _aware_datetime(request.prediction_time) and _aware_datetime(request.quote_observed_at):
+        observed = request.quote_observed_at.astimezone(UTC)
+        available = request.quote_available_at.astimezone(UTC)
+        prediction = request.prediction_time.astimezone(UTC)
+        if not observed <= available <= prediction:
+            flags.append("future_entry_quote")
+        elif (prediction - available).total_seconds() > request.max_entry_quote_age_seconds:
+            flags.append("stale_entry_quote")
+    if request.entry_bid is None or request.entry_ask is None:
+        flags.append("missing_entry_quote")
+    elif not _valid_book(request.entry_bid, request.entry_ask):
+        flags.append("invalid_entry_quote")
+    if not _finite_positive(request.entry_mid) or (
+        request.entry_bid is not None
+        and request.entry_ask is not None
+        and request.entry_mid is not None
+        and not request.entry_bid <= request.entry_mid <= request.entry_ask
+    ):
+        flags.append("invalid_entry_mid")
+    if not request.quote_source.strip() or not request.source_record_id.strip():
+        flags.append("missing_entry_provenance")
+    if not _finite_positive(request.planned_risk_distance):
+        flags.append("invalid_planned_risk_distance")
+    if not _canonical_levels_valid(request):
+        flags.append("invalid_risk_levels")
+    if not request.path:
+        flags.append("missing_executable_path")
+    else:
+        flags.extend(_canonical_path_flags(request))
+    cost = request.cost_model
+    if cost is None:
+        flags.append("missing_cost_model")
+    else:
+        flags.extend(cost_model_contract_flags(cost))
+        if (
+            not cost.cost_model_version.strip()
+            or not cost.slippage_model_id.strip()
+            or not cost.commission_model_id.strip()
+            or cost.cost_status != DEFAULT_COST_STATUS
+        ):
+            flags.append("invalid_cost_model")
+        if cost.entry_quote_source != request.quote_source:
+            flags.append("entry_quote_source_mismatch")
+        if cost.spread_source != request.quote_source:
+            flags.append("spread_source_mismatch")
+        planned_risk = request.planned_risk_distance
+        expected_entry_spread_r = (
+            (request.entry_ask - request.entry_bid) / planned_risk
+            if request.entry_bid is not None
+            and request.entry_ask is not None
+            and planned_risk is not None
+            and _finite_positive(planned_risk)
+            else None
+        )
+        if cost.entry_spread_r is None:
+            flags.append("missing_entry_spread_r")
+        elif (
+            expected_entry_spread_r is None
+            or not math.isfinite(cost.entry_spread_r)
+            or not math.isclose(
+                cost.entry_spread_r,
+                expected_entry_spread_r,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            flags.append("entry_spread_r_mismatch")
+        if any(
+            not _finite_nonnegative(value)
+            for value in (cost.slippage_r, cost.commission_r, cost.financing_r)
+        ):
+            flags.append("invalid_cost_value")
+    return tuple(dict.fromkeys(flags))
+
+
+def _unavailable_canonical_outcome(
+    request: CanonicalTradeRequest,
+    flags: Sequence[str],
+) -> CanonicalTradeOutcome:
+    cost = request.cost_model
+    return CanonicalTradeOutcome(
+        decision_id=request.decision_id,
+        label_version=request.label_version,
+        label_provenance=request.label_provenance,
+        symbol=request.symbol,
+        mode=request.mode,
+        timeframe=request.timeframe,
+        horizon_hours=request.horizon_hours,
+        direction=request.direction,
+        prediction_time=(
+            request.prediction_time.astimezone(UTC).isoformat()
+            if _aware_datetime(request.prediction_time)
+            else None
+        ),
+        entry_bid=request.entry_bid,
+        entry_ask=request.entry_ask,
+        planned_risk_distance=request.planned_risk_distance,
+        slippage_r=(cost.slippage_r if cost is not None else None),
+        commission_r=(cost.commission_r if cost is not None else None),
+        financing_r=(cost.financing_r if cost is not None else None),
+        cost_model_id=(cost.cost_model_id if cost is not None else "missing"),
+        cost_model_version=(cost.cost_model_version if cost is not None else ""),
+        cost_status=(cost.cost_status if cost is not None else "missing"),
+        entry_quote_source=(cost.entry_quote_source if cost is not None else ""),
+        spread_source=(cost.spread_source if cost is not None else ""),
+        slippage_model_id=(cost.slippage_model_id if cost is not None else ""),
+        commission_model_id=(cost.commission_model_id if cost is not None else ""),
+        cost_quality_flags=(cost.quality_flags if cost is not None else ()),
+        net_label_eligible=False,
+        quality_flags=tuple(dict.fromkeys(flags)),
+    )
+
+
+def _canonical_exit(
+    request: CanonicalTradeRequest,
+) -> tuple[str, ExecutableQuoteBar, float, float, tuple[str, ...]]:
+    assert request.stop is not None
+    assert request.target1 is not None
+    assert request.target2 is not None
+    for bar in request.path:
+        if request.direction == "long":
+            open_price = bar.bid_open
+            high = bar.bid_high
+            low = bar.bid_low
+            stop_gap = open_price <= request.stop
+            target2_gap = open_price >= request.target2
+            target1_gap = open_price >= request.target1
+            stop_hit = low <= request.stop
+            target2_hit = high >= request.target2
+            target1_hit = high >= request.target1
+        else:
+            open_price = bar.ask_open
+            high = bar.ask_high
+            low = bar.ask_low
+            stop_gap = open_price >= request.stop
+            target2_gap = open_price <= request.target2
+            target1_gap = open_price <= request.target1
+            stop_hit = high >= request.stop
+            target2_hit = low <= request.target2
+            target1_hit = low <= request.target1
+        if stop_gap:
+            return (
+                "sl_gap",
+                bar,
+                open_price,
+                (bar.bid_open + bar.ask_open) / 2.0,
+                ("gap_through_stop",),
+            )
+        if target2_gap:
+            return (
+                "tp2",
+                bar,
+                request.target2,
+                _canonical_trigger_mid(request.direction, request.target2, bar),
+                ("favorable_gap_target_capped",),
+            )
+        if target1_gap:
+            return (
+                "tp1",
+                bar,
+                request.target1,
+                _canonical_trigger_mid(request.direction, request.target1, bar),
+                ("favorable_gap_target_capped",),
+            )
+        if stop_hit and (target1_hit or target2_hit):
+            return (
+                "ambiguous_sl_tp",
+                bar,
+                request.stop,
+                _canonical_trigger_mid(request.direction, request.stop, bar),
+                ("same_bar_ambiguous_stop_first", "intrabar_mid_from_open_spread"),
+            )
+        if stop_hit:
+            return (
+                "sl",
+                bar,
+                request.stop,
+                _canonical_trigger_mid(request.direction, request.stop, bar),
+                ("intrabar_mid_from_open_spread",),
+            )
+        if target2_hit:
+            return (
+                "tp2",
+                bar,
+                request.target2,
+                _canonical_trigger_mid(request.direction, request.target2, bar),
+                ("intrabar_mid_from_open_spread",),
+            )
+        if target1_hit:
+            return (
+                "tp1",
+                bar,
+                request.target1,
+                _canonical_trigger_mid(request.direction, request.target1, bar),
+                ("intrabar_mid_from_open_spread",),
+            )
+    terminal = request.path[-1]
+    if request.direction == "long":
+        return (
+            "terminal",
+            terminal,
+            terminal.bid_close,
+            (terminal.bid_close + terminal.ask_close) / 2.0,
+            (),
+        )
+    return (
+        "terminal",
+        terminal,
+        terminal.ask_close,
+        (terminal.bid_close + terminal.ask_close) / 2.0,
+        (),
+    )
+
+
+def _canonical_trigger_mid(
+    direction: str,
+    executable_price: float,
+    bar: ExecutableQuoteBar,
+) -> float:
+    half_spread = (bar.ask_open - bar.bid_open) / 2.0
+    return executable_price + half_spread if direction == "long" else executable_price - half_spread
+
+
+def _canonical_planned_payoff(
+    request: CanonicalTradeRequest,
+    touch: str,
+    entry_executable: float,
+) -> float | None:
+    assert request.planned_risk_distance is not None
+    if touch in {"sl", "sl_gap", "ambiguous_sl_tp"}:
+        return -1.0
+    if touch == "tp1":
+        assert request.target1 is not None
+        return (
+            _signed_move(request.direction, entry_executable, request.target1)
+            / request.planned_risk_distance
+        )
+    if touch == "tp2":
+        assert request.target2 is not None
+        return (
+            _signed_move(request.direction, entry_executable, request.target2)
+            / request.planned_risk_distance
+        )
+    return None
+
+
+def _canonical_levels_valid(request: CanonicalTradeRequest) -> bool:
+    if not all(
+        _finite_positive(value) for value in (request.stop, request.target1, request.target2)
+    ):
+        return False
+    if request.entry_bid is None or request.entry_ask is None:
+        return False
+    assert request.stop is not None
+    assert request.target1 is not None
+    assert request.target2 is not None
+    if request.direction == "long":
+        return request.stop < request.entry_ask < request.target1 < request.target2
+    if request.direction == "short":
+        return request.stop > request.entry_bid > request.target1 > request.target2
+    return False
+
+
+def _canonical_path_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
+    flags: list[str] = []
+    previous: datetime | None = None
+    for bar in request.path:
+        if not _aware_datetime(bar.ts) or not bar.closed:
+            flags.append("invalid_path_time")
+            continue
+        current = bar.ts.astimezone(UTC)
+        if not _aware_datetime(bar.bar_start) or not _aware_datetime(bar.available_time):
+            flags.append("missing_path_availability")
+            continue
+        assert bar.bar_start is not None
+        assert bar.available_time is not None
+        start = bar.bar_start.astimezone(UTC)
+        available = bar.available_time.astimezone(UTC)
+        if current <= request.prediction_time.astimezone(UTC):
+            flags.append("invalid_path_time")
+        if start < request.prediction_time.astimezone(UTC):
+            flags.append("forming_bar_path")
+        if not start < current <= available:
+            flags.append("invalid_path_availability")
+        if previous is not None and current <= previous:
+            flags.append("out_of_order_path")
+        previous = current
+        if not bar.quote_source.strip() or not bar.source_record_id.strip():
+            flags.append("missing_path_provenance")
+        if bar.quote_source != request.quote_source:
+            flags.append("path_source_mismatch")
+        if not 0.0 < bar.path_quality <= 1.0:
+            flags.append("invalid_path_quality")
+        bid = (bar.bid_open, bar.bid_high, bar.bid_low, bar.bid_close)
+        ask = (bar.ask_open, bar.ask_high, bar.ask_low, bar.ask_close)
+        if not all(_finite_positive(value) for value in (*bid, *ask)):
+            flags.append("invalid_path_quote")
+            continue
+        if not all(ask_value >= bid_value for bid_value, ask_value in zip(bid, ask)):
+            flags.append("invalid_path_quote")
+        if bar.bid_high < max(bar.bid_open, bar.bid_low, bar.bid_close):
+            flags.append("invalid_path_ohlc")
+        if bar.bid_low > min(bar.bid_open, bar.bid_high, bar.bid_close):
+            flags.append("invalid_path_ohlc")
+        if bar.ask_high < max(bar.ask_open, bar.ask_low, bar.ask_close):
+            flags.append("invalid_path_ohlc")
+        if bar.ask_low > min(bar.ask_open, bar.ask_high, bar.ask_close):
+            flags.append("invalid_path_ohlc")
+    return tuple(dict.fromkeys(flags))
+
+
+def _valid_book(bid: float, ask: float) -> bool:
+    return _finite_positive(bid) and _finite_positive(ask) and ask >= bid
+
+
+def _finite_positive(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
+
+
+def _finite_nonnegative(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
+def _aware_datetime(value: object) -> bool:
+    return (
+        isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
+    )
+
+
+def _canonical_round(value: float | None) -> float | None:
+    return round(value, 8) if value is not None else None
+
+
+@dataclass(frozen=True)
 class TradeOutcome:
     """One journal decision scored as a hypothetical full-position trade."""
 
@@ -91,6 +775,8 @@ class TradeOutcome:
     horizon_hours: float
     conviction: int
     data_quality: float | None
+    mode: str = "fusion"
+    timeframe: str = "fusion"
     # 判断ログ行の識別子(shadow予測の満期照合キー)。無い行は None。
     decision_id: str | None = None
     entry: float | None = None
@@ -114,11 +800,31 @@ class TradeOutcome:
     first_touch: str = "none"
     first_touch_ts: str | None = None
     realized_r: float | None = None  # 執行コスト控除前(グロス)の実現R
-    # 執行コスト控除後の実現R。realized_r から execution_cost_r を引いた「市場が返した
-    # 正解ラベル」。コスト不明(spread未取得等)なら None。MLの収益ラベルはこれを使う。
+    # close/OHLC-only legacy scorerはcanonical net labelを生成しない。
     realized_net_r: float | None = None
-    execution_cost_r: float | None = None  # 差し引いた執行コスト(R換算)。判断時の実測値
-    net_expected_r: float | None = None  # 判断時点の予測(比較対象)。実測 realized_net_r と対比
+    execution_cost_r: float | None = None
+    net_expected_r: float | None = None
+    diagnostic_execution_cost_r: float | None = None
+    diagnostic_net_expected_r: float | None = None
+    net_label_eligible: bool = False
+    label_version: str = ""
+    label_provenance: str = ""
+    entry_bid: float | None = None
+    entry_ask: float | None = None
+    quote_realized_r: float | None = None
+    entry_spread_r: float | None = None
+    slippage_r: float | None = None
+    commission_r: float | None = None
+    financing_r: float | None = None
+    additional_cost_r: float | None = None
+    cost_model_id: str = "missing"
+    cost_model_version: str = ""
+    cost_status: str = "missing"
+    entry_quote_source: str = ""
+    spread_source: str = ""
+    slippage_model_id: str = ""
+    commission_model_id: str = ""
+    cost_quality_flags: tuple[str, ...] = field(default_factory=tuple)
     path_points: int = 0
     path_start: str | None = None
     path_end: str | None = None
@@ -131,11 +837,23 @@ class TradeOutcome:
     def tradable(self) -> bool:
         return self.realized_r is not None and self.path_quality >= MIN_PATH_QUALITY
 
+    @property
+    def prediction_time(self) -> str:
+        return self.ts
+
+    @property
+    def holding_end_time(self) -> str | None:
+        return self.path_end
+
     def to_dict(self) -> dict:
         return {
             "symbol": self.symbol,
             "direction": self.direction,
+            "mode": self.mode,
+            "timeframe": self.timeframe,
             "ts": self.ts,
+            "prediction_time": self.ts,
+            "holding_end_time": self.path_end,
             "horizon_hours": self.horizon_hours,
             "conviction": self.conviction,
             "data_quality": self.data_quality,
@@ -160,10 +878,33 @@ class TradeOutcome:
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
             "realized_r": self.realized_r,
+            "gross_realized_r": self.realized_r,
+            "quote_realized_r": self.quote_realized_r,
             "realized_net_r": self.realized_net_r,
+            "net_label_eligible": self.net_label_eligible,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
             "decision_id": self.decision_id,
             "execution_cost_r": self.execution_cost_r,
             "net_expected_r": self.net_expected_r,
+            "diagnostic_execution_cost_r": self.diagnostic_execution_cost_r,
+            "diagnostic_net_expected_r": self.diagnostic_net_expected_r,
+            "entry_bid": self.entry_bid,
+            "entry_ask": self.entry_ask,
+            "planned_risk_distance": self.risk_distance,
+            "entry_spread_r": self.entry_spread_r,
+            "slippage_r": self.slippage_r,
+            "commission_r": self.commission_r,
+            "financing_r": self.financing_r,
+            "additional_cost_r": self.additional_cost_r,
+            "cost_model_id": self.cost_model_id,
+            "cost_model_version": self.cost_model_version,
+            "cost_status": self.cost_status,
+            "entry_quote_source": self.entry_quote_source,
+            "spread_source": self.spread_source,
+            "slippage_model_id": self.slippage_model_id,
+            "commission_model_id": self.commission_model_id,
+            "cost_quality_flags": list(self.cost_quality_flags),
             "path_points": self.path_points,
             "path_start": self.path_start,
             "path_end": self.path_end,
@@ -180,6 +921,22 @@ class ExpectancyStats:
     evaluated: int = 0
     tradable: int = 0
     low_quality: int = 0
+    raw_samples: int = 0
+    effective_samples: int = 0
+    gross_samples: int = 0
+    net_label_samples: int = 0
+    net_label_coverage: float | None = None
+    overlap_ratio: float | None = None
+    cluster_count: int = 0
+    market_days: int = 0
+    gross_expectancy_r: float | None = None
+    net_expectancy_r: float | None = None
+    net_sharpe_per_period: float | None = None
+    gross_profit_factor_r: float | None = None
+    net_profit_factor_r: float | None = None
+    label_version: str = ""
+    label_provenance: str = ""
+    cost_model_id: str = ""
     wins: int = 0
     losses: int = 0
     win_rate: float | None = None
@@ -201,6 +958,22 @@ class ExpectancyStats:
             "evaluated": self.evaluated,
             "tradable": self.tradable,
             "low_quality": self.low_quality,
+            "raw_samples": self.raw_samples,
+            "effective_samples": self.effective_samples,
+            "gross_samples": self.gross_samples,
+            "net_label_samples": self.net_label_samples,
+            "net_label_coverage": self.net_label_coverage,
+            "overlap_ratio": self.overlap_ratio,
+            "cluster_count": self.cluster_count,
+            "market_days": self.market_days,
+            "gross_expectancy_r": self.gross_expectancy_r,
+            "net_expectancy_r": self.net_expectancy_r,
+            "net_sharpe_per_period": self.net_sharpe_per_period,
+            "gross_profit_factor_r": self.gross_profit_factor_r,
+            "net_profit_factor_r": self.net_profit_factor_r,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "cost_model_id": self.cost_model_id,
             "wins": self.wins,
             "losses": self.losses,
             "win_rate": self.win_rate,
@@ -327,7 +1100,18 @@ class TradeVariantScore:
     tradable: int
     sample_ok: bool
     expectancy_r: float | None
+    net_sharpe_per_period: float | None
     profit_factor_r: float | None
+    gross_expectancy_r: float | None
+    net_expectancy_r: float | None
+    gross_profit_factor_r: float | None
+    net_profit_factor_r: float | None
+    net_label_samples: int
+    net_label_coverage: float | None
+    effective_samples: int
+    label_version: str
+    label_provenance: str
+    cost_model_id: str
     tp1_rate: float | None
     tp2_rate: float | None
     sl_rate: float | None
@@ -347,7 +1131,18 @@ class TradeVariantScore:
             "tradable": self.tradable,
             "sample_ok": self.sample_ok,
             "expectancy_r": self.expectancy_r,
+            "net_sharpe_per_period": self.net_sharpe_per_period,
             "profit_factor_r": self.profit_factor_r,
+            "gross_expectancy_r": self.gross_expectancy_r,
+            "net_expectancy_r": self.net_expectancy_r,
+            "gross_profit_factor_r": self.gross_profit_factor_r,
+            "net_profit_factor_r": self.net_profit_factor_r,
+            "net_label_samples": self.net_label_samples,
+            "net_label_coverage": self.net_label_coverage,
+            "effective_samples": self.effective_samples,
+            "label_version": self.label_version,
+            "label_provenance": self.label_provenance,
+            "cost_model_id": self.cost_model_id,
             "tp1_rate": self.tp1_rate,
             "tp2_rate": self.tp2_rate,
             "sl_rate": self.sl_rate,
@@ -355,6 +1150,7 @@ class TradeVariantScore:
             "avg_mae_r": self.avg_mae_r,
             "avg_path_quality": self.avg_path_quality,
             "delta_expectancy_r": self.delta_expectancy_r,
+            "delta_net_expectancy_r": self.delta_expectancy_r,
             "delta_profit_factor_r": self.delta_profit_factor_r,
             "recommendation": self.recommendation,
             "reason_ja": self.reason_ja,
@@ -426,6 +1222,7 @@ def evaluate_trade_outcomes(
             continue
         counterfactual = bool(entry.get(COUNTERFACTUAL_ENTRY_KEY))
         symbol = str(entry.get("symbol", "")).upper()
+        timeframe = str(entry.get("timeframe") or "fusion")
         entry_price = _float(entry.get("close"))
         stop = _float(entry.get("stop"))
         target1 = _float(entry.get("target1"))
@@ -469,6 +1266,7 @@ def evaluate_trade_outcomes(
                     horizon_hours=horizon_hours,
                     conviction=conviction,
                     data_quality=data_quality,
+                    timeframe=timeframe,
                     entry=entry_price,
                     stop=stop,
                     target1=target1,
@@ -515,18 +1313,19 @@ def evaluate_trade_outcomes(
         mae = max(0.0, max(_adverse_move(direction, entry_price, point) for point in active_path))
 
         realized_r = _realized_r(first_touch, terminal_r, tp1_r_value, tp2_r_value)
-        # 収益ラベル: 判断時に保存した執行コスト(R換算)をグロスRから差し引き、
-        # 「市場が返したコスト控除後の実現R」を作る。コスト不明(None)なら差し引かず
-        # realized_net_r も None(採点側=MLは欠損として扱う)。net_expected_r は
-        # 判断時点の予測をそのまま持ち、実測 realized_net_r と対比できるようにする。
-        execution_cost_r = _float(entry.get("execution_cost_r"))
-        net_expected_r = _float(entry.get("net_expected_r"))
+        # close/OHLC-only pathとchecklist cost estimateはcanonical会計ではない。
+        # 旧キーも診断値として保持するが、realized_net_rは必ずNoneにする。
+        diagnostic_execution_cost_r = _float(
+            entry.get("diagnostic_execution_cost_r", entry.get("execution_cost_r"))
+        )
+        diagnostic_net_expected_r = _float(
+            entry.get("diagnostic_net_expected_r", entry.get("net_expected_r"))
+        )
         raw_decision_id = str(entry.get("decision_id", "")).strip()
         decision_id = raw_decision_id or None
-        realized_net_r = (
-            round(realized_r - execution_cost_r, 4) if execution_cost_r is not None else None
-        )
         quality, flags, path_source = _path_quality(ts, future, horizon_hours, min_path_points)
+        if diagnostic_execution_cost_r is not None or diagnostic_net_expected_r is not None:
+            flags = tuple(dict.fromkeys((*flags, NONCANONICAL_COST_QUALITY_FLAG)))
         if ambiguous_intrabar:
             flags = tuple(dict.fromkeys((*flags, "ambiguous_intrabar_touch")))
         if counterfactual:
@@ -539,6 +1338,7 @@ def evaluate_trade_outcomes(
                 horizon_hours=horizon_hours,
                 conviction=conviction,
                 data_quality=data_quality,
+                timeframe=timeframe,
                 entry=entry_price,
                 stop=stop,
                 target1=target1,
@@ -560,9 +1360,11 @@ def evaluate_trade_outcomes(
                 first_touch=first_touch,
                 first_touch_ts=first_touch_ts,
                 realized_r=round(realized_r, 4),
-                realized_net_r=realized_net_r,
-                execution_cost_r=execution_cost_r,
-                net_expected_r=net_expected_r,
+                realized_net_r=None,
+                execution_cost_r=None,
+                net_expected_r=None,
+                diagnostic_execution_cost_r=diagnostic_execution_cost_r,
+                diagnostic_net_expected_r=diagnostic_net_expected_r,
                 decision_id=decision_id,
                 path_points=len(future),
                 path_start=future[0].ts.isoformat(),
@@ -615,10 +1417,35 @@ def aggregate_expectancy(
     usable = [outcome for outcome in outcomes if outcome.realized_r is not None]
     tradable = [outcome for outcome in usable if outcome.tradable]
     r_values = [float(outcome.realized_r) for outcome in tradable if outcome.realized_r is not None]
-    wins = sum(1 for value in r_values if value > 0)
-    losses = sum(1 for value in r_values if value < 0)
     gross_win = sum(value for value in r_values if value > 0)
     gross_loss = abs(sum(value for value in r_values if value < 0))
+    gross_expectancy = _round(_mean(r_values))
+    gross_profit_factor = (
+        _round(gross_win / gross_loss)
+        if gross_loss > 0
+        else (None if gross_win <= 0 else float("inf"))
+    )
+    valid_net_records = [
+        outcome.to_dict()
+        for outcome in tradable
+        if not canonical_net_label_contract_flags(outcome.to_dict())
+    ]
+    effective = summarize_effective_samples(valid_net_records, min_samples=min_samples)
+    selected_keys = set(effective.selected_keys)
+    effective_net_values = [
+        float(record["realized_net_r"])
+        for record in valid_net_records
+        if f"{record['decision_id']}+{record['label_version']}" in selected_keys
+        and record.get("realized_net_r") is not None
+    ]
+    net_wins = sum(value for value in effective_net_values if value > 0)
+    net_losses = abs(sum(value for value in effective_net_values if value < 0))
+    net_expectancy = _round(_mean(effective_net_values))
+    net_profit_factor = (
+        _round(net_wins / net_losses)
+        if net_losses > 0
+        else (None if net_wins <= 0 else float("inf"))
+    )
     mfe_values = [float(outcome.mfe_r) for outcome in tradable if outcome.mfe_r is not None]
     mae_values = [float(outcome.mae_r) for outcome in tradable if outcome.mae_r is not None]
     qualities = [outcome.path_quality for outcome in usable]
@@ -626,17 +1453,35 @@ def aggregate_expectancy(
         evaluated=evaluated,
         tradable=len(tradable),
         low_quality=evaluated - len(tradable),
-        wins=wins,
-        losses=losses,
-        win_rate=_round(wins / len(r_values)) if r_values else None,
-        expectancy_r=_round(_mean(r_values)),
-        avg_win_r=_round(_mean([value for value in r_values if value > 0])),
-        avg_loss_r=_round(_mean([value for value in r_values if value < 0])),
-        profit_factor_r=(
-            _round(gross_win / gross_loss)
-            if gross_loss > 0
-            else (None if gross_win <= 0 else float("inf"))
+        raw_samples=evaluated,
+        effective_samples=effective.effective_samples,
+        gross_samples=len(r_values),
+        net_label_samples=len(valid_net_records),
+        net_label_coverage=(len(valid_net_records) / len(r_values) if r_values else None),
+        overlap_ratio=effective.overlap_ratio,
+        cluster_count=effective.cluster_count,
+        market_days=effective.market_days,
+        gross_expectancy_r=gross_expectancy,
+        net_expectancy_r=net_expectancy,
+        net_sharpe_per_period=_round(_sample_sharpe(effective_net_values)),
+        gross_profit_factor_r=gross_profit_factor,
+        net_profit_factor_r=net_profit_factor,
+        label_version=_single_contract_value(valid_net_records, "label_version"),
+        label_provenance=_single_contract_value(valid_net_records, "label_provenance"),
+        cost_model_id=_single_contract_value(valid_net_records, "cost_model_id"),
+        wins=sum(1 for value in effective_net_values if value > 0),
+        losses=sum(1 for value in effective_net_values if value < 0),
+        win_rate=(
+            _round(
+                sum(1 for value in effective_net_values if value > 0) / len(effective_net_values)
+            )
+            if effective_net_values
+            else None
         ),
+        expectancy_r=net_expectancy,
+        avg_win_r=_round(_mean([value for value in effective_net_values if value > 0])),
+        avg_loss_r=_round(_mean([value for value in effective_net_values if value < 0])),
+        profit_factor_r=net_profit_factor,
         avg_mfe_r=_round(_mean(mfe_values)),
         avg_mae_r=_round(_mean(mae_values)),
         tp1_rate=(
@@ -655,7 +1500,7 @@ def aggregate_expectancy(
             else None
         ),
         avg_path_quality=_round(_mean(qualities)),
-        sample_ok=len(tradable) >= min_samples,
+        sample_ok=effective.sample_ok,
         min_samples=min_samples,
     )
 
@@ -728,10 +1573,22 @@ def variant_improvement_candidates(
     baseline = variant_report.get("baseline")
     baseline_overall = baseline.get("overall") if isinstance(baseline, Mapping) else {}
     if isinstance(variants, Sequence):
-        for raw in [item for item in variants if isinstance(item, Mapping)]:
-            if raw.get("recommendation") != "paper_test":
+        variant_rows = [item for item in variants if isinstance(item, Mapping)]
+        trial_sharpes = _variant_trial_sharpes(variant_rows)
+        for raw in variant_rows:
+            if raw.get("recommendation") != "paper_test" or not _variant_has_canonical_net_evidence(
+                raw
+            ):
                 continue
-            output.append(_candidate_from_variant(raw, baseline_overall, len(output) + 1))
+            output.append(
+                _candidate_from_variant(
+                    raw,
+                    baseline_overall,
+                    len(output) + 1,
+                    trial_sharpes=trial_sharpes,
+                    trial_count=len(variant_rows),
+                )
+            )
             if len(output) >= limit:
                 return output
     cells = variant_report.get("cells")
@@ -746,8 +1603,12 @@ def variant_improvement_candidates(
                 cell_baseline = cell_report.get("baseline")
                 if not isinstance(cell_variants, Sequence):
                     continue
-                for raw in [item for item in cell_variants if isinstance(item, Mapping)]:
-                    if raw.get("recommendation") != "paper_test":
+                cell_variant_rows = [item for item in cell_variants if isinstance(item, Mapping)]
+                cell_trial_sharpes = _variant_trial_sharpes(cell_variant_rows)
+                for raw in cell_variant_rows:
+                    if raw.get(
+                        "recommendation"
+                    ) != "paper_test" or not _variant_has_canonical_net_evidence(raw):
                         continue
                     output.append(
                         _candidate_from_variant(
@@ -756,6 +1617,8 @@ def variant_improvement_candidates(
                             len(output) + 1,
                             scope=str(scope),
                             key=str(key),
+                            trial_sharpes=cell_trial_sharpes,
+                            trial_count=len(cell_variant_rows),
                         )
                     )
                     if len(output) >= limit:
@@ -903,33 +1766,49 @@ def update_improvement_registry(
     now: datetime | None = None,
     managed_action_types: set[str] | None = None,
     data_contract: str | None = None,
+    prospective_outcomes: Sequence[object] = (),
 ) -> dict:
-    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    generated_time = _utc(now or datetime.now(UTC))
+    generated_at = generated_time.isoformat()
+    if (
+        isinstance(previous, Mapping)
+        and _stat_int(previous, "schema") != IMPROVEMENT_REGISTRY_SCHEMA
+    ):
+        previous = None
     previous_records = _registry_records(previous)
     events = _registry_events(previous)
+    evidence_rows = _prospective_evidence_rows(prospective_outcomes)
     current_ids = {candidate.candidate_id for candidate in candidates}
     records: dict[str, dict] = {}
     for candidate in candidates:
         prior = previous_records.get(candidate.candidate_id, {})
         seen_count = _stat_int(prior, "seen_count") + 1
         prior_stage = str(prior.get("stage", ""))
+        first_seen = str(prior.get("first_seen") or generated_at)
+        if prior:
+            prospective_metadata = _preserved_prospective_metadata(prior)
+        else:
+            prospective_metadata = _initial_prospective_metadata(
+                candidate,
+                evidence_rows,
+                generated_time,
+            )
         stage = (
-            prior_stage
-            if prior_stage in APPROVAL_PRESERVED_STAGES
-            else _candidate_stage(candidate.priority, seen_count)
+            prior_stage if prior_stage in APPROVAL_PRESERVED_STAGES else "prospective_collecting"
         )
         record = {
             **candidate.to_dict(),
             "status": "active",
             "stage": stage,
-            "first_seen": str(prior.get("first_seen") or generated_at),
+            "first_seen": first_seen,
             "last_seen": generated_at,
             "resolved_at": None,
             "seen_count": seen_count,
-            "ready_seen_threshold": READY_SEEN_BY_PRIORITY.get(candidate.priority, 3),
+            **prospective_metadata,
         }
-        if data_contract:
-            record["data_contract"] = data_contract
+        record_data_contract = data_contract or str(prior.get("data_contract") or "")
+        if record_data_contract:
+            record["data_contract"] = record_data_contract
         for key in (
             "approved_at",
             "approved_by",
@@ -945,6 +1824,9 @@ def update_improvement_registry(
         ):
             if key in prior:
                 record[key] = prior[key]
+        if stage not in APPROVAL_PRESERVED_STAGES:
+            record = _evaluate_prospective_candidate(record, evidence_rows, generated_time)
+            stage = str(record.get("stage", "prospective_collecting"))
         records[candidate.candidate_id] = record
         if not prior:
             _append_registry_event(
@@ -953,7 +1835,16 @@ def update_improvement_registry(
                 candidate_id=candidate.candidate_id,
                 event_type="detected",
                 to_stage=stage,
-                details={"action_type": candidate.action_type, "priority": candidate.priority},
+                details={
+                    "action_type": candidate.action_type,
+                    "priority": candidate.priority,
+                    "candidate_created_at": record.get("candidate_created_at"),
+                    "training_data_end": record.get("training_data_end"),
+                    "prospective_start": record.get("prospective_start"),
+                    "prospective_end": record.get("prospective_end"),
+                    "lockbox_id": record.get("lockbox_id"),
+                    "dataset_hash": record.get("dataset_hash"),
+                },
             )
         elif str(prior.get("stage", "")) != stage:
             _append_registry_event(
@@ -963,6 +1854,13 @@ def update_improvement_registry(
                 event_type="stage_changed",
                 from_stage=str(prior.get("stage", "")),
                 to_stage=stage,
+                details={
+                    "prospective_dataset_hash": record.get("prospective_dataset_hash"),
+                    "prospective_effective_dataset_hash": record.get(
+                        "prospective_effective_dataset_hash"
+                    ),
+                    "prospective_metrics": record.get("prospective_metrics"),
+                },
             )
     for candidate_id, prior in previous_records.items():
         if candidate_id in current_ids:
@@ -993,12 +1891,460 @@ def update_improvement_registry(
     return payload
 
 
+def _prospective_evidence_rows(outcomes: Sequence[object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for outcome in outcomes:
+        if isinstance(outcome, Mapping):
+            rows.append({str(key): value for key, value in outcome.items()})
+            continue
+        to_dict = getattr(outcome, "to_dict", None)
+        if callable(to_dict):
+            raw = to_dict()
+            if isinstance(raw, Mapping):
+                rows.append({str(key): value for key, value in raw.items()})
+    return rows
+
+
+def _initial_prospective_metadata(
+    candidate: TradeImprovementCandidate,
+    evidence_rows: Sequence[Mapping[str, object]],
+    created_at: datetime,
+) -> dict[str, object]:
+    training_rows = [
+        row
+        for row in evidence_rows
+        if (holding_end := _parse_aware_iso(row.get("holding_end_time"))) is not None
+        and holding_end <= created_at
+    ]
+    training_end = max(
+        (
+            parsed
+            for row in training_rows
+            if (parsed := _parse_aware_iso(row.get("holding_end_time"))) is not None
+        ),
+        default=created_at,
+    )
+    prospective_start = max(created_at, training_end)
+    dataset_hash = _prospective_dataset_hash(training_rows)
+    lockbox_raw = (
+        f"{candidate.candidate_id}|{created_at.isoformat()}|"
+        f"{training_end.isoformat()}|{dataset_hash}"
+    )
+    lockbox_id = "prospective-" + hashlib.sha256(lockbox_raw.encode("utf-8")).hexdigest()[:20]
+    return {
+        "prospective_schema": PROSPECTIVE_EVIDENCE_SCHEMA,
+        "candidate_created_at": created_at.isoformat(),
+        "candidate_definition_hash": _candidate_definition_hash(candidate.to_dict()),
+        "training_data_end": training_end.isoformat(),
+        "prospective_start": prospective_start.isoformat(),
+        "prospective_end": (prospective_start + timedelta(days=PROSPECTIVE_VALID_DAYS)).isoformat(),
+        "lockbox_id": lockbox_id,
+        "dataset_hash": dataset_hash,
+        "prospective_dataset_hash": _prospective_dataset_hash(()),
+        "prospective_effective_dataset_hash": _prospective_dataset_hash(()),
+        "prospective_outcome_keys": [],
+        "prospective_metrics": _empty_prospective_metrics(),
+    }
+
+
+def _preserved_prospective_metadata(prior: Mapping[str, object]) -> dict[str, object]:
+    raw_outcome_keys = prior.get("prospective_outcome_keys")
+    raw_metrics = prior.get("prospective_metrics")
+    return {
+        "prospective_schema": prior.get("prospective_schema"),
+        "candidate_created_at": prior.get("candidate_created_at"),
+        "candidate_definition_hash": prior.get("candidate_definition_hash"),
+        "training_data_end": prior.get("training_data_end"),
+        "prospective_start": prior.get("prospective_start"),
+        "prospective_end": prior.get("prospective_end"),
+        "lockbox_id": prior.get("lockbox_id"),
+        "dataset_hash": prior.get("dataset_hash"),
+        "prospective_dataset_hash": prior.get("prospective_dataset_hash"),
+        "prospective_effective_dataset_hash": prior.get("prospective_effective_dataset_hash"),
+        "prospective_outcome_keys": (
+            list(raw_outcome_keys) if isinstance(raw_outcome_keys, list) else []
+        ),
+        "prospective_metrics": (
+            {str(key): value for key, value in raw_metrics.items()}
+            if isinstance(raw_metrics, Mapping)
+            else _empty_prospective_metrics()
+        ),
+        "prospective_last_evaluated_at": prior.get("prospective_last_evaluated_at"),
+    }
+
+
+def _evaluate_prospective_candidate(
+    record: dict[str, object],
+    evidence_rows: Sequence[Mapping[str, object]],
+    now: datetime,
+) -> dict[str, object]:
+    start = _parse_aware_iso(record.get("prospective_start"))
+    end = _parse_aware_iso(record.get("prospective_end"))
+    if start is None or end is None or end <= start:
+        record["stage"] = "expired"
+        record["prospective_metrics"] = {
+            **_empty_prospective_metrics(),
+            "blocking_reasons": ["invalid_prospective_window"],
+        }
+        return record
+    if record.get("candidate_definition_hash") != _candidate_definition_hash(record):
+        record["stage"] = "expired"
+        record["expired_at"] = record.get("expired_at") or now.isoformat()
+        record["prospective_metrics"] = {
+            **_empty_prospective_metrics(),
+            "blocking_reasons": ["candidate_definition_changed"],
+        }
+        return record
+
+    scoped_rows: list[Mapping[str, object]] = []
+    gross_rows: list[Mapping[str, object]] = []
+    valid_rows: list[Mapping[str, object]] = []
+    for row in evidence_rows:
+        prediction_time = _parse_aware_iso(row.get("prediction_time"))
+        holding_end_time = _parse_aware_iso(row.get("holding_end_time"))
+        if (
+            prediction_time is None
+            or holding_end_time is None
+            or prediction_time <= start
+            or holding_end_time <= start
+            or holding_end_time > now
+            or holding_end_time > end
+            or not _prospective_scope_match(record, row)
+        ):
+            continue
+        scoped_rows.append(row)
+        if _prospective_gross_value(row) is not None and row.get("tradable") is True:
+            gross_rows.append(row)
+        if row.get("tradable") is True and not canonical_net_label_contract_flags(row):
+            valid_rows.append(row)
+
+    try:
+        effective_rows, effective = select_effective_samples(valid_rows, min_samples=1)
+    except EffectiveSampleConflict:
+        record["stage"] = "expired"
+        record["expired_at"] = record.get("expired_at") or now.isoformat()
+        record["prospective_metrics"] = {
+            **_empty_prospective_metrics(),
+            "raw_samples": len(gross_rows),
+            "net_label_samples": len(valid_rows),
+            "blocking_reasons": ["effective_sample_conflict"],
+        }
+        return record
+    net_values = [
+        value for row in effective_rows if (value := _stat_float(row, "realized_net_r")) is not None
+    ]
+    versions = sorted({str(row.get("label_version", "")) for row in gross_rows})
+    provenances = sorted({str(row.get("label_provenance", "")) for row in gross_rows})
+    cost_models = sorted({str(row.get("cost_model_id", "")) for row in gross_rows})
+    proposed = record.get("proposed_change")
+    proposed_change = proposed if isinstance(proposed, Mapping) else {}
+    expected_version = str(proposed_change.get("label_version") or "")
+    expected_provenance = str(proposed_change.get("label_provenance") or "")
+    expected_cost_model = str(proposed_change.get("cost_model_id") or "")
+    contract_consistent = (
+        len(versions) <= 1
+        and len(provenances) <= 1
+        and len(cost_models) <= 1
+        and (not expected_version or versions == [expected_version])
+        and (not expected_provenance or provenances == [expected_provenance])
+        and (not expected_cost_model or cost_models == [expected_cost_model])
+    )
+    coverage = len(valid_rows) / len(gross_rows) if gross_rows else None
+    expectancy = _mean(net_values)
+    lcb = _prospective_lcb(net_values)
+    dsr, dsr_trials = _prospective_dsr(net_values, proposed_change)
+    max_drawdown = _prospective_max_drawdown(net_values)
+    stressed_expectancy = expectancy - PROSPECTIVE_COST_STRESS_R if expectancy is not None else None
+    concentration = _prospective_concentration(effective_rows)
+    scope = str(proposed_change.get("scope") or record.get("scope") or "")
+    concentration_ok = concentration is not None and (
+        scope in {"by_symbol", "by_symbol_direction", "通貨ペア", "通貨ペア×方向"}
+        or concentration <= PROSPECTIVE_MAX_CONCENTRATION
+    )
+    blocking_reasons: list[str] = []
+    if effective.effective_samples < PROSPECTIVE_MIN_EFFECTIVE_SAMPLES:
+        blocking_reasons.append("insufficient_effective_samples")
+    if coverage is None or coverage < PROSPECTIVE_MIN_NET_COVERAGE:
+        blocking_reasons.append("insufficient_net_label_coverage")
+    if lcb is None or lcb <= 0:
+        blocking_reasons.append("nonpositive_net_expectancy_lcb")
+    if dsr is None or dsr < PROSPECTIVE_MIN_DSR:
+        blocking_reasons.append("insufficient_dsr")
+    expected_trials = _stat_int(proposed_change, "trial_count")
+    if record.get("action_type") == "tp_sl_variant_paper_test" and (
+        expected_trials < 1 or dsr_trials != expected_trials
+    ):
+        blocking_reasons.append("incomplete_trial_sharpe_history")
+    if max_drawdown is None or max_drawdown < -PROSPECTIVE_MAX_DRAWDOWN_R:
+        blocking_reasons.append("max_drawdown_exceeded")
+    if stressed_expectancy is None or stressed_expectancy <= 0:
+        blocking_reasons.append("cost_stress_failed")
+    if not concentration_ok:
+        blocking_reasons.append("concentration_exceeded")
+    if not contract_consistent:
+        blocking_reasons.append("mixed_label_or_cost_contract")
+
+    metrics = {
+        "schema": PROSPECTIVE_EVIDENCE_SCHEMA,
+        "scoped_samples": len(scoped_rows),
+        "quality_excluded_samples": len(scoped_rows) - len(gross_rows),
+        "raw_samples": len(gross_rows),
+        "net_label_samples": len(valid_rows),
+        "effective_samples": effective.effective_samples,
+        "net_label_coverage": coverage,
+        "overlap_ratio": effective.overlap_ratio,
+        "cluster_count": effective.cluster_count,
+        "market_days": effective.market_days,
+        "net_expectancy_r": _round(expectancy),
+        "net_expectancy_lcb": _round(lcb),
+        "dsr": _round(dsr),
+        "dsr_trials": dsr_trials,
+        "max_drawdown_r": _round(max_drawdown),
+        "cost_stressed_expectancy_r": _round(stressed_expectancy),
+        "max_symbol_concentration": _round(concentration),
+        "label_versions": versions,
+        "label_provenances": provenances,
+        "cost_model_ids": cost_models,
+        "contract_consistent": contract_consistent,
+        "blocking_reasons": blocking_reasons,
+    }
+    record["prospective_metrics"] = metrics
+    record["prospective_dataset_hash"] = _prospective_dataset_hash(scoped_rows)
+    record["prospective_effective_dataset_hash"] = _prospective_dataset_hash(effective_rows)
+    record["prospective_outcome_keys"] = list(effective.selected_keys)
+    record["prospective_last_evaluated_at"] = now.isoformat()
+    if not blocking_reasons:
+        record["stage"] = "ready_for_review"
+        record["ready_for_review_at"] = record.get("ready_for_review_at") or now.isoformat()
+    elif now >= end:
+        record["stage"] = "expired"
+        record["expired_at"] = record.get("expired_at") or now.isoformat()
+    else:
+        record["stage"] = "prospective_collecting"
+    return record
+
+
+def _prospective_scope_match(
+    record: Mapping[str, object],
+    row: Mapping[str, object],
+) -> bool:
+    if record.get("action_type") == "tp_sl_variant_paper_test" and str(
+        row.get("target_policy_id") or ""
+    ) != str(record.get("candidate_id") or ""):
+        return False
+    proposed = record.get("proposed_change")
+    proposed_change = proposed if isinstance(proposed, Mapping) else {}
+    scope = str(proposed_change.get("scope") or record.get("scope") or "")
+    key = str(proposed_change.get("key") or record.get("key") or "")
+    symbol = str(row.get("symbol") or "").upper()
+    direction = str(row.get("direction") or "").lower()
+    if scope in {"overall", "全体", "データ品質", "TP/SL候補"}:
+        return True
+    if scope in {"by_symbol_direction", "通貨ペア×方向"}:
+        return key == f"{symbol}:{direction}"
+    if scope in {"by_symbol", "通貨ペア"}:
+        return key == symbol
+    if scope in {"by_direction", "方向"}:
+        return key == direction
+    if scope in {"by_confidence", "確信度"}:
+        return key == _confidence_label_from_int(_stat_int(row, "conviction"))
+    return False
+
+
+def _prospective_gross_value(row: Mapping[str, object]) -> float | None:
+    gross = _float(row.get("gross_realized_r"))
+    return gross if gross is not None else _float(row.get("realized_r"))
+
+
+def _prospective_dataset_hash(rows: Sequence[Mapping[str, object]]) -> str:
+    canonical = [
+        {
+            "decision_id": str(row.get("decision_id") or ""),
+            "label_version": str(row.get("label_version") or ""),
+            "label_provenance": str(row.get("label_provenance") or ""),
+            "prediction_time": row.get("prediction_time"),
+            "holding_end_time": row.get("holding_end_time"),
+            "symbol": row.get("symbol"),
+            "direction": row.get("direction"),
+            "timeframe": row.get("timeframe"),
+            "horizon_hours": _float(row.get("horizon_hours")),
+            "conviction": row.get("conviction"),
+            "tradable": row.get("tradable"),
+            "gross_realized_r": _prospective_gross_value(row),
+            "quote_realized_r": _float(row.get("quote_realized_r")),
+            "realized_net_r": _float(row.get("realized_net_r")),
+            "net_label_eligible": row.get("net_label_eligible"),
+            "entry_bid": _float(row.get("entry_bid")),
+            "entry_ask": _float(row.get("entry_ask")),
+            "planned_risk_distance": _float(row.get("planned_risk_distance")),
+            "entry_spread_r": _float(row.get("entry_spread_r")),
+            "slippage_r": _float(row.get("slippage_r")),
+            "commission_r": _float(row.get("commission_r")),
+            "financing_r": _float(row.get("financing_r")),
+            "additional_cost_r": _float(row.get("additional_cost_r")),
+            "execution_cost_r": _float(row.get("execution_cost_r")),
+            "cost_model_id": row.get("cost_model_id"),
+            "cost_model_version": row.get("cost_model_version"),
+            "cost_status": row.get("cost_status"),
+            "entry_quote_source": row.get("entry_quote_source"),
+            "spread_source": row.get("spread_source"),
+            "target_policy_id": row.get("target_policy_id"),
+        }
+        for row in rows
+    ]
+    canonical.sort(
+        key=lambda row: (
+            str(row["prediction_time"] or ""),
+            str(row["decision_id"]),
+            str(row["label_version"]),
+        )
+    )
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _candidate_definition_hash(candidate: Mapping[str, object]) -> str:
+    frozen = {
+        key: candidate.get(key)
+        for key in (
+            "candidate_id",
+            "scope",
+            "key",
+            "priority",
+            "action_type",
+            "proposed_change",
+            "validation_ja",
+            "guardrail_ja",
+        )
+    }
+    encoded = json.dumps(
+        json_safe(frozen),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prospective_lcb(values: Sequence[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return mean - 1.645 * math.sqrt(variance / len(values))
+
+
+def _prospective_dsr(
+    values: Sequence[float],
+    proposed_change: Mapping[str, object],
+) -> tuple[float | None, int]:
+    if len(values) < 3:
+        return None, 0
+    try:
+        import numpy as np
+
+        from fx_backtester.overfitting import deflated_sharpe_ratio, per_period_sharpe
+    except ImportError:
+        return None, 0
+    raw_trials = proposed_change.get("trial_sharpes")
+    trial_sharpes = (
+        [
+            float(value)
+            for value in raw_trials
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ]
+        if isinstance(raw_trials, Sequence) and not isinstance(raw_trials, str | bytes)
+        else []
+    )
+    selected = np.asarray(values, dtype=float)
+    if not trial_sharpes:
+        trial_sharpes = [per_period_sharpe(selected)]
+    try:
+        result = deflated_sharpe_ratio(selected, trial_sharpes)
+    except ValueError:
+        return None, len(trial_sharpes)
+    return float(result["dsr"]), len(trial_sharpes)
+
+
+def _prospective_max_drawdown(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    equity = 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for value in values:
+        equity += value
+        peak = max(peak, equity)
+        drawdown = min(drawdown, equity - peak)
+    return drawdown
+
+
+def _prospective_concentration(rows: Sequence[Mapping[str, object]]) -> float | None:
+    if not rows:
+        return None
+    counts: dict[str, int] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "unknown")
+        counts[symbol] = counts.get(symbol, 0) + 1
+    return max(counts.values()) / len(rows)
+
+
+def _empty_prospective_metrics() -> dict[str, object]:
+    return {
+        "schema": PROSPECTIVE_EVIDENCE_SCHEMA,
+        "scoped_samples": 0,
+        "quality_excluded_samples": 0,
+        "raw_samples": 0,
+        "net_label_samples": 0,
+        "effective_samples": 0,
+        "net_label_coverage": None,
+        "overlap_ratio": None,
+        "cluster_count": 0,
+        "market_days": 0,
+        "net_expectancy_r": None,
+        "net_expectancy_lcb": None,
+        "dsr": None,
+        "dsr_trials": 0,
+        "max_drawdown_r": None,
+        "cost_stressed_expectancy_r": None,
+        "max_symbol_concentration": None,
+        "label_versions": [],
+        "label_provenances": [],
+        "cost_model_ids": [],
+        "contract_consistent": False,
+        "blocking_reasons": ["insufficient_effective_samples"],
+    }
+
+
+def _parse_aware_iso(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
 def load_improvement_registry(path: str | Path) -> dict:
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict) or raw.get("schema") != IMPROVEMENT_REGISTRY_SCHEMA:
+        return {}
+    return raw
 
 
 def save_improvement_registry(registry: Mapping[str, object], path: str | Path) -> None:
@@ -1021,10 +2367,11 @@ def set_improvement_candidate_approval(
 ) -> tuple[dict, dict]:
     """改善候補を人間承認/却下/再開する。
 
-    approved は paper_ready のみ、resumed は auto_paused のみ許可する。
+    approved は ready_for_review のみ、resumed は auto_paused のみ許可する。
     TP/SL候補は、期待Rが現行比で改善している証跡がある場合だけ昇格できる。
     """
-    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    generated_time = _utc(now or datetime.now(UTC))
+    generated_at = generated_time.isoformat()
     records = _registry_records(registry)
     events = _registry_events(registry)
     candidate_id = str(candidate_id)
@@ -1048,11 +2395,11 @@ def set_improvement_candidate_approval(
             }
         )
         return _registry_payload(records, generated_at), result
-    if decision == "approved" and stage != "paper_ready":
+    if decision == "approved" and stage != "ready_for_review":
         result.update(
             {
                 "status": "not_ready",
-                "message_ja": "paper_ready到達前のため承認できません",
+                "message_ja": "ready_for_review到達前のため承認できません",
             }
         )
         return _registry_payload(records, generated_at), result
@@ -1073,6 +2420,18 @@ def set_improvement_candidate_approval(
         )
         return _registry_payload(records, generated_at), result
     if decision in {"approved", "resumed"}:
+        prospective_ok, prospective_reason = _prospective_approval_gate(
+            record,
+            now=generated_time,
+        )
+        if not prospective_ok:
+            result.update(
+                {
+                    "status": "not_ready",
+                    "message_ja": prospective_reason,
+                }
+            )
+            return _registry_payload(records, generated_at), result
         improvement_ok, improvement_reason = _approval_improvement_gate(record)
         if not improvement_ok:
             result.update(
@@ -1145,7 +2504,7 @@ def build_monitoring_snapshot(
     health_report = health_report or check_expectancy_health(summary)
     records = _registry_records(registry)
     active = [record for record in records.values() if record.get("status") == "active"]
-    paper_ready = [record for record in active if record.get("stage") == "paper_ready"]
+    ready_for_review = [record for record in active if record.get("stage") == "ready_for_review"]
     approved = [record for record in active if record.get("stage") == "approved"]
     rejected = [record for record in active if record.get("stage") == "rejected"]
     auto_paused = [record for record in active if record.get("stage") == "auto_paused"]
@@ -1161,12 +2520,12 @@ def build_monitoring_snapshot(
     ]
     alerts.extend(
         {
-            "type": "paper_ready",
+            "type": "ready_for_review",
             "severity": "info",
             "candidate_id": str(record.get("candidate_id", "")),
             "message_ja": str(record.get("title_ja", "承認待ちの改善候補")),
         }
-        for record in paper_ready
+        for record in ready_for_review
     )
     alerts.extend(
         {
@@ -1178,7 +2537,7 @@ def build_monitoring_snapshot(
         for record in auto_paused
     )
     return {
-        "schema": 1,
+        "schema": 2,
         "generated_at": generated_at,
         "status": health_report.status,
         "exit_code": health_report.exit_code,
@@ -1186,14 +2545,14 @@ def build_monitoring_snapshot(
         "summary": summary,
         "registry": {
             "active_count": len(active),
-            "paper_ready_count": len(paper_ready),
+            "ready_for_review_count": len(ready_for_review),
             "approved_count": len(approved),
             "rejected_count": len(rejected),
             "auto_paused_count": len(auto_paused),
             "resolved_count": sum(
                 1 for record in records.values() if record.get("status") == "resolved"
             ),
-            "paper_ready": _monitor_records(paper_ready),
+            "ready_for_review": _monitor_records(ready_for_review),
             "approved": _monitor_records(approved),
             "rejected": _monitor_records(rejected),
             "auto_paused": _monitor_records(auto_paused),
@@ -1204,12 +2563,23 @@ def build_monitoring_snapshot(
     }
 
 
-def approved_target_policies(registry: Mapping[str, object] | None) -> list[ApprovedTargetPolicy]:
+def approved_target_policies(
+    registry: Mapping[str, object] | None,
+    *,
+    now: datetime | None = None,
+) -> list[ApprovedTargetPolicy]:
     policies: list[ApprovedTargetPolicy] = []
+    current_time = _utc(now or datetime.now(UTC))
     for record in _registry_records(registry).values():
         if record.get("status") != "active" or record.get("stage") != "approved":
             continue
         if record.get("action_type") != "tp_sl_variant_paper_test":
+            continue
+        prospective_ok, _ = _prospective_approval_gate(record, now=current_time)
+        if not prospective_ok:
+            continue
+        improvement_ok, _ = _approval_improvement_gate(record)
+        if not improvement_ok:
             continue
         proposed = record.get("proposed_change")
         if not isinstance(proposed, Mapping):
@@ -1252,8 +2622,10 @@ def select_approved_target_policy(
     symbol: str,
     direction: str,
     conviction: int,
+    *,
+    now: datetime | None = None,
 ) -> ApprovedTargetPolicy | None:
-    for policy in approved_target_policies(registry):
+    for policy in approved_target_policies(registry, now=now):
         if _target_policy_matches(policy, symbol, direction, conviction):
             return policy
     return None
@@ -1281,8 +2653,12 @@ def approved_policy_stats(
                 "tradable": _stat_int(stats, "tradable"),
                 "evaluated": _stat_int(stats, "evaluated"),
                 "sample_ok": bool(stats.get("sample_ok")),
-                "expectancy_r": _stat_float(stats, "expectancy_r"),
-                "profit_factor_r": _stat_float(stats, "profit_factor_r"),
+                "gross_expectancy_r": _stat_float(stats, "gross_expectancy_r"),
+                "net_expectancy_r": _stat_float(stats, "net_expectancy_r"),
+                "gross_profit_factor_r": _stat_float(stats, "gross_profit_factor_r"),
+                "net_profit_factor_r": _stat_float(stats, "net_profit_factor_r"),
+                "net_label_samples": _stat_int(stats, "net_label_samples"),
+                "net_label_coverage": _stat_float(stats, "net_label_coverage"),
                 "avg_path_quality": _stat_float(stats, "avg_path_quality"),
             }
         )
@@ -1296,12 +2672,12 @@ def auto_pause_underperforming_approved_policies(
     *,
     now: datetime | None = None,
 ) -> tuple[dict, list[dict]]:
-    generated_at = _utc(now or datetime.now(UTC)).isoformat()
+    generated_time = _utc(now or datetime.now(UTC))
+    generated_at = generated_time.isoformat()
     records = _registry_records(registry)
     events = _registry_events(registry)
-    by_policy = summary.get("by_target_policy")
-    if not isinstance(by_policy, Mapping):
-        return _registry_payload(records, generated_at, _bounded_registry_events(events)), []
+    raw_by_policy = summary.get("by_target_policy")
+    by_policy = raw_by_policy if isinstance(raw_by_policy, Mapping) else {}
 
     paused: list[dict] = []
     for candidate_id, record in list(records.items()):
@@ -1309,10 +2685,24 @@ def auto_pause_underperforming_approved_policies(
             continue
         if record.get("action_type") != "tp_sl_variant_paper_test":
             continue
+        prospective_ok, prospective_reason = _prospective_approval_gate(
+            record,
+            now=generated_time,
+        )
         stats = by_policy.get(candidate_id)
-        if not isinstance(stats, Mapping) or not bool(stats.get("sample_ok")):
-            continue
-        reason = _policy_pause_reason(stats)
+        if not prospective_ok:
+            reason = prospective_reason
+            stats = stats if isinstance(stats, Mapping) else {}
+        elif not isinstance(stats, Mapping):
+            reason = "承認済みTP/SLのcanonical純R証拠が取得不能"
+            stats = {}
+        elif not bool(stats.get("sample_ok")) or _stat_int(stats, "net_label_samples") <= 0:
+            reason = (
+                "承認済みTP/SLのcanonical純Rサンプル不足"
+                f"(n={_stat_int(stats, 'net_label_samples')})"
+            )
+        else:
+            reason = _policy_pause_reason(stats)
         if not reason:
             continue
         updated = dict(record)
@@ -1329,18 +2719,18 @@ def auto_pause_underperforming_approved_policies(
             to_stage="auto_paused",
             details={
                 "reason_ja": reason,
-                "expectancy_r": _stat_float(stats, "expectancy_r"),
-                "profit_factor_r": _stat_float(stats, "profit_factor_r"),
-                "tradable": _stat_int(stats, "tradable"),
+                "net_expectancy_r": _stat_float(stats, "net_expectancy_r"),
+                "net_profit_factor_r": _stat_float(stats, "net_profit_factor_r"),
+                "net_label_samples": _stat_int(stats, "net_label_samples"),
             },
         )
         paused.append(
             {
                 "candidate_id": candidate_id,
                 "reason_ja": reason,
-                "expectancy_r": _stat_float(stats, "expectancy_r"),
-                "profit_factor_r": _stat_float(stats, "profit_factor_r"),
-                "tradable": _stat_int(stats, "tradable"),
+                "net_expectancy_r": _stat_float(stats, "net_expectancy_r"),
+                "net_profit_factor_r": _stat_float(stats, "net_profit_factor_r"),
+                "net_label_samples": _stat_int(stats, "net_label_samples"),
             }
         )
     return _registry_payload(records, generated_at, _bounded_registry_events(events)), paused
@@ -1367,15 +2757,17 @@ def format_expectancy_report_ja(summary: Mapping[str, object], *, limit: int = 5
     sample_status = "サンプルOK" if bool(overall.get("sample_ok")) else "サンプル不足"
     lines = [
         "トレード期待値監視(MFE/MAE/TP/SL): "
-        f"期待R {_fmt_signed(_stat_float(overall, 'expectancy_r'), 'R')}"
-        f" / PF {_fmt_number(_stat_float(overall, 'profit_factor_r'))}"
+        f"canonical net期待R {_fmt_signed(_stat_float(overall, 'net_expectancy_r'), 'R')}"
+        f" / net PF {_fmt_number(_stat_float(overall, 'net_profit_factor_r'))}"
+        f" / gross診断 {_fmt_signed(_stat_float(overall, 'gross_expectancy_r'), 'R')}"
         f" / TP1 {_fmt_pct(_stat_float(overall, 'tp1_rate'))}"
         f" / TP2 {_fmt_pct(_stat_float(overall, 'tp2_rate'))}"
         f" / SL {_fmt_pct(_stat_float(overall, 'sl_rate'))}"
         f" / 平均MFE {_fmt_signed(_stat_float(overall, 'avg_mfe_r'), 'R')}"
         f" / 平均MAE {_fmt_number(_stat_float(overall, 'avg_mae_r'), 'R')}"
-        f" (n={tradable}/{evaluated}, {sample_status}"
-        + (f" {tradable}/{min_samples}" if min_samples else "")
+        f" (net n={_stat_int(overall, 'net_label_samples')}, gross n={tradable}/{evaluated}, "
+        f"{sample_status}"
+        + (f" {_stat_int(overall, 'effective_samples')}/{min_samples}" if min_samples else "")
         + ")"
     ]
     quality = summary.get("quality")
@@ -1446,12 +2838,12 @@ def format_improvement_registry_ja(registry: Mapping[str, object], *, limit: int
     records = _registry_records(registry)
     active = [record for record in records.values() if record.get("status") == "active"]
     resolved = [record for record in records.values() if record.get("status") == "resolved"]
-    ready = [record for record in active if record.get("stage") == "paper_ready"]
+    ready = [record for record in active if record.get("stage") == "ready_for_review"]
     approved = [record for record in active if record.get("stage") == "approved"]
     rejected = [record for record in active if record.get("stage") == "rejected"]
     auto_paused = [record for record in active if record.get("stage") == "auto_paused"]
     lines = [
-        f"改善候補レジストリ: active={len(active)} / paper_ready={len(ready)}"
+        f"改善候補レジストリ: active={len(active)} / ready_for_review={len(ready)}"
         f" / approved={len(approved)} / auto_paused={len(auto_paused)}"
         f" / rejected={len(rejected)} / resolved={len(resolved)}"
     ]
@@ -1463,11 +2855,20 @@ def format_improvement_registry_ja(registry: Mapping[str, object], *, limit: int
             f"{len(events)}件 / latest={last.get('event_type')}:{last.get('candidate_id')}"
         )
     for record in sorted(
-        active, key=lambda item: (-_stat_int(item, "seen_count"), str(item.get("candidate_id", "")))
+        active,
+        key=lambda item: (
+            -_record_prospective_effective_samples(item),
+            str(item.get("candidate_id", "")),
+        ),
     )[:limit]:
+        metrics = record.get("prospective_metrics")
+        effective_samples = (
+            _stat_int(metrics, "effective_samples") if isinstance(metrics, Mapping) else 0
+        )
         lines.append(
             f"・{record.get('title_ja', record.get('candidate_id'))}"
-            f" (stage={record.get('stage')}, seen={_stat_int(record, 'seen_count')})"
+            f" (stage={record.get('stage')}, prospective effective={effective_samples}, "
+            f"expiry={record.get('prospective_end') or '—'})"
         )
     return "\n".join(lines)
 
@@ -1481,9 +2882,12 @@ def format_variant_retest_report_ja(report: Mapping[str, object], *, limit: int 
         return "TP/SL候補paper再採点: 対象なし"
     lines = [
         "TP/SL候補paper再採点: "
-        f"現行 期待R {_fmt_signed(_stat_float(overall, 'expectancy_r'), 'R')}"
-        f" / PF {_fmt_number(_stat_float(overall, 'profit_factor_r'))}"
-        f" / n={_stat_int(overall, 'tradable')}/{_stat_int(overall, 'evaluated')}"
+        f"現行 canonical net期待R "
+        f"{_fmt_signed(_stat_float(overall, 'net_expectancy_r'), 'R')}"
+        f" / net PF {_fmt_number(_stat_float(overall, 'net_profit_factor_r'))}"
+        f" / gross診断 {_fmt_signed(_stat_float(overall, 'gross_expectancy_r'), 'R')}"
+        f" / net n={_stat_int(overall, 'net_label_samples')}"
+        f" / gross n={_stat_int(overall, 'tradable')}/{_stat_int(overall, 'evaluated')}"
     ]
     best = report.get("best")
     if isinstance(best, Mapping):
@@ -1530,6 +2934,8 @@ def check_expectancy_health(
         )
     evaluated = _stat_int(overall, "evaluated")
     tradable = _stat_int(overall, "tradable")
+    net_label_samples = _stat_int(overall, "net_label_samples")
+    effective_samples = _stat_int(overall, "effective_samples")
     min_samples = _stat_int(overall, "min_samples")
     sample_ok = bool(overall.get("sample_ok"))
     expectancy_r = _stat_float(overall, "expectancy_r")
@@ -1541,13 +2947,22 @@ def check_expectancy_health(
         checks.append(
             TradeOutcomeHealthCheck("sample", STATUS_FAIL, "期待値計算に使える判断がありません")
         )
+    elif net_label_samples <= 0:
+        checks.append(
+            TradeOutcomeHealthCheck(
+                "sample",
+                STATUS_FAIL,
+                "canonical純Rラベルがなく期待値を判定できません",
+                {"gross_samples": tradable, "net_label_samples": net_label_samples},
+            )
+        )
     elif not sample_ok:
         checks.append(
             TradeOutcomeHealthCheck(
                 "sample",
                 STATUS_FAIL if require_sample_ok else STATUS_WARN,
                 "期待値サンプルが不足しています",
-                {"tradable": tradable, "min_samples": min_samples},
+                {"effective_samples": effective_samples, "min_samples": min_samples},
             )
         )
     else:
@@ -1719,10 +3134,10 @@ def _variant_score(
     stats: Mapping[str, object],
     baseline: Mapping[str, object],
 ) -> TradeVariantScore:
-    expectancy = _stat_float(stats, "expectancy_r")
-    baseline_expectancy = _stat_float(baseline, "expectancy_r")
-    profit_factor = _stat_float(stats, "profit_factor_r")
-    baseline_pf = _stat_float(baseline, "profit_factor_r")
+    expectancy = _stat_float(stats, "net_expectancy_r")
+    baseline_expectancy = _stat_float(baseline, "net_expectancy_r")
+    profit_factor = _stat_float(stats, "net_profit_factor_r")
+    baseline_pf = _stat_float(baseline, "net_profit_factor_r")
     delta_expectancy = (
         _round(expectancy - baseline_expectancy)
         if expectancy is not None and baseline_expectancy is not None
@@ -1750,7 +3165,18 @@ def _variant_score(
         tradable=_stat_int(stats, "tradable"),
         sample_ok=sample_ok,
         expectancy_r=expectancy,
+        net_sharpe_per_period=_stat_float(stats, "net_sharpe_per_period"),
         profit_factor_r=profit_factor,
+        gross_expectancy_r=_stat_float(stats, "gross_expectancy_r"),
+        net_expectancy_r=expectancy,
+        gross_profit_factor_r=_stat_float(stats, "gross_profit_factor_r"),
+        net_profit_factor_r=profit_factor,
+        net_label_samples=_stat_int(stats, "net_label_samples"),
+        net_label_coverage=_stat_float(stats, "net_label_coverage"),
+        effective_samples=_stat_int(stats, "effective_samples"),
+        label_version=str(stats.get("label_version") or ""),
+        label_provenance=str(stats.get("label_provenance") or ""),
+        cost_model_id=str(stats.get("cost_model_id") or ""),
         tp1_rate=_stat_float(stats, "tp1_rate"),
         tp2_rate=_stat_float(stats, "tp2_rate"),
         sl_rate=_stat_float(stats, "sl_rate"),
@@ -2125,6 +3551,17 @@ def _candidate_from_finding(
     return None
 
 
+def _variant_trial_sharpes(
+    variants: Sequence[Mapping[str, object]],
+) -> list[float]:
+    return [
+        value
+        for variant in variants
+        if (value := _stat_float(variant, "net_sharpe_per_period")) is not None
+        and math.isfinite(value)
+    ]
+
+
 def _candidate_from_variant(
     variant: Mapping[str, object],
     baseline_overall: object,
@@ -2132,13 +3569,15 @@ def _candidate_from_variant(
     *,
     scope: str = "overall",
     key: str = "",
+    trial_sharpes: Sequence[float] = (),
+    trial_count: int = 0,
 ) -> TradeImprovementCandidate:
     baseline = baseline_overall if isinstance(baseline_overall, Mapping) else {}
     target1_r = _stat_float(variant, "target1_r")
     target2_r = _stat_float(variant, "target2_r")
-    expectancy = _stat_float(variant, "expectancy_r")
-    delta = _stat_float(variant, "delta_expectancy_r")
-    profit_factor = _stat_float(variant, "profit_factor_r")
+    expectancy = _stat_float(variant, "net_expectancy_r")
+    delta = _stat_float(variant, "delta_net_expectancy_r")
+    profit_factor = _stat_float(variant, "net_profit_factor_r")
     variant_id = str(variant.get("variant_id") or f"variant-{index}")
     scope_label = _variant_scope_label(scope, key)
     title = (
@@ -2162,16 +3601,40 @@ def _candidate_from_variant(
             "target1_r": target1_r,
             "target2_r": target2_r,
             "execution_policy": "paper_ab_test",
-            "baseline_expectancy_r": _stat_float(baseline, "expectancy_r"),
-            "candidate_expectancy_r": expectancy,
-            "delta_expectancy_r": delta,
+            "baseline_net_expectancy_r": _stat_float(baseline, "net_expectancy_r"),
+            "candidate_net_expectancy_r": expectancy,
+            "delta_net_expectancy_r": delta,
+            "label_version": str(variant.get("label_version") or ""),
+            "label_provenance": str(variant.get("label_provenance") or ""),
+            "cost_model_id": str(variant.get("cost_model_id") or ""),
+            "net_label_samples": _stat_int(variant, "net_label_samples"),
+            "net_label_coverage": _stat_float(variant, "net_label_coverage"),
             "scope": scope,
             "key": key,
             "min_expected_improvement_r": MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+            "trial_count": trial_count,
+            "trial_sharpes": list(trial_sharpes),
         },
         "paper期間で期待Rが現行比+0.05R以上、PF>=1.05、最低サンプル数を維持することを確認",
-        "live反映はpaper_ready後も即時採用せず、人間承認とデータ品質確認を必須にする",
+        "分析用policyへの反映はready_for_review後も即時採用せず、人間承認と"
+        "データ品質確認を必須にする",
         {"variant": dict(variant), "baseline_overall": dict(baseline), "scope": scope, "key": key},
+    )
+
+
+def _variant_has_canonical_net_evidence(variant: Mapping[str, object]) -> bool:
+    return (
+        variant.get("label_version") in KNOWN_NET_LABEL_VERSIONS
+        and variant.get("label_provenance") in KNOWN_NET_LABEL_PROVENANCES
+        and variant.get("cost_model_id") in KNOWN_EXECUTABLE_COST_MODEL_IDS
+        and _stat_int(variant, "net_label_samples") >= MIN_EXPECTANCY_SAMPLES
+        and math.isclose(
+            _stat_float(variant, "net_label_coverage") or 0.0,
+            1.0,
+            abs_tol=1e-12,
+        )
+        and _stat_float(variant, "net_expectancy_r") is not None
+        and _stat_float(variant, "delta_net_expectancy_r") is not None
     )
 
 
@@ -2390,8 +3853,99 @@ def _confidence_label_from_int(conviction: int) -> str:
     return "unknown"
 
 
-def _candidate_stage(priority: str, seen_count: int) -> str:
-    return "paper_ready" if seen_count >= READY_SEEN_BY_PRIORITY.get(priority, 3) else "watch"
+def _prospective_approval_gate(
+    record: Mapping[str, object],
+    *,
+    now: datetime,
+) -> tuple[bool, str]:
+    if _stat_int(record, "prospective_schema") != PROSPECTIVE_EVIDENCE_SCHEMA:
+        return False, "前向き検証schemaが不一致のため承認できません"
+    created_at = _parse_aware_iso(record.get("candidate_created_at"))
+    training_end = _parse_aware_iso(record.get("training_data_end"))
+    start = _parse_aware_iso(record.get("prospective_start"))
+    end = _parse_aware_iso(record.get("prospective_end"))
+    if (
+        created_at is None
+        or training_end is None
+        or start is None
+        or end is None
+        or created_at > start
+        or training_end > start
+        or end <= start
+    ):
+        return False, "前向き検証期間の来歴が不正なため承認できません"
+    if now > end:
+        return False, "前向き検証証拠が期限切れのため承認できません"
+    last_evaluated = _parse_aware_iso(record.get("prospective_last_evaluated_at"))
+    if last_evaluated is None or last_evaluated > now:
+        return False, "前向き検証の評価時刻が不正なため承認できません"
+    if record.get("candidate_definition_hash") != _candidate_definition_hash(record):
+        return False, "候補定義が登録後に変更されたため承認できません"
+    for key in (
+        "candidate_definition_hash",
+        "dataset_hash",
+        "prospective_dataset_hash",
+        "prospective_effective_dataset_hash",
+    ):
+        value = str(record.get(key) or "")
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            return False, f"{key}が不正なため承認できません"
+    if not str(record.get("lockbox_id") or "").startswith("prospective-"):
+        return False, "lockbox IDが不正なため承認できません"
+    metrics = record.get("prospective_metrics")
+    if not isinstance(metrics, Mapping):
+        return False, "前向き検証指標がないため承認できません"
+    if _stat_int(metrics, "schema") != PROSPECTIVE_EVIDENCE_SCHEMA:
+        return False, "前向き検証指標schemaが不一致のため承認できません"
+    effective_samples = _stat_int(metrics, "effective_samples")
+    outcome_keys = record.get("prospective_outcome_keys")
+    if (
+        not isinstance(outcome_keys, list)
+        or len(outcome_keys) != effective_samples
+        or effective_samples < PROSPECTIVE_MIN_EFFECTIVE_SAMPLES
+    ):
+        return False, "前向き検証のeffective sampleが不足しています"
+    coverage = _stat_float(metrics, "net_label_coverage")
+    if coverage is None or coverage < PROSPECTIVE_MIN_NET_COVERAGE:
+        return False, "前向き検証のcanonical net coverageが不足しています"
+    lcb = _stat_float(metrics, "net_expectancy_lcb")
+    if lcb is None or lcb <= 0:
+        return False, "前向き検証のnet期待R片側信頼下限が非正です"
+    dsr = _stat_float(metrics, "dsr")
+    if dsr is None or dsr < PROSPECTIVE_MIN_DSR:
+        return False, "前向き検証のDSRが基準未達です"
+    max_drawdown = _stat_float(metrics, "max_drawdown_r")
+    if max_drawdown is None or max_drawdown < -PROSPECTIVE_MAX_DRAWDOWN_R:
+        return False, "前向き検証の最大ドローダウンが基準超過です"
+    stressed = _stat_float(metrics, "cost_stressed_expectancy_r")
+    if stressed is None or stressed <= 0:
+        return False, "前向き検証のcost stress後期待Rが非正です"
+    concentration = _stat_float(metrics, "max_symbol_concentration")
+    proposed = record.get("proposed_change")
+    proposed_change = proposed if isinstance(proposed, Mapping) else {}
+    scope = str(proposed_change.get("scope") or record.get("scope") or "")
+    if concentration is None or (
+        scope not in {"by_symbol", "by_symbol_direction", "通貨ペア", "通貨ペア×方向"}
+        and concentration > PROSPECTIVE_MAX_CONCENTRATION
+    ):
+        return False, "前向き検証の集中度が基準超過です"
+    if metrics.get("contract_consistent") is not True:
+        return False, "前向き検証のlabel/cost契約が混在しています"
+    versions = metrics.get("label_versions")
+    provenances = metrics.get("label_provenances")
+    cost_models = metrics.get("cost_model_ids")
+    if (
+        versions != sorted(KNOWN_NET_LABEL_VERSIONS)
+        or provenances != sorted(KNOWN_NET_LABEL_PROVENANCES)
+        or not isinstance(cost_models, list)
+        or len(cost_models) != 1
+        or cost_models[0] not in KNOWN_EXECUTABLE_COST_MODEL_IDS
+    ):
+        return False, "前向き検証のcanonical label/cost schemaが不一致です"
+    blockers = metrics.get("blocking_reasons")
+    if not isinstance(blockers, list) or blockers:
+        return False, "前向き検証に未解決の昇格阻害理由があります"
+    return True, ""
 
 
 def _approval_improvement_gate(record: Mapping[str, object]) -> tuple[bool, str]:
@@ -2400,22 +3954,40 @@ def _approval_improvement_gate(record: Mapping[str, object]) -> tuple[bool, str]
     proposed = record.get("proposed_change")
     if not isinstance(proposed, Mapping):
         return False, "TP/SL候補の改善根拠がないため昇格できません"
-    delta = _stat_float(proposed, "delta_expectancy_r")
-    candidate = _stat_float(proposed, "candidate_expectancy_r")
+    label_version = str(proposed.get("label_version") or "")
+    label_provenance = str(proposed.get("label_provenance") or "")
+    cost_model_id = str(proposed.get("cost_model_id") or "")
+    net_samples = _stat_int(proposed, "net_label_samples")
+    net_coverage = _stat_float(proposed, "net_label_coverage")
+    if (
+        label_version not in KNOWN_NET_LABEL_VERSIONS
+        or label_provenance not in KNOWN_NET_LABEL_PROVENANCES
+        or cost_model_id not in KNOWN_EXECUTABLE_COST_MODEL_IDS
+    ):
+        return False, "TP/SL候補のcanonical純R来歴が不明なため昇格できません"
+    if net_samples < MIN_EXPECTANCY_SAMPLES:
+        return (
+            False,
+            f"TP/SL候補のcanonical純Rサンプル不足({net_samples}/{MIN_EXPECTANCY_SAMPLES}件)",
+        )
+    if net_coverage is None or not math.isclose(net_coverage, 1.0, abs_tol=1e-12):
+        return False, "TP/SL候補のcanonical純R coverage不足のため昇格できません"
+    delta = _stat_float(proposed, "delta_net_expectancy_r")
+    candidate = _stat_float(proposed, "candidate_net_expectancy_r")
     min_delta = _stat_float(proposed, "min_expected_improvement_r")
     if min_delta is None:
         min_delta = MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R
     if delta is None:
-        return False, "TP/SL候補の期待R改善幅が未記録のため昇格できません"
+        return False, "TP/SL候補の純R改善幅が未記録のため昇格できません"
     if delta < min_delta:
         return (
             False,
-            f"TP/SL候補の期待R改善幅が不足しています({delta:+.2f}R<{min_delta:+.2f}R)",
+            f"TP/SL候補の純R改善幅が不足しています({delta:+.2f}R<{min_delta:+.2f}R)",
         )
     if candidate is None:
-        return False, "TP/SL候補の候補期待Rが未記録のため昇格できません"
+        return False, "TP/SL候補の候補純Rが未記録のため昇格できません"
     if candidate <= 0:
-        return False, f"TP/SL候補の候補期待Rが非正です({candidate:+.2f}R)"
+        return False, f"TP/SL候補の候補純Rが非正です({candidate:+.2f}R)"
     return True, ""
 
 
@@ -2508,8 +4080,8 @@ def _registry_payload(
         "schema": IMPROVEMENT_REGISTRY_SCHEMA,
         "generated_at": generated_at,
         "active_count": sum(1 for record in records.values() if record.get("status") == "active"),
-        "paper_ready_count": sum(
-            1 for record in records.values() if record.get("stage") == "paper_ready"
+        "ready_for_review_count": sum(
+            1 for record in records.values() if record.get("stage") == "ready_for_review"
         ),
         "approved_count": sum(
             1 for record in records.values() if record.get("stage") == "approved"
@@ -2540,7 +4112,7 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
     sorted_records = sorted(
         records,
         key=lambda record: (
-            -_stat_int(record, "seen_count"),
+            -_record_prospective_effective_samples(record),
             str(record.get("priority", "")),
             str(record.get("candidate_id", "")),
         ),
@@ -2548,6 +4120,7 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
     output: list[dict] = []
     for record in sorted_records[: max(0, limit)]:
         proposed_change = record.get("proposed_change")
+        prospective_metrics = record.get("prospective_metrics")
         output.append(
             {
                 "candidate_id": str(record.get("candidate_id", "")),
@@ -2560,6 +4133,22 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
                 "seen_count": _stat_int(record, "seen_count"),
                 "first_seen": record.get("first_seen"),
                 "last_seen": record.get("last_seen"),
+                "candidate_created_at": record.get("candidate_created_at"),
+                "candidate_definition_hash": record.get("candidate_definition_hash"),
+                "training_data_end": record.get("training_data_end"),
+                "prospective_start": record.get("prospective_start"),
+                "prospective_end": record.get("prospective_end"),
+                "lockbox_id": record.get("lockbox_id"),
+                "dataset_hash": record.get("dataset_hash"),
+                "prospective_dataset_hash": record.get("prospective_dataset_hash"),
+                "prospective_effective_dataset_hash": record.get(
+                    "prospective_effective_dataset_hash"
+                ),
+                "prospective_metrics": (
+                    {str(key): value for key, value in prospective_metrics.items()}
+                    if isinstance(prospective_metrics, Mapping)
+                    else {}
+                ),
                 "approved_at": record.get("approved_at"),
                 "approved_by": record.get("approved_by"),
                 "auto_paused_at": record.get("auto_paused_at"),
@@ -2576,6 +4165,11 @@ def _monitor_records(records: Sequence[Mapping[str, object]], *, limit: int = 20
     return output
 
 
+def _record_prospective_effective_samples(record: Mapping[str, object]) -> int:
+    metrics = record.get("prospective_metrics")
+    return _stat_int(metrics, "effective_samples") if isinstance(metrics, Mapping) else 0
+
+
 def _policy_specificity(policy: ApprovedTargetPolicy) -> int:
     return {
         "by_symbol_direction": 5,
@@ -2587,10 +4181,10 @@ def _policy_specificity(policy: ApprovedTargetPolicy) -> int:
 
 
 def _policy_pause_reason(stats: Mapping[str, object]) -> str:
-    expectancy = _stat_float(stats, "expectancy_r")
-    profit_factor = _stat_float(stats, "profit_factor_r")
+    expectancy = _stat_float(stats, "net_expectancy_r")
+    profit_factor = _stat_float(stats, "net_profit_factor_r")
     avg_quality = _stat_float(stats, "avg_path_quality")
-    tradable = _stat_int(stats, "tradable")
+    tradable = _stat_int(stats, "net_label_samples")
     if expectancy is not None and expectancy <= 0:
         return f"承認済みTP/SLの適用後期待Rが{_fmt_signed(expectancy, 'R')}に悪化(n={tradable})"
     if profit_factor is not None and profit_factor < 1.0:
@@ -2697,6 +4291,24 @@ def _float(value: object) -> float | None:
 
 def _mean(values: Sequence[float]) -> float | None:
     return sum(values) / len(values) if values else None
+
+
+def _sample_sharpe(values: Sequence[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    if variance <= 1e-24:
+        return None
+    return mean / math.sqrt(variance)
+
+
+def _single_contract_value(
+    records: Sequence[Mapping[str, object]],
+    key: str,
+) -> str:
+    values = {str(record.get(key) or "") for record in records}
+    return next(iter(values)) if len(values) == 1 else ""
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:

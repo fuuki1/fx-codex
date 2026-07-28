@@ -8,6 +8,7 @@ from itertools import count
 import pytest
 
 from fx_intel import briefing, learning
+from fx_intel import journal
 from fx_intel.journal import append_plans, read_entries
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -62,6 +63,13 @@ def pit_entry(ts: datetime, **kwargs) -> dict:
             "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
             "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
             "pit_eligible": True,
+            "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+            "decision_id": f"decision:{row['symbol']}:{ts.isoformat()}",
+            "mode": "fusion",
+            "producer": journal.FUSION_PRODUCER,
+            "producer_version": journal.FUSION_PRODUCER_VERSION,
+            "input_context_id": f"context:{ts.isoformat()}",
+            "source_record_ids": [f"source:{ts.isoformat()}"],
         }
     )
     return row
@@ -126,6 +134,22 @@ def test_evaluate_history_scores_hits_misses_and_flat() -> None:
     calls = learning.evaluate_history(entries)
     outcomes = {c.symbol: c.outcome for c in calls}
     assert outcomes == {"USDJPY": "hit", "EURUSD": "miss", "GBPJPY": "flat"}
+
+
+def test_evaluate_history_never_builds_net_r_from_atr_move_and_stop_r_cost() -> None:
+    """分母が異なるlegacy値を引かず、正準outcome未接続なら純Rを欠損にする。"""
+    decision = entry(NOW, direction="long", close=100.0, atr=2.0)
+    decision["execution_cost_r"] = 0.25
+    rows = [
+        decision,
+        entry(NOW + DAY, direction="neutral", close=102.0, atr=2.0),
+    ]
+
+    calls = learning.evaluate_history(rows)
+
+    assert len(calls) == 1
+    assert calls[0].move_atr == 1.0
+    assert calls[0].realized_net_r is None
 
 
 def test_evaluate_history_picks_price_closest_to_horizon() -> None:

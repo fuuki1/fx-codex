@@ -103,7 +103,7 @@ TP/SL の同一足先着が不明な場合は現行どおり SL 優先とし、�
 
 ```json
 {
-  "label_version": "net-r-v1",
+  "label_version": "net-r-v2",
   "label_provenance": "paper_quote_model",
   "decision_id": "...",
   "gross_realized_r": 0.82,
@@ -113,7 +113,7 @@ TP/SL の同一足先着が不明な場合は現行どおり SL 優先とし、�
   "execution_cost_r": 0.05,
   "realized_net_r": 0.77,
   "cost_status": "quote_measured_modelled_execution",
-  "cost_model_id": "oanda-paper-v1",
+  "cost_model_id": "fixture-executable-quotes-zero-slippage-v1",
   "path_quality": 0.96,
   "quality_flags": []
 }
@@ -192,8 +192,8 @@ active -> auto_paused -> approved（再承認時のみ）
   "threshold": 0.2,
   "fallback_threshold": 0.15,
   "scope": "overall",
-  "label_version": "net-r-v1",
-  "cost_model_id": "oanda-paper-v1",
+  "label_version": "net-r-v2",
+  "cost_model_id": "ibkr-paper-executable-quotes-zero-slippage-v1",
   "dataset_hash": "...",
   "train_end": "...",
   "test_end": "...",
@@ -219,7 +219,7 @@ active -> auto_paused -> approved（再承認時のみ）
 - Discord 分析結果から broker/executor へ注文を送る
 
 既存の `risk_pct` は説明用の固定値として残せるが、D の候補レジストリには含めない。
-将来発注を再導入する場合は、D とは別のリスク設計・paper 運用・人間承認を必須とする。
+broker 発注と口座リスク変更は、このリポジトリでは恒久的に対象外とする。
 
 ## 6. 実装境界
 
@@ -287,3 +287,79 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
 - threshold challenger が OOS、DSR、stress、承認、rollback を通る
 - `0.15` fallback と全安全ゲートの拒否権がテストで固定される
 - リスク量と発注が学習・昇格経路から構造的に切り離されている
+
+## 10. 実装状態
+
+2026-07-23時点では、D1完了前の安全措置として次を実装済みとする。
+
+- `learning.evaluate_history()` は `move_atr` だけを作り、
+  `move_atr - execution_cost_r` を `realized_net_r` として生成しない。
+- `promotion.evaluate_member()` のlegacy journal診断はATR換算値幅だけを返す。
+- legacy学習曲線は `cum_move_atr` / `move_atr_points` として表示し、純Rと呼ばない。
+- ダッシュボードの正準net集計は `decision_id`、`label_version`、
+  `label_provenance`、`cost_model_id`、`net_label_eligible=true` がそろう保存済み行だけを読む。
+- `trade_outcome.score_canonical_outcome()` はprovider-neutralな完了bid/ask足から、
+  longのask entry/bid exit、shortのbid entry/ask exit、gap、同一足SL優先、
+  terminal exitを同じ `planned_risk_distance` で決定論的に採点する。
+- 同一 `decision_id + label_version` の同値再採点は許可し、異なる結果は
+  `CanonicalOutcomeConflict` としてhard errorにする。
+- fusion / timeframe の判断producerは `label_version`、`label_provenance`、
+  `planned_risk_distance`、quoteの観測時刻・利用可能時刻・source・source record ID、
+  cost modelのversion/statusと追加コストmodel IDを判断ログへ保存する。
+- TradingView scanner由来のproxy quoteは
+  `scanner-proxy-mid-diagnostic-v1 / diagnostic_only` のままとし、
+  lineage付きのmeasured decision quoteだけを executable cost modelとして記録する。
+- executable cost modelはquote sourceへ固定し、fixtureは
+  `fixture-executable-quotes-zero-slippage-v1`、IBKR paper snapshotは
+  `ibkr-paper-executable-quotes-zero-slippage-v1`を使う。未知sourceは`missing`として
+  net label不可にする。zero-slippage / zero-commission IDで非ゼロ値を保存した行、
+  financing modelなしの非ゼロfinancing、entry/spread source不一致、
+  entry spread R不一致もfail-closedにする。
+  これらのcomponent model/sourceをoutcomeへ保存するstore/export schemaはv2とし、
+  v1を暗黙に新契約へ読み替えない。
+- 9段checklistのspread＋modelled slippage見積りは
+  `spread-plus-modelled-slippage-diagnostic-v1 / diagnostic_only`として分離し、
+  legacy close/OHLC採点から`realized_net_r`を生成しない。正準net Rは完了bid/ask
+  pathを使うcanonical scorerだけが生成する。
+- downstreamのguard、decision feedback、maximization、TP/SL学習、改善候補承認、
+  auto-pause、direction threshold、shadow集計、promotion参考判定、ML return headは、
+  現行label version/provenanceとcost component/accounting恒等式を満たす行だけを
+  canonical net証拠として読む。legacy `realized_r`は`gross_expectancy_r`等の診断欄に
+  限定し、`expectancy_r` / `profit_factor_r`互換欄やblock/boostへ代入しない。
+  canonical net不足は`sample_ok=false`またはevaluation unavailableであり、
+  gross黒字を使った代替昇格・ガード解除は行わない。
+- canonical outcomeは `prediction_time` と `holding_end_time` を保存する。
+  `effective_samples.summarize_effective_samples()` は5分の最小間隔、保有区間の重複、
+  同一symbol、共通通貨エクスポージャー(符号は問わない)、FX市場日を使い、
+  raw/effective/overlap/cluster/market-day件数を決定論的に返す。
+- canonical gross/net集計の `sample_ok` はraw件数ではなくeffective件数で判定し、
+  時刻欠損・naive時刻・競合duplicateがある場合はfail-closedにする。
+- direction thresholdのtune/test・片側LCB・DSR・auto-pause、ML return headの
+  train/test・t検定・PBO/DSR、shadow dimension集計、promotion参考統計、
+  dashboardのnet期待値/PF/累積曲線も同じeffective subsetを使う。threshold policyは
+  schema 2、GBDT artifactはschema 5としてraw/effective/overlap/cluster/market-day
+  来歴を保存し、旧schemaを暗黙に有効化しない。過学習検定が実行不能ならML収益ヘッドを
+  採用しない。
+- canonical outcome storeは `decision_id + label_version` を自然キーにし、
+  `flock`、`fsync`、record hashで追記する。同値replayは追記せず、
+  競合値、partial JSON、hash不一致、既存duplicateをhard errorにする。
+  eligible行は既知label/provenance/cost、awareな保有区間、有限な会計内訳と
+  gross/quote/net/cost恒等式をstore境界でも再検証し、store欠損はunavailableとする。
+  verified exportには並べ替え済みoutcomeのcanonical SHA-256を記録し、
+  store監査値との一致を検証する。
+- provider-neutral offline pipelineは保存済みdecision eventと
+  `completed_bid_ask_bar`だけを読み、row hash、aware bar時刻、連続した保有経路、
+  full horizon、source record一意性を確認して同じcanonical scorer/storeへ接続する。
+  forming足、hash欠損、内部gap、満期前など再取得可能なpath不備はpendingとして
+  final storeへ入れず、満期後の決定論的再実行を妨げない。
+  expectancy guard単独で見送ったPIT適格decisionは、producerが判断時に凍結した
+  `pre_guard_*`完全プランから決定論的な子decisionを作る。明示mode/producerが
+  現行契約と一致し、target policyとexecution snapshotがそろう場合だけ対象とし、
+  raw scoreや別producerのshadow predictionから復元しない。子decisionも同じ
+  canonical scorer/storeで採点し、executable quote、cost model、完了bid/ask pathの
+  条件を満たさなければ`realized_net_r`を生成しない。
+  CLIは明示されたローカルJSONLだけを読み、broker接続や注文面を持たない。
+
+この状態はD1の会計・永続化実装済み、runtime配備前である。MLのdecision ID joinと
+consumer移行が完了するまで、
+正準net label coverageは不足または0としてfail-closedに扱う。

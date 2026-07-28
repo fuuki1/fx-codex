@@ -431,19 +431,41 @@ def flat_features_from_mapping(
 def decision_quote_from_mapping(
     value: object,
 ) -> tuple[float | None, float | None, str | None]:
+    contract = decision_quote_contract_from_mapping(value)
+    return (
+        _number(contract.get("bid")),
+        _number(contract.get("ask")),
+        str(contract.get("observed_at") or contract.get("available_time") or "") or None,
+    )
+
+
+def decision_quote_contract_from_mapping(value: object) -> dict[str, object]:
+    """Return executable-quote values and lineage without inventing defaults."""
+
     context = context_from_mapping(value)
     liquidity = context.get("liquidity")
     if not isinstance(liquidity, Mapping):
-        return None, None, None
+        return {}
     quote = liquidity.get("quote")
     if not isinstance(quote, Mapping) or quote.get("role") != "decision_quote":
-        return None, None, None
+        return {}
     bid = _number(quote.get("bid"))
     ask = _number(quote.get("ask"))
     if bid is None or ask is None or bid <= 0 or ask < bid:
-        return None, None, None
-    observed = str(quote.get("observed_at") or quote.get("available_time") or "") or None
-    return bid, ask, observed
+        return {}
+    observed = str(quote.get("observed_at") or "")
+    available = str(quote.get("available_time") or "")
+    return {
+        "bid": bid,
+        "ask": ask,
+        "observed_at": observed,
+        "available_time": available,
+        "source": str(quote.get("source") or ""),
+        "source_record_id": str(quote.get("source_record_id") or ""),
+        "content_hash": str(quote.get("content_hash") or ""),
+        "quality_status": str(quote.get("quality_status") or ""),
+        "quality_flags": list(quote.get("quality_flags") or []),
+    }
 
 
 def macro_score_from_mapping(value: object) -> float | None:

@@ -402,9 +402,9 @@ function renderCurve(data) {
   const last = curve[curve.length - 1];
   if (summaryEl) {
     let summary = `採点 ${last.scored}件 / 累積的中率 ${pct(last.hit_rate)}`;
-    if ((last.net_r_points || 0) > 0) {
-      const netR = Number(last.cum_net_r);
-      summary += ` / 純R ${(netR >= 0 ? "+" : "") + netR.toFixed(2)}R(${last.net_r_points}件)`;
+    if ((last.move_atr_points || 0) > 0) {
+      const moveAtr = Number(last.cum_move_atr);
+      summary += ` / ATR換算値幅 ${(moveAtr >= 0 ? "+" : "") + moveAtr.toFixed(2)}(${last.move_atr_points}件)`;
     }
     summaryEl.textContent = summary;
   }
@@ -501,38 +501,37 @@ function drawCurve(canvas, curve) {
     ctx.fill();
   });
 
-  // 累積純R(コスト控除後)の折れ線(琥珀)。net_rを持つ採点があれば重畳する。
-  // 0を中心にした対称スケールで、儲かっているか(正/負)を同じ時間軸で見る。
-  const hasNetR = curve.some((p) => (p.net_r_points || 0) > 0);
-  if (hasNetR) {
-    const netVals = curve.map((p) => Number(p.cum_net_r) || 0);
-    const maxAbs = Math.max(0.5, ...netVals.map((v) => Math.abs(v)));
-    const yNet = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2); // -maxAbs..+maxAbs
-    // 0Rの基準線(琥珀の点線)
+  // legacy終値照合の累積ATR換算値幅(琥珀)。正準gross/net Rではない。
+  const hasMoveAtr = curve.some((p) => (p.move_atr_points || 0) > 0);
+  if (hasMoveAtr) {
+    const moveVals = curve.map((p) => num(p.cum_move_atr) ?? 0);
+    const maxAbs = Math.max(0.5, ...moveVals.map((v) => Math.abs(v)));
+    const yMove = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2);
+    // 0の基準線(琥珀の点線)
     ctx.strokeStyle = amber;
     ctx.globalAlpha = 0.35;
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
-    ctx.moveTo(padL, yNet(0));
-    ctx.lineTo(padL + plotW, yNet(0));
+    ctx.moveTo(padL, yMove(0));
+    ctx.lineTo(padL + plotW, yMove(0));
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.globalAlpha = 1;
-    // 累積純Rの線
+    // 累積ATR換算値幅の線
     ctx.strokeStyle = amber;
     ctx.lineWidth = 2;
     ctx.beginPath();
     curve.forEach((p, i) => {
-      const y = yNet(Number(p.cum_net_r) || 0);
+      const y = yMove(num(p.cum_move_atr) ?? 0);
       if (i === 0) ctx.moveTo(xFor(i), y);
       else ctx.lineTo(xFor(i), y);
     });
     ctx.stroke();
-    // 純R軸のレンジラベル(琥珀)。左軸(%)と重ならないよう plot 内側の左上/左下へ置く
+    // ATR換算値幅のレンジラベル
     ctx.fillStyle = amber;
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
-    ctx.fillText(`純R +${maxAbs.toFixed(1)}`, padL + 4, padT + 2);
+    ctx.fillText(`ATR換算 +${maxAbs.toFixed(1)}`, padL + 4, padT + 2);
     ctx.textBaseline = "bottom";
     ctx.fillText(`-${maxAbs.toFixed(1)}`, padL + 4, padT + plotH - 2);
   }
@@ -544,15 +543,15 @@ function drawCurve(canvas, curve) {
   ctx.textBaseline = "bottom";
   ctx.font = "600 12px system-ui, sans-serif";
   ctx.fillText(pct(lp.hit_rate), padL + plotW, yRate(lp.hit_rate) - 6);
-  if (hasNetR) {
-    const netVals = curve.map((p) => Number(p.cum_net_r) || 0);
-    const maxAbs = Math.max(0.5, ...netVals.map((v) => Math.abs(v)));
-    const yNet = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2);
+  if (hasMoveAtr) {
+    const moveVals = curve.map((p) => num(p.cum_move_atr) ?? 0);
+    const maxAbs = Math.max(0.5, ...moveVals.map((v) => Math.abs(v)));
+    const yMove = (v) => padT + plotH * (1 - (v / maxAbs + 1) / 2);
     ctx.fillStyle = amber;
     ctx.fillText(
-      `${(lp.cum_net_r >= 0 ? "+" : "") + Number(lp.cum_net_r).toFixed(2)}R`,
+      `${(lp.cum_move_atr >= 0 ? "+" : "") + Number(lp.cum_move_atr).toFixed(2)} ATR`,
       padL + plotW,
-      yNet(Number(lp.cum_net_r) || 0) - 6,
+      yMove(num(lp.cum_move_atr) ?? 0) - 6,
     );
   }
 }
@@ -1350,16 +1349,19 @@ function renderTradeMonitor(data) {
 
   const actions = $("tradeActionList");
   actions.replaceChildren();
-  const paperReady = trade.paper_ready || [];
+  const readyForReview = trade.ready_for_review || [];
   const paused = trade.auto_paused || [];
-  if (!paperReady.length && !paused.length) {
+  if (!readyForReview.length && !paused.length) {
     actions.appendChild(empty("承認待ち・自動停止中の改善候補はありません"));
   }
-  paperReady.slice(0, 5).forEach((row) => {
+  readyForReview.slice(0, 5).forEach((row) => {
+    const metrics = row.prospective_metrics || {};
     actions.appendChild(
       tradeItem(
         `承認待ち ${row.priority || ""}`,
-        `${row.title_ja || row.candidate_id || "--"} / seen ${row.seen_count || 0}`,
+        `${row.title_ja || row.candidate_id || "--"} / prospective effective ${
+          metrics.effective_samples || 0
+        } / expiry ${shortDate(row.prospective_end)}`,
         "amber-text",
       ),
     );
@@ -1381,12 +1383,15 @@ function renderTradeMonitor(data) {
     policyStats.appendChild(empty("承認済みTP/SL候補の採点はまだありません"));
   }
   stats.slice(0, 8).forEach((row) => {
-    const expectancy = num(row.expectancy_r);
+    const netExpectancy = num(row.net_expectancy_r);
+    const grossExpectancy = num(row.gross_expectancy_r);
     policyStats.appendChild(
       tradeItem(
         `${row.stage || "--"} ${row.candidate_id || "--"}`,
-        `期待R ${signedR(expectancy)} / PF ${num(row.profit_factor_r)?.toFixed(2) || "--"} / n=${row.tradable || 0}`,
-        expectancy !== null && expectancy < 0 ? "red-text" : "green-text",
+        `canonical net期待R ${signedR(netExpectancy)} / net PF ${
+          num(row.net_profit_factor_r)?.toFixed(2) || "--"
+        } / gross診断 ${signedR(grossExpectancy)} / net n=${row.net_label_samples || 0}`,
+        netExpectancy !== null && netExpectancy < 0 ? "red-text" : "green-text",
       ),
     );
   });
@@ -1412,8 +1417,10 @@ function renderDecisionMonitor(data) {
   const performance = decision.performance || {};
   const modelDelta = decision.model_expectancy_delta || {};
   const counts = decision.counts || {};
-  const expectancy = num(overall.expectancy_r);
-  const profitFactor = num(overall.profit_factor_r);
+  const grossExpectancy = num(overall.gross_expectancy_r);
+  const netExpectancy = num(overall.net_expectancy_r);
+  const grossProfitFactor = num(overall.gross_profit_factor_r);
+  const netProfitFactor = num(overall.net_profit_factor_r);
   const netR = num(performance.net_R);
   const deltaExpected = num(modelDelta.delta_expected_R);
   const cellCount = Object.values(counts).reduce((total, value) => total + Number(value || 0), 0);
@@ -1423,9 +1430,11 @@ function renderDecisionMonitor(data) {
   setText("decisionHealth", decision.status || "unknown");
   setText(
     "decisionExpectancy",
-    `期待R ${signedR(expectancy)} / net ${signedR(netR)} / Δ ${signedR(deltaExpected)} / PF ${
-      profitFactor === null ? "--" : profitFactor.toFixed(2)
-    }`,
+    `canonical net期待R ${signedR(netExpectancy)} / 累積net ${signedR(netR)} / gross診断 ${signedR(
+      grossExpectancy,
+    )} / Δ ${signedR(deltaExpected)} / net PF ${
+      netProfitFactor === null ? "--" : netProfitFactor.toFixed(2)
+    } / gross PF ${grossProfitFactor === null ? "--" : grossProfitFactor.toFixed(2)}`,
   );
   setText(
     "decisionCounts",
@@ -1433,11 +1442,11 @@ function renderDecisionMonitor(data) {
   );
   setText(
     "decisionNetR",
-    `純R期待 ${signedR(num(canonicalNet.expectancy_r))} / 累積 ${signedR(num(canonicalNet.cumulative_net_r))}`,
+    `正準net期待 ${signedR(num(canonicalNet.net_expectancy_r))} / 累積 ${signedR(num(canonicalNet.cumulative_net_r))} / gross期待 ${signedR(num(canonicalNet.gross_expectancy_r))}`,
   );
   setText(
     "decisionNetCoverage",
-    `label ${canonicalNet.labels || 0} / scored ${canonicalNet.scored || 0} (${pct(num(canonicalNet.coverage))})`,
+    `net label ${canonicalNet.net_label_samples || 0} / gross ${canonicalNet.gross_samples || 0} (${pct(num(canonicalNet.net_label_coverage))}) / raw ${canonicalNet.raw_samples || 0} → effective ${canonicalNet.effective_samples || 0} / overlap ${pct(num(canonicalNet.overlap_ratio))} / ${canonicalNet.sample_ok ? "sample OK" : "sample不足"} / version ${(canonicalNet.label_versions || []).join(", ") || "--"} / cost ${(canonicalNet.cost_model_ids || []).join(", ") || "--"}`,
   );
 
   const actions = $("decisionActionList");

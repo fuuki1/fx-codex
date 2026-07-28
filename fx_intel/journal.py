@@ -26,6 +26,7 @@ JSONLへ追記し、次回以降の実行で過去の方向判断が的中して
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -38,7 +39,14 @@ from .timeframe import TimeframePlan
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
 DEFAULT_ATR_FRACTION = 0.1  # |値動き| がATRのこの割合未満なら判定しない
-FUSION_PIT_DATA_CONTRACT = "fusion-pit-v1"
+DECISION_JOURNAL_PIT_CONTRACT = "decision-journal-pit-v2"
+# 既存のML・改善候補レジストリが参照する公開名。時間足別と融合判断を
+# 同じPIT水準に揃えたため、値は共通のdecision journal契約を指す。
+FUSION_PIT_DATA_CONTRACT = DECISION_JOURNAL_PIT_CONTRACT
+FUSION_PRODUCER = "fusion_raw"
+TIMEFRAME_PRODUCER = "timeframe_raw"
+FUSION_PRODUCER_VERSION = "fusion-journal-v2"
+TIMEFRAME_PRODUCER_VERSION = "timeframe-journal-v2"
 
 
 class PointInTimeError(ValueError):
@@ -62,8 +70,28 @@ def _parse_aware_ts(value: object) -> datetime | None:
 
 
 def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
-    """Return whether a fusion row proves all inputs were available before prediction."""
+    """Return whether a decision row proves identity, provenance, and temporal ordering."""
     if entry.get("pit_eligible") is not True:
+        return False
+    if entry.get("pit_contract") != DECISION_JOURNAL_PIT_CONTRACT:
+        return False
+    mode = str(entry.get("mode") or "")
+    producer = str(entry.get("producer") or "")
+    expected_identity = {
+        "fusion": (FUSION_PRODUCER, FUSION_PRODUCER_VERSION),
+        "per_timeframe": (TIMEFRAME_PRODUCER, TIMEFRAME_PRODUCER_VERSION),
+    }.get(mode)
+    producer_version = str(entry.get("producer_version") or "")
+    if expected_identity is None or (producer, producer_version) != expected_identity:
+        return False
+    if not str(entry.get("decision_id") or "").strip():
+        return False
+    if not str(entry.get("input_context_id") or "").strip():
+        return False
+    raw_source_ids = entry.get("source_record_ids")
+    if not isinstance(raw_source_ids, Sequence) or isinstance(raw_source_ids, (str, bytes)):
+        return False
+    if not any(str(value).strip() for value in raw_source_ids):
         return False
     recorded = _parse_aware_ts(entry.get("ts"))
     prediction = _parse_aware_ts(entry.get("prediction_time"))
@@ -78,12 +106,140 @@ def is_pit_eligible_entry(entry: Mapping[str, object]) -> bool:
     return recorded == prediction and source_cutoff <= feature_available <= prediction
 
 
+def _pit_times(
+    prediction_time: datetime | None,
+    source_cutoff: datetime | None,
+    max_feature_available_time: datetime | None,
+) -> tuple[datetime, datetime | None, datetime | None]:
+    prediction = _aware_utc(prediction_time or datetime.now(UTC), "prediction_time")
+    source = _aware_utc(source_cutoff, "source_cutoff") if source_cutoff is not None else None
+    feature = (
+        _aware_utc(max_feature_available_time, "max_feature_available_time")
+        if max_feature_available_time is not None
+        else None
+    )
+    if source is not None and source > prediction:
+        raise PointInTimeError(
+            "PIT ordering must satisfy source_cutoff <= "
+            "max_feature_available_time <= prediction_time"
+        )
+    if feature is not None and feature > prediction:
+        raise PointInTimeError(
+            "PIT ordering must satisfy source_cutoff <= "
+            "max_feature_available_time <= prediction_time"
+        )
+    if source is not None and feature is not None and source > feature:
+        raise PointInTimeError(
+            "PIT ordering must satisfy source_cutoff <= "
+            "max_feature_available_time <= prediction_time"
+        )
+    return prediction, source, feature
+
+
+def _decision_id_at(decision_ids: Sequence[str] | None, index: int) -> str:
+    if decision_ids is None:
+        return ""
+    return str(decision_ids[index]).strip()
+
+
+def _source_record_ids(plan: object) -> list[str]:
+    """Collect raw source record IDs already carried by the immutable input context."""
+
+    values: list[str] = []
+
+    def add(value: object) -> None:
+        text = str(value or "").strip()
+        if text and text not in values:
+            values.append(text)
+
+    add(getattr(plan, "quote_source_record_id", ""))
+    context = getattr(plan, "input_context", None)
+    if not isinstance(context, Mapping):
+        return sorted(values)
+    macro = context.get("macro")
+    if isinstance(macro, Mapping):
+        raw_values = macro.get("values")
+        if isinstance(raw_values, Mapping):
+            for raw in raw_values.values():
+                if isinstance(raw, Mapping):
+                    add(raw.get("source_record_id"))
+    liquidity = context.get("liquidity")
+    if isinstance(liquidity, Mapping):
+        quote = liquidity.get("quote")
+        if isinstance(quote, Mapping):
+            add(quote.get("source_record_id"))
+    return sorted(values)
+
+
+def _row_pit_eligible(
+    *,
+    source_cutoff: datetime | None,
+    max_feature_available_time: datetime | None,
+    decision_id: str,
+    input_context_id: str,
+    source_record_ids: Sequence[str],
+) -> bool:
+    return (
+        source_cutoff is not None
+        and max_feature_available_time is not None
+        and bool(decision_id)
+        and bool(input_context_id)
+        and bool(source_record_ids)
+    )
+
+
+def pit_metadata_for_plan(
+    plan: object,
+    *,
+    prediction_time: datetime,
+    source_cutoff: datetime | None,
+    max_feature_available_time: datetime | None,
+    decision_id: str,
+    mode: str,
+) -> dict[str, object]:
+    """Build the canonical PIT envelope shared by journals and full decision events."""
+
+    prediction, source, feature = _pit_times(
+        prediction_time,
+        source_cutoff,
+        max_feature_available_time,
+    )
+    identity = {
+        "fusion": (FUSION_PRODUCER, FUSION_PRODUCER_VERSION),
+        "per_timeframe": (TIMEFRAME_PRODUCER, TIMEFRAME_PRODUCER_VERSION),
+    }.get(mode)
+    if identity is None:
+        raise PointInTimeError(f"unsupported decision mode: {mode}")
+    producer, producer_version = identity
+    normalized_decision_id = str(decision_id).strip()
+    input_context_id = str(getattr(plan, "input_context_id", "") or "").strip()
+    source_record_ids = _source_record_ids(plan)
+    return {
+        "prediction_time": prediction.isoformat(),
+        "source_cutoff": source.isoformat() if source else None,
+        "max_feature_available_time": feature.isoformat() if feature else None,
+        "pit_eligible": _row_pit_eligible(
+            source_cutoff=source,
+            max_feature_available_time=feature,
+            decision_id=normalized_decision_id,
+            input_context_id=input_context_id,
+            source_record_ids=source_record_ids,
+        ),
+        "pit_contract": DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": normalized_decision_id or None,
+        "mode": mode,
+        "producer": producer,
+        "producer_version": producer_version,
+        "input_context_id": input_context_id,
+        "source_record_ids": source_record_ids,
+    }
+
+
 # 期待値ガード反実仮想の対象ゲート。このゲート「だけ」で見送りになった行を
 # counterfactual_guard_entries が復元する。event_window / low_data_quality 等の
 # データ・リスク由来の見送りは、ガードが無くても見送っていた行なので含めない
 # (含めると反実仮想の根拠が汚染される)。
 GUARD_COUNTERFACTUAL_GATE = "expectancy_guard"
-SHADOW_FUSION_PRODUCER = "fusion_raw"
 # 合成行に立てるマーカー。採点側(learning / trade_outcome)はこのキーで
 # 「実際の推奨」と「ガード見送り中のシャドー計画」を区別して集計に注記する。
 COUNTERFACTUAL_ENTRY_KEY = "counterfactual_guard"
@@ -111,40 +267,35 @@ def append_plans(
     *,
     source_cutoff: datetime | None = None,
     max_feature_available_time: datetime | None = None,
+    decision_ids: Sequence[str] | None = None,
 ) -> None:
     """今回の判断をJSONLへ追記する(1プラン1行)。
 
-    source_cutoff と max_feature_available_time の両方がある行だけをGBDTの
+    時刻順序、decision ID、input context、source record IDが全てある行だけを
     PIT適格行として記録する。旧呼出しは互換のため記録できるが、学習対象外になる。
     """
-    now = _aware_utc(now or datetime.now(UTC), "prediction_time")
-    pit_eligible = source_cutoff is not None and max_feature_available_time is not None
-    source_utc: datetime | None = None
-    feature_utc: datetime | None = None
-    if pit_eligible:
-        assert source_cutoff is not None
-        assert max_feature_available_time is not None
-        source_utc = _aware_utc(source_cutoff, "source_cutoff")
-        feature_utc = _aware_utc(max_feature_available_time, "max_feature_available_time")
-        if not source_utc <= feature_utc <= now:
-            raise PointInTimeError(
-                "PIT ordering must satisfy source_cutoff <= "
-                "max_feature_available_time <= prediction_time"
-            )
+    now, source_utc, feature_utc = _pit_times(now, source_cutoff, max_feature_available_time)
+    if decision_ids is not None and len(decision_ids) != len(plans):
+        raise PointInTimeError("decision_ids must contain exactly one ID per plan")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        for plan in plans:
+        for index, plan in enumerate(plans):
+            decision_id = _decision_id_at(decision_ids, index)
+            pit_metadata = pit_metadata_for_plan(
+                plan,
+                prediction_time=now,
+                source_cutoff=source_utc,
+                max_feature_available_time=feature_utc,
+                decision_id=decision_id,
+                mode="fusion",
+            )
+            input_context_id = str(pit_metadata["input_context_id"])
             handle.write(
                 json.dumps(
                     {
                         "ts": now.isoformat(),
-                        "prediction_time": now.isoformat(),
-                        "source_cutoff": source_utc.isoformat() if source_utc else None,
-                        "max_feature_available_time": (
-                            feature_utc.isoformat() if feature_utc else None
-                        ),
-                        "pit_eligible": pit_eligible,
+                        **pit_metadata,
                         "symbol": plan.symbol,
                         "direction": plan.direction,
                         "analysis_direction": plan.analysis_direction,
@@ -161,11 +312,24 @@ def append_plans(
                         "entry_bid": plan.entry_bid,
                         "entry_ask": plan.entry_ask,
                         "quote_observed_at": plan.quote_observed_at,
+                        "quote_available_at": plan.quote_available_at,
+                        "quote_source": plan.quote_source,
+                        "quote_source_record_id": plan.quote_source_record_id,
+                        "planned_risk_distance": plan.planned_risk_distance,
+                        "label_version": plan.label_version,
+                        "label_provenance": plan.label_provenance,
                         "cost_model_id": plan.cost_model_id,
+                        "cost_model_version": plan.cost_model_version,
+                        "cost_status": plan.cost_status,
+                        "slippage_model_id": plan.slippage_model_id,
+                        "commission_model_id": plan.commission_model_id,
                         "slippage_r": plan.slippage_r,
                         "commission_r": plan.commission_r,
+                        "financing_r": plan.financing_r,
+                        "cost_quality_flags": list(plan.cost_quality_flags),
                         "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
+                        **_pre_guard_plan(plan),
                         "data_quality": plan.data_quality,
                         # チャート状態の特徴量(learning.pyの状態別学習に使う)
                         "features": plan.features,
@@ -177,7 +341,7 @@ def append_plans(
                         "learning_dimensions": plan.learning_dimensions,
                         "gate_trace": plan.gate_trace,
                         "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": plan.input_context_id,
+                        "input_context_id": input_context_id,
                         "input_features": plan.input_features,
                         "input_feature_masks": plan.input_feature_masks,
                         "input_context_schema_version": plan.input_context.get(
@@ -191,7 +355,13 @@ def append_plans(
 
 
 def append_timeframe_plans(
-    path: str | Path, plans: Sequence[TimeframePlan], now: datetime | None = None
+    path: str | Path,
+    plans: Sequence[TimeframePlan],
+    now: datetime | None = None,
+    *,
+    source_cutoff: datetime | None = None,
+    max_feature_available_time: datetime | None = None,
+    decision_ids: Sequence[str] | None = None,
 ) -> None:
     """時間足別の判断をJSONLへ追記する(1プラン1行)。
 
@@ -203,15 +373,28 @@ def append_timeframe_plans(
     エントリが追記されるので、その close 列が「過去判断から見た将来価格」に
     なる(price_history.build_close_series が (symbol, timeframe) 別に組む)。
     """
-    now = now or datetime.now(UTC)
+    now, source_utc, feature_utc = _pit_times(now, source_cutoff, max_feature_available_time)
+    if decision_ids is not None and len(decision_ids) != len(plans):
+        raise PointInTimeError("decision_ids must contain exactly one ID per plan")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        for plan in plans:
+        for index, plan in enumerate(plans):
+            decision_id = _decision_id_at(decision_ids, index)
+            pit_metadata = pit_metadata_for_plan(
+                plan,
+                prediction_time=now,
+                source_cutoff=source_utc,
+                max_feature_available_time=feature_utc,
+                decision_id=decision_id,
+                mode="per_timeframe",
+            )
+            input_context_id = str(pit_metadata["input_context_id"])
             handle.write(
                 json.dumps(
                     {
                         "ts": now.isoformat(),
+                        **pit_metadata,
                         "symbol": plan.symbol,
                         # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
                         # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
@@ -236,11 +419,24 @@ def append_timeframe_plans(
                         "entry_bid": plan.entry_bid,
                         "entry_ask": plan.entry_ask,
                         "quote_observed_at": plan.quote_observed_at,
+                        "quote_available_at": plan.quote_available_at,
+                        "quote_source": plan.quote_source,
+                        "quote_source_record_id": plan.quote_source_record_id,
+                        "planned_risk_distance": plan.planned_risk_distance,
+                        "label_version": plan.label_version,
+                        "label_provenance": plan.label_provenance,
                         "cost_model_id": plan.cost_model_id,
+                        "cost_model_version": plan.cost_model_version,
+                        "cost_status": plan.cost_status,
+                        "slippage_model_id": plan.slippage_model_id,
+                        "commission_model_id": plan.commission_model_id,
                         "slippage_r": plan.slippage_r,
                         "commission_r": plan.commission_r,
+                        "financing_r": plan.financing_r,
+                        "cost_quality_flags": list(plan.cost_quality_flags),
                         "direction_threshold": plan.direction_threshold,
                         "target_policy": plan.target_policy,
+                        **_pre_guard_plan(plan),
                         "data_quality": plan.data_quality,
                         "features": plan.features,
                         "components": plan.components,
@@ -248,7 +444,7 @@ def append_timeframe_plans(
                         "learning_dimensions": plan.learning_dimensions,
                         "gate_trace": plan.gate_trace,
                         "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": plan.input_context_id,
+                        "input_context_id": input_context_id,
                         "input_features": plan.input_features,
                         "input_feature_masks": plan.input_feature_masks,
                         "input_context_schema_version": plan.input_context.get(
@@ -262,20 +458,44 @@ def append_timeframe_plans(
 
 
 def _plan_execution(plan: object) -> dict[str, object]:
-    """plan.checklist から執行コスト系の値を採点・学習用に取り出す。
+    """Persist checklist costs as diagnostics, never as canonical net-label inputs.
 
-    値は build_checklist が判断時の実測 spread から既に計算済み。realized_net_r
-    (コスト控除後の実現R=収益ラベル)を trade_outcome が作るのに使う。checklist を
-    持たない plan(時間足別など)は None。欠損は採点側が欠損として扱う。
+    The checklist estimate includes spread even though executable bid/ask accounting
+    already embeds spread. Keeping it under the old canonical keys would double count.
     """
     checklist = getattr(plan, "checklist", None)
     if not isinstance(checklist, Mapping):
-        return {"execution_cost_r": None, "net_expected_r": None}
+        return {
+            "execution_cost_r": None,
+            "net_expected_r": None,
+            "diagnostic_execution_cost_r": None,
+            "diagnostic_net_expected_r": None,
+            "diagnostic_cost_model": {},
+        }
     cost = checklist.get("execution_cost_r")
     net = checklist.get("net_expected_r")
+    cost_model = checklist.get("diagnostic_cost_model")
     return {
-        "execution_cost_r": float(cost) if isinstance(cost, (int, float)) else None,
-        "net_expected_r": float(net) if isinstance(net, (int, float)) else None,
+        "execution_cost_r": None,
+        "net_expected_r": None,
+        "diagnostic_execution_cost_r": (float(cost) if isinstance(cost, (int, float)) else None),
+        "diagnostic_net_expected_r": (float(net) if isinstance(net, (int, float)) else None),
+        "diagnostic_cost_model": (dict(cost_model) if isinstance(cost_model, Mapping) else {}),
+    }
+
+
+def _pre_guard_plan(plan: object) -> dict[str, object]:
+    return {
+        "pre_guard_direction": str(getattr(plan, "pre_guard_direction", "") or ""),
+        "pre_guard_conviction": getattr(plan, "pre_guard_conviction", None),
+        "pre_guard_stop": getattr(plan, "pre_guard_stop", None),
+        "pre_guard_target1": getattr(plan, "pre_guard_target1", None),
+        "pre_guard_target2": getattr(plan, "pre_guard_target2", None),
+        "pre_guard_target_policy": dict(getattr(plan, "pre_guard_target_policy", {}) or {}),
+        "pre_guard_execution_snapshot": dict(
+            getattr(plan, "pre_guard_execution_snapshot", {}) or {}
+        ),
+        "pre_guard_cost_model_id": str(getattr(plan, "pre_guard_cost_model_id", "") or ""),
     }
 
 
@@ -318,70 +538,93 @@ def counterfactual_guard_entries(
 
     期待値ガードは自分がブロックした判断の結果を観測できないため、放置すると
     根拠サンプルが増えず永久ブロックに陥る(学習飢餓)。この関数は、ゲート前の
-    分析方向(analysis_direction)と判断時に凍結記録済みのシャドーSL/TP
-    (shadow_predictionsのfusion_raw)から「ガードが無ければ推奨していた計画」を
-    合成し、既存の採点エンジンへそのまま流せる行として返す。
+    producer側が判断時に凍結したpre_guard_*から「ガードが無ければ推奨していた
+    完全プラン」を合成し、既存の診断採点エンジンへ流せる行として返す。
 
-    PIT安全性: 合成に使う値はすべて判断時点で記録済みのもの(分析方向・
-    分析確信度・凍結SL/TP)に限る。事後の再計算・推定は行わず、必要な記録が
-    欠けた行は黙って除外する(fail-closed)。
+    PIT安全性: modeと明示producerが現行PIT契約に一致し、凍結方向・確信度・
+    SL/TP・target policy・execution snapshotが揃う行だけを受け入れる。
+    正準bid/ask outcomeが未生成のため、ここでrealized_net_rは作らない。
     """
     output: list[dict[str, object]] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
             continue
+        if not is_pit_eligible_entry(entry):
+            continue
         if blocked_gate_names(entry) != {GUARD_COUNTERFACTUAL_GATE}:
             continue
-        direction = entry.get("analysis_direction")
+        direction = entry.get("pre_guard_direction")
         if direction not in ("long", "short"):
             continue
-        prediction = _fusion_shadow_prediction(entry)
-        if prediction is None:
+        conviction = entry.get("pre_guard_conviction")
+        if isinstance(conviction, bool) or not isinstance(conviction, (int, float)):
             continue
-        if prediction.get("direction") != direction:
-            # 凍結スコアと分析方向の不整合は記録欠陥として採点しない
+        if not math.isfinite(float(conviction)) or not 0 <= float(conviction) <= 100:
             continue
-        stop = _level(prediction.get("stop"))
-        target1 = _level(prediction.get("target1"))
-        target2 = _level(prediction.get("target2"))
+        stop = _level(entry.get("pre_guard_stop"))
+        target1 = _level(entry.get("pre_guard_target1"))
+        target2 = _level(entry.get("pre_guard_target2"))
         if stop is None or target1 is None or target2 is None:
             continue
-        conviction = entry.get("analysis_conviction")
-        target_policy = prediction.get("target_policy")
+        target_policy = entry.get("pre_guard_target_policy")
+        execution = entry.get("pre_guard_execution_snapshot")
+        cost_model_id = str(entry.get("pre_guard_cost_model_id") or "").strip()
+        if not isinstance(target_policy, Mapping) or not target_policy:
+            continue
+        if not isinstance(execution, Mapping) or not execution or not cost_model_id:
+            continue
+        if str(execution.get("cost_model_id") or "") != cost_model_id:
+            continue
+        original_decision_id = str(entry.get("decision_id") or "").strip()
         synthesized: dict[str, object] = dict(entry)
         synthesized["direction"] = str(direction)
-        synthesized["conviction"] = int(conviction) if isinstance(conviction, (int, float)) else 0
+        synthesized["conviction"] = int(conviction)
         synthesized["stop"] = stop
         synthesized["target1"] = target1
         synthesized["target2"] = target2
-        synthesized["target_policy"] = (
-            dict(target_policy)
-            if isinstance(target_policy, Mapping)
-            else {"policy_id": "shadow-default-atr-v1"}
+        synthesized["target_policy"] = dict(target_policy)
+        for key in (
+            "entry_bid",
+            "entry_ask",
+            "quote_observed_at",
+            "quote_available_at",
+            "quote_source",
+            "quote_source_record_id",
+            "planned_risk_distance",
+            "entry_spread_r",
+            "label_version",
+            "label_provenance",
+            "cost_model_id",
+            "cost_model_version",
+            "cost_status",
+            "slippage_model_id",
+            "commission_model_id",
+            "slippage_r",
+            "commission_r",
+            "financing_r",
+            "cost_quality_flags",
+        ):
+            synthesized[key] = execution.get(key)
+        synthesized["parent_decision_id"] = original_decision_id
+        synthesized["decision_id"] = f"{original_decision_id}:pre-guard"
+        # Legacy diagnostic scoring may produce gross realized_r, but a net label
+        # must come from the canonical executable-quote scorer and verified store.
+        synthesized["execution_cost_r"] = None
+        synthesized["net_expected_r"] = None
+        synthesized["canonical_net_label_input_eligible"] = bool(
+            execution.get("canonical_net_label_input_eligible")
         )
+        synthesized["canonical_net_label_status"] = "pending_canonical_outcome"
         synthesized[COUNTERFACTUAL_ENTRY_KEY] = True
         output.append(synthesized)
     return output
 
 
-def _fusion_shadow_prediction(entry: Mapping[str, object]) -> Mapping[str, object] | None:
-    predictions = entry.get("shadow_predictions")
-    if not isinstance(predictions, (list, tuple)):
-        return None
-    for row in predictions:
-        if (
-            isinstance(row, Mapping)
-            and str(row.get("producer", "")) == SHADOW_FUSION_PRODUCER
-            and row.get("eligible_for_scoring") is True
-        ):
-            return row
-    return None
-
-
 def _level(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def evaluate_directional_accuracy(

@@ -15,6 +15,7 @@ import math
 import mimetypes
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,16 @@ APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 REPO_ROOT = APP_DIR.parents[1]
 DEFAULT_LOG_DIR = REPO_ROOT / "logs"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from fx_intel.effective_samples import summarize_effective_samples  # noqa: E402
+from fx_intel.evaluation_labels import (  # noqa: E402
+    KNOWN_EXECUTABLE_COST_MODEL_IDS,
+    KNOWN_NET_LABEL_PROVENANCES,
+    KNOWN_NET_LABEL_VERSIONS,
+    canonical_net_label_contract_flags,
+)
 
 JOURNAL_FILE = "briefing_journal.jsonl"
 LEARNING_FILE = "briefing_learning.json"
@@ -67,7 +78,12 @@ LAUNCHD_SERVICES = (
 ML_MIN_TRAIN_ROWS = 150
 ML_THIN_MIN_GAP_HOURS = 4.0
 ML_ARTIFACT_SCHEMA = 4
-ML_TRAINING_CONTRACT = "fusion-pit-v1"
+ML_TRAINING_CONTRACT = "decision-journal-pit-v2"
+DECISION_JOURNAL_PIT_CONTRACT = ML_TRAINING_CONTRACT
+DECISION_PRODUCER_IDENTITIES = {
+    "fusion": ("fusion_raw", "fusion-journal-v2"),
+    "per_timeframe": ("timeframe_raw", "timeframe-journal-v2"),
+}
 
 # 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
 # ダッシュボードは fx_intel に依存しない方針なのでここに独立して持つ。
@@ -117,9 +133,30 @@ def _parse_ts(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _is_pit_eligible_fusion_row(entry: dict[str, Any]) -> bool:
-    """Mirror fx_intel.journal's fail-closed fusion learning provenance contract."""
+def _is_pit_eligible_decision_row(entry: dict[str, Any]) -> bool:
+    """Mirror fx_intel.journal's fail-closed decision provenance contract."""
     if entry.get("pit_eligible") is not True:
+        return False
+    if entry.get("pit_contract") != DECISION_JOURNAL_PIT_CONTRACT:
+        return False
+    identity = DECISION_PRODUCER_IDENTITIES.get(str(entry.get("mode") or ""))
+    if (
+        identity is None
+        or (
+            str(entry.get("producer") or ""),
+            str(entry.get("producer_version") or ""),
+        )
+        != identity
+    ):
+        return False
+    if not str(entry.get("decision_id") or "").strip():
+        return False
+    if not str(entry.get("input_context_id") or "").strip():
+        return False
+    source_record_ids = entry.get("source_record_ids")
+    if not isinstance(source_record_ids, list) or not any(
+        str(value).strip() for value in source_record_ids
+    ):
         return False
 
     def aware(value: object) -> datetime | None:
@@ -652,7 +689,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         parsed.append((ts, entry))
         if close is not None and symbol:
             prices.setdefault((symbol, timeframe), []).append((ts, close))
-            if not timeframe and _is_pit_eligible_fusion_row(entry):
+            if not timeframe and _is_pit_eligible_decision_row(entry):
                 pit_prices.setdefault((symbol, timeframe), []).append((ts, close))
     for series in prices.values():
         series.sort(key=lambda row: row[0])
@@ -672,7 +709,8 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         direction = str(entry.get("direction") or "").strip().lower()
         symbol = str(entry.get("symbol") or "")
         timeframe = str(entry.get("timeframe") or "").strip().lower()
-        pit_eligible = _is_pit_eligible_fusion_row(entry) if not timeframe else False
+        pit_eligible = _is_pit_eligible_decision_row(entry)
+        ml_pit_eligible = pit_eligible and not timeframe
         ts_text = ts.isoformat()
         display_base = {
             "ts": ts_text,
@@ -701,7 +739,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         atr = _number(entry.get("atr"))
         if close is None or not symbol:
             pending += 1
-            if pit_eligible:
+            if ml_pit_eligible:
                 ml_pit_pending += 1
             if symbol:
                 display_decisions.append({**display_base, "outcome": "pending", "move": None})
@@ -709,28 +747,23 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
         # その足の主ホライズンで採点(旧スキーマ行=24h)
         horizon = _number(entry.get("horizon_hours")) or 24.0
         future = _future_close(
-            (pit_prices if pit_eligible else prices).get((symbol, timeframe), []),
+            (pit_prices if ml_pit_eligible else prices).get((symbol, timeframe), []),
             ts,
             horizon_hours=horizon,
             tolerance_hours=_tolerance_for(horizon),
         )
         if future is None:
             pending += 1
-            if pit_eligible:
+            if ml_pit_eligible:
                 ml_pit_pending += 1
             display_decisions.append({**display_base, "outcome": "pending", "move": None})
             continue
         move = future - close
         signed = move if direction == "long" else -move
         threshold = (atr or 0.0) * 0.1
-        # 収益R: 判断方向の値動きをATR換算(=learning.move_atr相当)し、判断時に保存した
-        # 執行コスト(R換算)を引いてコスト控除後の実現Rにする。atr・コストが揃う時だけ。
-        net_r: float | None = None
-        if atr and atr > 0:
-            realized_r_atr = signed / atr
-            cost_r = _number(entry.get("execution_cost_r"))
-            if cost_r is not None:
-                net_r = round(realized_r_atr - cost_r, 4)
+        # legacy判断ログから得られるのはATR換算値幅だけ。execution_cost_rは
+        # planned stop distance分母なので、ここで引いて「純R」とは呼ばない。
+        move_atr = round(signed / atr, 4) if atr is not None and atr > 0 else None
         # flat も内訳(by_symbol/by_timeframe)に計上する。的中率の分母は
         # evaluated のままなので、flat を数えても hit_rate は変わらない。
         stat = by_symbol.setdefault(symbol, {"evaluated": 0, "hits": 0, "flat": 0})
@@ -747,7 +780,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 tf_stat["flat"] += 1
         else:
             evaluated += 1
-            if pit_eligible:
+            if ml_pit_eligible:
                 ml_pit_evaluated += 1
             hit = signed > 0
             hits += int(hit)
@@ -761,7 +794,7 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             **display_base,
             "outcome": outcome,
             "move": round(move, 6),
-            "net_r": net_r,
+            "move_atr": move_atr,
         }
         outcomes.append(outcome_row)
         display_decisions.append(outcome_row)
@@ -852,10 +885,9 @@ def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     その判断までの累積で、flat(小動き)は的中率の分母から除く(hits/evaluated と同義)。
     データが1日分でも点が増えるほど曲線が伸び、的中率が基準に収束していく様子が見える。
 
-    的中率(方向)に加え、コスト控除後の累積純R(cum_net_r)も持つ。的中率が高くても
-    薄利でコスト負けしていないか=「儲かっているか」を同じ時間軸で見るため。net_r は
-    execution_cost_r が保存された判断でだけ算出されるので、cum_net_r は net_r を持つ
-    採点のみを累積し、net_r_points にその件数を持たせる(欠損時は前値を据え置き)。
+    的中率(方向)に加え、legacy終値照合のATR換算値幅(cum_move_atr)を持つ。
+    これはterminal-price proxyであり、正準のgross/net Rではない。ATR欠損行は
+    0埋めせず、move_atr_pointsにも数えない。
     """
     scored = sorted(
         (o for o in outcomes if o.get("outcome") in {"hit", "miss"}),
@@ -863,22 +895,22 @@ def _learning_curve(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     curve: list[dict[str, Any]] = []
     cumulative_hits = 0
-    cumulative_net_r = 0.0
-    net_r_points = 0
+    cumulative_move_atr = 0.0
+    move_atr_points = 0
     for index, outcome in enumerate(scored, start=1):
         cumulative_hits += int(outcome.get("outcome") == "hit")
-        net_r = outcome.get("net_r")
-        if isinstance(net_r, (int, float)):
-            cumulative_net_r += float(net_r)
-            net_r_points += 1
+        move_atr = outcome.get("move_atr")
+        if isinstance(move_atr, (int, float)):
+            cumulative_move_atr += float(move_atr)
+            move_atr_points += 1
         curve.append(
             {
                 "ts": outcome.get("ts"),
                 "scored": index,
                 "hits": cumulative_hits,
                 "hit_rate": round(cumulative_hits / index, 4),
-                "cum_net_r": round(cumulative_net_r, 4),
-                "net_r_points": net_r_points,
+                "cum_move_atr": (round(cumulative_move_atr, 4) if move_atr_points else None),
+                "move_atr_points": move_atr_points,
             }
         )
     return curve
@@ -1460,9 +1492,9 @@ def _trade_monitor_summary(
             return value
         return sum(1 for record in active if record.get("stage") == stage)
 
-    paper_ready = _list_from_payload(monitor_registry, "paper_ready") or _registry_records_by_stage(
-        registry, "paper_ready"
-    )
+    ready_for_review = _list_from_payload(
+        monitor_registry, "ready_for_review"
+    ) or _registry_records_by_stage(registry, "ready_for_review")
     approved = _list_from_payload(monitor_registry, "approved") or _registry_records_by_stage(
         registry, "approved"
     )
@@ -1482,7 +1514,7 @@ def _trade_monitor_summary(
         "health": (monitor.get("health") if isinstance(monitor.get("health"), dict) else {}),
         "counts": {
             "active": int(monitor_registry.get("active_count", len(active)) or 0),
-            "paper_ready": _count("paper_ready"),
+            "ready_for_review": _count("ready_for_review"),
             "approved": _count("approved"),
             "auto_paused": _count("auto_paused"),
             "rejected": _count("rejected"),
@@ -1495,7 +1527,7 @@ def _trade_monitor_summary(
             ),
         },
         "alerts": _list_from_payload(monitor, "alerts")[:20],
-        "paper_ready": paper_ready[:10],
+        "ready_for_review": ready_for_review[:10],
         "approved": approved[:10],
         "auto_paused": auto_paused[:10],
         "rejected": rejected[:10],
@@ -1567,25 +1599,50 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
     raw_outcomes = payload.get("outcomes")
     outcomes = raw_outcomes if isinstance(raw_outcomes, list) else []
-    scored = [
-        row
-        for row in outcomes
-        if isinstance(row, dict) and _number(row.get("realized_r")) is not None
+
+    def gross_value(row: dict[str, Any]) -> float | None:
+        canonical_gross = _number(row.get("gross_realized_r"))
+        return canonical_gross if canonical_gross is not None else _number(row.get("realized_r"))
+
+    scored = [row for row in outcomes if isinstance(row, dict) and gross_value(row) is not None]
+
+    def canonical(row: dict[str, Any]) -> bool:
+        return (
+            _number(row.get("realized_net_r")) is not None
+            and row.get("net_label_eligible") is True
+            and bool(str(row.get("decision_id") or "").strip())
+            and row.get("label_version") in KNOWN_NET_LABEL_VERSIONS
+            and row.get("label_provenance") in KNOWN_NET_LABEL_PROVENANCES
+            and row.get("cost_model_id") in KNOWN_EXECUTABLE_COST_MODEL_IDS
+            and not canonical_net_label_contract_flags(row)
+        )
+
+    labeled = [row for row in scored if canonical(row)]
+    gross_values = [value for row in scored if (value := gross_value(row)) is not None]
+    effective = summarize_effective_samples(labeled)
+    selected_keys = set(effective.selected_keys)
+    effective_labeled = [
+        row for row in labeled if f"{row['decision_id']}+{row['label_version']}" in selected_keys
     ]
-    labeled = [
-        row
-        for row in scored
-        if _number(row.get("realized_net_r")) is not None
-        and bool(row.get("net_label_eligible", row.get("tradable", False)))
-    ]
-    values = [float(row["realized_net_r"]) for row in labeled]
+    values = [float(row["realized_net_r"]) for row in effective_labeled]
+
+    def profit_factor(samples: list[float]) -> float | None:
+        gains = sum(value for value in samples if value > 0)
+        losses = abs(sum(value for value in samples if value < 0))
+        if losses <= 0:
+            return None
+        return gains / losses
+
     cumulative = 0.0
     curve: list[dict[str, Any]] = []
-    for row, value in sorted(zip(labeled, values), key=lambda item: str(item[0].get("ts", ""))):
+    for row, value in sorted(
+        zip(effective_labeled, values),
+        key=lambda item: str(item[0].get("prediction_time", "")),
+    ):
         cumulative += value
         curve.append(
             {
-                "ts": row.get("ts"),
+                "ts": row.get("prediction_time"),
                 "decision_id": row.get("decision_id"),
                 "realized_net_r": round(value, 4),
                 "cumulative_net_r": round(cumulative, 4),
@@ -1593,7 +1650,10 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
         )
     missing: dict[str, int] = {}
     for row in scored:
+        if canonical(row):
+            continue
         if _number(row.get("realized_net_r")) is not None:
+            missing["noncanonical_net_label"] = missing.get("noncanonical_net_label", 0) + 1
             continue
         flags = row.get("quality_flags")
         if not isinstance(flags, list):
@@ -1605,11 +1665,27 @@ def _net_r_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "scored": len(scored),
         "labels": len(labeled),
-        "coverage": len(labeled) / len(scored) if scored else 0.0,
-        "expectancy_r": sum(values) / len(values) if values else None,
+        "gross_samples": len(gross_values),
+        "net_label_samples": len(labeled),
+        "raw_samples": len(scored),
+        "effective_input_samples": effective.raw_samples,
+        "effective_samples": effective.effective_samples,
+        "overlap_ratio": effective.overlap_ratio,
+        "cluster_count": effective.cluster_count,
+        "market_days": effective.market_days,
+        "invalid_effective_samples": effective.invalid_samples,
+        "effective_sample_invalid_reasons": effective.invalid_reasons,
+        "minimum_effective_samples": effective.min_samples,
+        "sample_ok": effective.sample_ok,
+        "net_label_coverage": len(labeled) / len(scored) if scored else None,
+        "gross_expectancy_r": (sum(gross_values) / len(gross_values) if gross_values else None),
+        "net_expectancy_r": sum(values) / len(values) if values else None,
+        "gross_profit_factor": profit_factor(gross_values),
+        "net_profit_factor": profit_factor(values),
         "cumulative_net_r": sum(values) if values else None,
-        "label_versions": sorted({str(row.get("label_version")) for row in labeled}),
-        "cost_model_ids": sorted({str(row.get("cost_model_id")) for row in labeled}),
+        "label_versions": sorted({str(row["label_version"]) for row in labeled}),
+        "label_provenances": sorted({str(row["label_provenance"]) for row in labeled}),
+        "cost_model_ids": sorted({str(row["cost_model_id"]) for row in labeled}),
         "missing_reasons": dict(sorted(missing.items())),
         "curve": curve,
     }

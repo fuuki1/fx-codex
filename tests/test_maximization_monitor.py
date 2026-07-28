@@ -96,9 +96,10 @@ def test_maximization_monitor_writes_profile_monitor_and_candidates(monitor, tmp
 
     assert result["exit_code"] == 1
     assert payload["status"] == "fail"
-    assert payload["summary"]["action_counts"]["avoid"] == 1
-    assert payload["improvement_candidates"][0]["action_type"] == "max_expectancy_avoid"
-    assert profile["cells"]["USDJPY|1h|long"]["action"] == "avoid"
+    assert payload["summary"]["action_counts"]["collect_samples"] == 1
+    assert payload["summary"]["evaluation_unavailable_cell_count"] == 1
+    assert payload["improvement_candidates"] == []
+    assert profile["cells"]["USDJPY|1h|long"]["action"] == "collect_samples"
 
 
 def test_maximization_monitor_cli_quiet_returns_exit_code(monitor, tmp_path) -> None:

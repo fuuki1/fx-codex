@@ -4,10 +4,9 @@
 採点対象から消える。ガード根拠のサンプルが永遠に増えず、blockが恒久化する
 (2026-07-17〜の実機で観測: 根拠n=28のまま全新規判断が見送りに固定)。
 
-修正の設計: expectancy_guard「単独」で見送りになった行を、判断時に凍結記録した
-シャドー計画(shadow_predictionsのfusion_raw)と分析方向(analysis_direction)から
-復元し、実績と同じ採点エンジンでガード根拠に加える。推奨(direction)は
-neutralのまま変えない。合成に事後計算は使わない(PIT安全・fail-closed)。
+修正の設計: expectancy_guard「単独」で見送りになった行を、producerが判断時に
+凍結したpre_guard完全プランから復元する。推奨(direction)はneutralのまま
+変えず、合成にraw scoreの再計算や別producerのshadowを使わない。
 """
 
 from __future__ import annotations
@@ -48,6 +47,9 @@ def _guard_blocked_row(
     conviction: int = 55,
     atr: float = 1.0,
     extra_blocked_gate: str | None = None,
+    mode: str = "fusion",
+    producer: str = "fusion_raw",
+    timeframe: str | None = None,
     **overrides: object,
 ) -> dict:
     sign = 1.0 if direction == "long" else -1.0
@@ -60,10 +62,60 @@ def _guard_blocked_row(
     row = _row(ts, symbol=symbol, close=close, atr=atr)
     row.update(
         {
+            "prediction_time": ts.isoformat(),
+            "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
+            "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
+            "pit_eligible": True,
+            "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+            "decision_id": f"decision:{symbol}:{ts.isoformat()}:{mode}",
+            "mode": mode,
+            "producer": producer,
+            "producer_version": (
+                journal.TIMEFRAME_PRODUCER_VERSION
+                if mode == "per_timeframe"
+                else journal.FUSION_PRODUCER_VERSION
+            ),
+            "input_context_id": f"context:{symbol}:{ts.isoformat()}",
+            "source_record_ids": [f"source:{symbol}:{ts.isoformat()}"],
+            **({"timeframe": timeframe} if timeframe is not None else {}),
             "direction": "neutral",
             "conviction": 0,
             "analysis_direction": direction,
             "analysis_conviction": conviction,
+            "pre_guard_direction": direction,
+            "pre_guard_conviction": conviction,
+            "pre_guard_stop": close - sign * risk,
+            "pre_guard_target1": close + sign * risk,
+            "pre_guard_target2": close + sign * risk * 2.0,
+            "pre_guard_target_policy": {
+                "policy_id": "default-atr-v1",
+                "target1_r": 1.0,
+                "target2_r": 2.0,
+            },
+            "pre_guard_cost_model_id": "scanner-proxy-mid-diagnostic-v1",
+            "pre_guard_execution_snapshot": {
+                "entry_bid": close - 0.01,
+                "entry_ask": close + 0.01,
+                "quote_observed_at": ts.isoformat(),
+                "quote_available_at": ts.isoformat(),
+                "quote_source": "fixture",
+                "quote_source_record_id": f"quote:{symbol}:{ts.isoformat()}",
+                "planned_risk_distance": risk,
+                "entry_spread_r": 0.02 / risk,
+                "label_version": "net-r-v2",
+                "label_provenance": "paper_quote_model",
+                "cost_model_id": "scanner-proxy-mid-diagnostic-v1",
+                "cost_model_version": "1",
+                "cost_status": "diagnostic_only",
+                "slippage_model_id": "zero-slippage-v1",
+                "commission_model_id": "zero-commission-v1",
+                "slippage_r": 0.0,
+                "commission_r": 0.0,
+                "financing_r": 0.0,
+                "cost_quality_flags": ["diagnostic_only"],
+                "canonical_net_label_input_eligible": False,
+                "canonical_net_label_status": "ineligible",
+            },
             "gate_trace": gate_trace,
             "shadow_predictions": [
                 {
@@ -88,6 +140,17 @@ def _guard_blocked_row(
 
 def test_counterfactual_synthesis_restores_frozen_plan() -> None:
     entry = _guard_blocked_row(MONDAY + 8 * HOUR)
+    # 別producerのshadowに矛盾する値があっても、凍結pre-guard以外を参照しない。
+    entry["shadow_predictions"] = [
+        {
+            "producer": "timeframe_raw",
+            "direction": "short",
+            "eligible_for_scoring": True,
+            "stop": 999.0,
+            "target1": 1.0,
+            "target2": 0.5,
+        }
+    ]
     synthesized = journal.counterfactual_guard_entries([entry])
 
     assert len(synthesized) == 1
@@ -97,7 +160,15 @@ def test_counterfactual_synthesis_restores_frozen_plan() -> None:
     assert synth["stop"] == 97.5
     assert synth["target1"] == 102.5
     assert synth["target2"] == 105.0
-    assert synth["target_policy"] == {"policy_id": "shadow-default-atr-v1"}
+    assert synth["target_policy"] == {
+        "policy_id": "default-atr-v1",
+        "target1_r": 1.0,
+        "target2_r": 2.0,
+    }
+    assert synth["parent_decision_id"] == entry["decision_id"]
+    assert synth["decision_id"] == f"{entry['decision_id']}:pre-guard"
+    assert synth["execution_cost_r"] is None
+    assert synth["canonical_net_label_status"] == "pending_canonical_outcome"
     assert synth[journal.COUNTERFACTUAL_ENTRY_KEY] is True
     # 元の行は破壊しない(推奨はneutralのまま)
     assert entry["direction"] == "neutral"
@@ -117,19 +188,70 @@ def test_counterfactual_requires_guard_only_block() -> None:
 
 def test_counterfactual_fails_closed_on_missing_records() -> None:
     base_ts = MONDAY + 8 * HOUR
-    no_analysis = _guard_blocked_row(base_ts)
-    no_analysis["analysis_direction"] = "neutral"
-    no_predictions = _guard_blocked_row(base_ts)
-    no_predictions["shadow_predictions"] = []
-    not_eligible = _guard_blocked_row(base_ts)
-    not_eligible["shadow_predictions"][0]["eligible_for_scoring"] = False
-    mismatched = _guard_blocked_row(base_ts)
-    mismatched["shadow_predictions"][0]["direction"] = "short"
+    no_direction = _guard_blocked_row(base_ts)
+    no_direction["pre_guard_direction"] = "neutral"
+    no_policy = _guard_blocked_row(base_ts)
+    no_policy["pre_guard_target_policy"] = {}
+    no_execution = _guard_blocked_row(base_ts)
+    no_execution["pre_guard_execution_snapshot"] = {}
+    mismatched_cost = _guard_blocked_row(base_ts)
+    mismatched_cost["pre_guard_execution_snapshot"]["cost_model_id"] = "other"
     missing_level = _guard_blocked_row(base_ts)
-    missing_level["shadow_predictions"][0]["stop"] = None
+    missing_level["pre_guard_stop"] = None
+    non_finite = _guard_blocked_row(base_ts)
+    non_finite["pre_guard_conviction"] = float("nan")
 
-    rows = [no_analysis, no_predictions, not_eligible, mismatched, missing_level]
+    rows = [
+        no_direction,
+        no_policy,
+        no_execution,
+        mismatched_cost,
+        missing_level,
+        non_finite,
+    ]
     assert journal.counterfactual_guard_entries(rows) == []
+
+
+def test_counterfactual_uses_explicit_mode_and_producer_not_timeframe_presence() -> None:
+    fusion_with_timeframe_marker = _guard_blocked_row(
+        MONDAY + 8 * HOUR,
+        mode="fusion",
+        producer="fusion_raw",
+        timeframe="fusion",
+    )
+    assert len(journal.counterfactual_guard_entries([fusion_with_timeframe_marker])) == 1
+
+    timeframe_row = _guard_blocked_row(
+        MONDAY + 9 * HOUR,
+        mode="per_timeframe",
+        producer="timeframe_raw",
+        timeframe="1h",
+    )
+    assert len(journal.counterfactual_guard_entries([timeframe_row])) == 1
+
+    unknown = _guard_blocked_row(
+        MONDAY + 10 * HOUR,
+        mode="unknown",
+        producer="unknown",
+        timeframe="1h",
+    )
+    assert journal.counterfactual_guard_entries([unknown]) == []
+
+
+def test_counterfactual_restores_approved_target_policy() -> None:
+    entry = _guard_blocked_row(MONDAY + 8 * HOUR)
+    entry["pre_guard_target1"] = 101.875
+    entry["pre_guard_target2"] = 103.75
+    entry["pre_guard_target_policy"] = {
+        "candidate_id": "approved-overall-tp",
+        "target1_r": 0.75,
+        "target2_r": 1.5,
+    }
+
+    synth = journal.counterfactual_guard_entries([entry])[0]
+    assert synth["target1"] == 101.875
+    assert synth["target2"] == 103.75
+    assert synth["target_policy"]["candidate_id"] == "approved-overall-tp"
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +284,10 @@ def test_trade_outcomes_score_counterfactual_with_frozen_levels() -> None:
     assert outcome.conviction == 55
     assert outcome.first_touch == "tp2"
     assert outcome.realized_r == 2.0
+    assert outcome.realized_net_r is None
     assert to.COUNTERFACTUAL_QUALITY_FLAG in outcome.quality_flags
-    # シャドー計画のpolicy_idはcandidate_id(承認済みTP/SL)ではないため、
-    # by_target_policy集計には載せない(反実仮想を承認ポリシー実績に混ぜない)
+    # default policy_idはcandidate_id(承認済みTP/SL)ではないため、
+    # by_target_policy集計には載せない。
     assert outcome.target_policy_id is None
 
 
@@ -217,12 +340,7 @@ def _losing_counterfactual_row(ts: datetime) -> list[dict]:
     ]
 
 
-def test_guard_evidence_releases_block_only_when_counterfactuals_turn_positive() -> None:
-    """デッドロック回帰テスト: 実績のみだと根拠が凍結してblockが恒久化する。
-
-    反実仮想を根拠に加えると、シャドー計画の期待Rが正に転じたときだけ
-    blockが解除され、負のままなら見送りが続く(fail-closed維持)。
-    """
+def test_legacy_gross_counterfactuals_cannot_drive_guard_release() -> None:
     rows: list[dict] = []
     for i in range(8):
         rows.extend(_losing_real_row(MONDAY + i * 4 * HOUR))
@@ -236,7 +354,8 @@ def test_guard_evidence_releases_block_only_when_counterfactuals_turn_positive()
         group_min_samples=4,
     )
     real_adjustment = to.decision_adjustment(real_only, "USDJPY", "long", 55)
-    assert real_adjustment.block is True
+    assert real_adjustment.action == "sample_guard"
+    assert real_adjustment.block is False
 
     with_counterfactuals = to.summarize_expectancy(
         to.evaluate_trade_outcomes(
@@ -247,13 +366,15 @@ def test_guard_evidence_releases_block_only_when_counterfactuals_turn_positive()
     )
     overall = with_counterfactuals["overall"]
     assert overall["tradable"] == 16
-    assert overall["expectancy_r"] > 0
+    assert overall["gross_expectancy_r"] > 0
+    assert overall["net_expectancy_r"] is None
     assert to.counterfactual_outcome_count(with_counterfactuals) == 8
     released = to.decision_adjustment(with_counterfactuals, "USDJPY", "long", 55)
+    assert released.action == "sample_guard"
     assert released.block is False
 
 
-def test_guard_evidence_stays_blocked_while_counterfactuals_lose() -> None:
+def test_legacy_losing_counterfactuals_remain_evaluation_unavailable() -> None:
     rows: list[dict] = []
     for i in range(8):
         rows.extend(_losing_real_row(MONDAY + i * 4 * HOUR))
@@ -269,7 +390,8 @@ def test_guard_evidence_stays_blocked_while_counterfactuals_lose() -> None:
         group_min_samples=4,
     )
     adjustment = to.decision_adjustment(summary, "USDJPY", "long", 55)
-    assert adjustment.block is True
+    assert adjustment.action == "sample_guard"
+    assert adjustment.block is False
 
 
 def test_format_guard_evidence_note_only_mentions_counterfactuals_when_present() -> None:

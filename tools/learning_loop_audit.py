@@ -56,6 +56,11 @@ MIN_SYMBOL_SAMPLES = 8
 MIN_CONDITION_SAMPLES = 12
 ML_MIN_TRAIN_ROWS = 150
 DEFAULT_TECH_WEIGHT = 0.55
+DECISION_JOURNAL_PIT_CONTRACT = "decision-journal-pit-v2"
+DECISION_PRODUCER_IDENTITIES = {
+    "fusion": ("fusion_raw", "fusion-journal-v2"),
+    "per_timeframe": ("timeframe_raw", "timeframe-journal-v2"),
+}
 
 CAPTURE_INTERVAL_MINUTES = 5.0
 STALE_WARN_MINUTES = 15.0  # 3周期
@@ -141,6 +146,43 @@ def _parse_ts(value: object) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def _is_pit_eligible_decision_row(row: dict) -> bool:
+    if row.get("pit_eligible") is not True:
+        return False
+    if row.get("pit_contract") != DECISION_JOURNAL_PIT_CONTRACT:
+        return False
+    identity = DECISION_PRODUCER_IDENTITIES.get(str(row.get("mode") or ""))
+    if (
+        identity is None
+        or (
+            str(row.get("producer") or ""),
+            str(row.get("producer_version") or ""),
+        )
+        != identity
+    ):
+        return False
+    if not str(row.get("decision_id") or "").strip():
+        return False
+    if not str(row.get("input_context_id") or "").strip():
+        return False
+    source_record_ids = row.get("source_record_ids")
+    if not isinstance(source_record_ids, list) or not any(
+        str(value).strip() for value in source_record_ids
+    ):
+        return False
+    recorded = _parse_ts(row.get("ts"))
+    prediction = _parse_ts(row.get("prediction_time"))
+    source_cutoff = _parse_ts(row.get("source_cutoff"))
+    feature_available = _parse_ts(row.get("max_feature_available_time"))
+    if None in (recorded, prediction, source_cutoff, feature_available):
+        return False
+    assert recorded is not None
+    assert prediction is not None
+    assert source_cutoff is not None
+    assert feature_available is not None
+    return recorded == prediction and source_cutoff <= feature_available <= prediction
 
 
 @dataclass
@@ -341,7 +383,7 @@ def audit_prediction_capture(
         if ts is None or ts < window_start or ts > now:
             continue
         fusion_ts.append(ts)
-        if row.get("pit_eligible") is True:
+        if _is_pit_eligible_decision_row(row):
             pit_rows += 1
     fusion_ts.sort()
     fusion_gaps = [
@@ -883,7 +925,7 @@ def audit_sample_sufficiency(
     cells_ge_symbol = sum(1 for count in cells.values() if count >= MIN_SYMBOL_SAMPLES)
     pit_directional = 0
     for row in fusion_journal.rows:
-        if row.get("pit_eligible") is True and row.get("direction") in ("long", "short"):
+        if _is_pit_eligible_decision_row(row) and row.get("direction") in ("long", "short"):
             pit_directional += 1
     status = PASS
     reasons: list[str] = []

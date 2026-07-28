@@ -116,13 +116,14 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
 
     assert result["exit_code"] == 1
     assert payload["status"] == "fail"
-    assert payload["summary"]["overall"]["expectancy_r"] == -1.0
-    assert payload["summary"]["action_counts"]["avoid"] == 1
+    assert payload["summary"]["overall"]["gross_expectancy_r"] == -1.0
+    assert payload["summary"]["overall"]["net_expectancy_r"] is None
+    assert payload["summary"]["action_counts"]["quality_guard"] == 1
     assert payload["runner"]["decision_event_count"] == 25
     assert outcome_report["scored_outcomes"] == 25
     assert outcome_report["failure_reason_summary"]
-    assert feedback["cells"]["USDJPY|1h|long"]["action"] == "avoid"
-    assert feedback["cells"]["USDJPY|1h|long"]["block"] is True
+    assert feedback["cells"]["USDJPY|1h|long"]["action"] == "quality_guard"
+    assert feedback["cells"]["USDJPY|1h|long"]["block"] is False
 
 
 def test_decision_expectancy_monitor_marks_immature_horizon_pending(

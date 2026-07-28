@@ -43,6 +43,8 @@ from .gbm import (
     platt_calibrate,
     rmse,
 )
+from .effective_samples import EffectiveSampleSummary, summarize_effective_samples
+from .evaluation_labels import canonical_net_label_contract_flags
 from .learning import EvaluatedCall
 from .learning import thin_calls as _thin_calls_impl
 from .journal import FUSION_PIT_DATA_CONTRACT
@@ -50,7 +52,7 @@ from .journal import FUSION_PIT_DATA_CONTRACT
 # 4: 入力コンテキスト特徴量(マクロ/流動性/セッション/レジーム)を追加。
 #    特徴量集合が変わると保存済みモデルのベクトル次元が合わなくなるため、
 #    旧スキーマのアーティファクトは load_artifact が破損扱いで捨てる(再学習で復元)。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TRAINING_CONTRACT = FUSION_PIT_DATA_CONTRACT
 
 # 方向依存(判断方向の符号を掛ける)特徴量と方向非依存の特徴量
@@ -269,6 +271,14 @@ def build_dataset(
       ヘッドの教師。コスト不明などで realized_net_r が無い行は None(回帰側で除外、
       二値側は従来どおり hit/miss があれば使う)。行の並びは全ラベルで共通。
     """
+    _effective, selected_net_keys = _effective_return_label_selection(calls)
+    return _build_dataset(calls, selected_net_keys)
+
+
+def _build_dataset(
+    calls: Sequence[EvaluatedCall],
+    selected_net_keys: set[str],
+) -> tuple[list[dict[str, float | None]], list[int], list[datetime], list[float | None]]:
     rows: list[dict[str, float | None]] = []
     labels: list[int] = []
     stamps: list[datetime] = []
@@ -291,8 +301,38 @@ def build_dataset(
         )
         labels.append(1 if call.outcome == "hit" else 0)
         stamps.append(ts)
-        r_labels.append(call.realized_net_r)
+        net_label_record = {
+            **call.net_label_metadata,
+            "realized_net_r": call.realized_net_r,
+        }
+        net_key = f"{net_label_record.get('decision_id')}+{net_label_record.get('label_version')}"
+        r_labels.append(
+            call.realized_net_r
+            if call.realized_net_r is not None
+            and not canonical_net_label_contract_flags(net_label_record)
+            and net_key in selected_net_keys
+            else None
+        )
     return rows, labels, stamps, r_labels
+
+
+def _effective_return_label_selection(
+    calls: Sequence[EvaluatedCall],
+) -> tuple[EffectiveSampleSummary, set[str]]:
+    records: list[Mapping[str, object]] = []
+    for call in calls:
+        if call.outcome not in ("hit", "miss") or call.direction not in ("long", "short"):
+            continue
+        if _parse_ts(call.ts) is None or call.realized_net_r is None:
+            continue
+        record = {
+            **call.net_label_metadata,
+            "realized_net_r": call.realized_net_r,
+        }
+        if not canonical_net_label_contract_flags(record):
+            records.append(record)
+    summary = summarize_effective_samples(records, min_samples=1)
+    return summary, set(summary.selected_keys)
 
 
 def _median(values: Sequence[float]) -> float:
@@ -353,6 +393,12 @@ class MLArtifact:
     # 教師は realized_net_r。二値ヘッド(model/usable)とは独立に評価・保存する。
     return_model: GradientBoostingRegressor | None = None
     quantile_models: dict[str, GradientBoostingRegressor] = field(default_factory=dict)
+    return_raw_samples: int = 0
+    return_effective_samples: int = 0
+    return_overlap_ratio: float | None = None
+    return_cluster_count: int = 0
+    return_market_days: int = 0
+    return_invalid_samples: int = 0
     n_return_train: int = 0
     n_return_test: int = 0
     return_val_rmse: float | None = None  # 回帰ヘッドのtest RMSE
@@ -472,7 +518,19 @@ def train_artifact(
     artifact = MLArtifact(trained_at=now.isoformat())
 
     thinned = thin_calls(calls)
-    rows, labels, stamps, r_labels = build_dataset(thinned)
+    effective_returns, selected_net_keys = _effective_return_label_selection(thinned)
+    artifact.return_raw_samples = effective_returns.raw_samples
+    artifact.return_effective_samples = effective_returns.effective_samples
+    artifact.return_overlap_ratio = effective_returns.overlap_ratio
+    artifact.return_cluster_count = effective_returns.cluster_count
+    artifact.return_market_days = effective_returns.market_days
+    artifact.return_invalid_samples = effective_returns.invalid_samples
+    if effective_returns.invalid_samples:
+        reasons = ",".join(
+            f"{name}={count}" for name, count in effective_returns.invalid_reasons.items()
+        )
+        artifact.return_reasons.append(f"canonical純Rのeffective sample metadata不正({reasons})")
+    rows, labels, stamps, r_labels = _build_dataset(thinned, selected_net_keys)
     if len(rows) < min_train_rows:
         artifact.reasons.append(f"学習サンプル不足(間引き後{len(rows)}件 < {min_train_rows}件)")
         return artifact
@@ -708,13 +766,13 @@ def _apply_overfitting_gate(
 ) -> bool:
     """試行群に PBO、採択試行の OOS リターンに DSR を適用して過学習を検定する。
 
-    観測不足(共有時刻<PBO_MIN_OBSERVATIONS)や試行<2ではゲートを課さず True を返す
-    (=条件1のみで判定)。理由は必ず記録する。fx_backtester(numpy/pandas依存)は
-    ここで遅延importし、モジュール読み込みを軽く保つ。
+    観測不足、試行不足、依存不足、計算不能は昇格不能(False)としてfail closedにする。
+    理由は必ず記録する。fx_backtester(numpy/pandas依存)はここで遅延importし、
+    モジュール読み込みを軽く保つ。
     """
     if len(trials) < 2:
         artifact.return_reasons.append("過学習検定skip: 試行が2件未満")
-        return True
+        return False
     # 同一時刻を共有する行だけを使う(PBOは全試行が同じ評価時刻を要求)。
     # 同一時刻に複数ペアがある場合は最初の1つに揃える(決定論のため時刻順)。
     unique_times: list[datetime] = []
@@ -730,7 +788,7 @@ def _apply_overfitting_gate(
         artifact.return_reasons.append(
             f"過学習検定skip: OOS共有時刻 {len(unique_times)} < {PBO_MIN_OBSERVATIONS} 件"
         )
-        return True
+        return False
 
     try:
         import numpy as np
@@ -743,7 +801,7 @@ def _apply_overfitting_gate(
         )
     except ImportError as error:  # numpy/pandas/fx_backtester 不在は検定skip
         artifact.return_reasons.append(f"過学習検定skip: 依存不足({error})")
-        return True
+        return False
 
     index = pd.DatetimeIndex(unique_times)
     columns = {
@@ -757,7 +815,7 @@ def _apply_overfitting_gate(
         pbo = float(pbo_result["pbo"])
     except ValueError as error:
         artifact.return_reasons.append(f"過学習検定skip: PBO計算不能({error})")
-        return True
+        return False
     artifact.return_pbo = round(pbo, 4)
 
     # DSR: 採択試行の OOS ゲート済みリターンを、全試行の per-period Sharpe で控除
@@ -776,7 +834,7 @@ def _apply_overfitting_gate(
         dsr = float(dsr_result["dsr"])
     except ValueError as error:
         artifact.return_reasons.append(f"過学習検定skip: DSR計算不能({error})")
-        return True
+        return False
     artifact.return_dsr = round(dsr, 4)
 
     if dsr < MIN_RETURN_DSR:
@@ -892,6 +950,12 @@ def save_artifact(artifact: MLArtifact, path: str | Path) -> None:
         "importance_by_name": artifact.importance_by_name,
         "model": artifact.model.to_dict() if artifact.model is not None else None,
         "return_head": {
+            "raw_samples": artifact.return_raw_samples,
+            "effective_samples": artifact.return_effective_samples,
+            "overlap_ratio": artifact.return_overlap_ratio,
+            "cluster_count": artifact.return_cluster_count,
+            "market_days": artifact.return_market_days,
+            "invalid_samples": artifact.return_invalid_samples,
             "n_train": artifact.n_return_train,
             "n_test": artifact.n_return_test,
             "val_rmse": artifact.return_val_rmse,
@@ -968,6 +1032,12 @@ def load_artifact(path: str | Path) -> MLArtifact:
 
         return_head = payload.get("return_head")
         if isinstance(return_head, Mapping):
+            artifact.return_raw_samples = int(return_head.get("raw_samples", 0))
+            artifact.return_effective_samples = int(return_head.get("effective_samples", 0))
+            artifact.return_overlap_ratio = _maybe_float(return_head.get("overlap_ratio"))
+            artifact.return_cluster_count = int(return_head.get("cluster_count", 0))
+            artifact.return_market_days = int(return_head.get("market_days", 0))
+            artifact.return_invalid_samples = int(return_head.get("invalid_samples", 0))
             artifact.n_return_train = int(return_head.get("n_train", 0))
             artifact.n_return_test = int(return_head.get("n_test", 0))
             artifact.return_val_rmse = _maybe_float(return_head.get("val_rmse"))

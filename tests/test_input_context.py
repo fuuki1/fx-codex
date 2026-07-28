@@ -185,3 +185,31 @@ def test_same_context_reaches_every_timeframe_without_changing_direction() -> No
         )
         for plan in connected
     )
+
+
+def test_decision_quote_contract_preserves_distinct_times_and_lineage() -> None:
+    context = {
+        "liquidity": {
+            "quote": {
+                "bid": 156.20,
+                "ask": 156.22,
+                "observed_at": "2026-06-29T08:59:57+00:00",
+                "available_time": "2026-06-29T08:59:59+00:00",
+                "source": "fixture_quotes",
+                "role": "decision_quote",
+                "source_record_id": "quote-123",
+                "content_hash": "a" * 64,
+                "quality_status": "measured",
+                "quality_flags": ["cross_checked"],
+            }
+        }
+    }
+
+    contract = input_context.decision_quote_contract_from_mapping(context)
+
+    assert contract["observed_at"] == "2026-06-29T08:59:57+00:00"
+    assert contract["available_time"] == "2026-06-29T08:59:59+00:00"
+    assert contract["source"] == "fixture_quotes"
+    assert contract["source_record_id"] == "quote-123"
+    assert contract["content_hash"] == "a" * 64
+    assert contract["quality_flags"] == ["cross_checked"]

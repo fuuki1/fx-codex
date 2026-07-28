@@ -17,6 +17,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .effective_samples import select_effective_samples
+from .evaluation_labels import canonical_net_label_contract_flags
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .tp_sl_learning import MVP_SYMBOLS, MVP_TIMEFRAMES
 from .trade_outcome import (
@@ -511,9 +513,14 @@ def build_monitoring_snapshot(
     action_counts: dict[str, int] = {}
     for cell in profile.cells.values():
         action_counts[cell.action] = action_counts.get(cell.action, 0) + 1
-    mature_cells = [cell for cell in profile.cells.values() if cell.tradable >= MIN_CELL_SAMPLES]
+    mature_cells = [cell for cell in profile.cells.values() if cell.sample_ok]
+    unavailable_cells = [
+        cell
+        for cell in profile.cells.values()
+        if cell.tradable >= MIN_CELL_SAMPLES and not cell.sample_ok
+    ]
     status = STATUS_OK
-    if any(cell.action == "avoid" for cell in mature_cells):
+    if unavailable_cells or any(cell.action == "avoid" for cell in mature_cells):
         status = STATUS_FAIL
     elif any(cell.action in {"dampen", "quality_guard"} for cell in mature_cells):
         status = STATUS_WARN
@@ -528,6 +535,7 @@ def build_monitoring_snapshot(
         "summary": {
             "cell_count": len(profile.cells),
             "mature_cell_count": len(mature_cells),
+            "evaluation_unavailable_cell_count": len(unavailable_cells),
             "action_counts": dict(sorted(action_counts.items())),
             "best_cells": [
                 cell.to_dict()
@@ -555,10 +563,17 @@ def _advanced_metrics(
     brier: float | None,
     brier_base: float | None,
 ) -> dict[str, float | None]:
-    tradable = [
-        outcome for outcome in outcomes if outcome.tradable and outcome.realized_r is not None
+    valid_net = [
+        outcome
+        for outcome in outcomes
+        if outcome.tradable
+        and outcome.realized_net_r is not None
+        and not canonical_net_label_contract_flags(outcome.to_dict())
     ]
-    r_values = [float(outcome.realized_r) for outcome in tradable if outcome.realized_r is not None]
+    tradable, _effective = select_effective_samples(valid_net, min_samples=1)
+    r_values = [
+        float(outcome.realized_net_r) for outcome in tradable if outcome.realized_net_r is not None
+    ]
     if not r_values:
         return {
             "calibration_error": None,
@@ -637,6 +652,8 @@ def _policy(
     max_drawdown = _float(advanced.get("max_drawdown_r"))
     label = _cell_label(symbol, timeframe, direction)
 
+    if not bool(stats.get("sample_ok")) or _int(stats.get("net_label_samples")) < MIN_CELL_SAMPLES:
+        return "collect_samples", 1.0, False, ""
     if tradable < MIN_CELL_SAMPLES:
         return "collect_samples", 1.0, False, ""
     if quality is not None and quality < QUALITY_FLOOR:
@@ -652,13 +669,6 @@ def _policy(
             BLOCK_FACTOR,
             True,
             f"{label}: 期待R {expectancy:+.2f}R、最大化スコア{score:+.2f}。見送り優先",
-        )
-    if score < -0.05:
-        return (
-            "avoid",
-            BLOCK_FACTOR,
-            True,
-            f"{label}: 最大化スコア{score:+.2f}が低く、見送り優先",
         )
     if profit_factor is not None and profit_factor < WEAK_PROFIT_FACTOR:
         return (
@@ -734,12 +744,17 @@ def _policy(
 
 
 def _brier_stats(outcomes: Sequence[TradeOutcome]) -> tuple[float | None, float | None]:
-    tradable = [
-        outcome for outcome in outcomes if outcome.tradable and outcome.realized_r is not None
+    valid_net = [
+        outcome
+        for outcome in outcomes
+        if outcome.tradable
+        and outcome.realized_net_r is not None
+        and not canonical_net_label_contract_flags(outcome.to_dict())
     ]
+    tradable, _effective = select_effective_samples(valid_net, min_samples=1)
     if not tradable:
         return None, None
-    labels = [1.0 if float(outcome.realized_r or 0.0) > 0 else 0.0 for outcome in tradable]
+    labels = [1.0 if float(outcome.realized_net_r or 0.0) > 0 else 0.0 for outcome in tradable]
     base = sum(labels) / len(labels)
     brier = sum(
         (outcome.conviction / 100.0 - label) ** 2 for outcome, label in zip(tradable, labels)
@@ -856,7 +871,7 @@ def _calibration_error(outcomes: Sequence[TradeOutcome]) -> float | None:
         if not bucket:
             continue
         avg_probability = sum(outcome.conviction / 100.0 for outcome in bucket) / len(bucket)
-        hit_rate = sum(1 for outcome in bucket if float(outcome.realized_r or 0.0) > 0) / len(
+        hit_rate = sum(1 for outcome in bucket if float(outcome.realized_net_r or 0.0) > 0) / len(
             bucket
         )
         weighted_error += len(bucket) * abs(avg_probability - hit_rate)

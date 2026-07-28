@@ -10,15 +10,42 @@ import pytest
 
 import fx_briefing
 from fx_intel.calendar import EconomicEvent
+from fx_intel.evaluation_labels import (
+    DEFAULT_COST_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel import trade_outcome as to
+from tests.support.prospective_registry import mark_candidate_ready_for_review
+
+
+def _pit_timeframe_row(row: dict[str, object]) -> dict[str, object]:
+    prediction = datetime.fromisoformat(str(row["ts"]))
+    decision_id = f"decision:{row['symbol']}:{row['timeframe']}:{prediction.isoformat()}"
+    return {
+        **row,
+        "prediction_time": prediction.isoformat(),
+        "source_cutoff": (prediction - timedelta(minutes=2)).isoformat(),
+        "max_feature_available_time": (prediction - timedelta(seconds=1)).isoformat(),
+        "pit_eligible": True,
+        "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": decision_id,
+        "mode": "per_timeframe",
+        "producer": fx_briefing.journal.TIMEFRAME_PRODUCER,
+        "producer_version": fx_briefing.journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": f"context:{prediction.isoformat()}",
+        "source_record_ids": [f"source:{prediction.isoformat()}"],
+    }
 
 
 def _view(interval, rec, close, rsi=55.0, adx=25.0, atr=0.15):
     summary = {"RECOMMENDATION": rec, "BUY": 10, "SELL": 3, "NEUTRAL": 5}
     indicators = {
         "close": close,
+        "bid": close - 0.005,
+        "ask": close + 0.005,
         "RSI": rsi,
         "ADX": adx,
         "ATR": atr,
@@ -84,10 +111,17 @@ def _approved_tp_registry(path) -> None:
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            "label_version": NET_LABEL_VERSION,
+            "label_provenance": NET_LABEL_PROVENANCE,
+            "cost_model_id": DEFAULT_COST_MODEL_ID,
+            "net_label_samples": to.MIN_EXPECTANCY_SAMPLES,
+            "net_label_coverage": 1.0,
+            "baseline_net_expectancy_r": -1.0,
+            "candidate_net_expectancy_r": 0.75,
+            "delta_net_expectancy_r": 1.75,
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+            "trial_count": 1,
+            "trial_sharpes": [0.0],
         },
         "paper",
         "approval",
@@ -98,11 +132,10 @@ def _approved_tp_registry(path) -> None:
         now=datetime(2026, 7, 1, tzinfo=UTC),
         data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
     )
-    registry = to.update_improvement_registry(
+    registry = mark_candidate_ready_for_review(
         registry,
-        [candidate],
-        now=datetime(2026, 7, 1, 1, tzinfo=UTC),
-        data_contract=fx_briefing.journal.FUSION_PIT_DATA_CONTRACT,
+        candidate.candidate_id,
+        evaluated_at=datetime(2026, 7, 1, 1, tzinfo=UTC),
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,
@@ -266,6 +299,18 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
     assert next(iter(context_ids))
     assert all(row["input_context_schema_version"] == "decision-input-v1" for row in rows)
     assert all("liquidity__is_rollover_window" in row["input_features"] for row in rows)
+    assert all(row["pit_eligible"] is True for row in rows)
+    assert all(
+        row["pit_contract"] == fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT for row in rows
+    )
+    assert all(
+        row["source_cutoff"] <= row["max_feature_available_time"] <= row["prediction_time"]
+        for row in rows
+    )
+    assert all(row["source_record_ids"] for row in rows)
+    assert len({row["decision_id"] for row in rows}) == 4
+    assert all(row["pre_guard_direction"] in {"long", "short", "neutral"} for row in rows)
+    assert all("canonical_net_label_status" in row["pre_guard_execution_snapshot"] for row in rows)
     # 各行に主ホライズンが紐づく
     horizons = {row["timeframe"]: row["horizon_hours"] for row in rows}
     assert horizons == {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
@@ -317,12 +362,22 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
         if line.strip()
     ]
     assert {row["timeframe"] for row in decision_rows} == {"15m", "1h", "4h", "1d"}
+    journal_rows = [
+        json.loads(line)
+        for line in tf_journal.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["decision_id"] for row in journal_rows} == {
+        row["decision_id"] for row in decision_rows
+    }
     latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
     assert latest["event_count"] == 4
     outcome_report = json.loads(
         fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.read_text(encoding="utf-8")
     )
     assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
+    assert outcome_report["pit_required"] is True
+    assert outcome_report["pit_eligible_decision_events"] == 4
     assert set(outcome_report["metrics"]) >= {"first_touch", "mfe_r", "mae_r"}
     feedback = json.loads(fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.read_text(encoding="utf-8"))
     assert "cells" in feedback
@@ -341,19 +396,21 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
         ts = start + timedelta(hours=i)
         lines.append(
             json.dumps(
-                {
-                    "ts": ts.isoformat(),
-                    "symbol": "USDJPY",
-                    "timeframe": "1h",
-                    "horizon_hours": 1.0,
-                    "direction": "long",
-                    "conviction": 60,
-                    "tech_score": 0.5,
-                    "news_score": 0.2,
-                    "close": price,
-                    "atr": 0.10,
-                    "features": {"rsi_1h": 70.0, "adx_1h": 15.0},
-                }
+                _pit_timeframe_row(
+                    {
+                        "ts": ts.isoformat(),
+                        "symbol": "USDJPY",
+                        "timeframe": "1h",
+                        "horizon_hours": 1.0,
+                        "direction": "long",
+                        "conviction": 60,
+                        "tech_score": 0.5,
+                        "news_score": 0.2,
+                        "close": price,
+                        "atr": 0.10,
+                        "features": {"rsi_1h": 70.0, "adx_1h": 15.0},
+                    }
+                )
             )
         )
         price -= 0.05
@@ -377,25 +434,27 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
         ts = start + timedelta(hours=i * 3)
         journal_lines.append(
             json.dumps(
-                {
-                    "ts": ts.isoformat(),
-                    "symbol": "USDJPY",
-                    "timeframe": "1h",
-                    "horizon_hours": 1.0,
-                    "direction": "long",
-                    "conviction": 70,
-                    "composite": 0.7,
-                    "tech_score": 0.7,
-                    "news_score": 0.1,
-                    "close": 100.0,
-                    "atr": 1.0,
-                    "stop": 99.0,
-                    "target1": 101.0,
-                    "target2": 102.0,
-                    "data_quality": 1.0,
-                    "features": {},
-                    "components": [],
-                }
+                _pit_timeframe_row(
+                    {
+                        "ts": ts.isoformat(),
+                        "symbol": "USDJPY",
+                        "timeframe": "1h",
+                        "horizon_hours": 1.0,
+                        "direction": "long",
+                        "conviction": 70,
+                        "composite": 0.7,
+                        "tech_score": 0.7,
+                        "news_score": 0.1,
+                        "close": 100.0,
+                        "atr": 1.0,
+                        "stop": 99.0,
+                        "target1": 101.0,
+                        "target2": 102.0,
+                        "data_quality": 1.0,
+                        "features": {},
+                        "components": [],
+                    }
+                )
             )
         )
         price_lines.append(
@@ -432,7 +491,8 @@ def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsy
     assert rc == 0
     out = capsys.readouterr().out
     assert "時間足別期待値監視" in out
-    assert "・1h: 期待R -1.00R" in out
+    assert "・1h: canonical net期待R n/a" in out
+    assert "gross診断 -1.00R" in out
     assert "期待値ガード" in out
     assert "1時間足" in out
 

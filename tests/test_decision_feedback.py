@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 
 from fx_intel import decision_feedback
+from fx_intel.evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 
 NOW = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
 
@@ -23,6 +32,7 @@ def _outcome(
     label_ja: str = "SL先着",
     learning_context: dict | None = None,
     quality_flags: list[str] | None = None,
+    index: int = 0,
 ) -> dict:
     reasons = []
     if reason_key:
@@ -34,12 +44,41 @@ def _outcome(
                 "evidence": {},
             }
         )
+    realized_net_r = realized_r - 0.2 if realized_r is not None else None
+    prediction_time = NOW + timedelta(hours=2 * index)
     return {
         "symbol": symbol,
         "timeframe": timeframe,
         "mode": "per_timeframe" if timeframe != "fusion" else "fusion",
         "direction": direction,
+        "prediction_time": prediction_time.isoformat(),
+        "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
+        "horizon_hours": 1.0,
         "realized_r": realized_r,
+        "gross_realized_r": realized_r,
+        "quote_realized_r": realized_net_r,
+        "realized_net_r": realized_net_r,
+        "net_label_eligible": realized_net_r is not None,
+        "decision_id": f"decision-{symbol}-{timeframe}-{direction}-{index}",
+        "label_version": NET_LABEL_VERSION,
+        "label_provenance": NET_LABEL_PROVENANCE,
+        "entry_bid": 99.9,
+        "entry_ask": 100.1,
+        "planned_risk_distance": 1.0,
+        "entry_spread_r": 0.2,
+        "slippage_r": 0.0,
+        "commission_r": 0.0,
+        "financing_r": 0.0,
+        "additional_cost_r": 0.0,
+        "execution_cost_r": 0.2,
+        "cost_model_id": DEFAULT_COST_MODEL_ID,
+        "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+        "cost_status": DEFAULT_COST_STATUS,
+        "entry_quote_source": "fixture",
+        "spread_source": "fixture",
+        "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
+        "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
+        "cost_quality_flags": [],
         "mfe_r": mfe_r,
         "mae_r": mae_r,
         "first_touch": first_touch,
@@ -53,7 +92,7 @@ def _outcome(
 
 
 def test_decision_feedback_blocks_repeated_negative_sl_cell() -> None:
-    report = {"outcomes": [_outcome(-1.0) for _ in range(20)]}
+    report = {"outcomes": [_outcome(-1.0, index=index) for index in range(20)]}
 
     profile = decision_feedback.derive_decision_feedback(report, now=NOW)
     cell = profile.cell_for("USDJPY", "1h", "long")
@@ -62,7 +101,8 @@ def test_decision_feedback_blocks_repeated_negative_sl_cell() -> None:
     assert cell.action == "avoid"
     assert cell.block is True
     assert cell.factor == decision_feedback.BLOCK_FACTOR
-    assert cell.expectancy_r == -1.0
+    assert cell.gross_expectancy_r == -1.0
+    assert cell.net_expectancy_r == -1.2
     assert cell.sl_rate == 1.0
     assert cell.failure_reasons[0].key == "sl_first"
 
@@ -72,6 +112,30 @@ def test_decision_feedback_blocks_repeated_negative_sl_cell() -> None:
     assert factor == decision_feedback.BLOCK_FACTOR
     assert block is True
     assert "見送り優先" in reason
+
+
+def test_overlapping_negative_rows_do_not_trigger_feedback_block() -> None:
+    rows = [_outcome(-1.0, index=index) for index in range(20)]
+    for index, row in enumerate(rows):
+        prediction_time = NOW + timedelta(minutes=5 * index)
+        row["prediction_time"] = prediction_time.isoformat()
+        row["holding_end_time"] = (prediction_time + timedelta(hours=1)).isoformat()
+
+    profile = decision_feedback.derive_decision_feedback({"outcomes": rows}, now=NOW)
+    cell = profile.cell_for("USDJPY", "1h", "long")
+
+    assert cell is not None
+    assert cell.net_label_samples == 20
+    assert cell.effective_samples == 2
+    assert cell.sample_ok is False
+    assert cell.block is False
+    assert cell.action == "quality_guard"
+
+    adjuster = profile.expectancy_lookup("USDJPY", "1h")
+    assert adjuster is not None
+    factor, _reason, block = adjuster("USDJPY", "long", 80)
+    assert factor == 1.0
+    assert block is False
 
 
 def test_decision_feedback_dampens_tp_too_far_without_blocking() -> None:
@@ -84,8 +148,9 @@ def test_decision_feedback_dampens_tp_too_far_without_blocking() -> None:
                 mae_r=0.2,
                 reason_key="tp_too_far",
                 label_ja="TPが遠い/利確未達",
+                index=index,
             )
-            for _ in range(8)
+            for index in range(8)
         ]
     }
 
@@ -99,7 +164,7 @@ def test_decision_feedback_dampens_tp_too_far_without_blocking() -> None:
 
 
 def test_decision_feedback_fusion_adjuster_uses_fusion_cell() -> None:
-    report = {"outcomes": [_outcome(-1.0, timeframe="fusion") for _ in range(20)]}
+    report = {"outcomes": [_outcome(-1.0, timeframe="fusion", index=index) for index in range(20)]}
 
     profile = decision_feedback.derive_decision_feedback(report, now=NOW)
     adjuster = profile.fusion_adjuster()
@@ -123,12 +188,13 @@ def test_monitoring_snapshot_reports_model_expected_r_delta() -> None:
             }
         },
         "outcomes": [
-            _outcome(1.0, reason_key=""),
-            _outcome(0.5, reason_key=""),
+            _outcome(1.0, reason_key="", index=1),
+            _outcome(0.5, reason_key="", index=2),
             _outcome(
                 2.0,
                 reason_key="",
                 learning_context={"decision_feedback": {"action": "dampen"}},
+                index=3,
             ),
         ],
     }
@@ -138,6 +204,6 @@ def test_monitoring_snapshot_reports_model_expected_r_delta() -> None:
     delta = monitor["summary"]["model_expectancy_delta"]
 
     assert delta["status"] == "ready"
-    assert delta["baseline_model"]["expected_R"] == 0.75
-    assert delta["learning_model"]["expected_R"] == 2.0
+    assert delta["baseline_model"]["expected_R"] == 0.55
+    assert delta["learning_model"]["expected_R"] == 1.8
     assert delta["delta_expected_R"] == 1.25

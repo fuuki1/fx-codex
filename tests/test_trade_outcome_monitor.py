@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from fx_intel import trade_outcome as to
+from fx_intel import journal, trade_outcome as to
+from fx_intel.evaluation_labels import (
+    DEFAULT_COST_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
+from tests.support.prospective_registry import mark_candidate_ready_for_review
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "trade_outcome_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -32,6 +38,13 @@ def _entry(ts: datetime, symbol: str, close: float, **overrides: object) -> dict
         "source_cutoff": (ts - timedelta(minutes=2)).isoformat(),
         "max_feature_available_time": (ts - timedelta(seconds=1)).isoformat(),
         "pit_eligible": True,
+        "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": f"decision:{symbol}:{ts.isoformat()}",
+        "mode": "fusion",
+        "producer": journal.FUSION_PRODUCER,
+        "producer_version": journal.FUSION_PRODUCER_VERSION,
+        "input_context_id": f"context:{symbol}:{ts.isoformat()}",
+        "source_record_ids": [f"source:{symbol}:{ts.isoformat()}"],
         "symbol": symbol,
         "direction": "neutral",
         "conviction": 0,
@@ -123,15 +136,13 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
 
     assert first["exit_code"] == 1
     assert third["exit_code"] == 1
-    assert registry["paper_ready_count"] >= 1
-    assert any(
-        record["stage"] == "paper_ready" and record["action_type"] == "tp_sl_variant_paper_test"
-        for record in registry["candidates"].values()
-    )
+    assert registry["ready_for_review_count"] == 0
     assert monitor_payload["runner"]["registry_updated"] is True
-    assert monitor_payload["variant_retest"]["candidate_count"] >= 1
-    assert outcome_report["summary"]["overall"]["expectancy_r"] == -1.0
-    assert variant_report["best"]["target1_r"] == 0.75
+    assert monitor_payload["variant_retest"]["candidate_count"] == 0
+    assert outcome_report["summary"]["overall"]["gross_expectancy_r"] == -1.0
+    assert outcome_report["summary"]["overall"]["net_expectancy_r"] is None
+    assert variant_report["best"] is None
+    assert variant_report["variants"][0]["target1_r"] == 0.75
     assert monitor_payload["runner"]["pit_ineligible_journal_rows"] == 0
 
 
@@ -179,22 +190,28 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
             "target2_r": 1.5,
             "scope": "overall",
             "key": "",
-            "baseline_expectancy_r": -1.0,
-            "candidate_expectancy_r": 0.75,
-            "delta_expectancy_r": 1.75,
+            "label_version": NET_LABEL_VERSION,
+            "label_provenance": NET_LABEL_PROVENANCE,
+            "cost_model_id": DEFAULT_COST_MODEL_ID,
+            "net_label_samples": to.MIN_EXPECTANCY_SAMPLES,
+            "net_label_coverage": 1.0,
+            "baseline_net_expectancy_r": -1.0,
+            "candidate_net_expectancy_r": 0.75,
+            "delta_net_expectancy_r": 1.75,
             "min_expected_improvement_r": to.MIN_VARIANT_EXPECTANCY_IMPROVEMENT_R,
+            "trial_count": 1,
+            "trial_sharpes": [0.0],
         },
         "paper",
         "approval",
     )
     registry = to.update_improvement_registry(
-        None, [candidate], now=NOW, data_contract="fusion-pit-v1"
+        None, [candidate], now=NOW, data_contract=journal.FUSION_PIT_DATA_CONTRACT
     )
-    registry = to.update_improvement_registry(
+    registry = mark_candidate_ready_for_review(
         registry,
-        [candidate],
-        now=NOW + timedelta(hours=1),
-        data_contract="fusion-pit-v1",
+        candidate.candidate_id,
+        evaluated_at=NOW + timedelta(hours=1),
     )
     registry, result = to.set_improvement_candidate_approval(
         registry,

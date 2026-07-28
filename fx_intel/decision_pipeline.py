@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from collections.abc import Callable, Mapping, Sequence
+import math
 
 from .briefing import (
     DEFAULT_ATR_MULTIPLE,
@@ -37,6 +38,13 @@ from .briefing import (
     TargetRAdjuster,
     TradePlan,
     build_trade_plan,
+)
+from .evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DIAGNOSTIC_COST_STATUS,
+    DIAGNOSTIC_EXECUTION_COST_MODEL_ID,
+    CostModelResult,
 )
 from .market import is_market_open
 from .technicals import PairTechnicals
@@ -101,6 +109,7 @@ class DecisionChecklist:
     expected_r: float | None = None  # 執行コスト控除前の素の期待R
     net_expected_r: float | None = None  # スプレッド+スリッページ控除後
     execution_cost_r: float | None = None  # 控除したコスト(R換算)
+    diagnostic_cost_model: dict[str, object] = field(default_factory=dict)
     position_units: float | None = None  # ポジションサイズ(通貨単位/ロット)
     expectancy_source: str = ""
     probability_calibrated: bool = False
@@ -124,6 +133,7 @@ class DecisionChecklist:
             "expected_r": self.expected_r,
             "net_expected_r": self.net_expected_r,
             "execution_cost_r": self.execution_cost_r,
+            "diagnostic_cost_model": self.diagnostic_cost_model,
             "position_units": self.position_units,
             "expectancy_source": self.expectancy_source,
             "probability_calibrated": self.probability_calibrated,
@@ -170,10 +180,55 @@ def execution_cost_in_r(
     R換算 = コスト / SL距離
     SL距離やスプレッドが不明なら None。
     """
-    if spread is None or stop_distance is None or stop_distance <= 0:
+    if (
+        spread is None
+        or stop_distance is None
+        or not math.isfinite(spread)
+        or not math.isfinite(stop_distance)
+        or not math.isfinite(slippage_spreads)
+        or spread < 0
+        or stop_distance <= 0
+        or slippage_spreads < 0
+    ):
         return None
-    cost_price = spread * (1.0 + max(0.0, slippage_spreads))
+    cost_price = spread * (1.0 + slippage_spreads)
     return round(cost_price / stop_distance, 4)
+
+
+def diagnostic_execution_cost_model(
+    *,
+    spread: float | None,
+    stop_distance: float | None,
+    slippage_spreads: float,
+    quote_source: str,
+) -> CostModelResult | None:
+    """Describe the checklist's spread-based estimate without making a net-label claim."""
+
+    total_cost_r = execution_cost_in_r(spread, stop_distance, slippage_spreads)
+    if total_cost_r is None or spread is None or stop_distance is None or stop_distance <= 0:
+        return None
+    entry_spread_r = spread / stop_distance
+    slippage_r = entry_spread_r * slippage_spreads
+    slippage_label = (
+        "one-spread-slippage-diagnostic-v1"
+        if math.isclose(slippage_spreads, 1.0)
+        else f"spread-multiple-{slippage_spreads:g}-slippage-diagnostic-v1"
+    )
+    source = quote_source.strip() or "unknown"
+    return CostModelResult(
+        cost_model_id=DIAGNOSTIC_EXECUTION_COST_MODEL_ID,
+        cost_model_version=DEFAULT_COST_MODEL_VERSION,
+        entry_quote_source=source,
+        spread_source=source,
+        slippage_model_id=slippage_label,
+        commission_model_id=DEFAULT_COMMISSION_MODEL_ID,
+        entry_spread_r=round(entry_spread_r, 8),
+        slippage_r=round(slippage_r, 8),
+        commission_r=0.0,
+        financing_r=0.0,
+        cost_status=DIAGNOSTIC_COST_STATUS,
+        quality_flags=("diagnostic_only",),
+    )
 
 
 def position_units(
@@ -472,8 +527,19 @@ def build_checklist(
         )
 
     # 8. 執行コスト控除 -------------------------------------------------------
+    diagnostic_cost = diagnostic_execution_cost_model(
+        spread=spread,
+        stop_distance=stop_distance,
+        slippage_spreads=slippage_spreads,
+        quote_source=plan.quote_source,
+    )
     cost_r = execution_cost_in_r(spread, stop_distance, slippage_spreads)
-    checklist.execution_cost_r = cost_r
+    checklist.execution_cost_r = round(cost_r, 4) if cost_r is not None else None
+    if diagnostic_cost is not None and cost_r is not None:
+        checklist.diagnostic_cost_model = {
+            **diagnostic_cost.to_dict(),
+            "diagnostic_total_cost_r": round(cost_r, 4),
+        }
     if not directional or expected_r is None:
         steps.append(
             CheckStep(

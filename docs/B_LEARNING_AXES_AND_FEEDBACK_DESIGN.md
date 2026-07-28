@@ -225,7 +225,7 @@ JSONL へ重複追記せず、`observation_id` で一意な派生スナップシ
 
 ```json
 {
-  "observation_id": "<prediction_id>:net-r-v1",
+  "observation_id": "<prediction_id>:net-r-v2",
   "decision_id": "...",
   "prediction_kind": "shadow_hypothesis",
   "producer": "fusion_raw",

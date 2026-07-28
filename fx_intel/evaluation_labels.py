@@ -9,12 +9,257 @@ change must use a new model id and label version.
 
 from __future__ import annotations
 
-NET_LABEL_VERSION = "net-r-v1"
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, UTC
+import math
+
+NET_LABEL_VERSION = "net-r-v2"
 NET_LABEL_PROVENANCE = "paper_quote_model"
-DEFAULT_COST_MODEL_ID = "executable-quotes-zero-slippage-v1"
+FIXTURE_COST_MODEL_ID = "fixture-executable-quotes-zero-slippage-v1"
+IBKR_PAPER_COST_MODEL_ID = "ibkr-paper-executable-quotes-zero-slippage-v1"
+# Existing call sites use DEFAULT for deterministic fixtures.
+DEFAULT_COST_MODEL_ID = FIXTURE_COST_MODEL_ID
 DEFAULT_COST_STATUS = "quote_measured_modelled_execution"
 DEFAULT_SLIPPAGE_R = 0.0
 DEFAULT_COMMISSION_R = 0.0
+DEFAULT_COST_MODEL_VERSION = "1"
+DEFAULT_SLIPPAGE_MODEL_ID = "zero-slippage-v1"
+DEFAULT_COMMISSION_MODEL_ID = "zero-commission-v1"
+DIAGNOSTIC_COST_MODEL_ID = "scanner-proxy-mid-diagnostic-v1"
+DIAGNOSTIC_COST_STATUS = "diagnostic_only"
+DIAGNOSTIC_EXECUTION_COST_MODEL_ID = "spread-plus-modelled-slippage-diagnostic-v1"
+MISSING_COST_MODEL_ID = "missing"
+MISSING_COST_STATUS = "unavailable"
+KNOWN_NET_LABEL_VERSIONS = frozenset({NET_LABEL_VERSION})
+KNOWN_NET_LABEL_PROVENANCES = frozenset({NET_LABEL_PROVENANCE})
+KNOWN_EXECUTABLE_COST_MODEL_IDS = frozenset({FIXTURE_COST_MODEL_ID, IBKR_PAPER_COST_MODEL_ID})
+COST_MODEL_QUOTE_SOURCES = {
+    FIXTURE_COST_MODEL_ID: frozenset({"fixture", "fixture_quotes"}),
+    IBKR_PAPER_COST_MODEL_ID: frozenset({"ibkr_paper_snapshot"}),
+}
+ZERO_COST_TOLERANCE = 1e-12
+
+
+@dataclass(frozen=True)
+class CostModelResult:
+    """Provider-neutral cost model metadata for one canonical outcome.
+
+    Executable bid/ask already embeds spread, so ``total_cost_r`` intentionally
+    contains only additional slippage, commission, and financing deductions.
+    ``entry_spread_r`` is an audit diagnostic and is never subtracted again.
+    """
+
+    cost_model_id: str
+    cost_model_version: str
+    entry_quote_source: str
+    spread_source: str
+    slippage_model_id: str
+    commission_model_id: str
+    entry_spread_r: float | None = None
+    slippage_r: float = 0.0
+    commission_r: float = 0.0
+    financing_r: float = 0.0
+    cost_status: str = DEFAULT_COST_STATUS
+    quality_flags: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def total_cost_r(self) -> float:
+        return self.slippage_r + self.commission_r + self.financing_r
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "cost_model_id": self.cost_model_id,
+            "cost_model_version": self.cost_model_version,
+            "entry_quote_source": self.entry_quote_source,
+            "spread_source": self.spread_source,
+            "slippage_model_id": self.slippage_model_id,
+            "commission_model_id": self.commission_model_id,
+            "entry_spread_r": self.entry_spread_r,
+            "slippage_r": self.slippage_r,
+            "commission_r": self.commission_r,
+            "financing_r": self.financing_r,
+            "total_cost_r": self.total_cost_r,
+            "cost_status": self.cost_status,
+            "quality_flags": list(self.quality_flags),
+        }
+
+
+def executable_cost_model_id_for_source(source: str) -> str | None:
+    """Resolve an executable cost model only for explicitly supported quote sources."""
+
+    normalized = source.strip()
+    for cost_model_id, sources in COST_MODEL_QUOTE_SOURCES.items():
+        if normalized in sources:
+            return cost_model_id
+    return None
+
+
+def cost_model_contract_flags(cost: CostModelResult) -> tuple[str, ...]:
+    """Return deterministic provenance/value mismatches for a declared cost model."""
+
+    flags: list[str] = []
+    allowed_sources = COST_MODEL_QUOTE_SOURCES.get(cost.cost_model_id)
+    if allowed_sources is None:
+        flags.append("unknown_cost_model")
+    else:
+        if cost.entry_quote_source not in allowed_sources:
+            flags.append("cost_model_entry_source_mismatch")
+        if cost.spread_source not in allowed_sources:
+            flags.append("cost_model_spread_source_mismatch")
+        if cost.cost_model_version != DEFAULT_COST_MODEL_VERSION:
+            flags.append("cost_model_version_mismatch")
+        if cost.cost_status != DEFAULT_COST_STATUS:
+            flags.append("cost_status_mismatch")
+        if cost.slippage_model_id != DEFAULT_SLIPPAGE_MODEL_ID:
+            flags.append("slippage_model_mismatch")
+        if cost.commission_model_id != DEFAULT_COMMISSION_MODEL_ID:
+            flags.append("commission_model_mismatch")
+        if not _is_zero(cost.slippage_r):
+            flags.append("slippage_model_value_mismatch")
+        if not _is_zero(cost.commission_r):
+            flags.append("commission_model_value_mismatch")
+        if not _is_zero(cost.financing_r):
+            flags.append("financing_model_missing")
+        if cost.quality_flags:
+            flags.append("declared_cost_quality_flag")
+    return tuple(flags)
+
+
+def canonical_net_label_contract_flags(record: Mapping[str, object]) -> tuple[str, ...]:
+    """Validate one persisted canonical net-R label at a downstream read boundary."""
+
+    flags: list[str] = []
+    if record.get("net_label_eligible") is not True:
+        flags.append("net_label_not_eligible")
+    if not str(record.get("decision_id") or "").strip():
+        flags.append("missing_decision_id")
+    if record.get("label_version") not in KNOWN_NET_LABEL_VERSIONS:
+        flags.append("unknown_label_version")
+    if record.get("label_provenance") not in KNOWN_NET_LABEL_PROVENANCES:
+        flags.append("unknown_label_provenance")
+    symbol = str(record.get("symbol") or "").upper()
+    for separator in ("/", "_", "-"):
+        symbol = symbol.replace(separator, "")
+    if len(symbol) != 6 or not symbol.isalpha():
+        flags.append("invalid_symbol")
+    if str(record.get("direction") or "").lower() not in {"long", "short"}:
+        flags.append("invalid_direction")
+    if not str(record.get("timeframe") or "").strip():
+        flags.append("missing_timeframe")
+    horizon_hours = _number(record.get("horizon_hours"))
+    if horizon_hours is None or horizon_hours <= 0:
+        flags.append("invalid_horizon_hours")
+    prediction_time = _aware_time(record.get("prediction_time"))
+    holding_end_time = _aware_time(record.get("holding_end_time"))
+    if prediction_time is None:
+        flags.append("invalid_prediction_time")
+    if holding_end_time is None:
+        flags.append("invalid_holding_end_time")
+    if (
+        prediction_time is not None
+        and holding_end_time is not None
+        and holding_end_time <= prediction_time
+    ):
+        flags.append("invalid_holding_interval")
+
+    required = {
+        name: _number(record.get(name))
+        for name in (
+            "entry_bid",
+            "entry_ask",
+            "planned_risk_distance",
+            "quote_realized_r",
+            "gross_realized_r",
+            "entry_spread_r",
+            "slippage_r",
+            "commission_r",
+            "financing_r",
+            "additional_cost_r",
+            "execution_cost_r",
+            "realized_net_r",
+            "path_quality",
+        )
+    }
+    for name, value in required.items():
+        if value is None:
+            flags.append(f"missing_or_invalid_{name}")
+
+    string_fields = {
+        name: record.get(name)
+        for name in (
+            "cost_model_id",
+            "cost_model_version",
+            "cost_status",
+            "entry_quote_source",
+            "spread_source",
+            "slippage_model_id",
+            "commission_model_id",
+        )
+    }
+    for string_name, string_value in string_fields.items():
+        if not isinstance(string_value, str) or not string_value:
+            flags.append(f"missing_or_invalid_{string_name}")
+    raw_cost_flags = record.get("cost_quality_flags")
+    if not isinstance(raw_cost_flags, (list, tuple)) or any(
+        not isinstance(flag, str) for flag in raw_cost_flags
+    ):
+        flags.append("invalid_cost_quality_flags")
+
+    if flags:
+        return tuple(dict.fromkeys(flags))
+
+    numeric = {name: float(value) for name, value in required.items() if value is not None}
+    cost_quality_flags = tuple(raw_cost_flags) if isinstance(raw_cost_flags, (list, tuple)) else ()
+    cost = CostModelResult(
+        cost_model_id=str(string_fields["cost_model_id"]),
+        cost_model_version=str(string_fields["cost_model_version"]),
+        entry_quote_source=str(string_fields["entry_quote_source"]),
+        spread_source=str(string_fields["spread_source"]),
+        slippage_model_id=str(string_fields["slippage_model_id"]),
+        commission_model_id=str(string_fields["commission_model_id"]),
+        entry_spread_r=numeric["entry_spread_r"],
+        slippage_r=numeric["slippage_r"],
+        commission_r=numeric["commission_r"],
+        financing_r=numeric["financing_r"],
+        cost_status=str(string_fields["cost_status"]),
+        quality_flags=cost_quality_flags,
+    )
+    flags.extend(cost_model_contract_flags(cost))
+    entry_bid = numeric["entry_bid"]
+    entry_ask = numeric["entry_ask"]
+    planned_risk = numeric["planned_risk_distance"]
+    if not 0.0 < numeric["path_quality"] <= 1.0:
+        flags.append("invalid_path_quality")
+    if not (0 < entry_bid <= entry_ask):
+        flags.append("invalid_entry_quote")
+    if planned_risk <= 0:
+        flags.append("invalid_planned_risk_distance")
+    if planned_risk > 0 and not math.isclose(
+        numeric["entry_spread_r"],
+        (entry_ask - entry_bid) / planned_risk,
+        abs_tol=1e-8,
+    ):
+        flags.append("entry_spread_r_mismatch")
+    if not math.isclose(
+        numeric["additional_cost_r"],
+        numeric["slippage_r"] + numeric["commission_r"] + numeric["financing_r"],
+        abs_tol=1e-8,
+    ):
+        flags.append("additional_cost_identity_mismatch")
+    if not math.isclose(
+        numeric["realized_net_r"],
+        numeric["quote_realized_r"] - numeric["additional_cost_r"],
+        abs_tol=1e-8,
+    ):
+        flags.append("net_r_identity_mismatch")
+    if not math.isclose(
+        numeric["execution_cost_r"],
+        numeric["gross_realized_r"] - numeric["realized_net_r"],
+        abs_tol=1e-8,
+    ):
+        flags.append("execution_cost_identity_mismatch")
+    return tuple(dict.fromkeys(flags))
 
 
 def has_executable_entry(entry_bid: float | None, entry_ask: float | None) -> bool:
@@ -23,7 +268,33 @@ def has_executable_entry(entry_bid: float | None, entry_ask: float | None) -> bo
     return (
         entry_bid is not None
         and entry_ask is not None
+        and math.isfinite(entry_bid)
+        and math.isfinite(entry_ask)
         and entry_bid > 0
         and entry_ask > 0
         and entry_ask >= entry_bid
     )
+
+
+def _is_zero(value: float) -> bool:
+    return math.isfinite(value) and abs(value) <= ZERO_COST_TOLERANCE
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def _aware_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)

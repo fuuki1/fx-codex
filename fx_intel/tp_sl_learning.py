@@ -42,6 +42,8 @@ class TpSlCall:
     ts: str
     first_touch: str = "none"
     realized_r: float | None = None
+    realized_net_r: float | None = None
+    net_label_eligible: bool = False
     path_quality: float = 0.0
 
 
@@ -292,7 +294,13 @@ def derive_tp_sl_profile(
     now: datetime | None = None,
 ) -> TpSlProfile:
     now = now or datetime.now(UTC)
-    scored = [call for call in calls if call.outcome in ("hit", "miss")]
+    scored = [
+        call
+        for call in calls
+        if call.outcome in ("hit", "miss")
+        and call.net_label_eligible
+        and call.realized_net_r is not None
+    ]
     hits = sum(1 for call in scored if call.outcome == "hit")
     unresolved = sum(1 for call in calls if call.outcome == "unresolved")
     unscored = sum(1 for call in calls if call.outcome == "unscored")
@@ -300,7 +308,13 @@ def derive_tp_sl_profile(
     by_direction: dict[str, TpSlStats] = {}
     for direction in ("long", "short"):
         direction_calls = [call for call in calls if call.direction == direction]
-        direction_scored = [call for call in direction_calls if call.outcome in ("hit", "miss")]
+        direction_scored = [
+            call
+            for call in direction_calls
+            if call.outcome in ("hit", "miss")
+            and call.net_label_eligible
+            and call.realized_net_r is not None
+        ]
         by_direction[direction] = TpSlStats(
             evaluated=len(direction_scored),
             hits=sum(1 for call in direction_scored if call.outcome == "hit"),
@@ -360,7 +374,9 @@ def save_timeframe_tp_sl_learning(learning: TimeframeTpSlLearning, path: str | P
 
 
 def _call_from_outcome(outcome: TradeOutcome, timeframe: str) -> TpSlCall:
-    if not outcome.tradable:
+    # TradeOutcome is the legacy close/OHLC scorer and cannot attest canonical net R.
+    net_eligible = False
+    if not outcome.tradable or not net_eligible:
         result = "unscored"
     elif outcome.first_touch in ("tp1", "tp2"):
         result = "hit"
@@ -377,6 +393,8 @@ def _call_from_outcome(outcome: TradeOutcome, timeframe: str) -> TpSlCall:
         ts=outcome.ts,
         first_touch=outcome.first_touch,
         realized_r=outcome.realized_r,
+        realized_net_r=outcome.realized_net_r,
+        net_label_eligible=net_eligible,
         path_quality=outcome.path_quality,
     )
 

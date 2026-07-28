@@ -6,8 +6,9 @@ from datetime import datetime, UTC
 import json
 from types import SimpleNamespace
 
-from fx_intel import decision_log, learning, maximization, tf_learning, tp_sl_learning
+from fx_intel import decision_log, journal, learning, maximization, tf_learning, tp_sl_learning
 from fx_intel.briefing import TradePlan
+from fx_intel.evaluation_labels import DEFAULT_COST_MODEL_ID
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from fx_intel.timeframe import TimeframePlan
@@ -63,11 +64,33 @@ def _plan() -> TimeframePlan:
         stop=149.5,
         target1=150.5,
         target2=151.0,
+        entry_bid=149.99,
+        entry_ask=150.01,
+        quote_observed_at="2026-07-08T07:59:57+00:00",
+        quote_available_at="2026-07-08T07:59:59+00:00",
+        quote_source="fixture_quotes",
+        quote_source_record_id="quote-123",
+        planned_risk_distance=0.5,
         data_quality=0.9,
         features={"rsi_1h": 55.0, "news_count": 2.0},
         components=[{"key": "tech", "score": 0.5, "weight": 0.55}],
         reason="1hレーティング 買い",
         warnings=["📈 期待値ガード: テスト"],
+        pre_guard_direction="long",
+        pre_guard_conviction=72,
+        pre_guard_stop=149.5,
+        pre_guard_target1=150.5,
+        pre_guard_target2=151.0,
+        pre_guard_target_policy={
+            "policy_id": "default-atr-v1",
+            "target1_r": 1.0,
+            "target2_r": 2.0,
+        },
+        pre_guard_execution_snapshot={
+            "cost_model_id": DEFAULT_COST_MODEL_ID,
+            "canonical_net_label_input_eligible": True,
+        },
+        pre_guard_cost_model_id=DEFAULT_COST_MODEL_ID,
     )
 
 
@@ -135,6 +158,17 @@ def test_build_timeframe_decision_event_persists_full_context(tmp_path) -> None:
     event = events[0]
     assert event["decision_id"]
     assert event["decision"]["target2"] == 151.0
+    assert event["decision"]["label_version"] == _plan().label_version
+    assert event["decision"]["label_provenance"] == _plan().label_provenance
+    assert event["decision"]["planned_risk_distance"] == 0.5
+    assert event["decision"]["quote_available_at"] == "2026-07-08T07:59:59+00:00"
+    assert event["decision"]["quote_source_record_id"] == "quote-123"
+    assert event["decision"]["pre_guard_direction"] == "long"
+    assert event["decision"]["pre_guard_target_policy"]["policy_id"] == "default-atr-v1"
+    assert (
+        event["decision"]["pre_guard_execution_snapshot"]["canonical_net_label_input_eligible"]
+        is True
+    )
     assert event["audit"]["scoring_ready"] is True
     assert event["technical_context"]["views"]["1h"]["atr"] == 0.2
     assert event["market_context"]["currency_sentiment"]["USD"]["score"] == 0.3
@@ -201,6 +235,56 @@ def test_score_decision_events_uses_tp_sl_mfe_mae(tmp_path) -> None:
     assert outcome["mfe_r"] == 1.2
     assert outcome["mae_r"] == 0.0
     assert outcome["decision_id"] == events[0]["decision_id"]
+
+
+def test_score_decision_events_require_pit_excludes_incomplete_events() -> None:
+    plan = _plan()
+    plan.input_context_id = "context-1"
+    events = decision_log.build_timeframe_decision_events(
+        {"USDJPY": [plan]},
+        now=NOW,
+        analysis=_analysis(),
+        tech_map={"USDJPY": _tech()},
+    )
+    price_rows = [
+        {
+            "ts": "2026-07-08T09:00:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "1h",
+            "close": 150.8,
+            "high": 150.9,
+            "low": 150.3,
+        }
+    ]
+
+    incomplete = decision_log.score_decision_events(
+        events,
+        price_entries=price_rows,
+        now=NOW,
+        require_pit=True,
+    )
+    assert incomplete["decision_events"] == 0
+    assert incomplete["pit_ineligible_decision_events"] == 1
+
+    events[0].update(
+        journal.pit_metadata_for_plan(
+            plan,
+            prediction_time=NOW,
+            source_cutoff=NOW,
+            max_feature_available_time=NOW,
+            decision_id=str(events[0]["decision_id"]),
+            mode="per_timeframe",
+        )
+    )
+    complete = decision_log.score_decision_events(
+        events,
+        price_entries=price_rows,
+        now=NOW,
+        require_pit=True,
+    )
+    assert complete["pit_contract"] == journal.DECISION_JOURNAL_PIT_CONTRACT
+    assert complete["decision_events"] == 1
+    assert complete["pit_eligible_decision_events"] == 1
 
 
 def test_score_decision_events_classifies_failure_reasons() -> None:
@@ -274,10 +358,8 @@ def test_score_decision_events_classifies_failure_reasons() -> None:
     assert report["failure_reason_summary"][0]["key"] == "sl_first"
 
 
-def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
-    """判断時に確定した執行コスト(R換算)と期待R予測を判断ログへ保存し、
-
-    採点スキーマへ引き継ぐ。realized_net_r 生成の入力になる。"""
+def test_fusion_decision_keeps_checklist_cost_diagnostic_only() -> None:
+    """Checklist estimate must not become a canonical net-label input."""
     plan = TradePlan(
         symbol="USDJPY",
         direction="long",
@@ -293,6 +375,10 @@ def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
         "expected_r": 0.55,
         "expectancy_source": "test",
         "probability_calibrated": True,
+        "diagnostic_cost_model": {
+            "cost_model_id": "spread-plus-modelled-slippage-diagnostic-v1",
+            "cost_status": "diagnostic_only",
+        },
     }
     events = decision_log.build_fusion_decision_events(
         [plan],
@@ -301,14 +387,19 @@ def test_fusion_decision_persists_execution_cost_for_scoring() -> None:
         tech_map={"USDJPY": _tech()},
     )
     execution = events[0]["decision"]["execution"]
-    assert execution["execution_cost_r"] == 0.13
-    assert execution["net_expected_r"] == 0.42
+    assert execution["execution_cost_r"] is None
+    assert execution["net_expected_r"] is None
+    assert execution["diagnostic_execution_cost_r"] == 0.13
+    assert execution["diagnostic_net_expected_r"] == 0.42
+    assert execution["diagnostic_cost_model"]["cost_status"] == "diagnostic_only"
     assert execution["expected_r"] == 0.55
 
     scoring = decision_log.decision_event_to_scoring_entry(events[0])
     assert scoring is not None
-    assert scoring["execution_cost_r"] == 0.13
-    assert scoring["net_expected_r"] == 0.42
+    assert scoring["execution_cost_r"] is None
+    assert scoring["net_expected_r"] is None
+    assert scoring["diagnostic_execution_cost_r"] == 0.13
+    assert scoring["diagnostic_net_expected_r"] == 0.42
 
 
 def test_fusion_decision_persists_null_execution_without_checklist() -> None:
@@ -330,3 +421,5 @@ def test_fusion_decision_persists_null_execution_without_checklist() -> None:
     execution = events[0]["decision"]["execution"]
     assert execution["execution_cost_r"] is None
     assert execution["net_expected_r"] is None
+    assert execution["diagnostic_execution_cost_r"] is None
+    assert execution["diagnostic_cost_model"] == {}

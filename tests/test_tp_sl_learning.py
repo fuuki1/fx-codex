@@ -54,7 +54,7 @@ def _price(ts: datetime, close: float, *, symbol: str = "USDJPY", timeframe: str
     }
 
 
-def test_evaluate_timeframe_tp_sl_calls_uses_first_touch() -> None:
+def test_legacy_first_touch_calls_are_not_eligible_for_net_adjustment() -> None:
     rows = [
         _decision(NOW, direction="long"),
         _price(NOW + timedelta(minutes=20), 100.2),
@@ -69,7 +69,7 @@ def test_evaluate_timeframe_tp_sl_calls_uses_first_touch() -> None:
     calls = tp_sl_learning.evaluate_timeframe_tp_sl_calls(rows, "1h")
 
     outcomes = {(call.symbol, call.direction): call.outcome for call in calls}
-    assert outcomes == {("USDJPY", "long"): "hit", ("EURUSD", "short"): "miss"}
+    assert outcomes == {("USDJPY", "long"): "unscored", ("EURUSD", "short"): "unscored"}
 
 
 def test_derive_tp_sl_profile_builds_non_blocking_confidence_adjustment() -> None:
@@ -82,6 +82,8 @@ def test_derive_tp_sl_profile_builds_non_blocking_confidence_adjustment() -> Non
             outcome="miss",
             ts=(NOW + timedelta(hours=i)).isoformat(),
             first_touch="sl",
+            realized_net_r=-1.0,
+            net_label_eligible=True,
             path_quality=0.7,
         )
         for i in range(100)
@@ -107,6 +109,8 @@ def test_timeframe_learning_lookup_never_blocks() -> None:
             outcome="miss",
             ts=(NOW + timedelta(hours=i)).isoformat(),
             first_touch="sl",
+            realized_net_r=-1.0,
+            net_label_eligible=True,
             path_quality=0.7,
         )
         for i in range(100)
@@ -137,6 +141,8 @@ def test_save_timeframe_tp_sl_learning_writes_json(tmp_path) -> None:
             outcome="hit" if i < 60 else "miss",
             ts=(NOW + timedelta(hours=i)).isoformat(),
             first_touch="tp1" if i < 60 else "sl",
+            realized_net_r=0.8 if i < 60 else -1.2,
+            net_label_eligible=True,
             path_quality=0.7,
         )
         for i in range(100)

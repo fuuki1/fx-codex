@@ -1,6 +1,17 @@
 from datetime import datetime, timedelta, UTC
 
+import pytest
+
 from fx_intel import decision_log, promotion
+from fx_intel.evaluation_labels import (
+    DEFAULT_COMMISSION_MODEL_ID,
+    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+)
 from fx_intel.shadow_learning import (
     SHADOW_LABEL_PROVENANCE,
     assign_prediction_ids,
@@ -14,6 +25,43 @@ from fx_intel.timeframe import TimeframePlan
 
 NOW = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
 DIMENSIONS = {"session_bucket": "london", "regime": "risk_off"}
+
+
+def _canonical_net_fields(index: int, *, gross_r: float, net_r: float) -> dict[str, object]:
+    prediction_time = NOW + timedelta(hours=5 * index)
+    return {
+        "decision_id": f"canonical-{index}",
+        "symbol": "USDJPY",
+        "direction": "long",
+        "timeframe": "1h",
+        "horizon_hours": 1.0,
+        "prediction_time": prediction_time.isoformat(),
+        "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
+        "net_label_eligible": True,
+        "label_version": NET_LABEL_VERSION,
+        "label_provenance": NET_LABEL_PROVENANCE,
+        "gross_realized_r": gross_r,
+        "quote_realized_r": net_r,
+        "realized_net_r": net_r,
+        "entry_bid": 99.9,
+        "entry_ask": 100.1,
+        "planned_risk_distance": 1.0,
+        "entry_spread_r": 0.2,
+        "slippage_r": 0.0,
+        "commission_r": 0.0,
+        "financing_r": 0.0,
+        "additional_cost_r": 0.0,
+        "execution_cost_r": gross_r - net_r,
+        "cost_model_id": DEFAULT_COST_MODEL_ID,
+        "cost_model_version": DEFAULT_COST_MODEL_VERSION,
+        "cost_status": DEFAULT_COST_STATUS,
+        "entry_quote_source": "fixture",
+        "spread_source": "fixture",
+        "slippage_model_id": DEFAULT_SLIPPAGE_MODEL_ID,
+        "commission_model_id": DEFAULT_COMMISSION_MODEL_ID,
+        "cost_quality_flags": [],
+        "path_quality": 1.0,
+    }
 
 
 def _prediction(score: float = 0.12) -> dict[str, object]:
@@ -157,8 +205,11 @@ def test_shadow_summary_and_promotion_use_separate_producer_stream() -> None:
                 "symbol": "USDJPY",
                 "producer": "ml_direction",
                 "direction_outcome": "hit" if index < 35 else "miss",
-                "realized_net_r": 0.2 if index < 35 else -0.1,
-                "net_label_eligible": True,
+                **_canonical_net_fields(
+                    index,
+                    gross_r=0.4 if index < 35 else -0.2,
+                    net_r=0.2 if index < 35 else -0.1,
+                ),
                 "learning_dimensions": DIMENSIONS,
             }
         )
@@ -171,6 +222,41 @@ def test_shadow_summary_and_promotion_use_separate_producer_stream() -> None:
     assert perf.net_expectancy_r is not None and perf.net_expectancy_r > 0
 
 
+def test_shadow_promotion_deduplicates_simultaneous_same_usd_factor() -> None:
+    outcomes = []
+    symbols_and_directions = (
+        ("EURUSD", "long"),
+        ("GBPUSD", "long"),
+        ("USDJPY", "short"),
+    )
+    for batch in range(50):
+        prediction_time = NOW + timedelta(hours=5 * batch)
+        for offset, (symbol, direction) in enumerate(symbols_and_directions):
+            index = batch * len(symbols_and_directions) + offset
+            row = {
+                "ts": prediction_time.isoformat(),
+                "producer": "ml_direction",
+                "direction_outcome": "hit",
+                **_canonical_net_fields(index, gross_r=0.3, net_r=0.2),
+            }
+            row.update(
+                {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "prediction_time": prediction_time.isoformat(),
+                    "holding_end_time": (prediction_time + timedelta(hours=1)).isoformat(),
+                }
+            )
+            outcomes.append(row)
+
+    perf = promotion.evaluate_shadow_member("ml", outcomes)
+
+    assert perf.net_r_raw_samples == 150
+    assert perf.net_r_samples == 50
+    assert perf.evaluated == 50
+    assert perf.net_r_overlap_ratio == pytest.approx(2 / 3)
+
+
 def test_final_outcomes_aggregate_net_r_by_regime() -> None:
     outcomes = [
         {
@@ -178,8 +264,11 @@ def test_final_outcomes_aggregate_net_r_by_regime() -> None:
             "symbol": "USDJPY",
             "direction": "long",
             "realized_r": 0.4 if index == 0 else -0.2,
-            "realized_net_r": 0.3 if index == 0 else -0.3,
-            "net_label_eligible": True,
+            **_canonical_net_fields(
+                index,
+                gross_r=0.4 if index == 0 else -0.2,
+                net_r=0.3 if index == 0 else -0.3,
+            ),
             "learning_dimensions": DIMENSIONS,
         }
         for index in range(2)
@@ -187,7 +276,30 @@ def test_final_outcomes_aggregate_net_r_by_regime() -> None:
     summary = summarize_outcome_dimensions(outcomes)
     cell = summary["regime"]["risk_off"]["long"]
     assert cell["net_labels"] == 2
+    assert cell["effective_net_labels"] == 2
     assert cell["net_expectancy_r"] == 0.0
+
+
+def test_dimension_net_expectancy_uses_non_overlapping_effective_subset() -> None:
+    outcomes = []
+    for index, net_r in enumerate((0.4, -4.0)):
+        prediction_time = NOW + timedelta(minutes=5 * index)
+        row = {
+            "ts": prediction_time.isoformat(),
+            "realized_r": net_r,
+            **_canonical_net_fields(index, gross_r=net_r, net_r=net_r),
+            "learning_dimensions": DIMENSIONS,
+        }
+        row["prediction_time"] = prediction_time.isoformat()
+        row["holding_end_time"] = (prediction_time + timedelta(hours=1)).isoformat()
+        outcomes.append(row)
+
+    cell = summarize_outcome_dimensions(outcomes)["regime"]["risk_off"]["long"]
+
+    assert cell["net_labels"] == 2
+    assert cell["effective_net_labels"] == 1
+    assert cell["net_overlap_ratio"] == 0.5
+    assert cell["net_expectancy_r"] == 0.4
 
 
 def test_shadow_promotion_does_not_mix_producer_versions_and_resets_stage() -> None:

@@ -33,6 +33,8 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
+from .effective_samples import summarize_effective_samples
+from .evaluation_labels import canonical_net_label_contract_flags
 from .market import WEEKEND_CLOSURE, WeekendOpenHours
 from .ml import THIN_MIN_GAP_HOURS
 
@@ -46,7 +48,7 @@ MEMBER_SHADOW_PRODUCER = {"macro": "macro", "ml": "ml_direction"}
 # legacy診断の参考閾値（段階昇格には使用しない）
 PROMOTE_MIN_SAMPLES = 40  # 自己相関間引き後の実効採点数
 PROMOTE_MIN_HIT_RATE = 0.52  # 方向的中率の下限
-PROMOTE_MIN_EXPECTANCY = 0.02  # ATR換算の1トレード期待値の下限
+PROMOTE_MIN_EXPECTANCY = 0.02  # canonical純Rの1トレード期待値の下限
 PROMOTE_MAX_PVALUE = 0.10  # 「偶然50%超」の確率がこれ以下なら有意
 
 # 委員の意見が「方向あり」とみなす最小の絶対スコア(中立票を採点から除く)
@@ -64,13 +66,15 @@ class MemberPerformance:
     hits: int = 0
     expectancy_atr: float | None = None  # 意見方向のATR正規化期待値
     p_value: float | None = None  # 的中率が偶然50%超である確率(片側)
-    # コスト控除後の実測純R(realized_net_r)の平均。shadow診断のみで昇格権限は持たない
-    # (expectancy_atr がATR換算の値幅なのに対し、こちらは執行コストまで引いた「儲け」)。
-    # 通常採点(evaluate_member)は保存済み execution_cost_r から、shadow採点
-    # (evaluate_shadow_member)は net_label_eligible な realized_net_r から算出する。
-    # 両経路は排他的に呼ばれるため同一フィールドを共有する。無ければ None。
+    # 正準outcome scorerが生成し、net_label_eligibleなrealized_net_rの平均。
+    # legacy evaluate_memberはATR分母のmove_atrとstop-distance分母のcostを混ぜず、
+    # 常にNoneにする。evaluate_shadow_memberだけが正準ラベルを読み取れる。
     net_expectancy_r: float | None = None
-    net_r_samples: int = 0  # net_expectancy_r の分母(realized_net_r が付いた採点数)
+    net_r_raw_samples: int = 0
+    net_r_samples: int = 0  # net_expectancy_r の分母(non-overlapping effective samples)
+    net_r_overlap_ratio: float | None = None
+    net_r_cluster_count: int = 0
+    net_r_market_days: int = 0
     producer_version: str = ""
 
     @property
@@ -88,13 +92,14 @@ class MemberPerformance:
         if rate is None or rate < PROMOTE_MIN_HIT_RATE:
             shown = f"{rate:.0%}" if rate is not None else "—"
             reasons.append(f"的中率不足({shown}<{PROMOTE_MIN_HIT_RATE:.0%})")
-        expectancy = (
-            self.net_expectancy_r if self.net_expectancy_r is not None else self.expectancy_atr
-        )
+        if self.net_r_samples < PROMOTE_MIN_SAMPLES:
+            reasons.append(
+                f"canonical純Rサンプル不足({self.net_r_samples}/{PROMOTE_MIN_SAMPLES}件)"
+            )
+        expectancy = self.net_expectancy_r
         if expectancy is None or expectancy < PROMOTE_MIN_EXPECTANCY:
             shown = f"{expectancy:+.3f}" if expectancy is not None else "—"
-            unit = "純R" if self.net_expectancy_r is not None else "ATR換算"
-            reasons.append(f"期待値不足({unit}{shown}<{PROMOTE_MIN_EXPECTANCY:+.3f})")
+            reasons.append(f"期待値不足(純R{shown}<{PROMOTE_MIN_EXPECTANCY:+.3f})")
         if self.p_value is None or self.p_value > PROMOTE_MAX_PVALUE:
             shown = f"{self.p_value:.2f}" if self.p_value is not None else "—"
             reasons.append(f"有意性不足(p={shown}>{PROMOTE_MAX_PVALUE:.2f})")
@@ -109,7 +114,11 @@ class MemberPerformance:
             "expectancy_atr": self.expectancy_atr,
             "p_value": self.p_value,
             "net_expectancy_r": self.net_expectancy_r,
+            "net_r_raw_samples": self.net_r_raw_samples,
             "net_r_samples": self.net_r_samples,
+            "net_r_overlap_ratio": self.net_r_overlap_ratio,
+            "net_r_cluster_count": self.net_r_cluster_count,
+            "net_r_market_days": self.net_r_market_days,
             "producer_version": self.producer_version,
         }
 
@@ -131,7 +140,11 @@ class MemberPerformance:
                 if payload.get("net_expectancy_r") is not None
                 else _float(payload.get("expectancy_net_r"))
             ),
+            net_r_raw_samples=_int(payload.get("net_r_raw_samples")),
             net_r_samples=_int(payload.get("net_r_samples")),
+            net_r_overlap_ratio=_float(payload.get("net_r_overlap_ratio")),
+            net_r_cluster_count=_int(payload.get("net_r_cluster_count")),
+            net_r_market_days=_int(payload.get("net_r_market_days")),
             producer_version=str(payload.get("producer_version", "")),
         )
 
@@ -190,8 +203,8 @@ def evaluate_member(
 
     # ペアごとの価格系列(将来価格の突き合わせ用)
     prices: dict[str, list[tuple[datetime, float]]] = {}
-    # (ts, symbol, close, atr, opinion, execution_cost_r)
-    parsed: list[tuple[datetime, str, float, float | None, float, float | None]] = []
+    # (ts, symbol, close, atr, opinion)
+    parsed: list[tuple[datetime, str, float, float | None, float]] = []
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
         if ts is None or ts > now:
@@ -206,15 +219,14 @@ def evaluate_member(
         atr_value = _finite_float(entry.get("atr"))
         if atr_value is not None and atr_value <= 0:
             atr_value = None
-        cost_r = _finite_float(entry.get("execution_cost_r"))
         if opinion_value is not None and close_value is not None:
-            parsed.append((ts, symbol, close_value, atr_value, opinion_value, cost_r))
+            parsed.append((ts, symbol, close_value, atr_value, opinion_value))
     for series in prices.values():
         series.sort(key=lambda point: point[0])
 
-    # (ts, hit(1/0), move_atr, net_r or None)。net_rはコスト控除後の実測R(診断用)
-    scored: list[tuple[datetime, int, float, float | None]] = []
-    for ts, symbol, entry_close, atr_value, opinion, cost_r in parsed:
+    # legacy経路は方向とATR換算値幅だけを診断する。
+    scored: list[tuple[datetime, int, float]] = []
+    for ts, symbol, entry_close, atr_value, opinion in parsed:
         if abs(opinion) < OPINION_ACTIVE_THRESHOLD:
             continue  # 中立票は方向判断していないので採点しない
         future_close = _future_close(prices.get(symbol, []), ts, horizon_hours, tolerance_hours)
@@ -227,10 +239,7 @@ def evaluate_member(
             continue  # 小動きは判定除外
         hit = 1 if signed_move > 0 else 0
         move_atr = signed_move / atr_value if atr_value is not None else 0.0
-        # コスト控除後の純R: move_atr(実測R相当)から執行コスト(R換算)を引く。
-        # atr・costが揃う時だけ算出(shadow診断)。
-        net_r = move_atr - cost_r if (atr_value is not None and cost_r is not None) else None
-        scored.append((ts, hit, move_atr, net_r))
+        scored.append((ts, hit, move_atr))
 
     if not scored:
         return MemberPerformance(member=member)
@@ -238,19 +247,17 @@ def evaluate_member(
     kept = _thin_indices([s[0] for s in scored], THIN_MIN_GAP_HOURS)
     effective = [scored[i] for i in kept]
     evaluated = len(effective)
-    hits = sum(hit for _, hit, _, _ in effective)
-    expectancy = sum(move for _, _, move, _ in effective) / evaluated if evaluated else None
+    hits = sum(hit for _, hit, _ in effective)
+    expectancy = sum(move for _, _, move in effective) / evaluated if evaluated else None
     p_value = _one_sided_binomial_pvalue(hits, evaluated)
-    net_values = [net for _, _, _, net in effective if net is not None]
-    net_expectancy_r = sum(net_values) / len(net_values) if net_values else None
     return MemberPerformance(
         member=member,
         evaluated=evaluated,
         hits=hits,
         expectancy_atr=round(expectancy, 4) if expectancy is not None else None,
         p_value=round(p_value, 4),
-        net_expectancy_r=round(net_expectancy_r, 4) if net_expectancy_r is not None else None,
-        net_r_samples=len(net_values),
+        net_expectancy_r=None,
+        net_r_samples=0,
     )
 
 
@@ -278,31 +285,43 @@ def evaluate_shadow_member(
         if ts is not None:
             parsed.append((ts, row))
     last: dict[str, datetime] = {}
-    effective: list[Mapping[str, object]] = []
+    legacy_effective: list[Mapping[str, object]] = []
     for ts, row in sorted(parsed, key=lambda item: item[0]):
         symbol = str(row.get("symbol", ""))
         previous = last.get(symbol)
         if previous is not None and ts - previous < timedelta(hours=THIN_MIN_GAP_HOURS):
             continue
         last[symbol] = ts
-        effective.append(row)
-    if not effective:
+        legacy_effective.append(row)
+    if not legacy_effective:
         return MemberPerformance(member=member)
-    hits = sum(1 for row in effective if row.get("direction_outcome") == "hit")
+    valid_net_records = [row for _ts, row in parsed if not canonical_net_label_contract_flags(row)]
+    net_effective = summarize_effective_samples(valid_net_records, min_samples=1)
+    selected_keys = set(net_effective.selected_keys)
+    effective_net_records = [
+        row
+        for row in valid_net_records
+        if f"{row['decision_id']}+{row['label_version']}" in selected_keys
+    ]
     net_values = [
         value
-        for row in effective
-        if bool(row.get("net_label_eligible", False))
-        and (value := _float(row.get("realized_net_r"))) is not None
+        for row in effective_net_records
+        if (value := _float(row.get("realized_net_r"))) is not None
     ]
+    decision_evidence = effective_net_records or legacy_effective
+    hits = sum(1 for row in decision_evidence if row.get("direction_outcome") == "hit")
     net_expectancy_r = sum(net_values) / len(net_values) if net_values else None
     return MemberPerformance(
         member=member,
-        evaluated=len(effective),
+        evaluated=len(decision_evidence),
         hits=hits,
         net_expectancy_r=(round(net_expectancy_r, 4) if net_expectancy_r is not None else None),
+        net_r_raw_samples=net_effective.raw_samples,
         net_r_samples=len(net_values),
-        p_value=round(_one_sided_binomial_pvalue(hits, len(effective)), 4),
+        net_r_overlap_ratio=net_effective.overlap_ratio,
+        net_r_cluster_count=net_effective.cluster_count,
+        net_r_market_days=net_effective.market_days,
+        p_value=round(_one_sided_binomial_pvalue(hits, len(decision_evidence)), 4),
         producer_version=active_version,
     )
 

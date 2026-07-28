@@ -52,6 +52,8 @@ from .briefing import (
     TECH_WEIGHT,
     _clip,
     _event_warnings,
+    freeze_pre_guard_execution,
+    freeze_target_plan,
     NEWS_FULL_COVERAGE_COUNT,
 )
 from .calendar import RiskWindow, active_and_next_window, symbol_currencies
@@ -61,8 +63,18 @@ from .sentiment import CurrencySentiment, pair_bias
 from .technicals import PairTechnicals
 from .evaluation_labels import (
     DEFAULT_COMMISSION_R,
-    DEFAULT_COST_MODEL_ID,
+    DEFAULT_COST_MODEL_VERSION,
+    DEFAULT_COST_STATUS,
+    DEFAULT_COMMISSION_MODEL_ID,
     DEFAULT_SLIPPAGE_R,
+    DEFAULT_SLIPPAGE_MODEL_ID,
+    DIAGNOSTIC_COST_MODEL_ID,
+    DIAGNOSTIC_COST_STATUS,
+    MISSING_COST_MODEL_ID,
+    MISSING_COST_STATUS,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+    executable_cost_model_id_for_source,
 )
 from .shadow_learning import build_shadow_predictions, prediction_draft
 from . import input_context as decision_inputs
@@ -157,9 +169,21 @@ class TimeframePlan:
     entry_bid: float | None = None
     entry_ask: float | None = None
     quote_observed_at: str | None = None
-    cost_model_id: str = DEFAULT_COST_MODEL_ID
+    quote_available_at: str | None = None
+    quote_source: str = ""
+    quote_source_record_id: str = ""
+    planned_risk_distance: float | None = None
+    label_version: str = NET_LABEL_VERSION
+    label_provenance: str = NET_LABEL_PROVENANCE
+    cost_model_id: str = DIAGNOSTIC_COST_MODEL_ID
+    cost_model_version: str = DEFAULT_COST_MODEL_VERSION
+    cost_status: str = DIAGNOSTIC_COST_STATUS
+    slippage_model_id: str = DEFAULT_SLIPPAGE_MODEL_ID
+    commission_model_id: str = DEFAULT_COMMISSION_MODEL_ID
     slippage_r: float = DEFAULT_SLIPPAGE_R
     commission_r: float = DEFAULT_COMMISSION_R
+    financing_r: float = 0.0
+    cost_quality_flags: tuple[str, ...] = ()
     direction_threshold: float = DIRECTION_THRESHOLD
     risk_pct: float = DEFAULT_RISK_PCT
     data_quality: float = 1.0
@@ -172,6 +196,14 @@ class TimeframePlan:
     reason: str = ""  # 判断根拠の一文(Discord表示・監査用)
     warnings: list[str] = field(default_factory=list)
     target_policy: dict[str, object] = field(default_factory=dict)
+    pre_guard_direction: str = "neutral"
+    pre_guard_conviction: int = 0
+    pre_guard_stop: float | None = None
+    pre_guard_target1: float | None = None
+    pre_guard_target2: float | None = None
+    pre_guard_target_policy: dict[str, object] = field(default_factory=dict)
+    pre_guard_execution_snapshot: dict[str, object] = field(default_factory=dict)
+    pre_guard_cost_model_id: str = ""
     # 補助ホライズン(観測専用)。{ホライズン時間: ラベル} の順序付き情報
     auxiliary_horizons: tuple[float, ...] = ()
     learning_dimensions: dict[str, object] = field(default_factory=dict)
@@ -436,6 +468,9 @@ def build_timeframe_plan(
             conviction = round(conviction * condition_factor)
             warnings.append(f"📉 学習調整: {condition_reason}")
 
+    pre_guard_direction = direction
+    pre_guard_conviction = conviction
+
     if expectancy_adjuster is not None and direction in ("long", "short"):
         expectancy_factor, expectancy_reason, expectancy_block = expectancy_adjuster(
             symbol, direction, conviction
@@ -459,45 +494,104 @@ def build_timeframe_plan(
     entry_bid = view.bid if view else None
     entry_ask = view.ask if view else None
     quote_observed_at = now.isoformat() if entry_bid is not None and entry_ask is not None else None
+    quote_available_at = quote_observed_at
+    quote_source = "tradingview_oanda_scanner" if quote_observed_at else ""
+    quote_source_record_id = ""
+    cost_model_id = DIAGNOSTIC_COST_MODEL_ID
+    cost_model_version = DEFAULT_COST_MODEL_VERSION
+    cost_status = DIAGNOSTIC_COST_STATUS
+    slippage_model_id = DEFAULT_SLIPPAGE_MODEL_ID
+    commission_model_id = DEFAULT_COMMISSION_MODEL_ID
+    slippage_r = DEFAULT_SLIPPAGE_R
+    commission_r = DEFAULT_COMMISSION_R
+    financing_r = 0.0
+    cost_quality_flags: tuple[str, ...] = ("diagnostic_only",)
     context_bid, context_ask, context_quote_at = decision_inputs.decision_quote_from_mapping(
         serialized_context
     )
+    quote_contract = decision_inputs.decision_quote_contract_from_mapping(serialized_context)
     if context_bid is not None and context_ask is not None:
         entry_bid, entry_ask, quote_observed_at = context_bid, context_ask, context_quote_at
+        quote_available_at = str(quote_contract.get("available_time") or "") or None
+        quote_source = str(quote_contract.get("source") or "")
+        quote_source_record_id = str(quote_contract.get("source_record_id") or "")
+        if (
+            quote_observed_at
+            and quote_available_at
+            and quote_source
+            and quote_source_record_id
+            and quote_contract.get("quality_status") == "measured"
+        ):
+            resolved_cost_model = executable_cost_model_id_for_source(quote_source)
+            if resolved_cost_model is not None:
+                cost_model_id = resolved_cost_model
+                cost_status = DEFAULT_COST_STATUS
+            else:
+                cost_model_id = MISSING_COST_MODEL_ID
+                cost_model_version = ""
+                cost_status = MISSING_COST_STATUS
+                slippage_model_id = ""
+                commission_model_id = ""
+                cost_quality_flags = ("unsupported_cost_source",)
+            if resolved_cost_model is not None:
+                cost_quality_flags = ()
 
-    stop = target1 = target2 = None
-    target_policy: dict[str, object] = {}
+    pre_guard_targets = freeze_target_plan(
+        symbol,
+        pre_guard_direction,
+        pre_guard_conviction,
+        close=close,
+        atr=atr,
+        atr_multiple=atr_multiple,
+        target_r_adjuster=target_r_adjuster,
+    )
+    final_targets = (
+        pre_guard_targets
+        if (direction, conviction) == (pre_guard_direction, pre_guard_conviction)
+        else freeze_target_plan(
+            symbol,
+            direction,
+            conviction,
+            close=close,
+            atr=atr,
+            atr_multiple=atr_multiple,
+            target_r_adjuster=target_r_adjuster,
+        )
+    )
+    stop = final_targets.stop
+    target1 = final_targets.target1
+    target2 = final_targets.target2
+    planned_risk_distance = final_targets.planned_risk_distance
+    target_policy: dict[str, object] = (
+        dict(final_targets.target_policy) if final_targets.approved_reason else {}
+    )
     if direction in ("long", "short") and (atr is None or atr <= 0):
         gate_reasons.append("missing_atr")
         warnings.append(
             f"⚠️ ATR({timeframe})取得失敗 — SL/TPを算出できず、"
             "学習の小動き判定・期待値計算も無効"
         )
-    if close is not None and atr is not None and atr > 0 and direction in ("long", "short"):
-        risk_distance = atr * atr_multiple
-        sign = 1.0 if direction == "long" else -1.0
-        target1_r = 1.0
-        target2_r = 2.0
-        if target_r_adjuster is not None:
-            adjusted_targets = target_r_adjuster(symbol, direction, conviction)
-            if adjusted_targets is not None:
-                candidate_target1_r, candidate_target2_r, reason = adjusted_targets[:3]
-                if candidate_target1_r > 0 and candidate_target2_r > candidate_target1_r:
-                    target1_r = candidate_target1_r
-                    target2_r = candidate_target2_r
-                    if len(adjusted_targets) >= 4 and isinstance(adjusted_targets[3], Mapping):
-                        target_policy = dict(adjusted_targets[3])
-                    else:
-                        target_policy = {
-                            "target1_r": target1_r,
-                            "target2_r": target2_r,
-                            "reason_ja": reason,
-                        }
-                    if reason:
-                        warnings.append(f"✅ 承認済みTP/SL: {reason}")
-        stop = close - sign * risk_distance
-        target1 = close + sign * risk_distance * target1_r
-        target2 = close + sign * risk_distance * target2_r
+    if final_targets.approved_reason:
+        warnings.append(f"✅ 承認済みTP/SL: {final_targets.approved_reason}")
+
+    pre_guard_execution_snapshot = freeze_pre_guard_execution(
+        entry_bid=entry_bid,
+        entry_ask=entry_ask,
+        quote_observed_at=quote_observed_at,
+        quote_available_at=quote_available_at,
+        quote_source=quote_source,
+        quote_source_record_id=quote_source_record_id,
+        planned_risk_distance=pre_guard_targets.planned_risk_distance,
+        cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
+        cost_status=cost_status,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_quality_flags=cost_quality_flags,
+    )
 
     dimensions = dict(learning_dimensions or {})
     shadow_drafts = [prediction_draft("timeframe_raw", composite)]
@@ -518,7 +612,7 @@ def build_timeframe_plan(
         entry_bid=entry_bid,
         entry_ask=entry_ask,
         quote_observed_at=quote_observed_at,
-        cost_model_id=DEFAULT_COST_MODEL_ID,
+        cost_model_id=cost_model_id,
         slippage_r=DEFAULT_SLIPPAGE_R,
         commission_r=DEFAULT_COMMISSION_R,
         atr_multiple=atr_multiple,
@@ -566,6 +660,19 @@ def build_timeframe_plan(
         entry_bid=entry_bid,
         entry_ask=entry_ask,
         quote_observed_at=quote_observed_at,
+        quote_available_at=quote_available_at,
+        quote_source=quote_source,
+        quote_source_record_id=quote_source_record_id,
+        planned_risk_distance=planned_risk_distance,
+        cost_model_id=cost_model_id,
+        cost_model_version=cost_model_version,
+        cost_status=cost_status,
+        slippage_model_id=slippage_model_id,
+        commission_model_id=commission_model_id,
+        slippage_r=slippage_r,
+        commission_r=commission_r,
+        financing_r=financing_r,
+        cost_quality_flags=cost_quality_flags,
         direction_threshold=direction_threshold,
         risk_pct=risk_pct,
         data_quality=quality,
@@ -576,6 +683,14 @@ def build_timeframe_plan(
         reason=tf_reason,
         warnings=warnings,
         target_policy=target_policy,
+        pre_guard_direction=pre_guard_direction,
+        pre_guard_conviction=pre_guard_conviction,
+        pre_guard_stop=pre_guard_targets.stop,
+        pre_guard_target1=pre_guard_targets.target1,
+        pre_guard_target2=pre_guard_targets.target2,
+        pre_guard_target_policy=dict(pre_guard_targets.target_policy),
+        pre_guard_execution_snapshot=pre_guard_execution_snapshot,
+        pre_guard_cost_model_id=cost_model_id,
         auxiliary_horizons=AUXILIARY_HORIZON_HOURS.get(timeframe, ()),
         learning_dimensions=dimensions,
         gate_trace=gate_trace,

@@ -45,9 +45,10 @@ launchdのワンショットサービスとして運用するための手順書�
 USDJPY/EURUSD/GBPUSDを対象にする。GBDTはモデル無し・stale時に融合実行内で自動再学習し、
 PIT適格な融合行だけを使う。件数・クラス数・時系列分割を通過してモデル本体ができた時点で
 artifactを保存し、検証スコア不合格なら`usable=false`のまま判断参加を禁止する。
-融合行には`source_cutoff <= max_feature_available_time <= prediction_time`を記録し、
-この来歴を持たない旧形式行は可視化には残すがGBDT学習・昇格から除外する。
-GBDT artifactはschema 4と`training_contract=fusion-pit-v1`を必須とし、旧artifactは
+融合・時間足別の両行には`source_cutoff <= max_feature_available_time <= prediction_time`に加え、
+`pit_contract`、`decision_id`、`input_context_id`、`source_record_ids`、明示producer/versionを記録する。
+完全な契約を持たない旧形式行は可視化には残すが、方向・収益学習、閾値停止、昇格から除外する。
+GBDT artifactはschema 5と`training_contract=decision-journal-pit-v2`を必須とし、旧artifactは
 未学習扱いで自動再学習する。期待値monitor/改善registryも同じdata contractを必須とし、
 旧registryのTP/SL候補は現行判断へ適用しない。
 融合判断には`--no-discord --no-price-write --require-freshness`を必須とし、Discordの重複通知と

@@ -11,10 +11,15 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, UTC
+import fcntl
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
+import tempfile
 
+from . import journal
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
 from .shadow_learning import (
@@ -27,6 +32,14 @@ from .shadow_learning import (
 
 SCHEMA_VERSION = 1
 EVENT_TYPE = "chart_decision"
+# One run builds one market_context and embeds it into every decision of that
+# run, so a single news batch is duplicated once per symbol/timeframe. Folding
+# the full text into content-hash references at write time keeps the audit log
+# from growing by the square of its own inputs. The reference contract is shared
+# with tools/decision_store_admin.py so backfilled history and newly written
+# events are indistinguishable, and `restore` reverses either one.
+NEWS_SIDECAR_SUFFIX = "_news.jsonl"
+NEWS_NORMALIZED_KEY = "news_items_normalized"
 SCORING_METHOD = "tp_sl_mfe_mae_first_touch"
 SCORING_METRICS = (
     "first_touch",
@@ -262,14 +275,161 @@ def build_fusion_decision_events(
     return events
 
 
-def append_decision_events(path: str | Path, events: Iterable[Mapping[str, object]]) -> None:
-    """Append audit events as JSONL.  One line is one immutable decision event."""
+def news_content_hash(item: Mapping[str, object]) -> str:
+    """Stable content hash; key order never changes the identity of one item."""
+
+    encoded = json.dumps(
+        dict(item),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def normalize_news_items(
+    event: Mapping[str, object],
+) -> tuple[Mapping[str, object], list[dict[str, object]]]:
+    """Fold one event's full news text into content-hash references.
+
+    Returns the event and the news rows it newly referenced. Every other field —
+    decision, accounting, PIT and shadow metadata — is untouched. An
+    already-normalized event is returned unchanged, so re-running is a no-op.
+
+    When there is nothing to fold, the *original* object is returned rather than
+    a copy: copying here would consume a mapping whose serialization is going to
+    fail, and swallow the error that must reach the caller before any write.
+    """
+
+    if event.get(NEWS_NORMALIZED_KEY) is True:
+        return event, []
+    context = event.get("market_context")
+    if not isinstance(context, Mapping):
+        return event, []
+    items = context.get("news_items")
+    if not isinstance(items, list):
+        return event, []
+
+    refs: list[str] = []
+    rows: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        digest = news_content_hash(item)
+        refs.append(digest)
+        rows.append({"news_item_hash": digest, **dict(item)})
+
+    new_context = dict(context)
+    new_context.pop("news_items", None)
+    new_context["news_item_refs"] = refs
+    new_context["news_count"] = len(refs)
+    rewritten = dict(event)
+    rewritten["market_context"] = new_context
+    rewritten[NEWS_NORMALIZED_KEY] = True
+    return rewritten, rows
+
+
+def news_sidecar_path(path: str | Path) -> Path:
+    """Return the sidecar that holds each referenced news item exactly once."""
+
+    target = Path(path)
+    return target.with_name(f"{target.stem}{NEWS_SIDECAR_SUFFIX}")
+
+
+def _append_news_sidecar(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    """Append only news items this sidecar has not recorded yet.
+
+    The existing hashes are scanned *while holding the exclusive lock*. Reading
+    first and locking afterwards would let two concurrent writers each observe
+    the same item as absent and then append it in turn, which breaks the
+    exactly-once contract this sidecar exists to provide. Competing writers are
+    a documented operational risk here, so the whole read-decide-append cycle is
+    serialized.
+    """
+
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" creates the file when absent and still permits reading, so the lock
+    # can be taken before the first byte is examined.
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            known: set[str] = set()
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    known.add(str(json.loads(stripped).get("news_item_hash", "")))
+                except json.JSONDecodeError:
+                    # A damaged sidecar line must not abort the decision write;
+                    # the worst case is re-appending one already-known item.
+                    continue
+            pending: list[Mapping[str, object]] = []
+            for row in rows:
+                digest = str(row.get("news_item_hash", ""))
+                if not digest or digest in known:
+                    continue
+                known.add(digest)
+                pending.append(row)
+            if not pending:
+                return
+            payload = "".join(
+                json.dumps(_json_ready(row), ensure_ascii=False, allow_nan=False) + "\n"
+                for row in pending
+            )
+            handle.seek(0, os.SEEK_END)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def append_decision_events(
+    path: str | Path,
+    events: Iterable[Mapping[str, object]],
+    *,
+    normalize_news: bool = True,
+) -> None:
+    """Durably append one locked audit batch; one line is one immutable event.
+
+    News text is folded into hash references before the decision line is
+    written, and the referenced items are persisted to the sidecar first — so a
+    crash between the two writes can only leave an unreferenced news row, never
+    a decision whose references cannot be resolved.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    prepared: list[Mapping[str, object]] = []
+    news_rows: list[dict[str, object]] = []
+    for event in events:
+        if normalize_news:
+            rewritten, rows = normalize_news_items(event)
+            prepared.append(rewritten)
+            news_rows.extend(rows)
+        else:
+            prepared.append(event)
+    if normalize_news:
+        _append_news_sidecar(news_sidecar_path(target), news_rows)
+
+    payload = "".join(
+        json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n"
+        for event in prepared
+    )
     with target.open("a", encoding="utf-8") as handle:
-        for event in events:
-            handle.write(json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if payload:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def save_latest_snapshot(
@@ -300,29 +460,55 @@ def save_latest_snapshot(
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
+    serialized = json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, allow_nan=False)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def read_decision_events(path: str | Path):
-    """Read append-only decision events.  Corrupt lines are skipped."""
+    """Stream append-only decision events. Corrupt lines are skipped.
+
+    A production audit log can exceed one gigabyte. Reading it with
+    ``read_text().splitlines()`` duplicates the complete corpus in memory before
+    scoring begins, so consumers must receive one decoded event at a time.
+    """
 
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        handle = Path(path).open(encoding="utf-8")
     except OSError:
         return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            yield event
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                yield event
 
 
 def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, object] | None:
@@ -363,9 +549,21 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "entry_bid": decision.get("entry_bid"),
         "entry_ask": decision.get("entry_ask"),
         "quote_observed_at": decision.get("quote_observed_at"),
+        "quote_available_at": decision.get("quote_available_at"),
+        "quote_source": decision.get("quote_source"),
+        "quote_source_record_id": decision.get("quote_source_record_id"),
+        "planned_risk_distance": decision.get("planned_risk_distance"),
+        "label_version": decision.get("label_version"),
+        "label_provenance": decision.get("label_provenance"),
         "cost_model_id": decision.get("cost_model_id"),
+        "cost_model_version": decision.get("cost_model_version"),
+        "cost_status": decision.get("cost_status"),
+        "slippage_model_id": decision.get("slippage_model_id"),
+        "commission_model_id": decision.get("commission_model_id"),
         "slippage_r": decision.get("slippage_r"),
         "commission_r": decision.get("commission_r"),
+        "financing_r": decision.get("financing_r"),
+        "cost_quality_flags": decision.get("cost_quality_flags", []),
         "direction_threshold": decision.get("direction_threshold"),
         "target_policy": decision.get("target_policy", {}),
         "data_quality": decision.get("data_quality"),
@@ -374,12 +572,14 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         "learning_context": event.get("learning_context", {}),
         "learning_dimensions": decision.get("learning_dimensions", {}),
     }
-    # 執行コスト(R換算)と判断時点の期待R予測を採点スキーマへ引き継ぐ。
-    # 採点側は execution_cost_r から realized_net_r を作り、net_expected_r と対比する。
+    # Checklist cost is a spread-based diagnostic, not a canonical net-label input.
     execution = decision.get("execution")
     if isinstance(execution, Mapping):
-        entry["execution_cost_r"] = execution.get("execution_cost_r")
-        entry["net_expected_r"] = execution.get("net_expected_r")
+        entry["execution_cost_r"] = None
+        entry["net_expected_r"] = None
+        entry["diagnostic_execution_cost_r"] = execution.get("diagnostic_execution_cost_r")
+        entry["diagnostic_net_expected_r"] = execution.get("diagnostic_net_expected_r")
+        entry["diagnostic_cost_model"] = execution.get("diagnostic_cost_model", {})
         entry["expected_r"] = execution.get("expected_r")
     return _json_ready_dict(entry)
 
@@ -435,9 +635,21 @@ def decision_event_to_shadow_entries(
                     "entry_bid": raw.get("entry_bid"),
                     "entry_ask": raw.get("entry_ask"),
                     "quote_observed_at": raw.get("quote_observed_at"),
+                    "quote_available_at": decision.get("quote_available_at"),
+                    "quote_source": decision.get("quote_source"),
+                    "quote_source_record_id": decision.get("quote_source_record_id"),
+                    "planned_risk_distance": decision.get("planned_risk_distance"),
+                    "label_version": decision.get("label_version"),
+                    "label_provenance": decision.get("label_provenance"),
                     "cost_model_id": raw.get("cost_model_id"),
+                    "cost_model_version": decision.get("cost_model_version"),
+                    "cost_status": decision.get("cost_status"),
+                    "slippage_model_id": decision.get("slippage_model_id"),
+                    "commission_model_id": decision.get("commission_model_id"),
                     "slippage_r": raw.get("slippage_r"),
                     "commission_r": raw.get("commission_r"),
+                    "financing_r": decision.get("financing_r"),
+                    "cost_quality_flags": decision.get("cost_quality_flags", []),
                     "target_policy": raw.get("target_policy", {}),
                     "data_quality": decision.get("data_quality"),
                     "features": decision.get("features", {}),
@@ -455,20 +667,35 @@ def score_decision_events(
     *,
     price_entries: Iterable[Mapping[str, object]] = (),
     now: datetime | None = None,
+    require_pit: bool = False,
 ) -> dict[str, object]:
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    materialized_events = list(events)
-    event_entries = [
-        entry
-        for event in materialized_events
-        if (entry := decision_event_to_scoring_entry(event)) is not None
-    ]
-    shadow_entries = [
-        entry for event in materialized_events for entry in decision_event_to_shadow_entries(event)
-    ]
-    shadow_predictions = _shadow_prediction_inventory(materialized_events)
+    # Project each full audit event during a single pass. The historical
+    # implementation retained the raw events, a second PIT-filtered list, and
+    # all derived projections simultaneously. On a 1 GB audit log that caused
+    # multi-gigabyte RSS and increased contention with the five-minute writer.
+    input_event_count = 0
+    pit_eligible_count = 0
+    event_entries: list[dict[str, object]] = []
+    shadow_entries: list[dict[str, object]] = []
+    shadow_prediction_events: list[Mapping[str, object]] = []
+    for event in events:
+        input_event_count += 1
+        eligible = journal.is_pit_eligible_entry(event)
+        if eligible:
+            pit_eligible_count += 1
+        if require_pit and not eligible:
+            continue
+        entry = decision_event_to_scoring_entry(event)
+        if entry is not None:
+            event_entries.append(entry)
+        shadow_entries.extend(decision_event_to_shadow_entries(event))
+        inventory_view = _shadow_inventory_view(event)
+        if inventory_view is not None:
+            shadow_prediction_events.append(inventory_view)
+    shadow_predictions = _shadow_prediction_inventory(shadow_prediction_events)
     normalized_prices = [_normalize_price_entry(row) for row in price_entries]
     final_entries = event_entries + normalized_prices
     all_entries = final_entries + shadow_entries
@@ -616,6 +843,11 @@ def score_decision_events(
         {
             "schema": SCHEMA_VERSION,
             "generated_at": generated_at.isoformat(),
+            "pit_contract": (journal.DECISION_JOURNAL_PIT_CONTRACT if require_pit else None),
+            "pit_required": require_pit,
+            "input_decision_events": input_event_count,
+            "pit_eligible_decision_events": pit_eligible_count,
+            "pit_ineligible_decision_events": input_event_count - pit_eligible_count,
             "scoring_method": SCORING_METHOD,
             "metrics": list(SCORING_METRICS),
             "decision_events": len(event_entries),
@@ -635,6 +867,26 @@ def score_decision_events(
             "learning_observations": learning_observations,
         }
     )
+
+
+def _shadow_inventory_view(event: Mapping[str, object]) -> dict[str, object] | None:
+    """Retain only the event fields consumed by shadow inventory reporting."""
+
+    decision = event.get("decision")
+    if not isinstance(decision, Mapping):
+        return None
+    predictions = decision.get("shadow_predictions")
+    if not isinstance(predictions, list) or not predictions:
+        return None
+    return {
+        "decision": {"shadow_predictions": predictions},
+        "decision_id": event.get("decision_id"),
+        "run_id": event.get("run_id"),
+        "ts": event.get("ts"),
+        "symbol": event.get("symbol"),
+        "mode": event.get("mode"),
+        "timeframe": event.get("timeframe"),
+    }
 
 
 def _shadow_prediction_inventory(
@@ -667,12 +919,24 @@ def _shadow_prediction_inventory(
 
 
 def save_outcome_report(report: Mapping[str, object], path: str | Path) -> None:
-    """Save the TP/SL/MFE/MAE scoring report for the complete decision log."""
+    """Save the TP/SL/MFE/MAE scoring report for the complete decision log.
+
+    The report embeds one row per scored outcome, so on a production-sized log
+    it reaches hundreds of megabytes and is re-read by the five-minute briefing.
+    It is machine-read only — every consumer uses ``json.load``, none parses it
+    by line — so it is written compactly. ``indent=2`` cost roughly 27% of the
+    file in pure whitespace.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(_json_ready(report), ensure_ascii=False, indent=2, allow_nan=False),
+        json.dumps(
+            _json_ready(report),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
 
@@ -786,6 +1050,8 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "direction": getattr(plan, "direction", ""),
         "direction_ja": getattr(plan, "direction_ja", ""),
         "conviction": _int_or_none(getattr(plan, "conviction", None)),
+        "analysis_direction": getattr(plan, "analysis_direction", ""),
+        "analysis_conviction": _int_or_none(getattr(plan, "analysis_conviction", None)),
         "tf_score": _number_or_none(getattr(plan, "tf_score", None)),
         "news_score": _number_or_none(getattr(plan, "news_score", None)),
         "composite": _number_or_none(getattr(plan, "composite", None)),
@@ -799,9 +1065,21 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "entry_bid": _number_or_none(getattr(plan, "entry_bid", None)),
         "entry_ask": _number_or_none(getattr(plan, "entry_ask", None)),
         "quote_observed_at": getattr(plan, "quote_observed_at", None),
+        "quote_available_at": getattr(plan, "quote_available_at", None),
+        "quote_source": getattr(plan, "quote_source", ""),
+        "quote_source_record_id": getattr(plan, "quote_source_record_id", ""),
+        "planned_risk_distance": _number_or_none(getattr(plan, "planned_risk_distance", None)),
+        "label_version": getattr(plan, "label_version", ""),
+        "label_provenance": getattr(plan, "label_provenance", ""),
         "cost_model_id": getattr(plan, "cost_model_id", ""),
+        "cost_model_version": getattr(plan, "cost_model_version", ""),
+        "cost_status": getattr(plan, "cost_status", ""),
+        "slippage_model_id": getattr(plan, "slippage_model_id", ""),
+        "commission_model_id": getattr(plan, "commission_model_id", ""),
         "slippage_r": _number_or_none(getattr(plan, "slippage_r", None)),
         "commission_r": _number_or_none(getattr(plan, "commission_r", None)),
+        "financing_r": _number_or_none(getattr(plan, "financing_r", None)),
+        "cost_quality_flags": list(getattr(plan, "cost_quality_flags", ()) or ()),
         "direction_threshold": _number_or_none(getattr(plan, "direction_threshold", None)),
         "risk_pct": _number_or_none(getattr(plan, "risk_pct", None)),
         "data_quality": _number_or_none(getattr(plan, "data_quality", None)),
@@ -812,6 +1090,7 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
         "reason": getattr(plan, "reason", ""),
         "warnings": list(getattr(plan, "warnings", []) or []),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
+        **_pre_guard_snapshot(plan),
         "auxiliary_horizons": list(getattr(plan, "auxiliary_horizons", ()) or ()),
         "learning_dimensions": dict(getattr(plan, "learning_dimensions", {}) or {}),
         "input_context_id": str(getattr(plan, "input_context_id", "") or ""),
@@ -825,26 +1104,37 @@ def _timeframe_plan_snapshot(plan: object) -> dict[str, object]:
 
 
 def _execution_snapshot(plan: object) -> dict[str, object]:
-    """発注前チェックリストが確定した執行コスト系の値を採点用に保存する。
-
-    trade_outcome の採点は「market が返した実現R」から realized_net_r を作るとき
-    このコスト(R換算)を差し引く。値は build_checklist が判断時点の実測 spread から
-    既に計算済み(decision_pipeline.execution_cost_in_r)なので、ここでは取り出して
-    載せるだけ(再計算しない)。net_expected_r は「判断時点の予測」として残し、
-    採点側で実測 realized_net_r と対比できるようにする。
-
-    checklist を持たない plan(時間足別=較正・コスト・サイズを通さない方向分析)は
-    全て None を保存する。採点側はコスト不明を欠損として扱う。
-    """
+    """Persist checklist cost estimates under an explicit diagnostic namespace."""
     checklist = getattr(plan, "checklist", None)
     if not isinstance(checklist, Mapping):
         checklist = {}
+    diagnostic_cost_model = checklist.get("diagnostic_cost_model")
     return {
-        "execution_cost_r": _number_or_none(checklist.get("execution_cost_r")),
+        "execution_cost_r": None,
         "expected_r": _number_or_none(checklist.get("expected_r")),
-        "net_expected_r": _number_or_none(checklist.get("net_expected_r")),
+        "net_expected_r": None,
+        "diagnostic_execution_cost_r": _number_or_none(checklist.get("execution_cost_r")),
+        "diagnostic_net_expected_r": _number_or_none(checklist.get("net_expected_r")),
+        "diagnostic_cost_model": (
+            dict(diagnostic_cost_model) if isinstance(diagnostic_cost_model, Mapping) else {}
+        ),
         "expectancy_source": str(checklist.get("expectancy_source") or ""),
         "probability_calibrated": bool(checklist.get("probability_calibrated", False)),
+    }
+
+
+def _pre_guard_snapshot(plan: object) -> dict[str, object]:
+    return {
+        "pre_guard_direction": str(getattr(plan, "pre_guard_direction", "") or ""),
+        "pre_guard_conviction": _int_or_none(getattr(plan, "pre_guard_conviction", None)),
+        "pre_guard_stop": _number_or_none(getattr(plan, "pre_guard_stop", None)),
+        "pre_guard_target1": _number_or_none(getattr(plan, "pre_guard_target1", None)),
+        "pre_guard_target2": _number_or_none(getattr(plan, "pre_guard_target2", None)),
+        "pre_guard_target_policy": dict(getattr(plan, "pre_guard_target_policy", {}) or {}),
+        "pre_guard_execution_snapshot": dict(
+            getattr(plan, "pre_guard_execution_snapshot", {}) or {}
+        ),
+        "pre_guard_cost_model_id": str(getattr(plan, "pre_guard_cost_model_id", "") or ""),
     }
 
 
@@ -854,6 +1144,8 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "direction": getattr(plan, "direction", ""),
         "direction_ja": getattr(plan, "direction_ja", ""),
         "conviction": _int_or_none(getattr(plan, "conviction", None)),
+        "analysis_direction": getattr(plan, "analysis_direction", ""),
+        "analysis_conviction": _int_or_none(getattr(plan, "analysis_conviction", None)),
         "composite": _number_or_none(getattr(plan, "composite", None)),
         "tech_score": _number_or_none(getattr(plan, "tech_score", None)),
         "news_score": _number_or_none(getattr(plan, "news_score", None)),
@@ -865,9 +1157,21 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "entry_bid": _number_or_none(getattr(plan, "entry_bid", None)),
         "entry_ask": _number_or_none(getattr(plan, "entry_ask", None)),
         "quote_observed_at": getattr(plan, "quote_observed_at", None),
+        "quote_available_at": getattr(plan, "quote_available_at", None),
+        "quote_source": getattr(plan, "quote_source", ""),
+        "quote_source_record_id": getattr(plan, "quote_source_record_id", ""),
+        "planned_risk_distance": _number_or_none(getattr(plan, "planned_risk_distance", None)),
+        "label_version": getattr(plan, "label_version", ""),
+        "label_provenance": getattr(plan, "label_provenance", ""),
         "cost_model_id": getattr(plan, "cost_model_id", ""),
+        "cost_model_version": getattr(plan, "cost_model_version", ""),
+        "cost_status": getattr(plan, "cost_status", ""),
+        "slippage_model_id": getattr(plan, "slippage_model_id", ""),
+        "commission_model_id": getattr(plan, "commission_model_id", ""),
         "slippage_r": _number_or_none(getattr(plan, "slippage_r", None)),
         "commission_r": _number_or_none(getattr(plan, "commission_r", None)),
+        "financing_r": _number_or_none(getattr(plan, "financing_r", None)),
+        "cost_quality_flags": list(getattr(plan, "cost_quality_flags", ()) or ()),
         "direction_threshold": _number_or_none(getattr(plan, "direction_threshold", None)),
         "risk_pct": _number_or_none(getattr(plan, "risk_pct", None)),
         "data_quality": _number_or_none(getattr(plan, "data_quality", None)),
@@ -881,6 +1185,7 @@ def _fusion_plan_snapshot(plan: object) -> dict[str, object]:
         "interval_summary": getattr(plan, "interval_summary", ""),
         "ma_note": getattr(plan, "ma_note", ""),
         "target_policy": dict(getattr(plan, "target_policy", {}) or {}),
+        **_pre_guard_snapshot(plan),
         "learning_dimensions": dict(getattr(plan, "learning_dimensions", {}) or {}),
         "input_context_id": str(getattr(plan, "input_context_id", "") or ""),
         "input_features": dict(getattr(plan, "input_features", {}) or {}),
@@ -1201,6 +1506,11 @@ def _normalize_price_entry(row: Mapping[str, object]) -> dict[str, object]:
     entry.setdefault("timeframe", timeframe)
     entry.setdefault("mode", "per_timeframe" if timeframe != "fusion" else "fusion")
     entry.setdefault("horizon_hours", _horizon_for_timeframe(timeframe))
+    # Journal rows are json.loads output and the three keys added above are
+    # always plain scalars, so a plain row is already JSON-ready. Checking once
+    # is far cheaper than walking every value of every price row on each pass.
+    if _is_plain_json(entry):
+        return entry
     return _json_ready_dict(entry)
 
 
@@ -1341,7 +1651,36 @@ def _json_ready_dict(value: Mapping[str, object]) -> dict[str, object]:
     return {str(key): _json_ready(item) for key, item in value.items()}
 
 
+def _is_plain_json(value: object) -> bool:
+    """True when *value* is already JSON-native and needs no conversion.
+
+    Rows read back from a journal are ``json.loads`` output, so the recursive
+    walk below can never find a dataclass or a datetime in them. Detecting that
+    up front with exact ``type()`` checks avoids the per-node ``is_dataclass``
+    and ABC ``isinstance`` lookups, which dominate the scoring pass on logs with
+    thousands of price rows. ``bool``/``int`` are matched exactly so subclasses
+    (and anything else custom) still take the conversion path.
+    """
+
+    kind = type(value)
+    if kind in (str, int, bool, type(None)):
+        return True
+    if kind is float:
+        # NaN/Infinity are not JSON compliant; json_safe folds them to None, so
+        # they must not take the fast path.
+        return math.isfinite(value)  # type: ignore[arg-type]
+    if kind is dict:
+        items: Mapping[object, object] = value  # type: ignore[assignment]
+        return all(type(key) is str and _is_plain_json(item) for key, item in items.items())
+    if kind is list:
+        entries: Sequence[object] = value  # type: ignore[assignment]
+        return all(_is_plain_json(item) for item in entries)
+    return False
+
+
 def _json_ready(value: object) -> object:
+    if _is_plain_json(value):
+        return value
     if is_dataclass(value) and not isinstance(value, type):
         return _json_ready(asdict(value))
     if isinstance(value, Mapping):

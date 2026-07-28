@@ -83,11 +83,12 @@ def test_good_legacy_signal_remains_shadow_even_after_improvement() -> None:
     assert any("shadow固定" in note for note in state.notes_ja)
 
 
-def test_good_signal_without_previous_improvement_stays_shadow() -> None:
+def test_good_legacy_signal_without_canonical_net_stays_unqualified_shadow() -> None:
     entries = _journal_with_signal(500, hit_prob=0.72, seed=1)
     perf = evaluate_member("ml", entries, now=NOW)
     ok, reasons = perf.meets_reference_thresholds()
-    assert ok, reasons
+    assert not ok
+    assert any("canonical純Rサンプル不足" in reason for reason in reasons)
     state = PromotionState()
     update_stages(state, {"ml": perf}, now=NOW)
     assert state.stage_of("ml") == "shadow"
@@ -199,19 +200,17 @@ def test_evaluation_rejects_naive_now_and_ignores_naive_or_future_rows() -> None
         evaluate_member("ml", entries, now=NOW.replace(tzinfo=None))
 
 
-def test_member_net_expectancy_r_is_computed_from_cost() -> None:
-    """execution_cost_r が保存された意見からコスト控除後の純R診断を算出する。"""
+def test_member_legacy_diagnostic_does_not_mix_atr_move_with_stop_r_cost() -> None:
+    """legacy journalはATR換算診断だけを返し、異なる分母から純Rを捏造しない。"""
     entries = _journal_with_signal(60, hit_prob=0.62, seed=3)
     for entry in entries:
         if entry.get("features", {}).get("ml_edge") is not None:
             entry["execution_cost_r"] = 0.1
     perf = evaluate_member("ml", entries, now=NOW)
     assert perf.evaluated > 0
-    assert perf.net_r_samples > 0
-    assert perf.net_expectancy_r is not None
     assert perf.expectancy_atr is not None
-    # 純R = ATR換算期待値 - コスト。コスト分だけ expectancy_atr より小さい
-    assert perf.net_expectancy_r < perf.expectancy_atr
+    assert perf.net_r_samples == 0
+    assert perf.net_expectancy_r is None
 
 
 def test_member_net_expectancy_r_none_without_cost() -> None:
@@ -237,11 +236,17 @@ def test_member_net_expectancy_r_roundtrips_and_gates_expectancy() -> None:
         expectancy_atr=0.3,
         p_value=0.01,
         net_expectancy_r=0.22,
+        net_r_raw_samples=100,
         net_r_samples=90,
+        net_r_overlap_ratio=0.1,
+        net_r_cluster_count=90,
+        net_r_market_days=50,
     )
     restored = MemberPerformance.from_mapping("ml", perf.to_dict())
     assert restored.net_expectancy_r == 0.22
+    assert restored.net_r_raw_samples == 100
     assert restored.net_r_samples == 90
+    assert restored.net_r_overlap_ratio == 0.1
     # 純Rが正(閾値超)なら参考判定を満たす
     ok_positive, _ = perf.meets_reference_thresholds()
     assert ok_positive
