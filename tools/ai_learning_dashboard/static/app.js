@@ -1557,15 +1557,28 @@ function renderHitDonut(data) {
   host.appendChild(el);
 
   setText("donutHitRate", pct(rate));
-  setText("donutHitCount", `${hits} / ${evaluated} 採点`);
+  // 点推定だけを大きく出すと過信を招くため、区間があれば併記する。
+  const ciLow = num(data.learning.ci_low);
+  const ciHigh = num(data.learning.ci_high);
+  const hasCI = ciLow !== null && ciHigh !== null;
+  setText(
+    "donutHitCount",
+    hasCI
+      ? `${hits} / ${evaluated} 採点 (95%区間 ${Math.round(ciLow * 100)}-${Math.round(ciHigh * 100)}%)`
+      : `${hits} / ${evaluated} 採点`,
+  );
   const note = $("donutSampleNote");
   if (note) {
+    // 「十分」と言えるのは重み学習の発火件数を満たしたときだけで、的中率の
+    // 推定精度が十分という意味ではない。区間が広い間はそれを明示する。
     note.textContent =
       evaluated === 0
         ? "採点済みの判断がまだありません"
         : evaluated < 20
           ? `重み学習の目安20件まであと${20 - evaluated}件`
-          : "重み学習に十分なサンプル数です";
+          : data.learning.ci_wide === true
+            ? "重み学習には足りていますが、的中率はまだ誤差が大きく優劣は読めません"
+            : "重み学習に十分なサンプル数です";
   }
 }
 
@@ -1655,7 +1668,15 @@ function renderLearnedMatrix(data) {
     const rate = row.evaluated ? row.hits / row.evaluated : null;
     tr.appendChild(
       matrixCell(
-        { hit_rate: rate, hits: row.hits, evaluated: row.evaluated },
+        {
+          hit_rate: rate,
+          hits: row.hits,
+          evaluated: row.evaluated,
+          // 時間足計セルも区間を出す(サーバが行に付けた値をそのまま渡す)
+          ci_low: row.ci_low,
+          ci_high: row.ci_high,
+          ci_wide: row.ci_wide,
+        },
         { tf: tfLabel, symbol: "全ペア", isTotal: true },
       ),
     );
@@ -1681,26 +1702,55 @@ function matrixCell(stat, ctx = {}) {
     return cell;
   }
   const rate = evaluated ? Number(stat.hits || 0) / evaluated : null;
-  const color = hitColor(rate);
-  cell.className = `matrix-cell filled${evaluated < 3 ? " dim" : ""}`;
+  // Wilson 95%区間はサーバ側(fx_backtester.calibration)が算出する。区間が広い
+  // セルは的中率の点推定を根拠にできないため、色を出さずグレーに倒す。
+  // 「5/6=83%を緑で見せる」ことが誤読の主因なので、色の抑制が本質。
+  const ciLow = num(stat.ci_low);
+  const ciHigh = num(stat.ci_high);
+  const hasCI = ciLow !== null && ciHigh !== null;
+  const unreliable = stat.ci_wide === true;
+  const color = unreliable ? "rgba(120,120,128,0.28)" : hitColor(rate);
+  cell.className = `matrix-cell filled${unreliable ? " dim" : ""}`;
   cell.tabIndex = 0;
   cell.style.background = color;
   cell.style.color = inkOn(color);
-  cell.style.borderLeftColor = rate >= 0.5 ? "rgba(9,42,28,0.55)" : "rgba(60,12,12,0.55)";
+  cell.style.borderLeftColor = unreliable
+    ? "rgba(120,120,128,0.55)"
+    : rate >= 0.5
+      ? "rgba(9,42,28,0.55)"
+      : "rgba(60,12,12,0.55)";
   const rateEl = document.createElement("span");
   rateEl.className = "cell-rate";
   rateEl.textContent = pct(rate);
   const nEl = document.createElement("span");
   nEl.className = "cell-n";
-  nEl.textContent = `${stat.hits}/${evaluated}`;
+  // 区間が出せるセルは分子分母に加えて幅を併記する(例: 5/6 [44-97%])。
+  nEl.textContent = hasCI
+    ? `${stat.hits}/${evaluated} [${Math.round(ciLow * 100)}-${Math.round(ciHigh * 100)}%]`
+    : `${stat.hits}/${evaluated}`;
   cell.append(rateEl, nEl);
   attachTooltip(cell, () => ({
     title: `${ctx.tf || ""} × ${ctx.symbol || ""}`,
     rows: [
-      { label: "的中率", value: pct(rate), color },
+      { label: "的中率(点推定)", value: pct(rate), color },
       { label: "的中 / 採点", value: `${stat.hits} / ${evaluated}`, muted: true },
-      ...(!ctx.isTotal && evaluated < 3
-        ? [{ label: "サンプル少", value: "参考値", muted: true }]
+      ...(hasCI
+        ? [
+            {
+              label: "95%信頼区間",
+              value: `${Math.round(ciLow * 100)}% 〜 ${Math.round(ciHigh * 100)}%`,
+              muted: true,
+            },
+          ]
+        : []),
+      ...(unreliable
+        ? [
+            {
+              label: "判定",
+              value: "サンプル不足 — この数値から優劣は読めません",
+              muted: true,
+            },
+          ]
         : []),
     ],
   }));

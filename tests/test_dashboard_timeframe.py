@@ -1160,3 +1160,68 @@ def test_flat_does_not_inflate_hit_rate_denominator(server) -> None:
     assert cell == {"evaluated": 1, "hits": 1, "flat": 1}
     # 的中率は flat を含まない 1/1
     assert result["hit_rate"] == 1.0
+
+
+def test_interval_fields_marks_small_samples_unreliable(server) -> None:
+    """少数サンプルのセルは Wilson 区間が広く、ci_wide で不可読と印される。
+
+    「5/6=83%」を緑で見せることが誤読の主因なので、点推定だけでなく区間と
+    「読めない」フラグを必ず返すことを固定する。
+    """
+    narrow = server._interval_fields(500, 1000)
+    assert narrow["ci_wide"] is False
+    assert narrow["ci_low"] < 0.5 < narrow["ci_high"]
+
+    # 実データで観測された 4h USDJPY の 5/6。点推定83%でも区間は44-97%。
+    wide = server._interval_fields(5, 6)
+    assert wide["ci_wide"] is True
+    assert wide["ci_low"] < 0.5, "83%でも下限が50%を割る=優位とは言えない"
+    assert wide["ci_high"] > 0.9
+
+    # 0/4 は「的中率0%」ではなく「上限49%まであり得る」
+    zero = server._interval_fields(0, 4)
+    assert zero["ci_low"] == 0.0
+    assert zero["ci_high"] > 0.4
+    assert zero["ci_wide"] is True
+
+
+def test_interval_fields_absent_without_samples(server) -> None:
+    """採点0件では区間を出さない(未採点と的中0%を混同させない)。"""
+    assert server._interval_fields(0, 0) == {
+        "ci_low": None,
+        "ci_high": None,
+        "ci_wide": None,
+    }
+
+
+def test_timeframe_summary_exposes_intervals(server, tmp_path) -> None:
+    """時間足別サマリの各セルに区間が伝播すること。"""
+    tf_learning = {
+        "generated_at": START.isoformat(),
+        "per_timeframe": {
+            "4h": {
+                "generated_at": START.isoformat(),
+                "evaluated": 10,
+                "hits": 7,
+                "flat": 4,
+                "symbol_stats": {"USDJPY": {"evaluated": 6, "hits": 5}},
+                "symbol_factors": {},
+                "condition_stats": {},
+                "condition_factors": {},
+            }
+        },
+    }
+    (tmp_path / "briefing_tf_learning.json").write_text(
+        json.dumps(tf_learning, ensure_ascii=False), encoding="utf-8"
+    )
+
+    state = server.build_state(tmp_path)
+    row = state["tf_learning"]["timeframes"][0]
+
+    # 行(時間足計)とセル(銘柄別)の両方に区間が付く
+    assert row["ci_wide"] is True
+    symbols = {s["symbol"]: s for s in row["symbols"]}
+    assert symbols["USDJPY"]["ci_wide"] is True
+    assert symbols["USDJPY"]["ci_low"] < 0.5
+    # 全体サマリにも伝播する
+    assert state["tf_learning"]["ci_wide"] is True

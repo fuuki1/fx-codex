@@ -30,6 +30,7 @@ DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from fx_backtester.calibration import wilson_interval  # noqa: E402
 from fx_intel.effective_samples import summarize_effective_samples  # noqa: E402
 from fx_intel.evaluation_labels import (  # noqa: E402
     KNOWN_EXECUTABLE_COST_MODEL_IDS,
@@ -987,6 +988,29 @@ def _journal_activity(entries: list[dict[str, Any]], *, buckets: int = 48) -> di
     }
 
 
+# 的中率セルは少数サンプルで極端な値(0%/83%)を出しやすい。区間を併記して
+# 「まだ何も言えない」ことを読み手に伝えるため、hits/evaluated から Wilson
+# score 区間を求める。区間の実装は fx_backtester.calibration が正準で、
+# ここでは再定義せずそれを呼ぶ(二重定義による契約ずれを避ける)。
+_WIDE_INTERVAL_POINTS = 0.30
+
+
+def _interval_fields(hits: int, evaluated: int) -> dict[str, Any]:
+    """Wilson 95%区間と「広すぎる=判断保留」フラグを返す。
+
+    evaluated が 0 の場合は区間を出さない(採点なしと未知は区別する)。
+    """
+    if evaluated < 1 or not 0 <= hits <= evaluated:
+        return {"ci_low": None, "ci_high": None, "ci_wide": None}
+    low, high = wilson_interval(hits, evaluated)
+    return {
+        "ci_low": round(low, 4),
+        "ci_high": round(high, 4),
+        # 区間幅がこの閾値を超えるセルは、色や数値を根拠に読んではいけない。
+        "ci_wide": bool((high - low) > _WIDE_INTERVAL_POINTS),
+    }
+
+
 def _symbol_rows(learning: dict[str, Any], evaluated: dict[str, Any]) -> list[dict[str, Any]]:
     raw_stats = learning.get("symbol_stats")
     if not isinstance(raw_stats, dict):
@@ -1006,6 +1030,7 @@ def _symbol_rows(learning: dict[str, Any], evaluated: dict[str, Any]) -> list[di
                 "hits": h,
                 "hit_rate": h / n if n else None,
                 "factor": _number(factors.get(symbol)) or 1.0,
+                **_interval_fields(h, n),
             }
         )
     rows.sort(key=lambda row: (-row["evaluated"], row["symbol"]))
@@ -1166,6 +1191,7 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "hits": hits,
             "flat": flat,
             "hit_rate": hits / evaluated if evaluated else None,
+            **_interval_fields(hits, evaluated),
             "tech_weight": _number(raw_profile.get("tech_weight")),
             "news_weight": _number(raw_profile.get("news_weight")),
             "tech_hit_rate": _number(raw_profile.get("tech_hit_rate")),
@@ -1197,6 +1223,7 @@ def _timeframe_learning_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "hits": hits,
         "flat": flat,
         "hit_rate": hits / evaluated if evaluated else None,
+        **_interval_fields(hits, evaluated),
         "tech_weight": _weighted_average(rows, "tech_weight") or 0.55,
         "news_weight": _weighted_average(rows, "news_weight") or 0.45,
         "tech_hit_rate": _weighted_average(rows, "tech_hit_rate"),
@@ -1270,6 +1297,7 @@ def _learning_payload(
             "hits": hits,
             "flat": int(tf_learning.get("flat", 0) or 0),
             "hit_rate": hits / evaluated_count if evaluated_count else None,
+            **_interval_fields(hits, evaluated_count),
             "tech_weight": _number(tf_learning.get("tech_weight")) or 0.55,
             "news_weight": _number(tf_learning.get("news_weight")) or 0.45,
             "tech_hit_rate": _number(tf_learning.get("tech_hit_rate")),
@@ -1301,6 +1329,7 @@ def _learning_payload(
         # 運用推奨の答え合わせと分けて表示するためにフロントへ渡す
         "counterfactual_evaluated": int(_number(learning.get("counterfactual_evaluated")) or 0),
         "hit_rate": hits / evaluated_count if evaluated_count else None,
+        **_interval_fields(hits, evaluated_count),
         "tech_weight": _number(learning.get("tech_weight")) or 0.55,
         "news_weight": _number(learning.get("news_weight")) or 0.45,
         "tech_hit_rate": _number(learning.get("tech_hit_rate")),
