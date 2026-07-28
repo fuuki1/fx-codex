@@ -1483,6 +1483,11 @@ def _normalize_price_entry(row: Mapping[str, object]) -> dict[str, object]:
     entry.setdefault("timeframe", timeframe)
     entry.setdefault("mode", "per_timeframe" if timeframe != "fusion" else "fusion")
     entry.setdefault("horizon_hours", _horizon_for_timeframe(timeframe))
+    # Journal rows are json.loads output and the three keys added above are
+    # always plain scalars, so a plain row is already JSON-ready. Checking once
+    # is far cheaper than walking every value of every price row on each pass.
+    if _is_plain_json(entry):
+        return entry
     return _json_ready_dict(entry)
 
 

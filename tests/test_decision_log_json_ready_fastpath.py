@@ -80,6 +80,34 @@ def test_nested_non_plain_value_disqualifies_the_container() -> None:
     assert converted == {"a": {"b": [stamp.isoformat()]}}
 
 
+def test_price_entry_defaults_are_filled_on_the_fast_path() -> None:
+    entry = decision_log._normalize_price_entry(
+        {"ts": "2026-07-28T00:00:00+00:00", "symbol": "USDJPY", "timeframe": "1h"}
+    )
+
+    assert entry["timeframe"] == "1h"
+    assert entry["mode"] == "per_timeframe"
+    assert entry["horizon_hours"] > 0
+    json.dumps(entry, allow_nan=False)
+
+
+def test_price_entry_with_non_string_keys_still_coerces() -> None:
+    """A non-string key must not ride the fast path, or it stays unserializable."""
+
+    entry = decision_log._normalize_price_entry({1: "a", "timeframe": "1h"})
+
+    assert "1" in entry
+    assert 1 not in entry
+    json.dumps(entry, allow_nan=False)
+
+
+def test_price_entry_with_non_finite_value_is_sanitized() -> None:
+    entry = decision_log._normalize_price_entry({"timeframe": "1h", "close": float("inf")})
+
+    assert entry["close"] is None
+    json.dumps(entry, allow_nan=False)
+
+
 def test_scoring_does_not_mutate_its_inputs() -> None:
     """The fast path returns shared containers, so callers must not mutate."""
 
