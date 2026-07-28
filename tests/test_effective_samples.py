@@ -95,6 +95,38 @@ def test_simultaneous_usd_factor_is_not_counted_once_per_pair() -> None:
     assert summary.sample_ok is False
 
 
+def test_opposite_shared_currency_exposure_is_still_dependent() -> None:
+    """EURUSD long と GBPUSD short はUSDで機械的に相関し、独立2件ではない。"""
+
+    rows = [
+        _row(1, START, symbol="EURUSD", direction="long"),
+        _row(2, START, symbol="GBPUSD", direction="short"),
+    ]
+
+    summary = summarize_effective_samples(rows, min_samples=2)
+
+    assert summary.raw_samples == 2
+    assert summary.effective_samples == 1
+    assert summary.cluster_count == 1
+    # 逆符号でも証拠件数を水増しできないこと。
+    assert summary.sample_ok is False
+
+
+def test_non_overlapping_currencies_stay_independent() -> None:
+    """通貨を共有しなければ、同時刻でも独立サンプルとして数える。"""
+
+    rows = [
+        _row(1, START, symbol="EURUSD", direction="long"),
+        _row(2, START, symbol="AUDJPY", direction="short"),
+    ]
+
+    summary = summarize_effective_samples(rows, min_samples=2)
+
+    assert summary.raw_samples == 2
+    assert summary.effective_samples == 2
+    assert summary.cluster_count == 2
+
+
 def test_missing_or_naive_holding_times_fail_closed() -> None:
     missing = _row(1, START)
     missing.pop("holding_end_time")

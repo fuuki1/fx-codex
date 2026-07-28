@@ -101,8 +101,8 @@ def summarize_effective_samples(
 ) -> EffectiveSampleSummary:
     """Count a deterministic, non-overlapping subset of canonical outcomes.
 
-    Rows sharing the same symbol, or the same signed currency exposure, are
-    dependent while their holding intervals (plus ``minimum_gap``) overlap.
+    Rows sharing the same symbol, or any currency exposure in either direction,
+    are dependent while their holding intervals (plus ``minimum_gap``) overlap.
     Connected overlap components are reported separately from the greedy
     effective subset so chained dependence remains visible.
     """
@@ -284,12 +284,14 @@ def _dependent(
         return False
     if left.symbol == right.symbol:
         return True
-    left_exposures = left.exposures
+    # Sharing a currency is what creates mechanical correlation, regardless of
+    # sign. EURUSD long and GBPUSD short both move with USD — inversely, but
+    # not independently — so requiring equal signs would count them as two
+    # independent samples and inflate the evidence behind every gate that
+    # consumes this number. Direction stays available to callers as portfolio
+    # risk metadata; it must not weaken the dependence test.
     right_exposures = right.exposures
-    return any(
-        currency in right_exposures and sign == right_exposures[currency]
-        for currency, sign in left_exposures.items()
-    )
+    return any(currency in right_exposures for currency in left.exposures)
 
 
 def _cluster_count(observations: Sequence[_Observation], minimum_gap: timedelta) -> int:
