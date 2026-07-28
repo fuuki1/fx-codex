@@ -51,6 +51,48 @@ def _prepare(tmp_path: Path) -> tuple[Path, Path]:
     return path, Path(report["backup_path"])
 
 
+def test_parity_verified_on_writer_first_mixed_store(tmp_path: Path) -> None:
+    """writerが先に畳んだ行を含む混在ログでも、無損失なら verified になる。
+
+    backup側にも正規化済み行が含まれるため、片側だけ復元して比較すると
+    無損失なbackfillを parity_failed と誤判定する。
+    """
+
+    from fx_intel import decision_log
+
+    path = tmp_path / "briefing_decisions.jsonl"
+    decision_log.append_decision_events(path, [_event("by-writer", [_news("live")])])
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_event("legacy", [_news("old")]), ensure_ascii=False) + "\n")
+
+    report = admin.backfill_store(path, apply=True).to_dict()
+    verdict = parity.verify_parity(path, Path(report["backup_path"]))
+
+    assert verdict.verdict == parity.VERDICT_VERIFIED
+    assert verdict.matched == 2
+    assert verdict.mismatched == 0
+
+
+def test_parity_detects_dropped_duplicate_events(tmp_path: Path) -> None:
+    """同一decision_idの重複をdictで潰すと、欠落を見逃す。"""
+
+    event = {
+        "decision_id": "dup",
+        "news_items_normalized": True,
+        "market_context": {"news_count": 0, "news_item_refs": []},
+    }
+    backup = tmp_path / "backup.jsonl"
+    normalized = tmp_path / "briefing_decisions.jsonl"
+    _write(backup, [event, event])  # backupには2件
+    _write(normalized, [event])  # 正規化ログには1件しか無い
+
+    verdict = parity.verify_parity(normalized, backup)
+
+    assert verdict.verdict == parity.VERDICT_FAILED
+    assert verdict.backup_events == 2
+    assert verdict.missing_in_normalized == 1
+
+
 def test_restore_event_is_inverse_of_normalize(tmp_path: Path) -> None:
     path = tmp_path / "briefing_decisions.jsonl"
     original = _event("d-1", [_news("cpi"), _news("unrate")])

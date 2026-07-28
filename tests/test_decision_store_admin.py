@@ -82,6 +82,46 @@ def test_backfill_keeps_sidecar_rows_written_by_the_live_writer(tmp_path: Path) 
             assert ref in known, "参照がサイドカーで解決できない"
 
 
+def test_reconcile_fails_closed_on_unavailable_log(tmp_path: Path) -> None:
+    """検証対象が1件も無い状態を「無損失」と認証してはいけない。"""
+
+    missing = admin.reconcile_store(tmp_path / "does_not_exist.jsonl")
+    assert missing.drift > 0
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert admin.reconcile_store(empty).drift > 0
+
+    assert admin.main(["--path", str(tmp_path / "does_not_exist.jsonl"), "reconcile"]) == 1
+
+
+def test_reconcile_counts_corrupt_lines_as_drift(tmp_path: Path) -> None:
+    path = tmp_path / "briefing_decisions.jsonl"
+    path.write_text("{ not json\n", encoding="utf-8")
+
+    assert admin.reconcile_store(path).drift > 0
+
+
+def test_backfill_backs_up_the_sidecar_before_replacing_it(tmp_path: Path) -> None:
+    """サイドカーも置換対象。退避しないと読めない行が復元不能になる。"""
+
+    from fx_intel import decision_log
+
+    path = tmp_path / "briefing_decisions.jsonl"
+    decision_log.append_decision_events(path, [_event("d-1", [_news("cpi")])])
+    sidecar = decision_log.news_sidecar_path(path)
+    # writerが書いた正常な行に続けて、壊れた行が紛れている状態。
+    with sidecar.open("a", encoding="utf-8") as handle:
+        handle.write("{ corrupt sidecar row\n")
+
+    report = admin.backfill_store(path, apply=True).to_dict()
+    backup_dir = Path(report["backup_path"]).parent
+    sidecar_backup = backup_dir / f"{path.stem}{admin.NEWS_SIDECAR_SUFFIX}.original"
+
+    assert sidecar_backup.is_file(), "サイドカーが退避されていない"
+    assert "corrupt sidecar row" in sidecar_backup.read_text(encoding="utf-8")
+
+
 def test_tool_shares_the_writer_reference_contract() -> None:
     """契約はwriterが唯一の定義元。再定義するとdangling refを静かに生む。"""
 
