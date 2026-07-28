@@ -14,6 +14,7 @@ from datetime import datetime, UTC
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -32,6 +33,13 @@ from .shadow_learning import (
 SCHEMA_VERSION = 1
 EVENT_TYPE = "chart_decision"
 DECISION_BATCH_EVENT_TYPE = "decision_batch"
+# One run builds one market_context and embeds it into every decision of that
+# run, so a single news batch is duplicated once per symbol/timeframe. Folding
+# the full text into content-hash references keeps the audit log from growing by
+# the square of its own inputs. This is the single definition of the reference
+# contract; tools/decision_store_admin.py imports it rather than restating it.
+NEWS_SIDECAR_SUFFIX = "_news.jsonl"
+NEWS_NORMALIZED_KEY = "news_items_normalized"
 SCORING_METHOD = "tp_sl_mfe_mae_first_touch"
 SCORING_METRICS = (
     "first_touch",
@@ -274,11 +282,118 @@ def build_fusion_decision_events(
     return events
 
 
+def news_content_hash(item: Mapping[str, object]) -> str:
+    """Stable content hash; key order never changes the identity of one item."""
+
+    encoded = json.dumps(
+        dict(item),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def news_sidecar_path(path: str | Path) -> Path:
+    """Return the sidecar that holds each referenced news item exactly once."""
+
+    target = Path(path)
+    return target.with_name(f"{target.stem}{NEWS_SIDECAR_SUFFIX}")
+
+
+def normalize_news_items(
+    event: Mapping[str, object],
+) -> tuple[Mapping[str, object], list[dict[str, object]]]:
+    """Fold one event's full news text into content-hash references.
+
+    Returns the event and the news rows it referenced. Every other field —
+    decision, accounting, PIT and shadow metadata — is untouched, so the
+    cross-log identity of the batch is unaffected apart from the folded text
+    itself. An already-normalized event is returned unchanged.
+    """
+
+    if event.get(NEWS_NORMALIZED_KEY) is True:
+        return event, []
+    context = event.get("market_context")
+    if not isinstance(context, Mapping):
+        return event, []
+    items = context.get("news_items")
+    if not isinstance(items, list):
+        return event, []
+
+    refs: list[str] = []
+    rows: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        digest = news_content_hash(item)
+        refs.append(digest)
+        rows.append({"news_item_hash": digest, **dict(item)})
+
+    new_context = dict(context)
+    new_context.pop("news_items", None)
+    new_context["news_item_refs"] = refs
+    new_context["news_count"] = len(refs)
+    rewritten = dict(event)
+    rewritten["market_context"] = new_context
+    rewritten[NEWS_NORMALIZED_KEY] = True
+    return rewritten, rows
+
+
+def _append_news_sidecar(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    """Append only news items this sidecar has not recorded yet.
+
+    The existing hashes are scanned *while holding the exclusive lock*. Reading
+    first and locking afterwards would let two concurrent writers each observe
+    the same item as absent and then append it in turn, breaking the
+    exactly-once contract this sidecar exists to provide.
+    """
+
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            known: set[str] = set()
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    known.add(str(json.loads(stripped).get("news_item_hash", "")))
+                except json.JSONDecodeError:
+                    # A damaged sidecar line must not abort the decision write;
+                    # the worst case is re-appending one already-known item.
+                    continue
+            pending: list[Mapping[str, object]] = []
+            for row in rows:
+                digest = str(row.get("news_item_hash", ""))
+                if not digest or digest in known:
+                    continue
+                known.add(digest)
+                pending.append(row)
+            if not pending:
+                return
+            payload = "".join(
+                json.dumps(_json_ready(row), ensure_ascii=False, allow_nan=False) + "\n"
+                for row in pending
+            )
+            handle.seek(0, os.SEEK_END)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def append_decision_events(
     path: str | Path,
     events: Iterable[Mapping[str, object]],
     *,
     transaction_id: str | None = None,
+    normalize_news: bool = True,
 ) -> dict[str, object]:
     """Durably append one self-validating full batch as one JSONL record.
 
@@ -289,6 +404,20 @@ def append_decision_events(
     normalized_events = [_json_ready_dict(event) for event in events]
     if not normalized_events:
         raise ValueError("decision batch must contain at least one event")
+    # News text is folded into hash references *before* the batch identity is
+    # computed, so `decision_batch_sha256` covers exactly the events that get
+    # written. The reader re-derives that hash from the stored events, and the
+    # commit record receives it through this function's return value — folding
+    # after the hash, or outside this function, would desynchronize all three
+    # and make every batch permanently invisible to readers.
+    news_rows: list[dict[str, object]] = []
+    if normalize_news:
+        folded: list[dict[str, object]] = []
+        for event in normalized_events:
+            rewritten, rows = normalize_news_items(event)
+            folded.append(dict(rewritten))
+            news_rows.extend(rows)
+        normalized_events = folded
     decision_ids = decision_commit.normalize_decision_ids(
         [event.get("decision_id") for event in normalized_events]
     )
@@ -316,6 +445,10 @@ def append_decision_events(
     }
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    # The referenced items are persisted first, so a crash between the two
+    # writes can only leave an unreferenced news row — never a batch whose
+    # references cannot be resolved.
+    _append_news_sidecar(news_sidecar_path(target), news_rows)
     payload = (
         json.dumps(batch, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
     ).encode("utf-8")
@@ -888,12 +1021,24 @@ def _shadow_prediction_inventory(
 
 
 def save_outcome_report(report: Mapping[str, object], path: str | Path) -> None:
-    """Save the TP/SL/MFE/MAE scoring report for the complete decision log."""
+    """Save the TP/SL/MFE/MAE scoring report for the complete decision log.
+
+    The report embeds one row per scored outcome, so on a production-sized log
+    it reaches hundreds of megabytes and is re-read by the five-minute briefing.
+    It is machine-read only — every consumer uses ``json.load``, none parses it
+    by line — so it is written compactly. ``indent=2`` cost roughly 27% of the
+    file in pure whitespace.
+    """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        json.dumps(_json_ready(report), ensure_ascii=False, indent=2, allow_nan=False),
+        json.dumps(
+            _json_ready(report),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
 
@@ -1426,6 +1571,11 @@ def _normalize_price_entry(row: Mapping[str, object]) -> dict[str, object]:
     entry.setdefault("timeframe", timeframe)
     entry.setdefault("mode", "per_timeframe" if timeframe != "fusion" else "fusion")
     entry.setdefault("horizon_hours", _horizon_for_timeframe(timeframe))
+    # Journal rows are json.loads output and the three keys added above are
+    # always plain scalars, so a plain row is already JSON-ready. Checking once
+    # is far cheaper than walking every value of every price row on each pass.
+    if _is_plain_json(entry):
+        return entry
     return _json_ready_dict(entry)
 
 
@@ -1566,7 +1716,36 @@ def _json_ready_dict(value: Mapping[str, object]) -> dict[str, object]:
     return {str(key): _json_ready(item) for key, item in value.items()}
 
 
+def _is_plain_json(value: object) -> bool:
+    """True when *value* is already JSON-native and needs no conversion.
+
+    Rows read back from a journal are ``json.loads`` output, so the recursive
+    walk below can never find a dataclass or a datetime in them. Detecting that
+    up front with exact ``type()`` checks avoids the per-node ``is_dataclass``
+    and ABC ``isinstance`` lookups, which dominate the scoring pass on logs with
+    thousands of price rows. ``bool``/``int`` are matched exactly so subclasses
+    (and anything else custom) still take the conversion path.
+    """
+
+    kind = type(value)
+    if kind in (str, int, bool, type(None)):
+        return True
+    if kind is float:
+        # NaN/Infinity are not JSON compliant; json_safe folds them to None, so
+        # they must not take the fast path.
+        return math.isfinite(value)  # type: ignore[arg-type]
+    if kind is dict:
+        items: Mapping[object, object] = value  # type: ignore[assignment]
+        return all(type(key) is str and _is_plain_json(item) for key, item in items.items())
+    if kind is list:
+        entries: Sequence[object] = value  # type: ignore[assignment]
+        return all(_is_plain_json(item) for item in entries)
+    return False
+
+
 def _json_ready(value: object) -> object:
+    if _is_plain_json(value):
+        return value
     if is_dataclass(value) and not isinstance(value, type):
         return _json_ready(asdict(value))
     if isinstance(value, Mapping):
