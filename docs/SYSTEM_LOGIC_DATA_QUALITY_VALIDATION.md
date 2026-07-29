@@ -69,7 +69,13 @@ flowchart LR
 > - `tests/test_no_live_execution_surface.py` — `trader` / `executor.py` / `params_gate.py` 等のパスが存在しないことと、`placeOrder(` / `ALLOW_LIVE` / `IB_PORT_LIVE` 等の文字列が検査対象ソースに現れないことを確認する
 > - `tests/test_collect_no_order_path.py` — 収集経路が `/orders` `/trades` `/positions` などのエンドポイントや `place_order` / `submit_order` / `cancel_order` を持たないことを確認する
 >
-> **これらのテストの検査範囲は限定的である。** 前者はリポジトリ直下の `*.py` と `fx_backtester` / `fx_intel` / `data_platform` / `tools` の4ディレクトリのみを走査し、`scripts/` や `ops/` は対象外である。後者は `data_platform.collect` 配下のみを対象とする。したがって、対象外ディレクトリへ追加された発注クライアントや、列挙されていないメソッド名を使う実装は**これらのテストを通過しうる**。テストは「既知の経路が復活していないこと」を検出する回帰ガードであって、発注系不在の網羅的証明ではない。
+> **検査範囲**（2026-07-29 更新）: 前者は `git ls-files '*.py'` で列挙した**追跡下の全 Python ファイル**を走査する。以前はリポジトリ直下と4ディレクトリのみが対象で `scripts/` や `examples/` が漏れていたが、git 由来の列挙にしたため新しいパッケージを追加しても自動的に検査対象へ入る。検出対象は broker SDK のコンストラクタ（`placeOrder(` 等）、live 切替（`ALLOW_LIVE` / `IB_PORT_LIVE`）、および broker REST の注文エンドポイント（`/orders` `/trades` `/positions` `/transactions`）である。後者（`test_collect_no_order_path.py`）は従来どおり `data_platform.collect` 配下を対象とし、import 経路とメソッド名まで検査する。
+>
+> **除外ファイルは存在しない。** ガードテスト自身は禁止文字列を書かねばならないが、ファイル単位で走査から外すと「そこだけが発注コードの隠し場所になる」ため、除外ではなく**出現ごとの判定**にしている。`LITERAL_ALLOWED_FILES` に挙げた3ファイルは、トークンが**引用符で完全に囲まれた不活性なリテラル**である場合に限り許容され、実行可能な呼び出しは他のファイルと同様に検出される。
+>
+> ただし**網羅的証明ではない**ことは変わらない。検査は既知パターンの照合であり、列挙外の SDK・別名のエンドポイント・動的に組み立てた URL は検出しない。テストは「既知の経路が復活していないこと」を検出する回帰ガードであり、方針の一次情報は上記のポリシー文書である。
+>
+> なお `fx_backtester` の `_close_position` / `_schedule_close_order` は**メモリ内のシミュレーション記帳**（ネットワークアクセス無し）であり、意図的に検出対象から除外している。「order」という語自体を禁止すると、正直なシミュレータ側の改名を強いることになり境界がかえって弱くなるためである。
 >
 > なお `fx_intel/ibkr_prices.py` は存在するが、これは **read-only の bid/ask 価格取得専用**であり注文 API を呼ばない（module docstring に明記）。IBKR という語が出ても発注経路ではない。
 
