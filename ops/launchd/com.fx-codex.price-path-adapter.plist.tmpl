@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 収集済み Dukascopy tick を確定足へ畳み、採点用の価格経路へ供給する。
+
+       なぜ必要か:
+         採点は TP/SL 到達を価格経路の high/low で判定するが、5分スナップショット
+         は形成中バー(ohlc_scope=forming_bar_snapshot)しか持たず、PIT 保護により
+         high/low が棄却される。tick を畳んだ確定足だけが
+         lower_timeframe_closed_bar を名乗れる。
+
+       起動時刻:
+         datafeed-collector が毎時 7 分に前 1 時間分を取り込む。その完了後に
+         走らせたいので毎時 20 分にする。取りこぼしても次の実行が拾う
+         (処理は tick 全体から確定足を再生成する冪等な設計で、既に書いた行は
+          自然キーで重複スキップされる)。
+
+       この process は構造的に発注できない:
+         読むのは収集済み JSONL だけで、ネットワークも broker 経路も持たない。 -->
+  <key>Label</key>
+  <string>com.fx-codex.price-path-adapter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ROOT__/.venv/bin/python</string>
+    <string>__ROOT__/tools/price_path_adapter_run.py</string>
+    <string>--write</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <!-- 起動時に走らせない。load 直後の実行は、収集器の取り込み途中と重なる
+       可能性があり、待って次の定刻に回すほうが安全。 -->
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Minute</key>
+    <integer>20</integer>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/srv/fx-codex/logs/launchd/price-path-adapter.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/srv/fx-codex/logs/launchd/price-path-adapter.err.log</string>
+</dict>
+</plist>
