@@ -56,7 +56,7 @@ action = argmax(E[net R | long], E[net R | short], 0.0)   # 0.0 = no-trade
 
 ## 4. baseline 群と dominance gate
 
-`experiment_pipeline.py::_FAMILY_KIND`:
+`experiment_pipeline.py::MODEL_FAMILY_KIND`:
 
 | family | 種別 | 実装状態 |
 |---|---|---|
@@ -68,7 +68,9 @@ action = argmax(E[net R | long], E[net R | short], 0.0)   # 0.0 = no-trade
 
 **複雑モデルは tune 区画で best baseline を厳密に上回る場合のみ admissible**（`test_evaluation_gates.py`）。的中率ではなく**コスト控除後期待R**が主指標。
 
-> 【2026-07-13 訂正】初版で「GBDTは pipeline 未登録」と記したのは誤り。定数名を `_FAMILY_KIND` と誤認したもので、正しくは `MODEL_FAMILY_KIND` に登録済み。実データ run で GBDT が選択候補として動作することを確認済み。`fx_intel/gbm.py`（committee側）とは別に pipeline 独自の GBDT 実装が存在する。
+> 【2026-07-13 訂正】初版で「GBDTは pipeline 未登録」と記したのは誤り。定数名を `_FAMILY_KIND` と誤認したもので、正しくは `MODEL_FAMILY_KIND` に登録済み。実データ run で GBDT が選択候補として動作することを確認済み。
+>
+> 【2026-07-29 訂正】上記訂正の末尾にあった「`fx_intel/gbm.py`（committee側）とは別に pipeline 独自の GBDT 実装が存在する」は誤り。**GBDT 実装は1つだけ**で、pipeline は committee と同一のクラスを import している（`experiment_pipeline.py:79` の `from fx_intel.gbm import GradientBoostingClassifier`）。`_GbdtModel`（同 670行）は `_TrainedModel` インターフェースへ合わせるための薄いラッパで、学習アルゴリズムを再実装していない。したがって「2実装が乖離する」二重管理リスクは存在せず、`gbm.py` の変更は pipeline 側へ直接波及する（変更時は `test_gbm.py` と `test_experiment_pipeline.py` の両方を回すこと）。
 
 ## 5. 階層型学習（設計、pipeline 実装は残作業）
 
@@ -80,9 +82,19 @@ global model + pair adjustment + timeframe adjustment + regime adjustment
 
 各補正は十分サンプルがある場合のみ有効化。**現状 pipeline は単一 global。** 階層縮退の結線は P2-2 として登記。
 
-## 6. 旧 `ml.py` の扱い
+## 6. `fx_intel/ml.py` の扱い
 
-旧 `fx_intel/ml.py` は同一 validation set を early stopping・較正・最終Brier に使い回すため、**正式昇格には使用禁止**。観測・互換用途で残すが、正式 artifact 生成は `experiment_pipeline.py` のみ（タスク§2遵守、`test_experiment_pipeline.py` が単一経路を担保）。ML委員は検証Brierが基準率を2%以上改善しないと `usable=False`（判断不参加）。
+`fx_intel/ml.py` は**正式昇格には使用禁止**。観測・互換用途で残すが、正式 artifact 生成は `experiment_pipeline.py` のみ（タスク§2遵守、`test_experiment_pipeline.py` が単一経路を担保）。ML委員は検証Brierが基準率を2%以上改善しないと `usable=False`（判断不参加、`MIN_BRIER_IMPROVEMENT = 0.02`）。
+
+> 【2026-07-29 訂正】この禁止の**理由**として初版が挙げた「同一 validation set を early stopping・較正・最終Brier に使い回す」は、現行コードでは解消済みであり根拠として無効。`ml.py` は train/tune/calibration/test/lockbox の5区間を時刻分離し、3者を別区間で行っている:
+>
+> - early stopping → **tune**（`ml.py::train_artifact` の `model.fit(x_train, y_train, x_tune, y_tune)`）
+> - Platt 較正 → **calibration**（同 `platt_calibrate(calibration_margins, y_calibration)`）
+> - 最終 Brier/logloss/AUC → **test**（同 `artifact.val_brier` / `val_logloss` / `test_auc` への代入）
+>
+> 加えて各境界で 72時間の embargo を引き（`EMBARGO_HOURS`、`ml.py::_temporal_partitions`）、基準率も train 有病率ではなく calibration 窓で当てた切片モデルを使う（同 `baseline = [calibration_base_rate] * len(y_test)`）。
+>
+> **禁止という結論自体は維持する**が、その根拠は「validation 再利用」ではなく**単一経路の原則**（正式 artifact の生成元を `experiment_pipeline.py` 1つに限定し、昇格判定の来歴を一本化する）である。`ml.py` は committee 用の shadow 診断器として位置づける。
 
 ## 7. 完了条件に対する現状（タスク§12）
 

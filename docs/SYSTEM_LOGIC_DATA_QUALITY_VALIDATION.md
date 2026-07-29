@@ -56,7 +56,7 @@ flowchart LR
 - [`trade_outcome.py`](../fx_intel/trade_outcome.py): MFE、MAE、TP/SL先着、実現R、経路品質を採点する。
 - [`oanda_prices.py`](../fx_intel/oanda_prices.py): 完了済みM5足をbid/ask別に取得し、時刻・ソース・hash付きの採点系列へ変換する。
 - [`decision_feedback.py`](../fx_intel/decision_feedback.py): 失敗理由を分類し、十分な標本があるセルだけ次回判断を減衰・見送りにする。
-- [`promotion.py`](../fx_intel/promotion.py): マクロ委員とML委員を `shadow → paper → live` で管理する。
+- [`promotion.py`](../fx_intel/promotion.py): マクロ委員とML委員の段階を管理する。段階は `shadow` の**1つのみ**（`STAGES = ("shadow",)`）で、保存済みの paper/live/未知の段階も shadow へ fail closed し、互換引数 `require_live_ack` が渡されても遷移しない。診断（実効サンプル・的中率・期待値・有意性）は計算・表示するが、段階昇格には使わない。
 - [`tools/ai_learning_dashboard`](../tools/ai_learning_dashboard/): ログを表示する読み取り専用UIであり、ダッシュボード自身は売買も学習も実行しない。
 
 ### 2.3 バックテスト・執行系
