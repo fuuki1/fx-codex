@@ -56,7 +56,7 @@ flowchart LR
 - [`trade_outcome.py`](../fx_intel/trade_outcome.py): MFE、MAE、TP/SL先着、実現R、経路品質を採点する。
 - [`oanda_prices.py`](../fx_intel/oanda_prices.py): 完了済みM5足をbid/ask別に取得し、時刻・ソース・hash付きの採点系列へ変換する。
 - [`decision_feedback.py`](../fx_intel/decision_feedback.py): 失敗理由を分類し、十分な標本があるセルだけ次回判断を減衰・見送りにする。
-- [`promotion.py`](../fx_intel/promotion.py): マクロ委員とML委員を `shadow → paper → live` で管理する。
+- [`promotion.py`](../fx_intel/promotion.py): マクロ委員とML委員の段階を管理する。段階は `shadow` の**1つのみ**（`STAGES = ("shadow",)`）で、保存済みの paper/live/未知の段階も shadow へ fail closed し、互換引数 `require_live_ack` が渡されても遷移しない。診断（実効サンプル・的中率・期待値・有意性）は計算・表示するが、段階昇格には使わない。
 - [`tools/ai_learning_dashboard`](../tools/ai_learning_dashboard/): ログを表示する読み取り専用UIであり、ダッシュボード自身は売買も学習も実行しない。
 
 ### 2.3 バックテスト・執行系
@@ -100,7 +100,9 @@ pair_news_score = sentiment(base_currency) - sentiment(quote_currency)
 composite = 0.55 × technical_score + 0.45 × news_score
 ```
 
-マクロ委員の生重みは0.15、ML委員は0.20だが、`paper` または `live` に昇格した委員だけが複合スコアへ参加する。`shadow` 中は意見を計算・記録するだけで、判断には影響しない。参加委員が増えた場合は全重みを正規化する。
+マクロ委員の生重みは0.15、ML委員は0.20と定義されているが、**現行ビルドではどちらも複合スコアへ参加しない**。参加条件は `committee.py` の `STAGE_ACTIVE` に段階が含まれることだが、現行は `STAGE_ACTIVE = ()`（空タプル）であり、`promotion.py` 側も `STAGES = ("shadow",)` の1段階しか持たないため、**両委員は恒久的に非参加**である。`shadow` 中は意見を計算・記録するだけで、判断には影響しない。上記の生重みと正規化の記述は、参加委員が存在する場合に備えた定義であり、現行の挙動ではない。
+
+> 【2026-07-29 訂正】初版は「`paper` または `live` に昇格した委員だけが複合スコアへ参加する」と記していたが、これは**到達不能な経路**を現行仕様のように読ませる記述だった。`STAGE_ACTIVE = ()` である以上、paper/live へ昇格する経路自体が存在しない。本システムは恒久的に研究・意思決定支援専用であり、paper/live broker execution への昇格は行わない（[AUTOMATED_TRADING_POLICY.md](AUTOMATED_TRADING_POLICY.md)）。
 
 ML委員は `P(hit | long) - P(hit | short)` を意見として使う。確率差の絶対値が0.05未満なら「分からない」とみなし、意見を出さない。
 
@@ -188,17 +190,18 @@ GBDTは「次に上がるか」ではなく、**その方向へ張った判断�
 
 したがって、「モデルファイルがある」「学習処理が走った」と「判断に使える」は別である。
 
-### 4.3 委員の昇格
+### 4.3 委員の診断指標（昇格には使わない）
 
-マクロ／ML委員の `shadow → paper` には、自己相関を間引いた後で次がすべて必要である。
+マクロ／ML委員は、自己相関を間引いた実効サンプルに対して次の参考診断を計算・表示する。
 
-- 40件以上
-- 的中率52%以上
-- ATR正規化期待値 `+0.02` 以上
-- 50%を帰無仮説にした片側検定で `p ≤ 0.10`
-- 前回評価から有意な改善があり、悪化していない
+- 40件以上（`PROMOTE_MIN_SAMPLES`）
+- 的中率52%以上（`PROMOTE_MIN_HIT_RATE`）
+- ATR正規化期待値 `+0.02` 以上（`PROMOTE_MIN_EXPECTANCY`）
+- 50%を帰無仮説にした片側検定で `p ≤ 0.10`（`PROMOTE_MAX_PVALUE`）
 
-paperで40件以上かつ的中率47%未満になるとshadowへ自動降格する。`paper → live` は数値だけでは進まず、人間の明示承認が必要である。
+**これらは観測用の診断であり、段階の昇格には使わない。** `promotion.py` の段階は `STAGES = ("shadow",)` の1つのみで、保存済みの paper/live/未知の段階も shadow へ fail closed する。互換引数 `require_live_ack` が渡されても遷移しない。したがって全条件を満たしても委員は shadow のままであり、複合スコアへは参加しない（§3.3）。
+
+> 【2026-07-29 訂正】初版は本節を「委員の昇格」と題し、`shadow → paper` の必要条件および `paper → live` の人間承認を現行仕様として記していたが、**いずれも到達不能**であるため見出しと本文を診断指標の記述へ改めた。この診断は重複ホライズン・terminal-price proxy・PIT未証明ジャーナルに基づく legacy 指標であり、institutional な validated/paper 証拠ではない（`promotion.py` の module docstring 参照）。
 
 ### 4.4 方向的中率と収益性は別物
 
