@@ -239,14 +239,24 @@ def _apply_capture_coverage(
 ) -> None:
     """最新capture slotが要求されたsymbol×timeframeを全て含むか検証する。"""
 
+    # 監視対象は required_timeframes に挙げた時間足の網羅性だけ。
+    # 同じファイルには別 cadence の writer(確定足アダプタ等)も追記され得るため、
+    # 対象外の行を混ぜたまま「最新slot」を取ると、その行の slot が基準になり
+    # 本来揃っている 15m/1h/4h/1d を見落として coverage_incomplete を誤報する。
+    # 誤報は fail-closed 経由で全判断を中立へ倒すので、ここで先に絞り込む。
     parsed: list[dict[str, object]] = []
     for line in lines:
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict):
-            parsed.append(row)
+        if not isinstance(row, dict):
+            continue
+        if target.required_timeframes and str(row.get("timeframe", "")) not in (
+            target.required_timeframes
+        ):
+            continue
+        parsed.append(row)
     if not parsed:
         result.status = STATUS_CRITICAL
         result.reason = "coverage_unavailable"

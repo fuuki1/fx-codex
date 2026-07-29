@@ -425,3 +425,40 @@ def test_slow_notification_does_not_age_the_report(monitor, tmp_path):
     stamped = datetime.fromisoformat(str(final["monitor_timestamp"]))
     assert stamped.tzinfo is not None  # aware UTCを維持
     assert before <= stamped <= after
+
+
+def test_unmonitored_timeframe_rows_do_not_break_coverage(monitor, tmp_path):
+    """監視対象外の時間足が末尾に追記されても coverage を誤報しないこと。
+
+    同じファイルには別 cadence の writer(確定足アダプタ = 5m_datafeed)も
+    追記される。対象外の行を混ぜたまま「最新capture_slot」を取ると、その行の
+    slot が基準になり、本来揃っている 15m/1h を見落として critical を誤報する。
+    誤報は fail-closed 経由で全判断を中立へ倒すため実害が大きい。
+    """
+    config = _write_coverage_config(tmp_path)
+    slot = "2026-07-10T03:00:00+00:00"
+    rows = [
+        {"capture_slot": slot, "symbol": symbol, "timeframe": timeframe, "close": 1.0}
+        for symbol in ("USDJPY", "EURUSD")
+        for timeframe in ("15m", "1h")
+    ]
+    # 監視対象外の行が最後に来る(別 slot を持つ)
+    rows.append(
+        {
+            "capture_slot": "2026-07-10T02:00:00+00:00",
+            "symbol": "USDJPY",
+            "timeframe": "5m_datafeed",
+            "close": 1.0,
+        }
+    )
+    _touch_jsonl(
+        tmp_path,
+        age_seconds=60,
+        content="\n".join(json.dumps(row) for row in rows),
+    )
+
+    report = _run(monitor, tmp_path, config, _Sender())
+    target = report["targets"][0]
+    assert target["status"] == "ok", "対象外の行で coverage を誤報している"
+    assert target["observed_coverage"] == 4
+    assert target["missing_coverage"] == []
