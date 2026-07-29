@@ -15,11 +15,12 @@ Two deliberate design choices:
   "order" outright would flag the simulator and pressure future authors to
   rename honest code, so the patterns below target broker SDK constructors,
   live-trading switches, and broker REST order endpoints instead.
-- **The guard files exempt themselves.** A test that asserts an order surface
-  is absent has to spell out the very strings it forbids, so a repository-wide
-  scan would otherwise always fail on its own source. The exemption is an
-  explicit allowlist in ``SCAN_EXEMPT_FILES`` — currently three files, each
-  justified there. Every other file, tests included, is scanned normally.
+- **No file is skipped; only inert literals are allowed.** A test that asserts
+  an order surface is absent has to spell out the strings it forbids. Skipping
+  those files wholesale would make them the one place a real broker order call
+  could hide while the suite stayed green. Instead every file is scanned, and
+  the modules in ``LITERAL_ALLOWED_FILES`` may carry those tokens *only* fully
+  enclosed in quotes; anything executable is reported there like anywhere else.
 """
 
 from __future__ import annotations
@@ -54,18 +55,32 @@ FORBIDDEN_ENDPOINT_PATTERN = re.compile(
     r"""["'][^"']*/(orders|trades|positions|transactions)(/|["'])"""
 )
 
-# The only files allowed to contain the strings above: tests that assert the
-# absence of an order surface must name the very strings they forbid.
-# ``test_collect_sources.py`` qualifies because it asserts the OANDA stream URL
-# is pricing-only ("/orders", "/trades", "/positions" must NOT appear in it) —
-# same intent as this module, expressed against a constructed URL.
-SCAN_EXEMPT_FILES = frozenset(
+# Guard modules must name the very strings they forbid. Rather than exempting
+# those files wholesale — which would leave the prohibited surface a place to
+# hide — each *occurrence* is judged: a forbidden token is tolerated only when
+# it appears as an inert quoted literal, i.e. the whole token sits inside
+# quotes, the way the tuples above name them. An actual call has the
+# identifier outside quotes and is still reported, in every file.
+INERT_LITERAL_TEMPLATE = r"""["']{token}["']"""
+
+# Files permitted to carry inert literals at all. Membership does NOT skip the
+# scan; it only allows the quoted-literal form above. Anything executable in
+# these files is still a violation.
+LITERAL_ALLOWED_FILES = frozenset(
     {
         "tests/test_no_live_execution_surface.py",
         "tests/test_collect_no_order_path.py",
+        # Asserts the OANDA stream URL is pricing-only: "/orders", "/trades",
+        # "/positions" must NOT appear in the constructed URL.
         "tests/test_collect_sources.py",
     }
 )
+
+
+def _inert_literal_count(text: str, token: str) -> int:
+    """How many times ``token`` appears fully enclosed in quotes."""
+
+    return len(re.findall(INERT_LITERAL_TEMPLATE.format(token=re.escape(token)), text))
 
 
 def tracked_python_files() -> list[Path]:
@@ -97,19 +112,34 @@ def test_tracked_source_scan_covers_every_package() -> None:
         assert directory in covered_dirs, f"{directory}/ escaped the source scan"
     assert "<root>" in covered_dirs, "root-level modules escaped the source scan"
 
-    for exempt in SCAN_EXEMPT_FILES:
-        assert exempt in scanned, f"exempt file no longer tracked: {exempt}"
+    for allowed in LITERAL_ALLOWED_FILES:
+        assert allowed in scanned, f"literal-allowed file no longer tracked: {allowed}"
 
 
-def scan_source(label: str, text: str) -> list[str]:
-    """Return every broker-order violation found in one source text."""
+def scan_source(label: str, text: str, *, allow_inert_literals: bool = False) -> list[str]:
+    """Return every broker-order violation found in one source text.
 
-    violations = [
-        f"{label}: {snippet}" for snippet in FORBIDDEN_ACTIVE_SOURCE_SNIPPETS if snippet in text
-    ]
-    endpoint = FORBIDDEN_ENDPOINT_PATTERN.search(text)
-    if endpoint is not None:
-        violations.append(f"{label}: broker order endpoint {endpoint.group(0)}")
+    ``allow_inert_literals`` tolerates occurrences that are entirely enclosed in
+    quotes, which is how the guard modules name what they forbid. Every other
+    occurrence is reported even in those files, so an executable call can never
+    hide behind the allowance.
+    """
+
+    violations: list[str] = []
+    for snippet in FORBIDDEN_ACTIVE_SOURCE_SNIPPETS:
+        total = text.count(snippet)
+        if not total:
+            continue
+        inert = _inert_literal_count(text, snippet) if allow_inert_literals else 0
+        if total > inert:
+            violations.append(f"{label}: {snippet}")
+
+    for match in FORBIDDEN_ENDPOINT_PATTERN.finditer(text):
+        endpoint = match.group(0)
+        # A bare one-segment literal is inert; a multi-segment broker URL is not.
+        if allow_inert_literals and re.fullmatch(r"""["']/\w+["']""", endpoint):
+            continue
+        violations.append(f"{label}: broker order endpoint {endpoint}")
     return violations
 
 
@@ -117,9 +147,14 @@ def test_active_source_has_no_broker_order_surface() -> None:
     violations: list[str] = []
 
     for path in tracked_python_files():
-        if path.as_posix() in SCAN_EXEMPT_FILES:
-            continue
-        violations.extend(scan_source(path.as_posix(), (ROOT / path).read_text(encoding="utf-8")))
+        name = path.as_posix()
+        violations.extend(
+            scan_source(
+                name,
+                (ROOT / path).read_text(encoding="utf-8"),
+                allow_inert_literals=name in LITERAL_ALLOWED_FILES,
+            )
+        )
 
     assert not violations, "broker execution surface detected:\n" + "\n".join(violations)
 
@@ -132,12 +167,16 @@ def test_scanner_detects_a_planted_order_client() -> None:
     an all-clear from a clean repository.
     """
 
+    # Assembled from fragments so this module never itself contains a non-inert
+    # broker call: the scan would (correctly) flag its own fixture otherwise.
+    order_call = "place" + "Order(" + "Market" + "Order('BUY', 1000))"
+    broker_url = "https://api.broker.com/v3/accounts/1/" + "orders" + "/"
     planted = (
         "import os\n"
         "def send():\n"
-        "    if os.environ.get('ALLOW_LIVE') == '1':\n"
-        "        ib.placeOrder(MarketOrder('BUY', 1000))\n"
-        "        session.post('https://api.broker.com/v3/accounts/1/orders/', json={})\n"
+        f"    if os.environ.get({'ALLOW' + '_LIVE'!r}) == '1':\n"
+        f"        ib.{order_call}\n"
+        f"        session.post({broker_url!r})\n"
     )
     found = scan_source("scripts/planted_probe.py", planted)
 
@@ -145,6 +184,34 @@ def test_scanner_detects_a_planted_order_client() -> None:
     assert any("MarketOrder(" in item for item in found)
     assert any("ALLOW_LIVE" in item for item in found)
     assert any("broker order endpoint" in item for item in found)
+
+
+def test_literal_allowance_does_not_hide_an_executable_call() -> None:
+    """The guard files get no safe harbour for real execution code.
+
+    ``allow_inert_literals`` exists so a guard can name what it forbids. If it
+    were a whole-file skip, those modules would become the one place a real
+    broker order call could sit unnoticed — the suite would stay green while
+    the boundary was already broken.
+    """
+
+    # Naming the tokens as quoted literals is what a guard legitimately does.
+    naming_only = 'FORBIDDEN = ("place' + 'Order(", "ALLOW' + '_LIVE", "/orders")\n'
+    assert scan_source("tests/guard.py", naming_only, allow_inert_literals=True) == []
+
+    # The same file must not get away with an executable call.
+    order_call = "place" + "Order(" + "Market" + "Order(1))"
+    executable = naming_only + f"def send():\n    ib.{order_call}\n"
+    found = scan_source("tests/guard.py", executable, allow_inert_literals=True)
+    assert any("placeOrder(" in item for item in found)
+    assert any("MarketOrder(" in item for item in found)
+
+    broker_url = "https://api.broker.com/v3/1/" + "orders" + "/"
+    live_url = naming_only + f"session.post({broker_url!r})\n"
+    assert any(
+        "broker order endpoint" in item
+        for item in scan_source("tests/guard.py", live_url, allow_inert_literals=True)
+    )
 
 
 def test_scanner_allows_backtest_position_bookkeeping() -> None:
