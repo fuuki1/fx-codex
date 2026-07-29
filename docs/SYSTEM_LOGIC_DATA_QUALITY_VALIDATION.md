@@ -1,17 +1,17 @@
 # FX Codex：システム、判断ロジック、データ品質、検証方法
 
-最終更新: 2026-07-17  
-対象: `fx_intel/`、`fx_briefing.py`、AI Learning Dashboard、`fx_backtester/`、`trader/`
+最終更新: 2026-07-29  
+対象: `fx_intel/`、`fx_briefing.py`、AI Learning Dashboard、`fx_backtester/`
 
 ## 1. 結論
 
-このプロジェクトは、単に「上がる／下がる」を出す予測器ではない。次の3つを分離したFX研究・判断支援・執行基盤である。
+このプロジェクトは、単に「上がる／下がる」を出す予測器ではない。次の3つを分離したFX研究・意思決定支援基盤である。**発注・執行は対象外**である（[AUTOMATED_TRADING_POLICY.md](AUTOMATED_TRADING_POLICY.md)）。
 
 1. **分析・判断**: テクニカル、ニュース、経済指標、マクロ、GBDTを統合し、条件が悪ければ見送る。
 2. **自己採点・学習**: 過去判断を固定ホライズンやTP/SL先着で採点し、重み・確信度・苦手条件を調整する。
-3. **バックテスト・執行**: コスト、リスク、次足約定、OOS、walk-forward、paper/live安全ゲートを別系統で検証する。
+3. **バックテスト・シミュレーション**: コスト、リスク、次足約定（シミュレーション上の仮定）、OOS、walk-forwardを別系統で検証する。
 
-設計面では、未来情報の混入防止、データ不足時の見送り、モデルの不参加ゲート、段階昇格、人間承認、実発注の二重ガードが入っており、方向性は良い。
+設計面では、未来情報の混入防止、データ不足時の見送り、モデルの不参加ゲート、そして発注経路そのものを持たないこと（既知経路の復活は `tests/test_no_live_execution_surface.py` / `tests/test_collect_no_order_path.py` が回帰検出する。検査範囲は §2.3 の注記を参照）が入っており、方向性は良い。
 
 ただし、**現時点の最大の弱点はデータ量と、旧close-only期間を含む実績の薄さである**。新規収集はOANDAの完了済みM5 bid/ask OHLCへ変更したが、過去ログの品質が遡って改善するわけではない。スクリーンショット時点の融合判断は3件中1件的中（33%）にすぎず、GBDT用の新形式採点データも2/150件である。これは「自己学習の器が動き始めた」状態であり、予測優位性や収益性を証明した状態ではない。
 
@@ -59,11 +59,19 @@ flowchart LR
 - [`promotion.py`](../fx_intel/promotion.py): マクロ委員とML委員の段階を管理する。段階は `shadow` の**1つのみ**（`STAGES = ("shadow",)`）で、保存済みの paper/live/未知の段階も shadow へ fail closed し、互換引数 `require_live_ack` が渡されても遷移しない。診断（実効サンプル・的中率・期待値・有意性）は計算・表示するが、段階昇格には使わない。
 - [`tools/ai_learning_dashboard`](../tools/ai_learning_dashboard/): ログを表示する読み取り専用UIであり、ダッシュボード自身は売買も学習も実行しない。
 
-### 2.3 バックテスト・執行系
+### 2.3 バックテスト・シミュレーション系
 
-- [`fx_backtester/`](../fx_backtester/): イベント駆動バックテスト、リスク、コスト、walk-forward、PBO/DSR、Monte Carloを扱う。
-- [`trader/`](../trader/): TradingView/webhookからRedis Streams、risk、executor、IBKRへ流す実運用スタックである。
-- 分析ログと実発注は直接つながっていない。`logs/` はpaper相当の分析・監査用で、`trader/` の発注系はこれを読まない。
+- [`fx_backtester/`](../fx_backtester/): イベント駆動バックテスト、リスク、コスト、walk-forward、PBO/DSR、Monte Carloを扱う。**すべてオフラインシミュレーションであり、broker へ注文を出す経路は無い。**
+- **本リポジトリに発注系は存在しない。** `logs/` は分析・監査用であり、ここから発注へつながる経路は無い。
+
+> 【2026-07-29 訂正】初版は「[`trader/`](../trader/): TradingView/webhookからRedis Streams、risk、executor、IBKRへ流す実運用スタックである」と記し、`logs/` を「paper相当」と説明していたが、**`trader/` は既に削除済み**でありリンクも切れている。この方針は [AUTOMATED_TRADING_POLICY.md](AUTOMATED_TRADING_POLICY.md) と `CLAUDE.md` / `AGENTS.md` が一次情報であり、回帰検出として次のテストがある:
+>
+> - `tests/test_no_live_execution_surface.py` — `trader` / `executor.py` / `params_gate.py` 等のパスが存在しないことと、`placeOrder(` / `ALLOW_LIVE` / `IB_PORT_LIVE` 等の文字列が検査対象ソースに現れないことを確認する
+> - `tests/test_collect_no_order_path.py` — 収集経路が `/orders` `/trades` `/positions` などのエンドポイントや `place_order` / `submit_order` / `cancel_order` を持たないことを確認する
+>
+> **これらのテストの検査範囲は限定的である。** 前者はリポジトリ直下の `*.py` と `fx_backtester` / `fx_intel` / `data_platform` / `tools` の4ディレクトリのみを走査し、`scripts/` や `ops/` は対象外である。後者は `data_platform.collect` 配下のみを対象とする。したがって、対象外ディレクトリへ追加された発注クライアントや、列挙されていないメソッド名を使う実装は**これらのテストを通過しうる**。テストは「既知の経路が復活していないこと」を検出する回帰ガードであって、発注系不在の網羅的証明ではない。
+>
+> なお `fx_intel/ibkr_prices.py` は存在するが、これは **read-only の bid/ask 価格取得専用**であり注文 API を呼ばない（module docstring に明記）。IBKR という語が出ても発注経路ではない。
 
 ## 3. 判断ロジック
 
@@ -139,7 +147,7 @@ TP2 = 2R
 推奨リスク = 資金の0.5%
 ```
 
-過去のTP/SL候補がpaper検証を通り、人間承認された場合だけ別のR倍率を適用できる。ATRが無い場合はSL/TPも期待Rも正しく計算できないため、欠陥データとして警告する。
+過去のTP/SL候補がオフライン検証を通り、人間承認された場合だけ別のR倍率を適用できる（action type は `tp_sl_variant_paper_test`）。この "paper" は**オフライン再採点による検証**を指す識別子であり、broker の paper 口座での取引ではない。ATRが無い場合はSL/TPも期待Rも正しく計算できないため、欠陥データとして警告する。
 
 ### 3.6 時間足別モード
 
@@ -368,27 +376,25 @@ GBDTについても単一の80/20分割だけで最終採用せず、時系列ro
 - ロンドン・NY重複、ロールオーバー、週末、重要指標、介入、流動性ショックを分ける。
 - 少なくとも1,000、推奨2,000以上のMonte Carlo経路で取引順序と損失尾部を見る。
 - 破産基準、最大DD、回復期間、連敗数を確認する。
-- 1.5倍コストで赤字になる戦略はlive候補にしない。
+- 1.5倍コストで赤字になる戦略は、shadow 判断の根拠として採用しない。
 
-### Step 7: paper／forward
+### Step 7: shadow／forward 収集
 
-コードも閾値も固定し、未使用期間で最低30日、できれば複数レジームにまたがって収集する。
+コードも閾値も固定し、未使用期間で最低30日、できれば複数レジームにまたがって収集する。ここで集めるのは **shadow 判断とオフライン再採点の記録**であり、broker への発注や実約定は含まない。
 
-- バックテストとpaperの取引数、期待R、勝率、spread、slippage差を比較する。
+- バックテストと shadow forward の判断数、期待R、勝率、spread、slippage差を比較する。
 - 判断が出なかったケースも記録する。
 - stale、API失敗、再起動、重複、欠損を含めた運用品質を測る。
 - 価格経路は可能ならDukascopyまたはOANDAのOHLC／bid-askで独立再採点する。
 
-### Step 8: shadow → paper → 最小live
+### Step 8: shadow が最終段階
 
-数値条件を満たしても、いきなり通常サイズへ上げない。
+**本システムに live 昇格の段階は存在しない。** 数値条件をすべて満たしても、到達点は shadow とオフラインシミュレーションであり、broker execution へは進まない。
 
-1. shadow: 記録のみ
-2. paper: 助言・仮想約定へ参加
-3. live最小ロット: 人間承認、`ALLOW_LIVE=1`、Kill switch確認後のみ
-4. 段階増量: 各段階で再度停止条件を確認
+1. shadow: 記録のみ（**最終段階**）
+2. オフラインシミュレーション: `fx_backtester/` によるコスト控除後の再現検証
 
-想定外約定、二重発注、監視欠落、broker／DB不一致が一度でも起きたらKill switchを入れて前段へ戻す。
+> 【2026-07-29 訂正】初版はこの節を「shadow → paper → 最小live」と題し、`3. live最小ロット: 人間承認、ALLOW_LIVE=1、Kill switch確認後のみ` `4. 段階増量` を手順として、また「想定外約定、二重発注、監視欠落、broker／DB不一致が一度でも起きたらKill switchを入れて前段へ戻す」を運用注意として記していた。**これらはいずれも本システムに存在しない経路**であり、自動売買開始フェーズを将来案として提示するものだったため削除した。`ALLOW_LIVE` はコードから削除済みで、現在は `tests/test_no_live_execution_surface.py` が**禁止語として検査する**形でのみ登場する。本システムは恒久的に研究・意思決定支援専用である（[AUTOMATED_TRADING_POLICY.md](AUTOMATED_TRADING_POLICY.md)）。
 
 ## 8. 既存の商用ゲートと注意点
 
@@ -402,7 +408,9 @@ GBDTについても単一の80/20分割だけで最終採用せず、時系列ro
 - 月次12か月以上
 - Monte Carlo 1,000経路以上、破産確率5%以下
 - リスク率ベースのロット管理
-- forward／paper 30日以上
+- forward trade log 30日以上（`--forward-trades`）
+
+> 【2026-07-29 注記】最後の項目は `forward_test_summary` が `--forward-trades` で渡された CSV を評価するもので、**判定材料は `entry_time`／`exit_time` から導いた期間と取引件数のみ**である。ログの出所（shadow か、broker の paper 口座か、外部ツールか）は検証しておらず、CLI のヘルプも `Optional forward/paper trade_log CSV` と汎用的に説明している。したがってこのゲートの合格は「30日以上の forward ログが提示された」ことの確認であって、**shadow 由来であることの証明ではない**。本システム自身は発注を行わないため、ここへ入れるべきログは shadow 判断とオフライン再採点の記録だが、その来歴チェックはゲート側に実装されていない。
 
 加えて、設定上は全評価月で月8%目標達成を商用必須条件にしている。これは事業目標としては理解できるが、統計的な汎用合格基準としては強すぎる。毎月8%を満たすよう最適化すると過学習や過大リスクを誘発しうるため、採否の中心は **期待R、DD、コスト耐性、確率較正、forward再現性** に置き、月次目標は別の事業KPIとして扱う方が安全である。
 
@@ -417,7 +425,7 @@ GBDTについても単一の80/20分割だけで最終採用せず、時系列ro
 | 価格経路品質 | 改善実装済み・蓄積待ち | 新規収集は完了済みM5 bid/ask OHLC。旧close-only期間と足内順序・スリッページの限界は残る |
 | point-in-time品質 | 改善中 | 旧形式を除外する方針は正しい。新形式を継続蓄積する必要がある |
 | 収益性の実証 | 未証明 | 方向的中率は実現損益ではなく、十分なOOS／forwardがない |
-| 実発注品質 | 未検証部分あり | IBKR接続・実約定を含むend-to-end実証は別途必要 |
+| 実発注品質 | **評価対象外** | 本システムは発注を行わないため、この軸は存在しない（[AUTOMATED_TRADING_POLICY.md](AUTOMATED_TRADING_POLICY.md)） |
 
 総評は、**「安全性を意識した研究・判断基盤としては良いが、データとforward実績が不足しており、勝てるシステムとしてはまだ未証明」**である。
 
@@ -429,7 +437,7 @@ GBDTについても単一の80/20分割だけで最終採用せず、時系列ro
 4. **融合と時間足別を別モデルとして評価する**: 母集団、目的変数、ホライズンを混ぜない。
 5. **主指標をexpected Rへ固定する**: 方向的中率は補助表示にする。
 6. **rolling OOSを追加する**: GBDTの単一検証区間だけでなく複数foldのBrier／expected Rを確認する。
-7. **paper差分を蓄積する**: バックテスト、判断時価格、仮想約定、実際のbroker quoteの差を測る。
+7. **shadow差分を蓄積する**: バックテスト、判断時価格、オフライン再採点の差を測る。参照 quote は収集済みの bid/ask（Dukascopy／OANDA／IBKR read-only）を使い、実約定は含まない。
 
 ## 11. 再現用コマンド
 
@@ -462,4 +470,4 @@ python3 tools/learning_capture.py --keep-going
 
 このシステムの良さは、予測を無理に出すことではなく、**分からないときに見送り、弱いモデルを不参加にし、ログを残し、段階的に信頼を上げる構造**にある。
 
-次のマイルストーンは的中率を上げることではない。まず、新形式のpoint-in-timeデータ、OHLC／bid-ask価格経路、重複のないforwardログを十分に集め、コスト控除後期待Rがrolling OOSとpaperの両方で再現するかを確認することである。それが確認できるまでは、ダッシュボードの数字は学習進捗であって、収益保証やlive投入根拠ではない。
+次のマイルストーンは的中率を上げることではない。まず、新形式のpoint-in-timeデータ、OHLC／bid-ask価格経路、重複のないforwardログを十分に集め、コスト控除後期待Rがrolling OOSとshadow forwardの両方で再現するかを確認することである。それが確認できたとしても、到達点は shadow とオフラインシミュレーションであり、ダッシュボードの数字は学習進捗であって収益保証ではない。
