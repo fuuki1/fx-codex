@@ -11,7 +11,7 @@
 2. **自己採点・学習**: 過去判断を固定ホライズンやTP/SL先着で採点し、重み・確信度・苦手条件を調整する。
 3. **バックテスト・シミュレーション**: コスト、リスク、次足約定（シミュレーション上の仮定）、OOS、walk-forwardを別系統で検証する。
 
-設計面では、未来情報の混入防止、データ不足時の見送り、モデルの不参加ゲート、そして発注経路そのものを持たないこと（`tests/test_no_live_execution_surface.py` / `tests/test_collect_no_order_path.py` が恒久的に検査）が入っており、方向性は良い。
+設計面では、未来情報の混入防止、データ不足時の見送り、モデルの不参加ゲート、そして発注経路そのものを持たないこと（既知経路の復活は `tests/test_no_live_execution_surface.py` / `tests/test_collect_no_order_path.py` が回帰検出する。検査範囲は §2.3 の注記を参照）が入っており、方向性は良い。
 
 ただし、**現時点の最大の弱点はデータ量と、旧close-only期間を含む実績の薄さである**。新規収集はOANDAの完了済みM5 bid/ask OHLCへ変更したが、過去ログの品質が遡って改善するわけではない。スクリーンショット時点の融合判断は3件中1件的中（33%）にすぎず、GBDT用の新形式採点データも2/150件である。これは「自己学習の器が動き始めた」状態であり、予測優位性や収益性を証明した状態ではない。
 
@@ -64,10 +64,12 @@ flowchart LR
 - [`fx_backtester/`](../fx_backtester/): イベント駆動バックテスト、リスク、コスト、walk-forward、PBO/DSR、Monte Carloを扱う。**すべてオフラインシミュレーションであり、broker へ注文を出す経路は無い。**
 - **本リポジトリに発注系は存在しない。** `logs/` は分析・監査用であり、ここから発注へつながる経路は無い。
 
-> 【2026-07-29 訂正】初版は「[`trader/`](../trader/): TradingView/webhookからRedis Streams、risk、executor、IBKRへ流す実運用スタックである」と記し、`logs/` を「paper相当」と説明していたが、**`trader/` は既に削除済み**でありリンクも切れている。現在この境界はテストで恒久的に強制されている:
+> 【2026-07-29 訂正】初版は「[`trader/`](../trader/): TradingView/webhookからRedis Streams、risk、executor、IBKRへ流す実運用スタックである」と記し、`logs/` を「paper相当」と説明していたが、**`trader/` は既に削除済み**でありリンクも切れている。この方針は [AUTOMATED_TRADING_POLICY.md](AUTOMATED_TRADING_POLICY.md) と `CLAUDE.md` / `AGENTS.md` が一次情報であり、回帰検出として次のテストがある:
 >
-> - `tests/test_no_live_execution_surface.py` — `trader` / `executor.py` / `params_gate.py` 等のパスと、`placeOrder(` / `ALLOW_LIVE` / `IB_PORT_LIVE` 等の文字列が active source に現れないことを検査する
-> - `tests/test_collect_no_order_path.py` — 収集経路が `/orders` `/trades` `/positions` などのエンドポイントや `place_order` / `submit_order` / `cancel_order` を持たないことを検査する
+> - `tests/test_no_live_execution_surface.py` — `trader` / `executor.py` / `params_gate.py` 等のパスが存在しないことと、`placeOrder(` / `ALLOW_LIVE` / `IB_PORT_LIVE` 等の文字列が検査対象ソースに現れないことを確認する
+> - `tests/test_collect_no_order_path.py` — 収集経路が `/orders` `/trades` `/positions` などのエンドポイントや `place_order` / `submit_order` / `cancel_order` を持たないことを確認する
+>
+> **これらのテストの検査範囲は限定的である。** 前者はリポジトリ直下の `*.py` と `fx_backtester` / `fx_intel` / `data_platform` / `tools` の4ディレクトリのみを走査し、`scripts/` や `ops/` は対象外である。後者は `data_platform.collect` 配下のみを対象とする。したがって、対象外ディレクトリへ追加された発注クライアントや、列挙されていないメソッド名を使う実装は**これらのテストを通過しうる**。テストは「既知の経路が復活していないこと」を検出する回帰ガードであって、発注系不在の網羅的証明ではない。
 >
 > なお `fx_intel/ibkr_prices.py` は存在するが、これは **read-only の bid/ask 価格取得専用**であり注文 API を呼ばない（module docstring に明記）。IBKR という語が出ても発注経路ではない。
 
@@ -406,7 +408,9 @@ GBDTについても単一の80/20分割だけで最終採用せず、時系列ro
 - 月次12か月以上
 - Monte Carlo 1,000経路以上、破産確率5%以下
 - リスク率ベースのロット管理
-- shadow forward 30日以上
+- forward trade log 30日以上（`--forward-trades`）
+
+> 【2026-07-29 注記】最後の項目は `forward_test_summary` が `--forward-trades` で渡された CSV を評価するもので、**判定材料は `entry_time`／`exit_time` から導いた期間と取引件数のみ**である。ログの出所（shadow か、broker の paper 口座か、外部ツールか）は検証しておらず、CLI のヘルプも `Optional forward/paper trade_log CSV` と汎用的に説明している。したがってこのゲートの合格は「30日以上の forward ログが提示された」ことの確認であって、**shadow 由来であることの証明ではない**。本システム自身は発注を行わないため、ここへ入れるべきログは shadow 判断とオフライン再採点の記録だが、その来歴チェックはゲート側に実装されていない。
 
 加えて、設定上は全評価月で月8%目標達成を商用必須条件にしている。これは事業目標としては理解できるが、統計的な汎用合格基準としては強すぎる。毎月8%を満たすよう最適化すると過学習や過大リスクを誘発しうるため、採否の中心は **期待R、DD、コスト耐性、確率較正、forward再現性** に置き、月次目標は別の事業KPIとして扱う方が安全である。
 
