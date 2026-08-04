@@ -271,6 +271,11 @@ def _digest(text: str) -> str:
     return phase0_inventory._sha256_bytes(text.encode("utf-8"))
 
 
+def _h(text: str) -> str:
+    """A syntactically valid sha256 fixture value."""
+    return _digest(text)
+
+
 def _script(parent: str, file_digest: str, basename: str = "worker.py") -> dict[str, object]:
     return {
         "parent_path_sha256": _digest(parent),
@@ -283,7 +288,7 @@ def _script(parent: str, file_digest: str, basename: str = "worker.py") -> dict[
 def _provenance(
     scripts: list[dict[str, object]],
     *,
-    interpreter_binary: str = "interp-a",
+    interpreter_binary: str = _h("interp-a"),
     interpreter_realpath: str = "/runtimes/approved/bin/python",
     status: str = "parsed",
 ) -> dict[str, object]:
@@ -312,7 +317,7 @@ def _label(pid: int | None, label: str) -> dict[str, object]:
     return {"pid": pid, "label": label, "last_exit_status": 0}
 
 
-def _approval(scripts: list[dict[str, object]], interpreter_binary: str = "interp-a"):
+def _approval(scripts: list[dict[str, object]], interpreter_binary: str = _h("interp-a")):
     return {
         "interpreter_binary_sha256": interpreter_binary,
         "interpreter_realpath_sha256": _digest("/runtimes/approved/bin/python"),
@@ -324,10 +329,10 @@ def _approval(scripts: list[dict[str, object]], interpreter_binary: str = "inter
 
 
 QUOTE_SCRIPTS = [
-    _script("/srv/approved/tools", "wrapper-sha", "run_exclusive.py"),
-    _script("/srv/approved/tools", "child-sha", "quote_tape_index.py"),
+    _script("/srv/approved/tools", _h("wrapper"), "run_exclusive.py"),
+    _script("/srv/approved/tools", _h("child"), "quote_tape_index.py"),
 ]
-DASH_SCRIPTS = [_script("/srv/approved/dash", "dash-sha", "server.py")]
+DASH_SCRIPTS = [_script("/srv/approved/dash", _h("dash"), "server.py")]
 
 
 def test_run_exclusive_child_is_mapped_through_its_launchd_parent() -> None:
@@ -348,7 +353,7 @@ def test_wrapper_and_child_are_both_verified() -> None:
 
     tampered = [
         QUOTE_SCRIPTS[0],
-        _script("/srv/approved/tools", "CHILD-TAMPERED", "quote_tape_index.py"),
+        _script("/srv/approved/tools", _h("child-tampered"), "quote_tape_index.py"),
     ]
     mapping = phase0_inventory.resolve_process_mapping(
         [_process(63256, 1, _provenance(tampered))],
@@ -366,7 +371,7 @@ def test_wrapper_and_child_are_both_verified() -> None:
 def test_same_directory_content_change_is_detected() -> None:
     """Editing a file in place inside an approved directory must fail."""
 
-    edited = [_script("/srv/approved/dash", "EDITED-IN-PLACE", "server.py")]
+    edited = [_script("/srv/approved/dash", _h("edited"), "server.py")]
     assert edited[0]["parent_path_sha256"] == DASH_SCRIPTS[0]["parent_path_sha256"]
 
     mapping = phase0_inventory.resolve_process_mapping(
@@ -404,7 +409,7 @@ def test_cross_service_substitution_is_rejected() -> None:
 def test_same_version_different_interpreter_is_rejected() -> None:
     """Two 3.12 builds differ by binary identity, not by version string."""
 
-    other = _provenance(DASH_SCRIPTS, interpreter_binary="interp-B-homebrew")
+    other = _provenance(DASH_SCRIPTS, interpreter_binary=_h("interp-b"))
     mapping = phase0_inventory.resolve_process_mapping(
         [_process(11764, 1, other)],
         [_label(11764, "com.fx-codex.dashboard")],
@@ -470,6 +475,7 @@ def test_manually_started_process_is_unmapped() -> None:
             _process(11764, 1, _provenance(DASH_SCRIPTS)),
         ],
         [_label(11764, "com.fx-codex.dashboard")],
+        process_graph={55195: 63592, 63592: 1, 11764: 1},
         approved_provenance={"com.fx-codex.dashboard": _approval(DASH_SCRIPTS)},
     )
 
@@ -590,7 +596,9 @@ def test_observer_classification_is_limited_to_this_runs_ancestry(monkeypatch) -
         {"pid": 49499, "ppid": 41598, "executable_basename": "ssh"},
     ]
 
-    mapping = phase0_inventory.resolve_process_mapping(processes, [])
+    mapping = phase0_inventory.resolve_process_mapping(
+        processes, [], process_graph={900: 800, 800: 1, 49499: 41598, 41598: 1}
+    )
 
     observers = {row["pid"] for row in cast(list[Any], mapping["observer_processes"])}
     unmapped = {row["pid"] for row in cast(list[Any], mapping["unmapped"])}
@@ -610,7 +618,9 @@ def test_unknown_ssh_listener_and_writer_are_not_excused(monkeypatch) -> None:
         {"pid": 222, "ppid": 1, "executable_basename": "Python"},
     ]
 
-    mapping = phase0_inventory.resolve_process_mapping(processes, [])
+    mapping = phase0_inventory.resolve_process_mapping(
+        processes, [], process_graph={900: 1, 111: 1, 222: 1}
+    )
 
     assert {row["pid"] for row in cast(list[Any], mapping["unmapped"])} == {111, 222}
     assert mapping["lineage_pass"] is False
@@ -624,3 +634,146 @@ def test_observer_basis_is_recorded() -> None:
 
     observers = cast(list[Any], mapping["observer_processes"])
     assert observers[0]["basis"] == "inventory_process_ancestry"
+
+
+_SHA_A = "a" * 64
+_SHA_B = "b" * 64
+
+
+def _full_approval() -> dict[str, object]:
+    return {
+        "interpreter_binary_sha256": _SHA_A,
+        "interpreter_realpath_sha256": _SHA_B,
+        "scripts": [{"parent_path_sha256": _SHA_A, "file_sha256": _SHA_B}],
+    }
+
+
+def _policy_verdict(approval: object) -> dict[str, Any]:
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(1, 1, _provenance(DASH_SCRIPTS))],
+        [_label(1, "com.fx-codex.dashboard")],
+        approved_provenance={"com.fx-codex.dashboard": cast(Any, approval)},
+    )
+    return cast(dict[str, Any], mapping["entrypoint_provenance"])
+
+
+def test_partial_approval_is_policy_invalid_not_wildcard() -> None:
+    """An omitted field must fail the policy, never match anything."""
+
+    for dropped in ("interpreter_binary_sha256", "interpreter_realpath_sha256", "scripts"):
+        approval = _full_approval()
+        del approval[dropped]
+        verdict = _policy_verdict(approval)
+
+        assert verdict["verdict"] == "approval_policy_invalid", dropped
+        assert any(e["field"] == dropped for e in verdict["policy_errors"]), dropped
+
+
+def test_none_and_empty_approval_values_are_policy_invalid() -> None:
+    for bad in (None, "", "not-a-sha", 123):
+        approval = _full_approval()
+        approval["interpreter_binary_sha256"] = cast(Any, bad)
+        verdict = _policy_verdict(approval)
+
+        assert verdict["verdict"] == "approval_policy_invalid", bad
+
+
+def test_partial_script_entry_is_policy_invalid() -> None:
+    approval = _full_approval()
+    approval["scripts"] = [{"parent_path_sha256": _SHA_A}]
+    verdict = _policy_verdict(approval)
+
+    assert verdict["verdict"] == "approval_policy_invalid"
+    assert verdict["policy_errors"][0]["field"] == "scripts[0].file_sha256"
+
+
+def test_empty_scripts_list_is_policy_invalid() -> None:
+    approval = _full_approval()
+    approval["scripts"] = []
+
+    assert _policy_verdict(approval)["verdict"] == "approval_policy_invalid"
+
+
+def test_invalid_policy_never_yields_pass_true() -> None:
+    """A malformed policy must not approve, even with matching processes."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(1, 1, _provenance(DASH_SCRIPTS))],
+        [_label(1, "com.fx-codex.dashboard")],
+        approved_provenance={"com.fx-codex.dashboard": cast(Any, {"scripts": []})},
+    )
+
+    assert mapping["pass"] is False
+
+
+def test_ancestry_through_filtered_parent_still_maps() -> None:
+    """A launchd chain passing through an out-of-scope ancestor must map."""
+
+    graph = {700: 600, 600: 500, 500: 1}
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(700, 600)],
+        [_label(500, "com.fx-codex.briefing")],
+        process_graph=graph,
+    )
+
+    assert mapping["unmapped_processes"] == 0
+    assert cast(list[Any], mapping["mapped"])[0]["launchd_label"] == "com.fx-codex.briefing"
+
+
+def test_broken_ancestry_is_indeterminate_not_unmapped() -> None:
+    """A vanished parent yields an unknown verdict, not a clean failure."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(700, 600)],
+        [_label(500, "com.fx-codex.briefing")],
+        process_graph={},
+    )
+
+    assert mapping["unmapped_processes"] == 0
+    assert mapping["indeterminate_processes"] == 1
+    assert cast(list[Any], mapping["indeterminate"])[0]["reason"] == "ancestry_incomplete"
+    assert mapping["lineage_pass"] is False
+
+
+def test_chain_terminating_at_pid_one_is_unmapped_not_indeterminate() -> None:
+    """Reaching init without a label is a real finding, not missing data."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(700, 1)],
+        [_label(500, "com.fx-codex.briefing")],
+        process_graph={700: 1},
+    )
+
+    assert mapping["unmapped_processes"] == 1
+    assert mapping["indeterminate_processes"] == 0
+
+
+def test_relative_script_token_is_indeterminate() -> None:
+    """Without the target's cwd a relative path cannot be identified."""
+
+    record = phase0_inventory._entrypoint_provenance(
+        "/usr/bin/python3.12 tools/server.py --port 8788",
+        "/usr/bin/python3.12",
+    )
+
+    assert record["parse_status"] == "indeterminate"
+    assert record["parse_reason"] == "relative_script_token_without_cwd"
+
+
+def test_chain_reaching_init_via_pid_zero_is_unmapped_not_indeterminate() -> None:
+    """``ps`` reports pid 1's parent as 0; that is a complete chain.
+
+    Observed on trader-mini 2026-08-04: 49499 -> 41598 -> 41597 -> 406 -> 1,
+    where ``graph[1] == 0``.  Treating pid 0 as a missing parent misreported
+    all six ssh clients as ancestry_incomplete.
+    """
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(49499, 41598)],
+        [_label(11764, "com.fx-codex.dashboard")],
+        process_graph={49499: 41598, 41598: 41597, 41597: 406, 406: 1, 1: 0},
+    )
+
+    assert mapping["indeterminate_processes"] == 0
+    assert mapping["unmapped_processes"] == 1
+    assert cast(list[Any], mapping["unmapped"])[0]["pid"] == 49499

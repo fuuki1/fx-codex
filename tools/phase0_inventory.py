@@ -520,9 +520,16 @@ def _entrypoint_provenance(raw_command: str, executable_token: str) -> dict[str,
     scripts = [token for token in tokens[1:] if token.endswith((".py", ".sh"))]
     interpreter = _interpreter_identity(executable_token)
 
+    relative = [token for token in scripts if not Path(token).is_absolute()]
     if not scripts:
         parse_status = "indeterminate"
         reason: str | None = "no_script_token"
+    elif relative:
+        # A relative token cannot be resolved to a file without the target
+        # process's cwd, which ``ps`` does not provide.  Hashing it against the
+        # collector's own cwd would identify the wrong file.
+        parse_status = "indeterminate"
+        reason = "relative_script_token_without_cwd"
     elif interpreter["version"] is None and interpreter["binary_sha256"] is None:
         # Neither a parseable version nor a readable binary: nothing identifies
         # what actually executed, so this must not be approvable.
@@ -539,6 +546,29 @@ def _entrypoint_provenance(raw_command: str, executable_token: str) -> dict[str,
         "script_count": len(scripts),
         "scripts": [_script_identity(token) for token in scripts],
     }
+
+
+def _process_graph() -> dict[int, int]:
+    """Build a pid -> ppid graph over **every** process on the host.
+
+    Ancestry and detail collection are separate concerns.  The inventory only
+    emits in-scope processes (secret-safe view), but a chain from an in-scope
+    process to its launchd label may pass through an out-of-scope ancestor such
+    as a shell wrapper.  Walking only in-scope rows breaks at that gap and
+    misreports the descendant.  This graph closes the gap without widening what
+    the inventory publishes.
+    """
+
+    graph: dict[int, int] = {}
+    try:
+        result = _run(["ps", "ax", "-o", "pid=,ppid="])
+    except Phase0InventoryError:  # pragma: no cover - platform guard
+        return graph
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            graph[int(fields[0])] = int(fields[1])
+    return graph
 
 
 def _process_inventory(root: Path) -> list[dict[str, object]]:
@@ -582,7 +612,10 @@ def _process_inventory(root: Path) -> list[dict[str, object]]:
     return rows
 
 
-def _observer_pid_chain(by_pid: Mapping[int, Mapping[str, object]]) -> frozenset[int]:
+def _observer_pid_chain(
+    by_pid: Mapping[int, Mapping[str, object]],
+    graph: Mapping[int, int],
+) -> frozenset[int]:
     """Return the pids of *this* inventory run's own ancestry.
 
     Only the collector process and the pids reachable by walking its ``ppid``
@@ -603,15 +636,17 @@ def _observer_pid_chain(by_pid: Mapping[int, Mapping[str, object]]) -> frozenset
         seen.add(cursor)
         if cursor in by_pid:
             chain.add(cursor)
-        row = by_pid.get(cursor)
-        parent = row.get("ppid") if row else None
-        if isinstance(parent, int):
-            cursor = parent
-            continue
-        try:
-            cursor = os.getppid() if cursor == os.getpid() else None
-        except OSError:  # pragma: no cover - platform guard
-            cursor = None
+        parent = graph.get(cursor)
+        if parent is None:
+            row = by_pid.get(cursor)
+            candidate = row.get("ppid") if row else None
+            parent = candidate if isinstance(candidate, int) else None
+        if parent is None and cursor == os.getpid():
+            try:
+                parent = os.getppid()
+            except OSError:  # pragma: no cover - platform guard
+                parent = None
+        cursor = parent
     return frozenset(chain)
 
 
@@ -619,6 +654,7 @@ def resolve_process_mapping(
     processes: Iterable[Mapping[str, object]],
     launchctl: Iterable[Mapping[str, object]],
     *,
+    process_graph: Mapping[int, int] | None = None,
     approved_provenance: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Decide which observed processes are accounted for by launchd.
@@ -666,25 +702,38 @@ def resolve_process_mapping(
         if isinstance(pid, int):
             by_pid[pid] = row
 
-    observer_pids = _observer_pid_chain(by_pid)
+    graph: Mapping[int, int] = process_graph if process_graph is not None else {}
+    observer_pids = _observer_pid_chain(by_pid, graph)
 
     mapped: list[dict[str, object]] = []
     unmapped: list[dict[str, object]] = []
     observers: list[dict[str, object]] = []
+    indeterminate: list[dict[str, object]] = []
     for pid in sorted(by_pid):
         row = by_pid[pid]
         chain: list[int] = []
         cursor: int | None = pid
         label: str | None = None
         seen: set[int] = set()
+        ancestry_complete = True
         while isinstance(cursor, int) and cursor not in seen:
             seen.add(cursor)
             if cursor in label_pids:
                 label = label_pids[cursor]
                 break
             chain.append(cursor)
-            parent = by_pid.get(cursor, {}).get("ppid")
-            cursor = parent if isinstance(parent, int) else None
+            parent = graph.get(cursor)
+            if parent is None:
+                parent_row = by_pid.get(cursor, {}).get("ppid")
+                parent = parent_row if isinstance(parent_row, int) else None
+            if parent is None or parent == 0 or parent == cursor:
+                # Reaching init (pid 1, whose parent is reported as 0) is a
+                # complete chain that simply never met a label.  A parent that
+                # is genuinely absent from the graph means the process exited
+                # mid-scan, and that verdict is unknown rather than clean.
+                ancestry_complete = cursor == 1 or parent == 0 or parent == cursor
+                break
+            cursor = parent
 
         entry: dict[str, object] = {
             "pid": pid,
@@ -693,6 +742,8 @@ def resolve_process_mapping(
         }
         if label is None and pid in observer_pids:
             observers.append({**entry, "basis": "inventory_process_ancestry"})
+        elif label is None and not ancestry_complete:
+            indeterminate.append({**entry, "reason": "ancestry_incomplete"})
         elif label is None:
             unmapped.append(entry)
         else:
@@ -703,7 +754,7 @@ def resolve_process_mapping(
         by_pid,
         approved_provenance=approved_provenance,
     )
-    lineage_pass = not unmapped
+    lineage_pass = not unmapped and not indeterminate
     provenance_verdict = provenance["verdict"]
     if provenance_verdict == "unverified":
         overall: bool | None = None
@@ -728,6 +779,8 @@ def resolve_process_mapping(
         ),
         "mapped": mapped,
         "observer_processes": observers,
+        "indeterminate": indeterminate,
+        "indeterminate_processes": len(indeterminate),
         "unmapped": unmapped,
         "unmapped_processes": len(unmapped),
         "loaded_label_pids": len(label_pids),
@@ -735,6 +788,59 @@ def resolve_process_mapping(
         "entrypoint_provenance": provenance,
         "pass": overall,
     }
+
+
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+REQUIRED_APPROVAL_FIELDS = ("interpreter_binary_sha256", "interpreter_realpath_sha256")
+REQUIRED_SCRIPT_FIELDS = ("parent_path_sha256", "file_sha256")
+
+
+def _validate_approval_policy(
+    approved_provenance: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Reject an approval policy that is not fully specified.
+
+    Every field is mandatory.  An omitted, ``None``, empty, or malformed value
+    is a policy error, never a wildcard: treating a missing digest as "matches
+    anything" would silently downgrade the control that this module exists to
+    enforce.  A partially specified label therefore fails closed rather than
+    approving whatever it did not mention.
+    """
+
+    errors: list[dict[str, object]] = []
+
+    def _bad(label: str, field: str, reason: str) -> None:
+        errors.append({"launchd_label": label, "field": field, "reason": reason})
+
+    for label, expected in approved_provenance.items():
+        if not isinstance(expected, Mapping):
+            _bad(label, "<root>", "not_a_mapping")
+            continue
+        for field in REQUIRED_APPROVAL_FIELDS:
+            if field not in expected:
+                _bad(label, field, "missing")
+            elif not isinstance(expected[field], str) or not SHA256_RE.match(str(expected[field])):
+                _bad(label, field, "not_a_sha256")
+        scripts = expected.get("scripts")
+        if "scripts" not in expected:
+            _bad(label, "scripts", "missing")
+        elif not isinstance(scripts, (list, tuple)):
+            _bad(label, "scripts", "not_a_sequence")
+        elif not scripts:
+            _bad(label, "scripts", "empty")
+        else:
+            for index, script in enumerate(scripts):
+                if not isinstance(script, Mapping):
+                    _bad(label, f"scripts[{index}]", "not_a_mapping")
+                    continue
+                for field in REQUIRED_SCRIPT_FIELDS:
+                    if field not in script:
+                        _bad(label, f"scripts[{index}].{field}", "missing")
+                    elif not isinstance(script[field], str) or not SHA256_RE.match(
+                        str(script[field])
+                    ):
+                        _bad(label, f"scripts[{index}].{field}", "not_a_sha256")
+    return errors
 
 
 def _resolve_entrypoint_provenance(
@@ -763,6 +869,16 @@ def _resolve_entrypoint_provenance(
         return {
             "verdict": "unverified",
             "reason": "approved_provenance not supplied",
+            "unapproved": [],
+            "unapproved_processes": 0,
+        }
+
+    policy_errors = _validate_approval_policy(approved_provenance)
+    if policy_errors:
+        return {
+            "verdict": "approval_policy_invalid",
+            "reason": "approved_provenance is not fully specified",
+            "policy_errors": policy_errors,
             "unapproved": [],
             "unapproved_processes": 0,
         }
@@ -799,8 +915,7 @@ def _resolve_entrypoint_provenance(
             ("binary_sha256", "interpreter_binary_sha256"),
             ("realpath_sha256", "interpreter_realpath_sha256"),
         ):
-            wanted = expected.get(key)
-            if wanted is not None and interpreter.get(field) != wanted:
+            if interpreter.get(field) != expected[key]:
                 reasons.append(f"{key}_mismatch")
 
         expected_scripts = expected.get("scripts")
@@ -816,9 +931,8 @@ def _resolve_entrypoint_provenance(
                 if not isinstance(want, Mapping) or not isinstance(seen, Mapping):
                     reasons.append(f"script_{index}_not_comparable")
                     continue
-                for key in ("parent_path_sha256", "file_sha256"):
-                    wanted = want.get(key)
-                    if wanted is not None and seen.get(key) != wanted:
+                for key in REQUIRED_SCRIPT_FIELDS:
+                    if seen.get(key) != want[key]:
                         reasons.append(f"script_{index}_{key}_mismatch")
 
         if reasons:
@@ -1146,7 +1260,11 @@ def build_inventory(root: Path, *, home: Path | None = None) -> dict[str, object
     runtime = {
         "launchctl": launchctl,
         "processes": processes,
-        "process_mapping": resolve_process_mapping(processes, launchctl),
+        "process_mapping": resolve_process_mapping(
+            processes,
+            launchctl,
+            process_graph=_process_graph(),
+        ),
         "cron": _cron_inventory(),
         "docker": _docker_inventory(),
     }
