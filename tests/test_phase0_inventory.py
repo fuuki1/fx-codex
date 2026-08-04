@@ -1,0 +1,626 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+import json
+from pathlib import Path
+import plistlib
+import sqlite3
+import subprocess
+import sys
+from typing import Any, cast
+
+from tools import phase0_inventory
+
+
+def _git(root: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_inventory_is_hash_bound_and_does_not_export_secret_values(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    _git(root, "init")
+    _git(root, "config", "user.name", "Phase Zero")
+    _git(root, "config", "user.email", "phase0@example.invalid")
+    secret = "secret-fixture"
+    (root / "README.md").write_text("baseline\n", encoding="utf-8")
+    _git(root, "add", "README.md")
+    _git(root, "commit", "-m", f"baseline {secret}")
+    (root / "README.md").write_text("dirty\n", encoding="utf-8")
+    (root / ".env.local").write_text(f"API_TOKEN={secret}\n", encoding="utf-8")
+
+    logs = root / "logs"
+    logs.mkdir()
+    now = datetime(2026, 8, 2, tzinfo=UTC)
+    rows = [
+        {"event_time": now.isoformat(), "available_time": now.isoformat(), "value": 1},
+        {
+            "event_time": (now - timedelta(minutes=1)).isoformat(),
+            "available_time": now.isoformat(),
+            "value": 2,
+        },
+    ]
+    (logs / "events.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows) + "not-json\n",
+        encoding="utf-8",
+    )
+    database = logs / "state.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE evidence(id TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute("INSERT INTO evidence VALUES('row-1', 'private-row-value')")
+    connection.commit()
+    connection.close()
+    config = root / "config"
+    config.mkdir()
+    (config / "risk_policy.json").write_text(
+        json.dumps({"max_loss": 1, "nested": {"private": "not-exported"}}),
+        encoding="utf-8",
+    )
+
+    plist_path = home / "Library" / "LaunchAgents" / "com.fx-codex.test.plist"
+    with plist_path.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": "com.fx-codex.test",
+                "ProgramArguments": [
+                    "python",
+                    "worker.py",
+                    "--auth",
+                    secret,
+                    f"postgres://user:{secret}@localhost/db",
+                ],
+                "EnvironmentVariables": {"FX_API_TOKEN": secret},
+            },
+            handle,
+        )
+
+    monkeypatch.setattr(phase0_inventory, "_launchctl_inventory", lambda: [])
+    monkeypatch.setattr(phase0_inventory, "_process_inventory", lambda _root: [])
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_cron_inventory",
+        lambda: {"available": False, "entry_count": 0, "sha256": None},
+    )
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_docker_inventory",
+        lambda: {"available": False, "containers": []},
+    )
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_runtime_environment_inventory",
+        lambda _root: {"pip_check_ok": True},
+    )
+
+    inventory = cast(dict[str, Any], phase0_inventory.build_inventory(root, home=home))
+    encoded = json.dumps(inventory, sort_keys=True)
+
+    assert inventory["contract"] == "fx-codex-phase0-inventory-v2"
+    assert inventory["git"]["status_counts"] == {
+        "tracked": 1,
+        "untracked": 4,
+        "deleted": 0,
+        "sensitive_paths": 1,
+    }
+    assert len(str(inventory["inventory_sha256"])) == 64
+    assert secret not in encoded
+    assert "private-row-value" not in encoded
+    assert "not-exported" not in encoded
+    assert "FX_API_TOKEN" in encoded
+    assert inventory["environment_files"][0]["key_names"] == ["API_TOKEN"]
+    assert inventory["environment_files"][0]["sha256_omitted"] == "sensitive_path"
+    assert "program_arguments" not in encoded
+    assert len(str(inventory["launchd_plists"][0]["safe_view_sha256"])) == 64
+    jsonl = inventory["data_stores"]["jsonl"][0]
+    assert jsonl["rows"] == 3
+    assert jsonl["malformed_rows"] == 1
+    assert jsonl["timestamp_reversals"] == 1
+    sqlite = inventory["data_stores"]["sqlite"][0]
+    assert sqlite["integrity_check"] == "ok"
+    assert sqlite["tables"] == [{"name": "evidence", "rows": 1}]
+
+
+def test_runtime_inventory_preserves_virtual_environment_entrypoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "repo"
+    executable = root / ".venv" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.symlink_to(Path(sys.executable))
+    commands: list[list[str]] = []
+    timeouts: list[float] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        check: bool = True,
+        timeout: float = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, check
+        commands.append(command)
+        timeouts.append(timeout)
+        return subprocess.CompletedProcess(command, 0, "No broken requirements found.\n", "")
+
+    monkeypatch.setattr(phase0_inventory.sys, "executable", str(executable))
+    monkeypatch.setattr(phase0_inventory.metadata, "distributions", lambda: [])
+    monkeypatch.setattr(phase0_inventory, "_run", fake_run)
+
+    inventory = cast(dict[str, Any], phase0_inventory._runtime_environment_inventory(root))
+
+    assert inventory["python_executable"]["path"] == ".venv/bin/python"
+    assert commands == [[str(executable), "-m", "pip", "check"]]
+    assert timeouts == [30]
+
+
+def test_argument_redaction_covers_environment_headers_urls_and_flag_values() -> None:
+    values = [
+        "FX_API_TOKEN=environment-secret",
+        "Authorization: Bearer header-secret",
+        "https://example.invalid/path?api_key=query-secret&mode=read",
+        "https://discord.com/api/webhooks/123/webhook-secret",
+        "--password",
+        "flag-secret",
+    ]
+
+    redacted = phase0_inventory._redact_arguments(values)
+    encoded = json.dumps(redacted)
+
+    assert redacted[0] == "FX_API_TOKEN=<redacted>"
+    assert redacted[1].endswith(": <redacted>")
+    assert "api_key=<redacted>&mode=read" in redacted[2]
+    assert redacted[3].endswith("/api/webhooks/<redacted>")
+    assert redacted[-2:] == ["--password", "<redacted>"]
+    for secret in (
+        "environment-secret",
+        "header-secret",
+        "query-secret",
+        "webhook-secret",
+        "flag-secret",
+    ):
+        assert secret not in encoded
+
+
+def test_process_inventory_never_exports_unstructured_command_values(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    secret = "proc-fixture"
+    command = (
+        " 12  1 Sat Aug  2 09:00:00 2026 "
+        f"/usr/bin/curl fx-codex -H 'Authorization: Bearer {secret}' "
+        f"--api-token='{secret} with spaces'"
+    )
+
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, command + "\n", ""),
+    )
+
+    inventory = phase0_inventory._process_inventory(tmp_path)
+    encoded = json.dumps(inventory)
+
+    assert len(inventory) == 1
+    assert inventory[0]["executable_basename"] == "curl"
+    assert inventory[0]["command_present"] is True
+    assert len(str(inventory[0]["safe_view_sha256"])) == 64
+    assert "command" not in inventory[0]
+    assert secret not in encoded
+
+
+def test_sqlite_inventory_binds_wal_component_to_row_counts(tmp_path: Path) -> None:
+    root = tmp_path
+    path = root / "live.sqlite3"
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY)")
+    writer.execute("INSERT INTO evidence VALUES(1)")
+    writer.commit()
+
+    inventory = cast(dict[str, Any], phase0_inventory._sqlite_inventory(path, root=root))
+    writer.close()
+
+    component_paths = [row["path"] for row in inventory["components"]]
+    assert "live.sqlite3-wal" in component_paths
+    assert inventory["tables"] == [{"name": "evidence", "rows": 1}]
+    assert inventory["observation_consistency"] == "stable_component_set"
+    assert inventory["row_counts_reproducible_from_component_hashes"] is True
+
+
+def test_sqlite_inventory_never_marks_missing_component_hash_as_reproducible(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+    component = {
+        "path": "state.sqlite3",
+        "kind": "file",
+        "error": "Phase0InventoryError",
+    }
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_sqlite_components",
+        lambda *_args, **_kwargs: [dict(component)],
+    )
+
+    inventory = phase0_inventory._sqlite_inventory(path, root=tmp_path)
+
+    assert inventory["observation_consistency"] == "component_hash_unavailable"
+    assert inventory["row_counts_reproducible_from_component_hashes"] is False
+
+
+def _digest(text: str) -> str:
+    return phase0_inventory._sha256_bytes(text.encode("utf-8"))
+
+
+def _script(parent: str, file_digest: str, basename: str = "worker.py") -> dict[str, object]:
+    return {
+        "parent_path_sha256": _digest(parent),
+        "basename": basename,
+        "file_sha256": file_digest,
+        "file_sha256_unavailable": None,
+    }
+
+
+def _provenance(
+    scripts: list[dict[str, object]],
+    *,
+    interpreter_binary: str = "interp-a",
+    interpreter_realpath: str = "/runtimes/approved/bin/python",
+    status: str = "parsed",
+) -> dict[str, object]:
+    return {
+        "parse_status": status,
+        "parse_reason": None if status == "parsed" else "unrecognised_interpreter",
+        "interpreter": {
+            "version": "3.12",
+            "realpath_sha256": _digest(interpreter_realpath),
+            "binary_sha256": interpreter_binary,
+            "binary_sha256_unavailable": None,
+        },
+        "script_count": len(scripts),
+        "scripts": scripts,
+    }
+
+
+def _process(pid: int, ppid: int, provenance: dict[str, object] | None = None) -> dict[str, object]:
+    row: dict[str, object] = {"pid": pid, "ppid": ppid, "executable_basename": "Python"}
+    if provenance is not None:
+        row["entrypoint_provenance"] = provenance
+    return row
+
+
+def _label(pid: int | None, label: str) -> dict[str, object]:
+    return {"pid": pid, "label": label, "last_exit_status": 0}
+
+
+def _approval(scripts: list[dict[str, object]], interpreter_binary: str = "interp-a"):
+    return {
+        "interpreter_binary_sha256": interpreter_binary,
+        "interpreter_realpath_sha256": _digest("/runtimes/approved/bin/python"),
+        "scripts": [
+            {"parent_path_sha256": s["parent_path_sha256"], "file_sha256": s["file_sha256"]}
+            for s in scripts
+        ],
+    }
+
+
+QUOTE_SCRIPTS = [
+    _script("/srv/approved/tools", "wrapper-sha", "run_exclusive.py"),
+    _script("/srv/approved/tools", "child-sha", "quote_tape_index.py"),
+]
+DASH_SCRIPTS = [_script("/srv/approved/dash", "dash-sha", "server.py")]
+
+
+def test_run_exclusive_child_is_mapped_through_its_launchd_parent() -> None:
+    """Regression: the false positive that blocked Gate 0 on 2026-08-03."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(63256, 1, _provenance(QUOTE_SCRIPTS))],
+        [_label(63256, "com.fx-codex.quote-index")],
+        approved_provenance={"com.fx-codex.quote-index": _approval(QUOTE_SCRIPTS)},
+    )
+
+    assert mapping["unmapped_processes"] == 0
+    assert mapping["pass"] is True
+
+
+def test_wrapper_and_child_are_both_verified() -> None:
+    """A tampered child must fail even when the wrapper is approved."""
+
+    tampered = [
+        QUOTE_SCRIPTS[0],
+        _script("/srv/approved/tools", "CHILD-TAMPERED", "quote_tape_index.py"),
+    ]
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(63256, 1, _provenance(tampered))],
+        [_label(63256, "com.fx-codex.quote-index")],
+        approved_provenance={"com.fx-codex.quote-index": _approval(QUOTE_SCRIPTS)},
+    )
+
+    assert mapping["pass"] is False
+    reason = cast(list[Any], cast(dict[str, Any], mapping["entrypoint_provenance"])["unapproved"])[
+        0
+    ]
+    assert reason["reason"] == "script_1_file_sha256_mismatch"
+
+
+def test_same_directory_content_change_is_detected() -> None:
+    """Editing a file in place inside an approved directory must fail."""
+
+    edited = [_script("/srv/approved/dash", "EDITED-IN-PLACE", "server.py")]
+    assert edited[0]["parent_path_sha256"] == DASH_SCRIPTS[0]["parent_path_sha256"]
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(11764, 1, _provenance(edited))],
+        [_label(11764, "com.fx-codex.dashboard")],
+        approved_provenance={"com.fx-codex.dashboard": _approval(DASH_SCRIPTS)},
+    )
+
+    assert mapping["pass"] is False
+    reason = cast(list[Any], cast(dict[str, Any], mapping["entrypoint_provenance"])["unapproved"])[
+        0
+    ]
+    assert reason["reason"] == "script_0_file_sha256_mismatch"
+
+
+def test_cross_service_substitution_is_rejected() -> None:
+    """A digest approved for one label must not satisfy another."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(11764, 1, _provenance(DASH_SCRIPTS))],
+        [_label(11764, "com.fx-codex.dashboard")],
+        approved_provenance={
+            "com.fx-codex.dashboard": _approval(QUOTE_SCRIPTS),
+            "com.fx-codex.quote-index": _approval(DASH_SCRIPTS),
+        },
+    )
+
+    assert mapping["pass"] is False
+    reason = cast(list[Any], cast(dict[str, Any], mapping["entrypoint_provenance"])["unapproved"])[
+        0
+    ]
+    assert "script_count_mismatch" in reason["reason"]
+
+
+def test_same_version_different_interpreter_is_rejected() -> None:
+    """Two 3.12 builds differ by binary identity, not by version string."""
+
+    other = _provenance(DASH_SCRIPTS, interpreter_binary="interp-B-homebrew")
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(11764, 1, other)],
+        [_label(11764, "com.fx-codex.dashboard")],
+        approved_provenance={"com.fx-codex.dashboard": _approval(DASH_SCRIPTS)},
+    )
+
+    assert mapping["pass"] is False
+    reason = cast(list[Any], cast(dict[str, Any], mapping["entrypoint_provenance"])["unapproved"])[
+        0
+    ]
+    assert reason["reason"] == "interpreter_binary_sha256_mismatch"
+
+
+def test_indeterminate_command_does_not_pass() -> None:
+    """An unparsable command must fail, never be waved through."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(500, 1, _provenance([], status="indeterminate"))],
+        [_label(500, "com.fx-codex.dashboard")],
+        approved_provenance={"com.fx-codex.dashboard": _approval(DASH_SCRIPTS)},
+    )
+
+    assert mapping["pass"] is False
+    reason = cast(list[Any], cast(dict[str, Any], mapping["entrypoint_provenance"])["unapproved"])[
+        0
+    ]
+    assert reason["reason"] == "provenance_indeterminate"
+
+
+def test_unlisted_label_is_rejected() -> None:
+    """A label absent from the approval map cannot pass."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(900, 1, _provenance(DASH_SCRIPTS))],
+        [_label(900, "com.fx-codex.newcomer")],
+        approved_provenance={"com.fx-codex.dashboard": _approval(DASH_SCRIPTS)},
+    )
+
+    assert mapping["pass"] is False
+    reason = cast(list[Any], cast(dict[str, Any], mapping["entrypoint_provenance"])["unapproved"])[
+        0
+    ]
+    assert reason["reason"] == "label_not_approved"
+
+
+def test_observation_mode_yields_none_not_true() -> None:
+    """No approved values: collect provenance, judge nothing."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(63256, 1, _provenance(QUOTE_SCRIPTS))],
+        [_label(63256, "com.fx-codex.quote-index")],
+    )
+
+    assert mapping["lineage_pass"] is True
+    assert mapping["pass"] is None
+    assert cast(dict[str, Any], mapping["entrypoint_provenance"])["verdict"] == "unverified"
+
+
+def test_manually_started_process_is_unmapped() -> None:
+    mapping = phase0_inventory.resolve_process_mapping(
+        [
+            _process(55195, 63592, _provenance(DASH_SCRIPTS)),
+            _process(11764, 1, _provenance(DASH_SCRIPTS)),
+        ],
+        [_label(11764, "com.fx-codex.dashboard")],
+        approved_provenance={"com.fx-codex.dashboard": _approval(DASH_SCRIPTS)},
+    )
+
+    assert mapping["unmapped_processes"] == 1
+    assert mapping["pass"] is False
+    assert cast(list[Any], mapping["unmapped"])[0]["pid"] == 55195
+
+
+def test_ppid_cycle_terminates() -> None:
+    mapping = phase0_inventory.resolve_process_mapping(
+        [_process(10, 11), _process(11, 10)],
+        [_label(99, "com.fx-codex.briefing")],
+    )
+
+    assert mapping["unmapped_processes"] == 2
+
+
+def test_mapping_does_not_pin_literal_pid_values() -> None:
+    first = phase0_inventory.resolve_process_mapping(
+        [_process(63256, 1, _provenance(QUOTE_SCRIPTS))],
+        [_label(63256, "com.fx-codex.quote-index")],
+        approved_provenance={"com.fx-codex.quote-index": _approval(QUOTE_SCRIPTS)},
+    )
+    rotated = phase0_inventory.resolve_process_mapping(
+        [_process(79718, 1, _provenance(QUOTE_SCRIPTS))],
+        [_label(79718, "com.fx-codex.quote-index")],
+        approved_provenance={"com.fx-codex.quote-index": _approval(QUOTE_SCRIPTS)},
+    )
+
+    assert first["pass"] == rotated["pass"] is True
+
+
+def test_script_identity_separates_path_from_content(tmp_path: Path) -> None:
+    """parent_path_sha256 is a path-string hash; file_sha256 is content."""
+
+    script = tmp_path / "worker.py"
+    script.write_text("original\n", encoding="utf-8")
+    before = phase0_inventory._script_identity(str(script))
+    script.write_text("modified\n", encoding="utf-8")
+    after = phase0_inventory._script_identity(str(script))
+
+    assert before["parent_path_sha256"] == after["parent_path_sha256"]
+    assert before["file_sha256"] != after["file_sha256"]
+    assert before["parent_path_sha256"] == _digest(str(tmp_path))
+
+
+def test_unreadable_script_is_flagged_not_silently_null(tmp_path: Path) -> None:
+    identity = phase0_inventory._script_identity(str(tmp_path / "missing.py"))
+
+    assert identity["file_sha256"] is None
+    assert identity["file_sha256_unavailable"] == "unreadable"
+
+
+def test_entrypoint_provenance_records_wrapper_and_child_in_order(tmp_path: Path) -> None:
+    wrapper = tmp_path / "run_exclusive.py"
+    child = tmp_path / "quote_tape_index.py"
+    wrapper.write_text("w\n", encoding="utf-8")
+    child.write_text("c\n", encoding="utf-8")
+    command = f"/usr/bin/python3.12 {wrapper} --name fx-quote-index -- {child} --db x"
+
+    record = phase0_inventory._entrypoint_provenance(command, "/usr/bin/python3.12")
+
+    assert record["parse_status"] == "parsed"
+    assert record["script_count"] == 2
+    scripts = cast(list[Any], record["scripts"])
+    assert scripts[0]["basename"] == "run_exclusive.py"
+    assert scripts[1]["basename"] == "quote_tape_index.py"
+    assert scripts[0]["file_sha256"] != scripts[1]["file_sha256"]
+    assert str(tmp_path) not in json.dumps(record)
+
+
+def test_command_without_script_token_is_indeterminate() -> None:
+    record = phase0_inventory._entrypoint_provenance(
+        "/usr/bin/curl https://example.invalid", "/usr/bin/curl"
+    )
+
+    assert record["parse_status"] == "indeterminate"
+    assert record["parse_reason"] == "no_script_token"
+
+
+def test_macos_framework_interpreter_version_is_recovered_from_path(tmp_path: Path) -> None:
+    """Real deployment shape: basename is ``Python`` with no version digits.
+
+    Observed on trader-mini 2026-08-04; parsing only the basename reported
+    every service as indeterminate.
+    """
+
+    binary = tmp_path / "Versions" / "3.12" / "Resources" / "Python.app" / "MacOS" / "Python"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("interpreter\n", encoding="utf-8")
+
+    identity = phase0_inventory._interpreter_identity(str(binary))
+
+    assert identity["version"] == "3.12"
+    assert identity["binary_sha256"] is not None
+
+
+def test_framework_interpreter_command_parses(tmp_path: Path) -> None:
+    binary = tmp_path / "Versions" / "3.12" / "MacOS" / "Python"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("i\n", encoding="utf-8")
+    script = tmp_path / "server.py"
+    script.write_text("s\n", encoding="utf-8")
+
+    record = phase0_inventory._entrypoint_provenance(f"{binary} {script} --port 8788", str(binary))
+
+    assert record["parse_status"] == "parsed"
+    assert cast(dict[str, Any], record["interpreter"])["version"] == "3.12"
+
+
+def test_observer_classification_is_limited_to_this_runs_ancestry(monkeypatch) -> None:
+    """Only the collector's own lineage is an observer; ssh alone is not."""
+
+    monkeypatch.setattr(phase0_inventory.os, "getpid", lambda: 900)
+    processes = [
+        {"pid": 900, "ppid": 800, "executable_basename": "Python"},
+        {"pid": 800, "ppid": 1, "executable_basename": "sshd-session"},
+        {"pid": 49499, "ppid": 41598, "executable_basename": "ssh"},
+    ]
+
+    mapping = phase0_inventory.resolve_process_mapping(processes, [])
+
+    observers = {row["pid"] for row in cast(list[Any], mapping["observer_processes"])}
+    unmapped = {row["pid"] for row in cast(list[Any], mapping["unmapped"])}
+
+    assert observers == {900, 800}
+    assert unmapped == {49499}
+    assert mapping["unmapped_processes"] == 1
+
+
+def test_unknown_ssh_listener_and_writer_are_not_excused(monkeypatch) -> None:
+    """Name-based exclusion would hide exactly these; ancestry must not."""
+
+    monkeypatch.setattr(phase0_inventory.os, "getpid", lambda: 900)
+    processes = [
+        {"pid": 900, "ppid": 1, "executable_basename": "Python"},
+        {"pid": 111, "ppid": 1, "executable_basename": "ssh"},
+        {"pid": 222, "ppid": 1, "executable_basename": "Python"},
+    ]
+
+    mapping = phase0_inventory.resolve_process_mapping(processes, [])
+
+    assert {row["pid"] for row in cast(list[Any], mapping["unmapped"])} == {111, 222}
+    assert mapping["lineage_pass"] is False
+
+
+def test_observer_basis_is_recorded() -> None:
+    mapping = phase0_inventory.resolve_process_mapping(
+        [{"pid": phase0_inventory.os.getpid(), "ppid": 1, "executable_basename": "Python"}],
+        [],
+    )
+
+    observers = cast(list[Any], mapping["observer_processes"])
+    assert observers[0]["basis"] == "inventory_process_ancestry"
