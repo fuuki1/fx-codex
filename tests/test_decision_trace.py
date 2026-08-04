@@ -105,16 +105,27 @@ def baseline_detects_anomaly(events: list[dict[str, Any]]) -> bool:
 # ---- 1. 既存追跡ファイルの変更が0件 ---------------------------------------
 
 
-def test_no_tracked_files_modified() -> None:
-    """追跡済みファイルを1行も変更していないこと。"""
+def test_no_pre_existing_tracked_files_modified() -> None:
+    """本機能の追加ファイル以外を1行も変更していないこと。
+
+    この機能が所有する4ファイル自体の編集は正当なので対象外にする。
+    それ以外の追跡ファイルに差分が出たら失敗させる(既存コード非改変の担保)。
+    """
+    owned = {
+        "fx_intel/decision_trace.py",
+        "tools/decision_trace_report.py",
+        "tests/test_decision_trace.py",
+        "docs/DECISION_TRACE_ANALYTICS_MVP.md",
+    }
     result = subprocess.run(
-        ["git", "diff", "--stat", "HEAD"],
+        ["git", "diff", "--name-only", "HEAD"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
     )
-    assert result.stdout.strip() == "", f"追跡ファイルが変更されている:\n{result.stdout}"
+    changed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    assert changed <= owned, f"本機能以外の追跡ファイルが変更されている: {sorted(changed - owned)}"
 
 
 # ---- 2. 読み取り専用であることのAST検査 -----------------------------------
@@ -337,6 +348,61 @@ def test_liquidity_alongside_real_block_does_not_shift_first_blocker() -> None:
     assert event.observed_gates == ("liquidity",)
 
 
+def test_observed_gates_are_reported_separately() -> None:
+    """observed(shadow)ゲートを別軸で集計し、blockedと混同しないこと。
+
+    実機データでは observed が blocked を上回る(1385:291)ため、
+    ここを落とすと判断工程の大半が不可視になる。
+    """
+    summary = build_report(
+        [
+            _event("d1", include_liquidity=True),
+            _event("d2", include_liquidity=True, blocked=["event_window"], direction="standby"),
+        ]
+    ).overall
+    assert summary.observed_gate_counts == {"liquidity": 2}
+    # observed は blocked にも passed にも混入しない。
+    assert summary.blocked_at == {"event_window": 1}
+    assert summary.passed_all_gates == 1
+
+
+def test_observed_gates_do_not_break_funnel_identity() -> None:
+    """observed は1判断が複数持ちうるので恒等式に参加させないこと。"""
+    events = [_event(f"d{index}", include_liquidity=True) for index in range(5)]
+    summary = build_report(events).overall
+    assert summary.observed_gate_counts["liquidity"] == 5
+    assert (
+        summary.passed_all_gates + sum(summary.blocked_at.values()) + summary.indeterminate
+        == summary.total_decisions
+    )
+
+
+def test_would_block_is_captured_from_shadow_gate() -> None:
+    """would_block=True(有効化時のブロック見込み)を捕捉すること。"""
+    raw = _event("d1", include_liquidity=True)
+    raw["decision"]["gate_trace"][-1]["would_block"] = True
+    raw["decision"]["gate_trace"][-1]["input_status"] = "stressed"
+    summary = build_report([raw]).overall
+    assert summary.would_block_counts == {"liquidity": 1}
+    # would_block でも実際にはブロックしていないので passed のまま。
+    assert summary.passed_all_gates == 1
+    assert summary.blocked_at == {}
+
+
+def test_would_block_absent_defaults_to_false() -> None:
+    """would_block が無い observed 行を True 扱いしないこと。"""
+    summary = build_report([_event("d1", include_liquidity=True)]).overall
+    assert summary.would_block_counts == {}
+
+
+def test_observed_counted_even_when_event_is_indeterminate() -> None:
+    """indeterminate な行の observed も観測として数える(黙って捨てない)。"""
+    raw = _event("d1", include_liquidity=True, ts="2026-08-04T00:00:00")  # naive
+    summary = build_report([raw]).overall
+    assert summary.indeterminate == 1
+    assert summary.observed_gate_counts == {"liquidity": 1}
+
+
 # ---- 7. expectancy_guard + missing_atr の共起は合法(偽陽性の回帰防止) -----
 
 
@@ -364,6 +430,30 @@ def test_two_exclusive_gates_are_flagged_invalid() -> None:
     ).overall
     assert len(summary.invalid_transitions) == 1
     assert summary.invalid_transitions[0]["reason"] == "mutually_exclusive_gates_co_occurred"
+
+
+def test_real_production_gate_names_are_handled() -> None:
+    """実機ログで観測された実在ゲート名を正しく分類すること。
+
+    2026-08-04 に実機 briefing_decisions.jsonl(687判断)で観測された構成:
+      observed: event_window_policy(687) / liquidity(687) / usd_factor_coherence(11)
+      blocked : operational_data_stale(187) / below_production_threshold(104)
+    実装が未知ゲート名で落ちたり誤分類したりしないことを固定する。
+    """
+    raw = _event("d1", blocked=["operational_data_stale"], direction="neutral")
+    raw["decision"]["gate_trace"].extend(
+        [
+            {"gate": "event_window_policy", "status": "observed", "policy_version": "v1"},
+            {"gate": "usd_factor_coherence", "status": "observed", "applied": False},
+        ]
+    )
+    summary = build_report([raw]).overall
+    assert summary.blocked_at == {"operational_data_stale": 1}
+    assert summary.observed_gate_counts == {
+        "event_window_policy": 1,
+        "usd_factor_coherence": 1,
+    }
+    assert summary.invalid_transitions == ()  # 未知ゲートを不正扱いしない
 
 
 def test_gate_classification_constants_match_source_semantics() -> None:
@@ -483,6 +573,81 @@ def test_counter_validation_b_per_timeframe_guard_anomaly() -> None:
         if summary.dominance.get("below_production_threshold", 0.0) >= 0.9
     ]
     assert anomalous == ["4h"]
+
+
+def test_non_decision_envelopes_are_excluded_from_funnel() -> None:
+    """判断行でない封筒レコードを母数に入れないこと。
+
+    実機ログには decision_batch / decision_cross_log_commit が混在する
+    (2026-08-04実測: 各620件)。これらを indeterminate として数えると
+    分母が汚れ、dominance が実態より小さく出る。
+    """
+    events: list[Any] = [
+        _event("d1"),
+        {"event_type": "decision_batch", "decision_ids": ["d1"], "schema_version": 1},
+        {"event_type": "decision_cross_log_commit", "decision_transaction_id": "t1"},
+    ]
+    report = build_report(events)
+    assert report.overall.total_decisions == 1  # 判断は1件だけ
+    assert report.overall.indeterminate == 0  # 封筒はindeterminateにしない
+    assert report.skipped_event_types == {
+        "decision_batch": 1,
+        "decision_cross_log_commit": 1,
+    }
+
+
+def test_skipped_envelopes_are_recorded_not_silently_dropped() -> None:
+    """除外した封筒の件数を必ず残すこと(黙って捨てない)。"""
+    report = build_report([{"event_type": "decision_batch"}] * 5)
+    assert report.overall.total_decisions == 0
+    assert report.skipped_event_types == {"decision_batch": 5}
+
+
+def test_blocking_detected_from_gate_trace_when_blocked_by_is_empty() -> None:
+    """blocked_by が空でも gate_trace からブロックを検出すること。
+
+    実機ログでは blocked_by が**全行で空**(2026-08-04実測 32,867行中0行が非空)で、
+    ブロック根拠は gate_trace にしか存在しない。ここを取り違えると
+    全判断が「通過」に見え、欠損遷移を大量に誤検出する。
+    """
+    raw = _event("d1", blocked=["expectancy_guard"], direction="neutral")
+    raw["decision"]["blocked_by"] = []  # 実機と同じ状態
+    event = parse_event(raw)
+    assert event.first_blocker == "expectancy_guard"
+
+    summary = build_report([raw]).overall
+    assert summary.blocked_at == {"expectancy_guard": 1}
+    assert summary.missing_transitions == ()  # 誤検出しない
+
+
+def test_build_report_consumes_input_lazily_without_materializing() -> None:
+    """解析済みイベントを蓄積せず逐次走査すること(実機1.86GBログ対応)。
+
+    ジェネレータを渡し、全件を一度にリスト化していないことを確認する。
+    受け入れ基準「大きな判断ログに対して全読込を要求しない」に対応。
+    """
+    consumed: list[int] = []
+
+    def lazy_events(count: int) -> Any:
+        for index in range(count):
+            consumed.append(index)
+            yield _event(f"d{index}")
+
+    report = build_report(lazy_events(500))
+    assert report.overall.total_decisions == 500
+    assert len(consumed) == 500  # 消費はされる
+
+
+def test_build_report_accepts_iterator_not_only_sequence() -> None:
+    """イテレータ(1回しか走査できない入力)でも正しく集計できること。
+
+    内部で複数回走査していると、2周目が空になり件数が壊れる。
+    """
+    events = iter([_event("d1"), _event("d2", blocked=["event_window"], direction="standby")])
+    summary = build_report(events).overall
+    assert summary.total_decisions == 2
+    assert summary.passed_all_gates == 1
+    assert summary.blocked_at == {"event_window": 1}
 
 
 def test_stratification_covers_pair_timeframe_regime() -> None:

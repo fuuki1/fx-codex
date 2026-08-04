@@ -86,6 +86,13 @@ INDEPENDENT_GATES: Final[frozenset[str]] = frozenset({"expectancy_guard", "missi
 _UNKNOWN: Final[str] = "unknown"
 _GATE_LATENCY_UNMEASURABLE_REASON: Final[str] = "gate_level_timestamps_absent"
 
+# 判断ログには判断行以外の封筒レコードが混在する(2026-08-04実機実測:
+# decision_batch 620件 / decision_cross_log_commit 620件)。これらは判断ではないので
+# ファネルの母数に入れると分母が汚れる。判断として数えず、件数だけを別に残す。
+NON_DECISION_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {"decision_batch", "decision_cross_log_commit"}
+)
+
 
 class FunnelReconciliationError(RuntimeError):
     """ファネルの件数恒等式が破れた場合に送出する。
@@ -97,11 +104,17 @@ class FunnelReconciliationError(RuntimeError):
 
 @dataclass(frozen=True)
 class GateRecord:
-    """gate_trace の1行。status は "blocked" か "observed" のみ。"""
+    """gate_trace の1行。status は "blocked" か "observed" のみ。
+
+    `would_block` は observed(shadow)行だけが持つ反実仮想シグナルで、
+    「有効化されていたらブロックしていた」ことを示す。適用はされていない
+    (`applied: False`)ので、blocked とは絶対に混同しない。
+    """
 
     name: str
     status: str
     order_index: int
+    would_block: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +163,11 @@ class FunnelSummary:
     dominance: dict[str, float]
     invalid_transitions: tuple[dict[str, Any], ...] = ()
     missing_transitions: tuple[dict[str, Any], ...] = ()
+    # observed(shadow)ゲートの出現件数。blocked とは別集計で、ファネルの
+    # 件数恒等式には**参加しない**(1判断が複数のobserved行を持ちうるため)。
+    observed_gate_counts: dict[str, int] = field(default_factory=dict)
+    # observed のうち would_block=True だった件数(有効化時のブロック見込み)。
+    would_block_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -163,6 +181,8 @@ class TraceReport:
     by_cell: dict[str, FunnelSummary] = field(default_factory=dict)
     latency: dict[str, Any] = field(default_factory=dict)
     parse_reason_counts: dict[str, int] = field(default_factory=dict)
+    # 判断行でないため母数から除いた封筒レコードの件数(黙って捨てず記録する)。
+    skipped_event_types: dict[str, int] = field(default_factory=dict)
 
 
 def _as_mapping(value: object) -> Mapping[str, object] | None:
@@ -226,7 +246,14 @@ def _gate_records(
                 seen_blocked.append(name)
             elif status == "observed":
                 # liquidity のような観測専用行。ブロックではない。
-                records.append(GateRecord(name=name, status="observed", order_index=index))
+                records.append(
+                    GateRecord(
+                        name=name,
+                        status="observed",
+                        order_index=index,
+                        would_block=mapping.get("would_block") is True,
+                    )
+                )
             else:
                 # 未知のstatusは推測せず indeterminate 理由として残す。
                 reasons.append(f"gate_trace_unknown_status:{status or 'empty'}")
@@ -351,7 +378,13 @@ def _invalid_transition(event: TraceEvent) -> dict[str, Any] | None:
 
 
 def _missing_transition(event: TraceEvent) -> dict[str, Any] | None:
-    """final_action=="neutral" かつ blocked_by==[] の判断(欠損遷移)。"""
+    """final_action=="neutral" なのにブロック根拠が無い判断(欠損遷移)。
+
+    根拠の判定は `gate_trace` 由来の blocked を見る。実機ログでは
+    `blocked_by` が**全行で空**(2026-08-04実測 32,867行中0行が非空)であり、
+    ブロック根拠は gate_trace にのみ存在するため、blocked_by だけを見ると
+    正常な判断を大量に誤検出する。
+    """
     if event.final_action != "neutral":
         return None
     if event.blocked_gates:
@@ -372,8 +405,18 @@ def _summarize(events: Sequence[TraceEvent]) -> FunnelSummary:
     indeterminate = 0
     invalid: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
+    observed_counts: dict[str, int] = {}
+    would_block: dict[str, int] = {}
 
     for event in events:
+        # observed はブロックではないので、indeterminate 判定より前に数える。
+        # ファネルの恒等式には参加しない別軸の集計。
+        for gate in event.gates:
+            if gate.status != "observed":
+                continue
+            observed_counts[gate.name] = observed_counts.get(gate.name, 0) + 1
+            if gate.would_block:
+                would_block[gate.name] = would_block.get(gate.name, 0) + 1
         if event.parse_status == "indeterminate":
             indeterminate += 1
             continue
@@ -417,6 +460,8 @@ def _summarize(events: Sequence[TraceEvent]) -> FunnelSummary:
         dominance=dominance,
         invalid_transitions=tuple(invalid),
         missing_transitions=tuple(missing),
+        observed_gate_counts=dict(sorted(observed_counts.items())),
+        would_block_counts=dict(sorted(would_block.items())),
     )
 
 
@@ -473,28 +518,206 @@ def _latency_section(events: Sequence[TraceEvent]) -> dict[str, Any]:
     return section
 
 
+class _Accumulator:
+    """1グループ分の集計状態。TraceEventを保持せず件数だけを持つ。
+
+    実機ログは1.86GBに達するため、解析済みイベントを全件メモリに置くと
+    RSSが数GB規模になる(実測: 20,000行で1.88GB)。集計に必要な統計量だけを
+    逐次畳み込むことで、行数に依存しない一定メモリで走査する。
+    """
+
+    __slots__ = (
+        "total",
+        "passed",
+        "indeterminate",
+        "unknown_status",
+        "blocked_at",
+        "observed_counts",
+        "would_block",
+        "invalid",
+        "missing",
+    )
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.passed = 0
+        self.indeterminate = 0
+        self.unknown_status: str | None = None
+        self.blocked_at: dict[str, int] = {}
+        self.observed_counts: dict[str, int] = {}
+        self.would_block: dict[str, int] = {}
+        self.invalid: list[dict[str, Any]] = []
+        self.missing: list[dict[str, Any]] = []
+
+    def add(self, event: TraceEvent) -> None:
+        self.total += 1
+        for gate in event.gates:
+            if gate.status != "observed":
+                continue
+            self.observed_counts[gate.name] = self.observed_counts.get(gate.name, 0) + 1
+            if gate.would_block:
+                self.would_block[gate.name] = self.would_block.get(gate.name, 0) + 1
+        if event.parse_status == "indeterminate":
+            self.indeterminate += 1
+            return
+        if event.parse_status != "ok":
+            # fail-closed。分類不能を"通過"に落とすと恒等式が偶然成立して隠れる。
+            self.unknown_status = event.parse_status
+            return
+        blocker = event.first_blocker
+        if blocker is None:
+            self.passed += 1
+        else:
+            self.blocked_at[blocker] = self.blocked_at.get(blocker, 0) + 1
+        invalid_row = _invalid_transition(event)
+        if invalid_row is not None:
+            self.invalid.append(invalid_row)
+        missing_row = _missing_transition(event)
+        if missing_row is not None:
+            self.missing.append(missing_row)
+
+    def finish(self) -> FunnelSummary:
+        if self.unknown_status is not None:
+            raise FunnelReconciliationError(f"unknown parse_status: {self.unknown_status!r}")
+        accounted = self.passed + sum(self.blocked_at.values()) + self.indeterminate
+        if accounted != self.total:
+            raise FunnelReconciliationError(
+                "funnel reconciliation failed: "
+                f"passed({self.passed}) + blocked({sum(self.blocked_at.values())}) "
+                f"+ indeterminate({self.indeterminate}) = {accounted} != total({self.total})"
+            )
+        denominator = self.total - self.indeterminate
+        dominance = {
+            name: (count / denominator if denominator > 0 else 0.0)
+            for name, count in sorted(self.blocked_at.items())
+        }
+        return FunnelSummary(
+            total_decisions=self.total,
+            blocked_at=dict(sorted(self.blocked_at.items())),
+            passed_all_gates=self.passed,
+            indeterminate=self.indeterminate,
+            dominance=dominance,
+            invalid_transitions=tuple(self.invalid),
+            missing_transitions=tuple(self.missing),
+            observed_gate_counts=dict(sorted(self.observed_counts.items())),
+            would_block_counts=dict(sorted(self.would_block.items())),
+        )
+
+
+class _LatencyAccumulator:
+    """遅延統計を一定メモリで畳み込む。
+
+    全timestampを保持せず、隣接差分の最小/最大/合計と、中央値近似のための
+    有限個のサンプルのみを持つ。入力順に依存しないよう、判断時刻の
+    最小・最大からspanを求める。
+    """
+
+    __slots__ = ("count", "earliest", "latest", "_stamps")
+
+    # 中央値を出すために保持する最大サンプル数(超過分は捨てて近似する)。
+    _MAX_SAMPLES = 50_000
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.earliest: datetime | None = None
+        self.latest: datetime | None = None
+        self._stamps: list[datetime] = []
+
+    def add(self, ts: datetime | None) -> None:
+        if ts is None:
+            return
+        self.count += 1
+        if self.earliest is None or ts < self.earliest:
+            self.earliest = ts
+        if self.latest is None or ts > self.latest:
+            self.latest = ts
+        if len(self._stamps) < self._MAX_SAMPLES:
+            self._stamps.append(ts)
+
+    def finish(self) -> dict[str, Any]:
+        section: dict[str, Any] = {
+            "per_gate": {
+                "measurable": False,
+                "reason": _GATE_LATENCY_UNMEASURABLE_REASON,
+            },
+            "per_decision": {
+                "measurable": self.count >= 2,
+                "sample_count": self.count,
+            },
+        }
+        if self.count < 2 or self.earliest is None or self.latest is None:
+            section["per_decision"]["reason"] = "insufficient_timestamps"
+            return section
+        stamps = sorted(self._stamps)
+        deltas = sorted(
+            (later - earlier).total_seconds()
+            for earlier, later in zip(stamps, stamps[1:], strict=False)
+        )
+        if not deltas:
+            section["per_decision"]["reason"] = "insufficient_timestamps"
+            return section
+        midpoint = len(deltas) // 2
+        median = (
+            deltas[midpoint]
+            if len(deltas) % 2 == 1
+            else (deltas[midpoint - 1] + deltas[midpoint]) / 2.0
+        )
+        section["per_decision"].update(
+            {
+                "span_seconds": (self.latest - self.earliest).total_seconds(),
+                "min_gap_seconds": deltas[0],
+                "median_gap_seconds": median,
+                "max_gap_seconds": deltas[-1],
+                "median_is_approximate": self.count > self._MAX_SAMPLES,
+            }
+        )
+        return section
+
+
 def build_report(events: Iterable[object]) -> TraceReport:
     """イベント列から MVP レポートを構築する。
 
+    解析済みイベントを蓄積せず**逐次走査**で集計するため、行数に依存しない
+    一定メモリで動作する(実機1.86GBログ対応)。
     同一入力からは決定論的に同一出力を返す(キーは常にsort)。
     """
-    parsed = parse_events(events)
+    overall = _Accumulator()
+    skipped_event_types: dict[str, int] = {}
+    by_pair: dict[str, _Accumulator] = {}
+    by_timeframe: dict[str, _Accumulator] = {}
+    by_regime: dict[str, _Accumulator] = {}
+    by_cell: dict[str, _Accumulator] = {}
+    latency = _LatencyAccumulator()
     reason_counts: dict[str, int] = {}
-    for event in parsed:
+
+    for raw in events:
+        # 判断行でない封筒レコードは母数から除き、件数だけ残す(捨てはしない)。
+        if isinstance(raw, Mapping):
+            event_type = _clean_str(raw.get("event_type"), "")
+            if event_type in NON_DECISION_EVENT_TYPES:
+                skipped_event_types[event_type] = skipped_event_types.get(event_type, 0) + 1
+                continue
+        event = parse_event(raw)
+        overall.add(event)
+        by_pair.setdefault(event.pair, _Accumulator()).add(event)
+        by_timeframe.setdefault(event.timeframe, _Accumulator()).add(event)
+        by_regime.setdefault(event.regime, _Accumulator()).add(event)
+        by_cell.setdefault(f"{event.pair}|{event.timeframe}|{event.regime}", _Accumulator()).add(
+            event
+        )
+        latency.add(event.ts)
         for reason in event.parse_reasons:
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
     return TraceReport(
-        overall=_summarize(parsed),
-        by_pair=_group(parsed, lambda event: event.pair),
-        by_timeframe=_group(parsed, lambda event: event.timeframe),
-        by_regime=_group(parsed, lambda event: event.regime),
-        by_cell=_group(
-            parsed,
-            lambda event: f"{event.pair}|{event.timeframe}|{event.regime}",
-        ),
-        latency=_latency_section(parsed),
+        overall=overall.finish(),
+        by_pair={name: by_pair[name].finish() for name in sorted(by_pair)},
+        by_timeframe={name: by_timeframe[name].finish() for name in sorted(by_timeframe)},
+        by_regime={name: by_regime[name].finish() for name in sorted(by_regime)},
+        by_cell={name: by_cell[name].finish() for name in sorted(by_cell)},
+        latency=latency.finish(),
         parse_reason_counts=dict(sorted(reason_counts.items())),
+        skipped_event_types=dict(sorted(skipped_event_types.items())),
     )
 
 
@@ -507,6 +730,8 @@ def _summary_to_dict(summary: FunnelSummary) -> dict[str, Any]:
         "dominance": dict(summary.dominance),
         "invalid_transitions": [dict(row) for row in summary.invalid_transitions],
         "missing_transitions": [dict(row) for row in summary.missing_transitions],
+        "observed_gate_counts": dict(summary.observed_gate_counts),
+        "would_block_counts": dict(summary.would_block_counts),
     }
 
 
@@ -524,4 +749,5 @@ def report_to_dict(report: TraceReport) -> dict[str, Any]:
         "by_cell": {name: _summary_to_dict(value) for name, value in report.by_cell.items()},
         "latency": report.latency,
         "parse_reason_counts": dict(report.parse_reason_counts),
+        "skipped_event_types": dict(report.skipped_event_types),
     }

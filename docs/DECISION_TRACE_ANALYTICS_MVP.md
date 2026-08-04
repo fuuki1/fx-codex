@@ -16,7 +16,8 @@
 | 判断ファネル | `total_decisions` / `blocked_at[gate]`(first blockerのみ計上)/ `passed_all_gates` / `indeterminate` |
 | veto支配率 | `dominance[g] = blocked_at[g] / (total - indeterminate)` |
 | 不正な状態遷移 | 相互排他ゲートの同時出現 |
-| 欠損遷移 | `final_action=="neutral"` かつ `blocked_by==[]` |
+| 欠損遷移 | `final_action=="neutral"` なのに blocked ゲートが無い判断 |
+| observed(shadow) | `observed_gate_counts` / `would_block_counts`(ブロックとは別軸) |
 | 層別 | pair / timeframe / regime / セル(pair×timeframe×regime)ごとに全指標 |
 | 遅延 | 判断単位の分布のみ。**gate単位は測定不能** |
 
@@ -63,6 +64,65 @@
    他ゲートとの共起は**合法**。ここを不正扱いすると偽陽性を量産するため、
    回帰防止テストで固定している。
 
+## 実機ログでの検証(2026-08-04)
+
+`/Users/fuuki/srv/fx-codex/logs/briefing_decisions.jsonl`(1.86GB / 34,107行)に対して
+実行した結果。**本番ツリーは一切変更していない**(読み取りのみ)。
+
+```
+判断行 n=32,875   passed=14,450   indeterminate=0
+封筒除外: decision_batch 620 / decision_cross_log_commit 620
+
+  market_closed               9,979   dominance=0.3035
+  expectancy_guard            2,896   dominance=0.0881
+  event_window                2,718   dominance=0.0827
+  below_production_threshold  1,478   dominance=0.0450
+  operational_data_stale      1,346   dominance=0.0409
+  missing_technical               8   dominance=0.0002
+
+observed: liquidity 24,541 / event_window_policy 10,945 / usd_factor_coherence 308
+invalid_transitions=0   missing_transitions=6,211
+処理: 14.2秒 / peak RSS 35MB
+```
+
+### 実機で判明した契約(設計と食い違う点)
+
+1. **`blocked_by` は実機で全行が空**(32,867行中0行が非空)。ブロック根拠は
+   `gate_trace` にのみ存在する。`blocked_by` だけを見る実装は全判断を
+   「通過」と誤認する。本実装は `gate_trace` を優先する。
+
+2. **`gate_trace` に `pass` 事象は存在しない**。実測の status は
+   `blocked`(291)と `observed`(1,385)の2値のみ。
+   設計文書 §2.6 の `outcome: "pass"|"veto"|"skip"` は実データに存在しない。
+
+3. **observed が blocked を上回る**。observed を落とすと判断工程の大半が不可視になる。
+
+4. **判断ログには判断以外の封筒レコードが混在する**
+   (`decision_batch` / `decision_cross_log_commit` 各620件)。母数に入れると
+   dominance が実態より小さく出るため除外し、件数のみ `skipped_event_types` に残す。
+
+### 受け入れ基準の充足状況
+
+- **既知事象の再現: 達成。** 「中立は閾値ではなく veto 起因」という既知の結論に
+  本機能が独立に到達した(中立11,936件のうち gate 由来が明示されるもの5,725件、
+  かつ timeframe 層別で 1h のみ `below_production_threshold` が支配的という
+  セル固有の偏りを自動検出)。
+- **全読込を要求しない: 達成。** 逐次走査に変更し、20,000行で
+  **peak RSS 1,879MB → 30MB(62分の1)**、処理時間も 18.4秒 → 7.8秒。
+  全34,107行でも 35MB 一定。
+
+### 未解決の観測(コード修正はしていない)
+
+**中立6,211件(全判断の18.9%)にブロック根拠が記録されていない。**
+うち5,175件は `conviction: 0`。`below_production_threshold` は1,478件しか
+発火しておらず、差分が説明されていない。`timeframe.py:429-432` の
+fail-closed 経路(`operational_data_ok`/`market_open` 不成立時に
+`analysis_direction` を空にする)など、`gate_reasons` に積まれない中立化経路が
+存在する可能性がある。
+
+これは**観測結果であって原因の断定ではない**。本MVPは読み取り専用であり、
+判断側のコードは変更していない。原因調査と対処は別作業。
+
 ## 未実装事項(このMVPが行わないこと)
 
 意図的に範囲外とした項目。**「プロセスマイニング導入済み」とは言えない。**
@@ -77,10 +137,11 @@
 - **真のプロセス発見は未実装** — アルファアルゴリズム等によるプロセスモデル導出、
   適合性検査(conformance checking)、変種分析(variant analysis)はいずれも行わない。
   本実装は固定されたゲート順序を前提とした集計にとどまる。
-- **実データでの有効性は未実証** — 合成fixtureでの動作確認のみ。
-  実機ログに対する有効性・閾値の妥当性は評価していない。
 - **異常判定の閾値を持たない** — `dominance` を算出するだけで、
-  「いくつ以上が異常か」の基準は運用側の判断に委ねる。
+  「いくつ以上が異常か」の基準は運用側の判断に委ねる。上記の実機検証で
+  既知事象の再現は確認したが、**閾値の妥当性は未評価**。
+- **改善効果は未実証** — 本機能は観測を提供するだけで、判断品質や収益性を
+  改善した証拠はない。可視化された6,211件の未説明中立も、原因調査は未実施。
 
 ## 使い方
 

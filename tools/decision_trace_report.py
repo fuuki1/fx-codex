@@ -61,6 +61,12 @@ def _format_summary(title: str, summary: FunnelSummary) -> list[str]:
             lines.append(f"    {name:<28} {count:>6}  dominance={share:.3f}")
     else:
         lines.append("  blocked_at        : (なし)")
+    if summary.observed_gate_counts:
+        lines.append("  observed (shadow・ブロックではない):")
+        for name, count in summary.observed_gate_counts.items():
+            would = summary.would_block_counts.get(name, 0)
+            suffix = f"  would_block={would}" if would else ""
+            lines.append(f"    {name:<28} {count:>6}{suffix}")
     if summary.invalid_transitions:
         lines.append(f"  invalid_transitions: {len(summary.invalid_transitions)} 件")
     if summary.missing_transitions:
@@ -120,19 +126,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.input == "-":
-        events = list(_iter_json_lines(sys.stdin))
-    else:
-        source = Path(args.input)
-        if not source.is_file():
-            print(f"入力が見つかりません: {source}", file=sys.stderr)
-            return 2
-        # 読み取り専用オープン。書き込みモードは使わない。
-        with source.open("r", encoding="utf-8") as handle:
-            events = list(_iter_json_lines(handle))
-
+    # 実機ログは1.86GBに達するため、全行をメモリへ載せず逐次で渡す。
     try:
-        report = build_report(events)
+        if args.input == "-":
+            report = build_report(_iter_json_lines(sys.stdin))
+        else:
+            source = Path(args.input)
+            if not source.is_file():
+                print(f"入力が見つかりません: {source}", file=sys.stderr)
+                return 2
+            # 読み取り専用オープン。書き込みモードは使わない。
+            with source.open("r", encoding="utf-8") as handle:
+                report = build_report(_iter_json_lines(handle))
     except FunnelReconciliationError as error:
         print(f"ファネル恒等式が破れました: {error}", file=sys.stderr)
         return 3
