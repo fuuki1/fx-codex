@@ -86,7 +86,7 @@ def test_inventory_is_hash_bound_and_does_not_export_secret_values(
         )
 
     monkeypatch.setattr(phase0_inventory, "_launchctl_inventory", lambda: [])
-    monkeypatch.setattr(phase0_inventory, "_process_inventory", lambda _root: [])
+    monkeypatch.setattr(phase0_inventory, "_process_inventory", lambda _root, **_kwargs: ([], []))
     monkeypatch.setattr(
         phase0_inventory,
         "_cron_inventory",
@@ -210,7 +210,7 @@ def test_process_inventory_never_exports_unstructured_command_values(
         lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, command + "\n", ""),
     )
 
-    inventory = phase0_inventory._process_inventory(tmp_path)
+    inventory, _excluded = phase0_inventory._process_inventory(tmp_path)
     encoded = json.dumps(inventory)
 
     assert len(inventory) == 1
@@ -777,3 +777,116 @@ def test_chain_reaching_init_via_pid_zero_is_unmapped_not_indeterminate() -> Non
     assert mapping["indeterminate_processes"] == 0
     assert mapping["unmapped_processes"] == 1
     assert cast(list[Any], mapping["unmapped"])[0]["pid"] == 49499
+
+
+def _ps_line(pid: int, ppid: int, command: str) -> str:
+    return f" {pid} {ppid} Sat Aug  2 09:00:00 2026 {command}"
+
+
+def _fake_ps(monkeypatch, lines: list[str]) -> None:
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, "\n".join(lines) + "\n", ""),
+    )
+
+
+def test_ssh_to_host_named_trader_is_out_of_scope(tmp_path: Path, monkeypatch) -> None:
+    """``"trader"`` matches the *hostname*, not any fx-codex code.
+
+    This substring pulled six ordinary outbound ssh clients into the
+    2026-08-04 audit and made them look like unmapped fx-codex processes.
+    """
+
+    _fake_ps(monkeypatch, [_ps_line(49499, 41598, "ssh trader-mini")])
+
+    rows, excluded = phase0_inventory._process_inventory(tmp_path)
+
+    assert rows == []
+    assert [row["pid"] for row in excluded] == [49499]
+    assert excluded[0]["reason"] == "no_scope_evidence"
+
+
+def test_ssh_holding_a_monitored_listener_stays_in_scope(tmp_path: Path, monkeypatch) -> None:
+    """An ssh process that is a listener is evidence, not noise."""
+
+    _fake_ps(monkeypatch, [_ps_line(600, 1, "ssh -L 8788:localhost:8788 trader-mini")])
+
+    rows, _excluded = phase0_inventory._process_inventory(tmp_path, listener_pids=frozenset({600}))
+
+    assert [row["pid"] for row in rows] == [600]
+    assert "monitored_listener" in cast(list[Any], rows[0]["scope_evidence"])
+
+
+def test_ssh_holding_a_monitored_writer_stays_in_scope(tmp_path: Path, monkeypatch) -> None:
+    _fake_ps(monkeypatch, [_ps_line(601, 1, "ssh trader-mini")])
+
+    rows, _excluded = phase0_inventory._process_inventory(tmp_path, writer_pids=frozenset({601}))
+
+    assert "monitored_writer" in cast(list[Any], rows[0]["scope_evidence"])
+
+
+def test_launchd_descendant_is_in_scope_without_any_keyword(tmp_path: Path, monkeypatch) -> None:
+    """The label is stronger evidence than any command-line string."""
+
+    _fake_ps(monkeypatch, [_ps_line(802, 801, "/bin/sleep 60")])
+
+    rows, _excluded = phase0_inventory._process_inventory(
+        tmp_path,
+        launchd_pids=frozenset({800}),
+        graph={802: 801, 801: 800, 800: 1},
+    )
+
+    assert [row["pid"] for row in rows] == [802]
+    assert "launchd_descendant" in cast(list[Any], rows[0]["scope_evidence"])
+
+
+def test_fx_entrypoint_is_in_scope(tmp_path: Path, monkeypatch) -> None:
+    _fake_ps(
+        monkeypatch, [_ps_line(900, 1, "/usr/bin/python3.12 /srv/x/tools/quote_tape_index.py")]
+    )
+
+    rows, _excluded = phase0_inventory._process_inventory(tmp_path)
+
+    assert "fx_entrypoint" in cast(list[Any], rows[0]["scope_evidence"])
+
+
+def test_out_of_scope_is_reported_separately_from_unmapped() -> None:
+    """out_of_scope must not inflate the unmapped finding."""
+
+    mapping = phase0_inventory.resolve_process_mapping(
+        [],
+        [],
+        out_of_scope=[{"pid": 49499, "executable_basename": "ssh", "reason": "no_scope_evidence"}],
+    )
+
+    assert mapping["out_of_scope_processes"] == 1
+    assert mapping["unmapped_processes"] == 0
+    assert mapping["indeterminate_processes"] == 0
+    assert mapping["lineage_pass"] is True
+
+
+def test_unrelated_system_listener_is_not_scope_evidence(monkeypatch) -> None:
+    """Only monitored ports count; ARDAgent:3283 and postgres:5432 do not.
+
+    Observed on trader-mini 2026-08-04: treating any listening socket as
+    evidence pulled both unrelated system services into the audit.
+    """
+
+    listing = "\n".join(
+        [
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME",
+            "ARDAgent 422 fuuki 10u IPv6 0x1 0t0 TCP *:3283 (LISTEN)",
+            "postgres 747 fuuki 7u IPv6 0x2 0t0 TCP [::1]:5432 (LISTEN)",
+            "Python 11764 fuuki 3u IPv4 0x3 0t0 TCP 100.118.242.40:8788 (LISTEN)",
+        ]
+    )
+    monkeypatch.setattr(
+        phase0_inventory,
+        "_run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, listing + "\n", ""),
+    )
+
+    pids = phase0_inventory._listener_pids()
+
+    assert pids == frozenset({11764})

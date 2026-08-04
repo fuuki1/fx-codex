@@ -571,45 +571,165 @@ def _process_graph() -> dict[int, int]:
     return graph
 
 
-def _process_inventory(root: Path) -> list[dict[str, object]]:
-    result = _run(["ps", "ax", "-o", "pid=,ppid=,lstart=,command="])
-    patterns = (
-        "fx-codex",
-        "fx_briefing",
-        "fx_tf_snapshot",
-        "fx_quote_collector",
-        "virtual_portfolio",
-        "tv_discord_notify",
-        "trader",
-        "executor",
-    )
-    rows: list[dict[str, object]] = []
-    for line in result.stdout.splitlines():
-        if not any(pattern in line for pattern in patterns):
+FX_ENTRYPOINT_RE = re.compile(
+    r"(?:^|/)(?:fx_briefing|fx_tf_snapshot|fx_quote_collector|virtual_portfolio"
+    r"|tv_discord_notify|quote_tape_index|run_exclusive|operational_[a-z_]+"
+    r"|price_path_adapter_run|data_freshness_monitor|fx_datafeed_collector"
+    r"|ai_learning_dashboard/[a-z_]+)\.(?:py|sh)\b"
+)
+LEGACY_SCOPE_HINT_RE = re.compile(r"trader|executor|fx-codex|fx_codex", re.IGNORECASE)
+# Ports this deployment is responsible for.  Derived from the fx-codex launchd
+# plists at collection time; the literals are the documented fallback used when
+# no plist declares a port.
+MONITORED_PORTS: frozenset[int] = frozenset({8770, 8771, 8788})
+FX_PATH_RE = re.compile(r"(?:^|\s|=)(?:/\S*/)?(?:fx-codex|fx_codex)(?:[-/]\S*)?(?=\s|$|/)")
+
+
+def _listener_pids(monitored_ports: Iterable[int] = MONITORED_PORTS) -> frozenset[int]:
+    """Pids listening on a **monitored** port.
+
+    Scope must be every listener this deployment is responsible for, not every
+    listener on the box.  Taking any listening socket as evidence pulled in
+    unrelated system services (macOS ARDAgent on 3283, Homebrew Postgres on
+    5432) during the 2026-08-04 observation.
+    """
+
+    ports = frozenset(monitored_ports)
+    try:
+        result = _run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], check=False, timeout=30)
+    except Phase0InventoryError:  # pragma: no cover - platform guard
+        return frozenset()
+    pids: set[int] = set()
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 2 or not fields[1].isdigit():
             continue
+        port_match = re.search(r":(\d+)\s+\(LISTEN\)", line)
+        if port_match and int(port_match.group(1)) in ports:
+            pids.add(int(fields[1]))
+    return frozenset(pids)
+
+
+def _writer_pids(root: Path) -> frozenset[int]:
+    """Pids holding a monitored data store open for writing."""
+
+    targets = [str(root / name) for name in ("logs", "collect", "runs")]
+    pids: set[int] = set()
+    for target in targets:
+        if not Path(target).is_dir():
+            continue
+        try:
+            result = _run(["lsof", "-nP", "+D", target], check=False, timeout=30)
+        except Phase0InventoryError:  # pragma: no cover - platform guard
+            continue
+        for line in result.stdout.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) >= 4 and fields[1].isdigit() and any(m in fields[3] for m in ("w", "u")):
+                pids.add(int(fields[1]))
+    return frozenset(pids)
+
+
+def _scope_evidence(
+    raw_command: str,
+    *,
+    root: Path,
+    listener_pids: frozenset[int],
+    writer_pids: frozenset[int],
+    pid: int,
+) -> list[str]:
+    """Collect the reasons a process belongs in the audited scope.
+
+    Substring matching alone is not evidence.  ``"trader"`` matches the
+    *hostname* in ``ssh trader-mini``, which pulled six ordinary outbound ssh
+    clients into the 2026-08-04 audit and made them look like unmapped
+    fx-codex processes.  Scope must rest on something that actually ties the
+    process to this deployment.
+    """
+
+    evidence: list[str] = []
+    if FX_ENTRYPOINT_RE.search(raw_command):
+        evidence.append("fx_entrypoint")
+    if FX_PATH_RE.search(raw_command):
+        evidence.append("fx_codex_path")
+    if str(root) in raw_command:
+        evidence.append("approved_root_reference")
+    if pid in listener_pids:
+        evidence.append("monitored_listener")
+    if pid in writer_pids:
+        evidence.append("monitored_writer")
+    return evidence
+
+
+def _process_inventory(
+    root: Path,
+    *,
+    launchd_pids: frozenset[int] | None = None,
+    graph: Mapping[int, int] | None = None,
+    listener_pids: frozenset[int] | None = None,
+    writer_pids: frozenset[int] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    result = _run(["ps", "ax", "-o", "pid=,ppid=,lstart=,command="])
+    label_pids = launchd_pids or frozenset()
+    process_graph = graph if graph is not None else {}
+    listeners = listener_pids or frozenset()
+    writers = writer_pids or frozenset()
+    rows: list[dict[str, object]] = []
+    excluded: list[dict[str, object]] = []
+    for line in result.stdout.splitlines():
         if "phase0_inventory.py" in line or re.search(r"\bpython\S*\s+-\s+--root\s+", line):
             continue
         match = re.match(r"\s*(\d+)\s+(\d+)\s+(.{24})\s+(.*)$", line)
         if match is None:
             continue
         raw_command = match.group(4)
+        pid = int(match.group(1))
+        evidence = _scope_evidence(
+            raw_command,
+            root=root,
+            listener_pids=listeners,
+            writer_pids=writers,
+            pid=pid,
+        )
+        # A launchd descendant is in scope even when its command line carries no
+        # fx-codex keyword: the label is stronger evidence than any string.
+        cursor: int | None = pid
+        seen_chain: set[int] = set()
+        while isinstance(cursor, int) and cursor not in seen_chain:
+            seen_chain.add(cursor)
+            if cursor in label_pids:
+                evidence.append("launchd_descendant")
+                break
+            parent = process_graph.get(cursor)
+            cursor = parent if isinstance(parent, int) and parent not in (0, cursor) else None
         executable_token = raw_command.lstrip().partition(" ")[0].strip("'\"")
+        if not evidence:
+            if LEGACY_SCOPE_HINT_RE.search(raw_command):
+                # Record only what a substring rule would have swept in, so the
+                # exclusion is auditable rather than silent.
+                excluded.append(
+                    {
+                        "pid": pid,
+                        "ppid": int(match.group(2)),
+                        "executable_basename": Path(executable_token).name,
+                        "reason": "no_scope_evidence",
+                    }
+                )
+            continue
+
         safe_view: dict[str, object] = {
-            "pid": int(match.group(1)),
+            "pid": pid,
             "ppid": int(match.group(2)),
             "started": match.group(3).strip(),
             "executable_basename": Path(executable_token).name,
             "command_present": bool(raw_command),
             "argument_count_approximate": max(len(raw_command.split()) - 1, 0),
-            "matched_process_kinds": sorted(
-                pattern for pattern in patterns if pattern in raw_command
-            ),
+            "scope_evidence": sorted(set(evidence)),
             "references_runtime_root": str(root) in raw_command,
             "entrypoint_provenance": _entrypoint_provenance(raw_command, executable_token),
         }
         safe_view["safe_view_sha256"] = _canonical_sha256(safe_view)
         rows.append(safe_view)
-    return rows
+    return rows, excluded
 
 
 def _observer_pid_chain(
@@ -655,6 +775,7 @@ def resolve_process_mapping(
     launchctl: Iterable[Mapping[str, object]],
     *,
     process_graph: Mapping[int, int] | None = None,
+    out_of_scope: Iterable[Mapping[str, object]] = (),
     approved_provenance: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Decide which observed processes are accounted for by launchd.
@@ -703,6 +824,7 @@ def resolve_process_mapping(
             by_pid[pid] = row
 
     graph: Mapping[int, int] = process_graph if process_graph is not None else {}
+    out_of_scope_rows = [dict(row) for row in out_of_scope]
     observer_pids = _observer_pid_chain(by_pid, graph)
 
     mapped: list[dict[str, object]] = []
@@ -777,8 +899,15 @@ def resolve_process_mapping(
             "observer; executable name is never a basis, so unknown ssh "
             "sessions, listeners and writers remain unmapped"
         ),
+        "scope_rule": (
+            "in-scope requires positive evidence: an fx-codex entrypoint or "
+            "path, an approved root reference, a monitored listener or writer, "
+            "or launchd descent; a hostname substring is not evidence"
+        ),
         "mapped": mapped,
         "observer_processes": observers,
+        "out_of_scope": out_of_scope_rows,
+        "out_of_scope_processes": len(out_of_scope_rows),
         "indeterminate": indeterminate,
         "indeterminate_processes": len(indeterminate),
         "unmapped": unmapped,
@@ -1256,14 +1385,23 @@ def build_inventory(root: Path, *, home: Path | None = None) -> dict[str, object
     git = _git_inventory(resolved)
     launchd_plists = _launchd_inventory(host_home)
     launchctl = _launchctl_inventory()
-    processes = _process_inventory(resolved)
+    graph = _process_graph()
+    label_pids = frozenset(pid for row in launchctl if isinstance(pid := row.get("pid"), int))
+    processes, out_of_scope = _process_inventory(
+        resolved,
+        launchd_pids=label_pids,
+        graph=graph,
+        listener_pids=_listener_pids(),
+        writer_pids=_writer_pids(resolved),
+    )
     runtime = {
         "launchctl": launchctl,
         "processes": processes,
         "process_mapping": resolve_process_mapping(
             processes,
             launchctl,
-            process_graph=_process_graph(),
+            process_graph=graph,
+            out_of_scope=out_of_scope,
         ),
         "cron": _cron_inventory(),
         "docker": _docker_inventory(),
