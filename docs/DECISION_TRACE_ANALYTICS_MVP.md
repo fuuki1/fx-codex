@@ -111,17 +111,42 @@ invalid_transitions=0   missing_transitions=6,211
   **peak RSS 1,879MB → 30MB(62分の1)**、処理時間も 18.4秒 → 7.8秒。
   全34,107行でも 35MB 一定。
 
-### 未解決の観測(コード修正はしていない)
+### 解決済み: 中立6,211件の「理由なし」は gate_trace 導入前の記録
 
-**中立6,211件(全判断の18.9%)にブロック根拠が記録されていない。**
-うち5,175件は `conviction: 0`。`below_production_threshold` は1,478件しか
-発火しておらず、差分が説明されていない。`timeframe.py:429-432` の
-fail-closed 経路(`operational_data_ok`/`market_open` 不成立時に
-`analysis_direction` を空にする)など、`gate_reasons` に積まれない中立化経路が
-存在する可能性がある。
+全期間で集計すると中立6,211件(18.9%)にブロック根拠が無く、当初は
+判断側の観測性の欠陥を疑った。**これは誤りで、原因は計測開始前のデータだった。**
 
-これは**観測結果であって原因の断定ではない**。本MVPは読み取り専用であり、
-判断側のコードは変更していない。原因調査と対処は別作業。
+境界は明確に分離している(重なり0件):
+
+```
+理由なし の最後 : 2026-07-17T11:55:05Z
+理由あり の最初 : 2026-07-17T17:00:05Z
+```
+
+`gate_trace` の書き出しが 2026-07-17 に開始されており、それ以前の中立は
+理由が記録されようがない。**現行コードの欠陥ではない。**
+`timeframe.py` の中立化6箇所(:421,:427,:436,:452,:461,:485)はいずれも
+`gate_reasons` へ追記しており、根拠を落とす経路は無いことをコードでも確認した。
+
+**gate_trace導入後(2026-07-17T17:00Z以降)のみで再集計すると:**
+
+```
+判断行 n=24,532   passed=6,302(25.7%)   missing_transitions=0
+
+  market_closed               9,979   dominance=0.4068
+  expectancy_guard            2,896   dominance=0.1180
+  event_window                2,243   dominance=0.0914
+  operational_data_stale      1,605   dominance=0.0654
+  below_production_threshold  1,499   dominance=0.0611
+  missing_technical               8   dominance=0.0003
+```
+
+`missing_transitions` が **0** になる。全期間の数値は計測開始前を含むため
+dominance が実態より小さく出る(`market_closed` 0.3035 → **0.4068**)。
+
+**運用上の含意**: 本ツールを実機ログへ適用する際は、`gate_trace` 導入日
+(2026-07-17)以降に期間を限定すること。それ以前を含めると veto 支配率を
+過小評価する。
 
 ## 未実装事項(このMVPが行わないこと)
 
@@ -146,10 +171,17 @@ fail-closed 経路(`operational_data_ok`/`market_open` 不成立時に
 ## 使い方
 
 ```bash
-python tools/decision_trace_report.py --input logs/decisions.jsonl
+# 実機ログに当てる場合は必ず gate_trace 導入日以降に限定する
+python tools/decision_trace_report.py \
+    --input logs/briefing_decisions.jsonl \
+    --since 2026-07-17T17:00:00+00:00
+
 python tools/decision_trace_report.py --input logs/decisions.jsonl --format json
 cat logs/decisions.jsonl | python tools/decision_trace_report.py --input -
 ```
+
+`--since` を省くと計測開始前の判断が母数に入り、veto 支配率を過小評価する
+(`market_closed` の dominance が 0.407 → 0.304 に薄まる)。
 
 終了コード: `0`=正常 / `2`=入力が見つからない / `3`=ファネル恒等式の破れ。
 

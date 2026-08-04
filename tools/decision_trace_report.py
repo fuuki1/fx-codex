@@ -30,21 +30,34 @@ from fx_intel.decision_trace import (  # noqa: E402
     report_to_dict,
 )
 
+# 実機で gate_trace の書き出しが開始された時刻(2026-08-04実測)。
+# これより前の判断はブロック根拠を持ちようがないため、含めると
+# veto 支配率を過小評価する(market_closed の dominance 0.407 → 0.304)。
+GATE_TRACE_INSTRUMENTATION_START = "2026-07-17T17:00:00+00:00"
 
-def _iter_json_lines(handle: Any) -> Iterator[object]:
+
+def _iter_json_lines(handle: Any, since: str | None = None) -> Iterator[object]:
     """JSONL を1行ずつ読む。壊れた行は捨てずにマーカーとして流す。
 
     解析層が indeterminate として件数と理由を残すため、ここで除外しない。
+    `since` を指定した場合のみ、その時刻より前の判断を除外する。
     """
     for raw in handle:
         text = raw.strip()
         if not text:
             continue
         try:
-            yield json.loads(text)
+            payload = json.loads(text)
         except json.JSONDecodeError:
             # 解析層で "event_not_mapping" として indeterminate 計上される。
             yield None
+            continue
+        if since is not None and isinstance(payload, dict):
+            ts = payload.get("ts")
+            # ts を持たない封筒レコードは解析層側で除外されるため素通しする。
+            if isinstance(ts, str) and ts < since:
+                continue
+        yield payload
 
 
 def _format_summary(title: str, summary: FunnelSummary) -> list[str]:
@@ -124,12 +137,21 @@ def main(argv: list[str] | None = None) -> int:
         default="text",
         help="出力形式(既定: text)",
     )
+    parser.add_argument(
+        "--since",
+        default=None,
+        help=(
+            "この時刻(ISO8601)以降の判断のみ集計する。実機では gate_trace の"
+            f"書き出しが {GATE_TRACE_INSTRUMENTATION_START} に開始しており、"
+            "それ以前を含めると veto 支配率を過小評価する"
+        ),
+    )
     args = parser.parse_args(argv)
 
     # 実機ログは1.86GBに達するため、全行をメモリへ載せず逐次で渡す。
     try:
         if args.input == "-":
-            report = build_report(_iter_json_lines(sys.stdin))
+            report = build_report(_iter_json_lines(sys.stdin, args.since))
         else:
             source = Path(args.input)
             if not source.is_file():
@@ -137,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             # 読み取り専用オープン。書き込みモードは使わない。
             with source.open("r", encoding="utf-8") as handle:
-                report = build_report(_iter_json_lines(handle))
+                report = build_report(_iter_json_lines(handle, args.since))
     except FunnelReconciliationError as error:
         print(f"ファネル恒等式が破れました: {error}", file=sys.stderr)
         return 3

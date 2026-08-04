@@ -699,6 +699,57 @@ def test_cli_writes_only_to_stdout(tmp_path: Path) -> None:
     assert fixture.read_bytes() == before
 
 
+def test_cli_since_filter_excludes_earlier_decisions(tmp_path: Path) -> None:
+    """--since で計測開始前の判断を除外できること。
+
+    実機では gate_trace の書き出しが 2026-07-17 に開始しており、それ以前を
+    含めると理由なし中立が混ざって veto 支配率を過小評価する。
+    """
+    fixture = tmp_path / "events.jsonl"
+    rows = [
+        _event("old1", ts="2026-07-01T00:00:00+00:00", direction="neutral"),
+        _event(
+            "new1",
+            ts="2026-08-01T00:00:00+00:00",
+            blocked=["market_closed"],
+            direction="closed",
+        ),
+    ]
+    fixture.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "python3",
+            str(CLI_PATH),
+            "--input",
+            str(fixture),
+            "--format",
+            "json",
+            "--since",
+            "2026-07-17T17:00:00+00:00",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["overall"]["total_decisions"] == 1
+    assert payload["overall"]["blocked_at"] == {"market_closed": 1}
+    # 除外しなければ2件になることを対比で確認する。
+    baseline = subprocess.run(
+        ["python3", str(CLI_PATH), "--input", str(fixture), "--format", "json"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    assert json.loads(baseline.stdout)["overall"]["total_decisions"] == 2
+
+
 def test_cli_has_no_write_mode_open() -> None:
     """CLIがファイル書き込みモードのopenを持たないこと。"""
     source = CLI_PATH.read_text(encoding="utf-8")
