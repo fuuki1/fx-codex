@@ -31,7 +31,7 @@ PIT境界・受け入れ基準・実装順を固定するためのものであ�
 | 3 | レジーム状態モデル | `multi_axis_learning.py:288` `_market_regime_features` が regime を**one-hot特徴量**として消費するのみ。`fx_backtester/regime_mixture.py` はボラ分位でGBDT expertを分ける（状態遷移ではない） | 状態遷移確率と信頼度を独立に出力するモデル |
 | 4 | 因子別ポートフォリオ | `virtual_portfolio.py` は建玉単位。`currency` 列は会計通貨 `JPY` 固定（`:293` の CHECK 制約）でエクスポージャー因子ではない | USD・金利・リスクオン・キャリーへの因子分解と重複集約 |
 | 5 | 判断品質ラベル | `evaluation_labels.py` は損益恒等式中心（`realized_net_r`、`gross_realized_r`、`net_r_identity_mismatch`）。**プロセス品質の軸が無い** | 損益と分離した判断品質の評価軸（良い損失／悪い利益） |
-| 6 | プロセスマイニング | `decision_log.py:1275,1369` が `gate_trace` を保存済み（**データ源は既にある**）。`policy_vetoed_by` も保存（`:798,993`） | `gate_trace` をイベントログとして再構成し、ボトルネックを自動抽出する層 |
+| 6 | プロセスマイニング | `decision_log.py:1275,1369` が `gate_trace` を保存済み（**データ源は既にある**）。ただし記録されるのは `status="blocked"` のみで pass 事象は無い（§2.6 訂正(1)）。`policy_vetoed_by` は main に存在しない（同(2)） | `gate_trace` をイベントログとして再構成し、ボトルネックを自動抽出する層 |
 | 7 | 適応的な研究配分 | `trial_ledger.py:108` `TrialLedger`（ハッシュ連鎖付き試行台帳）、`promotion.py:405` `update_stages` | 弱い戦略×レジーム×方向へ検証資源を配分する仕組み |
 
 **重要:** #6 は既存 `gate_trace` の上に載るため最も安価。#2 は上流のデータ契約
@@ -368,6 +368,32 @@ ProcessSummary:
   中立多発）を、本機能が自動で同じ結論に到達すること。**再現しないなら実装が誤り**。
 - 大きな判断ログに対して全読込を要求しないこと（既存の肥大化の経緯を踏まえ、
   逐次走査で成立させる）。
+
+> 【2026-08-04 訂正】本節の初版には、実装（`fx_intel/decision_trace.py`）と実機ログ
+> 検証で判明した誤りが3点ある。**本節の記述より実装とコードが正**。
+>
+> **(1) `outcome: "pass"|"veto"|"skip"` は成立しない。** `gate_trace` は
+> `timeframe.py:625-641` で `status="blocked"` のエントリのみを append しており、
+> **pass 事象は記録されていない**。通過を推論で復元すると、実際には評価されなかった
+> ゲートを「通過した」と偽ることになる。したがって実装は
+> `"blocked"｜"observed"` の2値契約を採る。`observed` は liquidity のみが持つ
+> 観測専用行（`status="observed"`, `applied: False`）で、ブロックではないため
+> ファネルの恒等式には参加させない。
+>
+> **(2) 「`policy_vetoed_by` を保存済み」は誤り。** このフィールドは `main`
+> （`7758d25`）に存在せず、未コミットの作業ツリーにのみ存在する。実装では入力に
+> 使っていない。`gate_trace` を一次入力とする。加えて実機ログでは `blocked_by` が
+> 全行空であり、`gate_trace` 優先はテストで固定した。
+>
+> **(3) 工程別の遅延は測定不能。** `ProcessEvent.entered_at` に相当する
+> gate 単位の timestamp は記録されていない（判断単位の `ts` のみ）。実装は
+> `measurable=false` と理由 `gate_level_timestamps_absent` を残し、推定値を捏造しない。
+>
+> なお `ProcessSummary.chains`（veto 連鎖パターン）は MVP では未実装。モジュール名は
+> `process_mining.py` ではなく `fx_intel/decision_trace.py` とし、本 MVP が
+> 「プロセスマイニング」そのものではないことを名前でも示す。
+> 受け入れ基準2点（既知事象の再現・全読込を要求しない）は実機ログで達成した。
+> 詳細は [DECISION_TRACE_ANALYTICS_MVP.md](DECISION_TRACE_ANALYTICS_MVP.md)。
 
 ---
 
