@@ -34,6 +34,7 @@ from collections.abc import Iterable, Mapping, Sequence
 
 from .briefing import TradePlan
 from .market import open_hours_between
+from .provenance import decision_provenance
 from .timeframe import TimeframePlan
 
 DEFAULT_HORIZON_HOURS = 24.0
@@ -232,6 +233,9 @@ def pit_metadata_for_plan(
         "producer_version": producer_version,
         "input_context_id": input_context_id,
         "source_record_ids": source_record_ids,
+        # 「どの入力から」に加えて「どのコード・設定から」出た判断かを残す。
+        # これが無いと過去の判断を再計算しても同値になる保証が無い。
+        **decision_provenance(),
     }
 
 
