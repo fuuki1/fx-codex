@@ -3793,6 +3793,7 @@ def _future_path(
 ) -> list[PricePathPoint]:
     upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
     open_hours = WeekendOpenHours(ts, upper)
+    limit = horizon_hours + tolerance_hours
     future: list[PricePathPoint] = []
     for index in range(bisect_left(times, ts), len(series)):
         point = series[index]
@@ -3801,7 +3802,13 @@ def _future_path(
         if point.ts > upper:
             break
         age = open_hours.age(point.ts)
-        if 0.0 < age <= horizon_hours + tolerance_hours:
+        if age > limit:
+            # age は point.ts に対して単調非減少(経過 - 休場重なりで、休場ぶんは
+            # end の増加を超えて増えない)。上限を越えた時点で以降も必ず越えるため
+            # 打ち切ってよい。upper は週末クローズ50時間ぶんの保守的padding込みで
+            # 広く、ここで切らないと採点対象外の点まで毎回走査することになる。
+            break
+        if age > 0.0:
             future.append(point)
     return future
 

@@ -9,6 +9,7 @@ import pytest
 
 from fx_intel import briefing, learning
 from fx_intel import journal
+from fx_intel.evaluation_labels import NET_LABEL_VERSION
 from fx_intel.journal import append_plans, read_entries
 from fx_intel.sentiment import CurrencySentiment
 from fx_intel.technicals import PairTechnicals, build_interval_view
@@ -70,6 +71,8 @@ def pit_entry(ts: datetime, **kwargs) -> dict:
             "producer_version": journal.FUSION_PRODUCER_VERSION,
             "input_context_id": f"context:{ts.isoformat()}",
             "source_record_ids": [f"source:{ts.isoformat()}"],
+            "label_version": NET_LABEL_VERSION,
+            "input_context_schema_version": "decision-input-v1",
         }
     )
     return row
@@ -178,6 +181,11 @@ def test_evaluate_history_require_pit_excludes_legacy_rows() -> None:
     calls = learning.evaluate_history(eligible, require_pit=True)
     assert len(calls) == 1
     assert calls[0].outcome == "hit"
+    assert calls[0].pit_eligible is True
+    assert calls[0].decision_id == eligible[0]["decision_id"]
+    assert calls[0].label_version == NET_LABEL_VERSION
+    assert calls[0].producer_version == journal.FUSION_PRODUCER_VERSION
+    assert calls[0].input_context_schema_version == "decision-input-v1"
 
 
 def test_evaluate_history_counts_open_hours_across_weekend() -> None:
@@ -699,6 +707,24 @@ def test_plan_embed_shows_actual_weights() -> None:
     assert "(30%)" in judgement["value"]
 
 
+def test_plan_embed_marks_moderate_aggressive_shadow_as_comparison_only() -> None:
+    plan = briefing.build_trade_plan("USDJPY", bullish_tech(), CURRENCIES, [], [], now=NOW)
+    plan.shadow_predictions.append(
+        {
+            "producer": "moderate_aggressive_policy",
+            "direction": "long",
+            "score": 0.13,
+            "decision_threshold": 0.12,
+            "policy_vetoed_by": [],
+        }
+    )
+    embed = briefing._plan_embed(plan, 20, 100)
+    shadow = next(field for field in embed["fields"] if "中強気shadow" in field["name"])
+
+    assert "買い候補" in shadow["value"]
+    assert "本番判断・発注には使わず" in shadow["value"]
+
+
 def test_agreement_ratio() -> None:
     tech = bullish_tech()
     assert tech.agreement_ratio() == 1.0  # 4時間足すべて買い方向
@@ -831,3 +857,64 @@ def test_build_discord_payload_includes_learning_note() -> None:
     macro = payload["embeds"][0]
     field = next(f for f in macro["fields"] if "学習メモ" in f["name"])
     assert "的中率 63%" in field["value"]
+
+
+def test_settled_match_cache_reuse_matches_full_rescan(tmp_path, monkeypatch) -> None:
+    """確定済みキャッシュを使っても全走査と同じ採点結果になる。
+
+    briefingは5分ごとに別プロセスで起動するため、突き合わせ結果を永続化して
+    再利用する。窓が閉じた判断だけを載せる契約が守られていれば、
+    キャッシュ有無で結果は完全一致する。
+    """
+    entries = [
+        entry(NOW, symbol="USDJPY", direction="long", close=100.0),
+        entry(NOW, symbol="EURUSD", direction="short", close=100.0),
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=101.0),
+        entry(NOW + DAY, symbol="EURUSD", direction="neutral", close=101.0),
+        # 窓を確実に閉じるための十分先の価格
+        entry(NOW + DAY * 5, symbol="USDJPY", direction="neutral", close=102.0),
+        entry(NOW + DAY * 5, symbol="EURUSD", direction="neutral", close=102.0),
+    ]
+    cache = tmp_path / "match_cache.json"
+
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, "")
+    baseline = learning.evaluate_history(entries)
+
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(cache))
+    cold = learning.evaluate_history(entries)
+    assert cache.is_file(), "確定済み判断があるのにキャッシュが書かれていない"
+    warm = learning.evaluate_history(entries)
+
+    assert [c.outcome for c in cold] == [c.outcome for c in baseline]
+    assert [c.outcome for c in warm] == [c.outcome for c in baseline]
+    assert [c.ts for c in warm] == [c.ts for c in baseline]
+
+
+def test_settled_match_cache_does_not_freeze_unsettled_calls(tmp_path, monkeypatch) -> None:
+    """将来価格が未到達の判断をキャッシュで固定してはならない。
+
+    未確定のまま載せると、価格が追記されても古い採点が残り続ける。
+    先に短い履歴で評価してキャッシュを作り、その後価格を足した時に
+    「後から入った将来価格」が反映されることを固定する。
+    """
+    cache = tmp_path / "match_cache.json"
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(cache))
+
+    # 将来価格がまだ無い状態(未成熟)ではそもそも採点されない
+    early = [entry(NOW, symbol="USDJPY", direction="long", close=100.0)]
+    assert learning.evaluate_history(early) == []
+
+    # 価格が追記されたら採点される。キャッシュが未確定を固定していれば
+    # ここで空のままになり、このアサーションが落ちる。
+    later = [
+        *early,
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=101.0),
+    ]
+    calls = learning.evaluate_history(later)
+    assert [c.outcome for c in calls] == ["hit"]
+
+
+def test_settled_match_cache_can_be_disabled(monkeypatch) -> None:
+    """空文字を指定したらキャッシュを一切読み書きしない。"""
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, "")
+    assert learning._settled_match_cache_path() is None

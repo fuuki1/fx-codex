@@ -1510,3 +1510,28 @@ def test_realized_net_r_is_none_without_cost() -> None:
     assert outcome.realized_net_r is None
     assert outcome.execution_cost_r is None
     assert outcome.diagnostic_execution_cost_r is None
+
+
+def test_future_path_stops_at_horizon_limit_without_scanning_padding() -> None:
+    """_future_path は上限を越えた時点で打ち切ってよい(結果は不変)。
+
+    探索窓 upper は週末クローズ50時間ぶんの保守的paddingを含むため、
+    採点対象(horizon+tolerance)を越えた点まで毎回走査すると
+    判断数×価格点数で重くなる。age は point.ts に対して単調非減少なので
+    早期breakしても採点対象の集合は変わらない。
+    """
+    start = datetime(2026, 8, 3, 0, 0, tzinfo=UTC)  # 月曜(週末を跨がない)
+    series = [
+        to.PricePathPoint(ts=start + timedelta(hours=hours), close=100.0 + hours)
+        for hours in range(1, 120)
+    ]
+    times = [point.ts for point in series]
+
+    future = to._future_path(series, times, start, 24.0, 2.0)
+
+    ages = [to.open_hours_between(start, point.ts) for point in future]
+    assert ages, "採点対象が空になってはいけない"
+    assert max(ages) <= 26.0
+    # 上限26h以内の点はすべて拾えている(打ち切りで取りこぼしていない)
+    expected = [point for point in series if 0.0 < to.open_hours_between(start, point.ts) <= 26.0]
+    assert [point.ts for point in future] == [point.ts for point in expected]

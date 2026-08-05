@@ -58,6 +58,7 @@ journal.evaluate_directional_accuracy が「いま24時間前後の判断」だ�
 from __future__ import annotations
 
 import json
+import os
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
@@ -79,6 +80,15 @@ from .market_session import dimensions_from_mapping
 # 学習サンプルの間引き幅。5分周期の高相関な判断を1時間単位へ間引き、
 # サンプル数の水増しを防ぐ。
 DERIVE_THIN_GAP_HOURS = 1.0
+
+# 確定済み突き合わせ結果の永続キャッシュ。briefingは5分ごとに別プロセスで
+# 起動するため、プロセス内キャッシュだけでは効かない。
+# 環境変数で差し替え可能にし、テストと実機で衝突させない。
+SETTLED_MATCH_CACHE_ENV = "FX_LEARNING_MATCH_CACHE"
+DEFAULT_SETTLED_MATCH_CACHE = Path("logs/learning_match_cache.json")
+# 1ファイルが無制限に膨らまないよう、保持する確定結果の上限を決める。
+# 超過分は判断時刻の古い順に落とす(古い判断ほど再利用価値が低い)。
+SETTLED_MATCH_CACHE_MAX_ENTRIES = 400_000
 
 # 重み再推定のガード
 MIN_WEIGHT_SAMPLES = 20  # テクニカル/ニュース両方の評価がこの件数未満なら既定重みのまま
@@ -232,6 +242,11 @@ class EvaluatedCall:
     news_score: float
     outcome: str
     ts: str  # 記録時刻(ISO)
+    decision_id: str = ""
+    label_version: str = ""
+    pit_eligible: bool = False
+    producer_version: str = ""
+    input_context_schema_version: str = ""
     features: Mapping[str, float] = field(default_factory=dict)  # 判断時のチャート状態
     # 判断方向に沿った符号付き値動きをATR換算した値(+1.0=ATR1個ぶん順行)。
     # ml.py(確率モデルの教師)と promotion.py(期待値計算)が使う
@@ -450,6 +465,96 @@ def horizon_report_ja(
     return "ホライズン別の方向的中率(学習には24hのみ使用): " + " / ".join(parts)
 
 
+MatchKey = tuple[str, datetime, float, float]
+MatchValue = tuple[float, float] | None
+
+
+def _settled_match_cache_path() -> Path | None:
+    """確定済みキャッシュの保存先。空文字を指定すると無効化する。"""
+    raw = os.environ.get(SETTLED_MATCH_CACHE_ENV)
+    if raw is None:
+        return DEFAULT_SETTLED_MATCH_CACHE
+    stripped = raw.strip()
+    return Path(stripped) if stripped else None
+
+
+class _SettledMatchCache(dict[MatchKey, MatchValue]):
+    """判断ごとの確定済み突き合わせ結果を保持する dict。
+
+    「確定済み」= 最終価格時刻が判断の探索窓上限を越えた状態。以後どれだけ
+    価格が追記されても結果は変わらないため、再計算せず再利用してよい。
+    未確定の判断は呼び出し側が毎回計算するので、全走査と常に同値になる。
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        super().__init__()
+        self._path = path
+        self._loaded_size = 0
+
+    def load(self) -> None:
+        if self._path is None or not self._path.is_file():
+            return
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # 壊れたキャッシュは黙って捨てる。再計算すれば必ず正しい値になる。
+            return
+        if not isinstance(raw, dict) or raw.get("contract") != "learning-match-cache-v1":
+            return
+        for row in raw.get("entries") or []:
+            try:
+                symbol, ts_text, horizon, tolerance, gap, close = row
+                key = (
+                    str(symbol),
+                    datetime.fromisoformat(str(ts_text)),
+                    float(horizon),
+                    float(tolerance),
+                )
+            except (TypeError, ValueError):
+                continue
+            self[key] = None if gap is None or close is None else (float(gap), float(close))
+        self._loaded_size = len(self)
+
+    def save(self) -> None:
+        if self._path is None or len(self) == self._loaded_size:
+            return
+        items = sorted(self.items(), key=lambda item: item[0][1])
+        if len(items) > SETTLED_MATCH_CACHE_MAX_ENTRIES:
+            items = items[-SETTLED_MATCH_CACHE_MAX_ENTRIES:]
+        payload = {
+            "contract": "learning-match-cache-v1",
+            "entries": [
+                [
+                    key[0],
+                    key[1].isoformat(),
+                    key[2],
+                    key[3],
+                    None if value is None else value[0],
+                    None if value is None else value[1],
+                ]
+                for key, value in items
+            ],
+        }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            # 別プロセスが読んでいる最中に壊れた中身を見せないため置換で公開する
+            temporary.replace(self._path)
+        except OSError:
+            # 保存できなくても採点結果は正しい。次回また計算するだけ。
+            return
+
+
+def _settled_match_cache() -> _SettledMatchCache:
+    cache = _SettledMatchCache(_settled_match_cache_path())
+    cache.load()
+    return cache
+
+
 def evaluate_history(
     entries: Iterable[dict],
     horizon_hours: float = DEFAULT_HORIZON_HOURS,
@@ -503,6 +608,15 @@ def evaluate_history(
     # 二分探索用に時刻列を分離(毎時追記で数万行たまっても全走査しないため)
     price_times = {symbol: [point[0] for point in series] for symbol, series in prices.items()}
 
+    # 判断×価格点の突き合わせは履歴が伸びるほど重くなる(実機で age() が
+    # 1回のbriefingあたり3,272万回、実行時間の54%)。突き合わせ結果は
+    # 「判断時刻・ペア・ホライズン」と、その窓に入る価格系列だけで決まり、
+    # 窓が閉じた(=最終価格時刻が window_upper を越えた)判断は将来の追記で
+    # 二度と変化しない。よって確定済みの結果だけを永続キャッシュに載せる。
+    # 未確定の判断は毎回計算し直すため、値は常に全走査と一致する。
+    match_cache = _settled_match_cache()
+    latest_price_ts = {symbol: series[-1][0] for symbol, series in prices.items() if series}
+
     calls: list[EvaluatedCall] = []
     for ts, entry in parsed:
         direction = entry.get("direction")
@@ -518,18 +632,32 @@ def evaluate_history(
         # [ホライズン下限, ホライズン上限+週末クローズ1回分] の範囲に限られる
         window_lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
         window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
-        open_hours = WeekendOpenHours(ts, window_upper)
-        best: tuple[float, float] | None = None  # (|経過-ホライズン|, 将来終値)
-        for index in range(bisect_left(times, window_lower), len(series)):
-            point_ts, point_close = series[index]
-            if point_ts > window_upper:
-                break
-            age = open_hours.age(point_ts)
-            if not (horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours):
-                continue
-            gap = abs(age - horizon_hours)
-            if best is None or gap < best[0]:
-                best = (gap, point_close)
+        newest = latest_price_ts.get(symbol_key)
+        settled = newest is not None and newest > window_upper
+        cache_key = (
+            symbol_key,
+            ts,
+            horizon_hours,
+            tolerance_hours,
+        )
+        best: tuple[float, float] | None
+        if settled and cache_key in match_cache:
+            best = match_cache[cache_key]
+        else:
+            open_hours = WeekendOpenHours(ts, window_upper)
+            best = None  # (|経過-ホライズン|, 将来終値)
+            for index in range(bisect_left(times, window_lower), len(series)):
+                point_ts, point_close = series[index]
+                if point_ts > window_upper:
+                    break
+                age = open_hours.age(point_ts)
+                if not (horizon_hours - tolerance_hours <= age <= horizon_hours + tolerance_hours):
+                    continue
+                gap = abs(age - horizon_hours)
+                if best is None or gap < best[0]:
+                    best = (gap, point_close)
+            if settled:
+                match_cache[cache_key] = best
         if best is None:
             continue
         move = best[1] - float(close)
@@ -569,11 +697,16 @@ def evaluate_history(
                 news_score=float(entry.get("news_score", 0.0) or 0.0),
                 outcome=outcome,
                 ts=ts.isoformat(),
+                decision_id=str(entry.get("decision_id") or ""),
+                label_version=str(entry.get("label_version") or ""),
+                pit_eligible=is_pit_eligible_entry(entry),
+                producer_version=str(entry.get("producer_version") or ""),
+                input_context_schema_version=str(entry.get("input_context_schema_version") or ""),
                 features=features,
                 move_atr=move_atr,
                 data_quality=data_quality,
                 # legacy journalの固定ホライズン終値照合は方向診断専用。
-                # canonical outcome joinはML収益ヘッド接続PRで別経路として行う。
+                # canonical outcomeはML再学習時にdecision_id+label_versionで別joinする。
                 realized_net_r=None,
                 net_expected_r=net_expected_r,
                 dimensions=dimensions_from_mapping(
@@ -582,6 +715,7 @@ def evaluate_history(
                 counterfactual=bool(entry.get(COUNTERFACTUAL_ENTRY_KEY)),
             )
         )
+    match_cache.save()
     return calls
 
 
