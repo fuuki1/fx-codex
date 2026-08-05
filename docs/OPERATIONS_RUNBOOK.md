@@ -18,19 +18,24 @@ launchdのワンショットサービスとして運用するための手順書�
 
 | Label | 周期 | 実体 | 役割 |
 |---|---|---|---|
-| `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | 時間足別採点用の価格系列を供給する唯一の定期writer |
-| `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 5分ごとの時間足別統合通知と、最大1時間ごとの融合判断・学習更新 |
+| `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | TradingViewを取得する唯一の定期producer。全テクニカルcacheと時間足別採点用価格系列を更新 |
+| `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 共有テクニカルcacheをread-onlyで使う時間足別統合通知と、最大1時間ごとの融合判断・学習更新 |
 | `com.fx-codex.health` | 5分毎 | `tools/data_freshness_monitor.py` | データ鮮度監視。WARNING/CRITICAL/RECOVERYをDiscordへ |
-| `com.fx-codex.horizon` | 5分毎(StartInterval 300) | `scripts/fx_horizon_once.sh` | 3ペア×9本のshadow予測、満期採点、セル学習。Discord/既存判断への影響なし |
+| `com.fx-codex.horizon` | 5分毎(StartInterval 300) | `scripts/fx_horizon_once.sh` | 共有テクニカルcacheをread-onlyで使う3ペア×9本のshadow予測、満期採点、セル学習 |
+| `com.fx-codex.monitors` | 15分毎 | `scripts/fx_monitors_once.sh` | 完全判断ログの全履歴採点・期待値フィードバック更新。5分writerから分離した重い派生処理 |
+| `com.fx-codex.quote-index` | 1分毎(StartInterval 60) | `tools/quote_tape_index.py` | 原本気配JSONLを変更せず、追記された完全行だけをSQLite byte-offset索引へ反映 |
 
 ### 0-1. writer所有権
 
 | 状態ファイル | 正規writer | 禁止する競合 |
 |---|---|---|
+| `logs/tradingview_technicals.json` | `com.fx-codex.snapshot`のみ | briefing/horizonからの直接TradingView取得、別checkoutのsnapshot |
 | `logs/briefing_tf_prices.jsonl` | `com.fx-codex.snapshot`のみ | signal boardの価格書込み、raw snapshot loop、別checkoutのcron |
 | `logs/briefing_journal.jsonl` | `com.fx-codex.briefing`のみ | manual briefing、signal board、旧cron/旧plist |
 | `logs/briefing_tf_journal.jsonl` | `com.fx-codex.briefing`のみ | manual per-timeframe、signal board、旧cron/旧plist |
-| 学習・昇格・decision系の状態 | `com.fx-codex.briefing`のみ | 同じ状態を更新する任意の別プロセス |
+| `logs/briefing_decisions.jsonl` / `briefing_decisions_latest.json` | `com.fx-codex.briefing`のみ | monitor、manual briefing、別checkout |
+| `logs/briefing_decision_outcomes.json` / `briefing_decision_feedback.json` / `decision_expectancy_monitor.json` | `com.fx-codex.monitors`のみ | briefing hot path、manual monitor、別checkout |
+| その他の学習・昇格状態 | `com.fx-codex.briefing`のみ | 同じ状態を更新する任意の別プロセス |
 
 全サービスは`tools/run_exclusive.py`の排他ロック（`flock`）経由で起動する。ただしロックは
 同一checkout・同一ロック名の呼出しにしか効かない。rawな手動コマンド、別名ロック、別checkout、
@@ -38,6 +43,21 @@ launchdのワンショットサービスとして運用するための手順書�
 `fx_intel/journal.py`と`fx_intel/decision_log.py`の直接appendにも、ライブラリ全体を横断する
 単一writer保証はない。正規writerの所有権は当面の運用統制であり、トランザクションDBまたは
 共通ファイルロックへ移行するまで**未解決の残存リスク**とする。
+
+`briefing_decisions.jsonl`の全履歴採点は、ファイル肥大時に5分周期を超えるため
+`com.fx-codex.briefing`内では実行しない。briefingは監査ログ追記とlatest更新までで終了し、
+TP/SL/MFE/MAE採点・outcome・feedback更新は`com.fx-codex.monitors`だけが担当する。
+
+TradingView取得は`com.fx-codex.snapshot`の`--refresh-technical-cache`だけが行う。
+cacheはhash、aware `available_time`、`ingested_time`、取得対象、MA窓、全interval viewを持ち、
+tmp→fsync→renameで原子的に更新する。`available_time`は上流market event timeではなく、
+全TradingView取得が完了してローカル利用可能になった時刻である。briefing/horizonは
+`--technical-cache-only`を必須とし、cache欠損・hash破損・6分超過・要求対象不足時に
+直接scannerへfallbackしない。古いcache観測を現在時刻で再スタンプすることも禁止する。
+これにより正規runtimeのscanner POSTは3サービス合計ではなく、snapshotの1取得周期
+（4時間足につき各1 POST）へ集約される。
+healthはcacheファイルのmtimeではなく、hash検証済み`available_time`を鮮度判定に使う。
+コピー・手動touchで古い観測を新鮮に見せず、hash不一致や未来時刻もCRITICALにする。
 
 `fx_briefing_once.sh`は同じ`fx-briefing`ロック内で、時間足別統合を5分ごとに実行した後、
 `logs/briefing_journal.jsonl`の最終aware UTC時刻を読み取り、55分以上経過した場合だけ融合判断を実行する。
@@ -428,9 +448,9 @@ SHA/行数を`AUDIT_ROOT`へ追記し、移行担当者と独立確認者を記�
 
 | 対象 | 期待周期 | WARNING | CRITICAL | 根拠 |
 |---|---|---|---|---|
+| `tradingview_technicals.json` | 5分 | 7分 | 15分 | read-only consumerの許容は6分。hash検証済み`available_time`で停止・改変・未来時刻を検知 |
 | `briefing_tf_prices.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 15m採点窓(9〜21分)を守るには45分停止が実害ライン |
-| `briefing_horizon_forecasts.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 5m恒久shadowを含む全9本のcapture継続を監視 |
-| `briefing_tf_journal.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 現行`--per-timeframe`定期経路の判断鮮度を直接監視 |
+| `briefing_tf_journal.jsonl` | 5分 | 15分(3周期) | 45分(9周期)、または直近30分の周期充足率80%未満 | 最新行だけ新しい断続運転も検知し、現行`--per-timeframe`定期経路の判断鮮度と連続性を監視 |
 
 融合判断は自身の実行前に`--require-freshness`を通すため、同じhard gateへ
 `briefing_journal.jsonl`を追加すると自己依存になる。独立した非循環monitorを導入するまでは、
@@ -443,7 +463,7 @@ SHA/行数を`AUDIT_ROOT`へ追記し、移行担当者と独立確認者を記�
 ## 4. Discord通知仕様
 
 - **WARNING**(黄): 更新遅延(warn閾値超過)。同一状態の再通知はcooldown(既定6時間)後のみ
-- **CRITICAL**(赤): ファイル欠落 / critical閾値超過 / JSONL末尾破損。悪化遷移は即通知
+- **CRITICAL**(赤): ファイル欠落 / critical閾値超過 / JSONL末尾破損 / 判断周期充足率低下。悪化遷移は即通知
 - **RECOVERY**(緑): 通知済みの異常が正常へ戻ったとき1回だけ。停止時間を含む
 - 全通知に: ホスト名 / 対象 / 発生時刻 / 最終更新 / 経過 / 最終正常 / 理由 / 連続検知回数 / 手動対応
 - 重複抑止: 状態遷移時のみ送信 + cooldown + `logs/freshness_state.json` に永続化
@@ -475,7 +495,7 @@ first-ingestion・SLAを含むPIT契約は別問題である。
 
 | 候補 | 期待する用途 | 採用前に解決する事項 | 現在の位置付け |
 |---|---|---|---|
-| Dukascopy/JForex | tick/quote履歴の候補 | 安定したversioned API、利用/再配布権、source timestamp、欠損/訂正契約を未受入 | 候補のみ |
+| Dukascopy/JForex | 仮想口座の遅延bid/ask replay | exact `.bi5` transportのversioned契約、利用/再配布権、欠損/訂正/SLAは未受入 | research-only遅延再生。real-time/paper fillではない |
 | OANDA v20 | broker candle/quoteとpaper照合の候補 | 口座/権限、取得範囲、bid/ask保持、timestamp/SLA/ライセンス検証 | 候補のみ |
 | IBKR | paper order/fill/reconciliationと補助market data | 口座/購読、pacing、履歴制限、API version、paper/live差の検証 | 候補のみ |
 | community TradingView scanner（現行） | current分析表示 | 公式のscanner履歴契約、source timestamp、immutable raw/revisionがない | research-only proxy |
@@ -546,3 +566,158 @@ research、offline validation、shadow判断、通知までで、`--promote-live
 
 legacy executionを検出した場合は移行を停止し、証拠を保存して人間へエスカレーションする。
 この分析系移行に、旧executionへ接続・操作・設定変更する権限はない。
+
+## 9. 仮想取引→決済→学習
+
+日次サイクルは、判断を`decision_intakes`へ先に固定し、既に収集済みの
+`collect/log/quotes.jsonl`だけで遅延履歴再生する。
+
+```bash
+.venv/bin/python tools/virtual_portfolio.py cycle \
+  --quotes collect/log/quotes.jsonl --close-session
+.venv/bin/python tools/virtual_portfolio.py summary
+```
+
+正常時でも当日判断は`waiting_for_historical_bid_ask`になり得る。Dukascopy downloadが
+判断より遅れて届くためで、次回サイクルが判断後5分以内の最初のtickをentryとして使う。
+判断後のsource watermarkが5分を超えてもtickが無ければ見送り、timeframeの経路が成熟すれば
+stop/targetの最初の実行可能bid/askで満期前でも決済する。未決済中は最新の利用可能な
+実行価格で`simulated_position_marks`へ評価損益を追記する。`--close-session`の要求は
+`session_close_requests`へ永続化され、遅延気配が未着でも後続5分サイクルが決済を継続する。
+完了判定は同じ`request_id`を持つ`session_close_completions`だけを使う。
+`session_events.closed`は互換投影であり、要求より前の同日eventでは完了しない。
+要求後は決済完了まで、cutoff以降の新規仮想建てを停止する。完了はその時刻までの
+建玉0件と台帳照合を封印するcheckpointであり、完了時刻より後の判断は直ちに新規評価へ
+戻す。17:30からJST日付変更までを一律停止しない。完了時刻以前の遅延判断は、
+後から到着しても決済済み状態へ遡及して建てない。完了後の遅延quoteで建てた場合は
+`simulated_trade_open_observations.open_known_at_ns`をreplay as-ofで固定し、それより前の
+snapshot・risk gate・session lifecycleへ建玉を遡及表示しない。
+遅延決済も`simulated_trade_close_observations.close_known_at_ns`を観測時刻で固定し、
+`close_known_at >= open_known_at`を必須とする。それ以前のsnapshot・cash・capacity・
+V2 valuationへ決済を遡及表示しない。V2のevent head、accounting count、同期valuationも
+snapshotのeffective/knowledge cutoffを超える行を参照しない。
+
+時間軸容量は`virtual-horizon-allocation-v1`で固定する。15m/1hだけがas-of方針の
+同時保有上限（v1は2件、v2は10件）を使用し、4h/1dはquote待ちも建玉も作らない
+観測専用である。v2は日・週・月損失、hard drawdown、同時保有枠だけをv1の5倍にし、
+1取引0.5%、PIT、bid/ask、コスト、鮮度、データ品質、安全学習の停止条件は変えない。
+方針変更はschema v7の`portfolio_policy_updates`へeffective/known時刻と前方針hash付きで
+追記し、遅延判断には判断時点で既知だった方針を使う。
+ダッシュボードの主表示は20日ローリング純R、全コスト後期待値、95%区間、drawdown、
+成熟行数とする。1日7万円はJST日次の必須運用タスクとして確定純損益、残額、進捗、
+完了状態を表示するが、最適化、学習ラベル、達成保証、リスク上限の上書きには使わない。
+
+確認項目:
+
+- `broker_connected=false`、`execution_mode=offline_simulation`
+- pending判断の初回観測時刻が判断から300秒以内
+- quoteの`event <= available <= ingested <= replay as_of`
+- long=`ask entry / bid exit`、short=`bid entry / ask exit`
+- gross - spread - slippage - commission - financing - conversion = net
+- 成熟した終了だけがlearning rowになり、日次KPIはfeature/labelに無い
+- 4h/1dが`observation_only`で、15m/1h以外が保有枠を使用していない
+- close requestとcompletionの`request_id`が一致し、完了時の建玉が0件
+- 遅延replay建玉の`open_known_at`以前のsnapshotに建玉・容量消費が現れない
+- 遅延決済の`close_known_at`以前のsnapshotに決済・現金・容量解放が現れない
+- 同一区分3連敗の自動還流は安全停止だけで、riskやalphaを増やさない
+
+週次成果物:
+
+```bash
+.venv/bin/python tools/virtual_portfolio_learning.py
+```
+
+`challenger_gate.json`、`outcome_memory.json`、`validation_evidence.json`、
+`promotion_audit.json`、`multi_axis_model.json`、全ファイルのSHA-256を列挙する
+`completion.json`が同一staging directoryで生成され、directory renameにより一括公開される。
+同じrun IDは上書きしない。`validation_evidence.json`はrolling development test窓の
+block bootstrapと1.0/1.5/2.0/3.0倍コストstressを診断として計算するが、これは固定
+final testではなく昇格証拠へ転記しない。trial matrixや候補確率が無い
+PBO/DSR/CPCVは`unavailable`として昇格を拒否する。
+`promotion_audit.json`はauthoritative governance gateへ欠損を`None`のまま渡し、
+作業ツリー、PIT、全trial、DSR/PBO、較正、lockbox、coverage、incidentの全失敗理由を保存する。
+`multi_axis_model.json`はnet-R分布、regime、流動性proxy、初回公表macro surprise、
+cross-asset、不確実性、執行コスト補助教師、判断時点portfolio riskを統合する。
+公開/ブローカー気配はdealer order flowと表示しない。実現コストを予測featureへ逆流させず、
+macro surpriseの改定値、未来availability、portfolio snapshot hash不整合を拒否する。
+確率校正には分離したcalibration窓を使い、net-Rのp10-p90区間は同じ窓の
+split-conformal補正を記録する。有限標本coverageの前提であるexchangeabilityは
+時系列・通貨ペア間依存では保証されないため、依存構造を考慮した検証を残存ゲートとする。
+第5分割は境界が動くrolling development holdoutであり、lockboxとは呼ばない。
+固定final testと一回限りの固定lockboxは対象行・境界・dataset hashを事前コミットするまで
+`unavailable_no_fixed_test_commitment` /
+`unavailable_no_fixed_lockbox_commitment`とする。
+`tools/virtual_portfolio_readiness.py`は最新の非hidden run directoryを一つだけ選び、
+`completion.json`のcontract・run ID・5ファイルの完全な名前集合・SHA-256を検証してから
+同一runの成果物を読む。completion欠落、hash不一致、部分staging、異なるrunの混在は
+P5不合格にする。旧`sealed_not_evaluated`を固定lockbox合格として扱わない。
+`trained_shadow_candidate`でも`model_usable_for_decisions=false`であり、
+PBO/DSR/CPCV/lockbox/独立レビューが揃うまで通知判断へ接続しない。
+150件未満、purge/embargo後の窓不足、cost/PIT不整合はfail closedであり、
+自動的なparameter昇格や注文経路は存在しない。
+
+5分consumer、平日の日次照合、金曜の検証証拠生成は次のlaunchdテンプレートを使う。
+
+- `ops/launchd/com.fx-codex.quote-index.plist.tmpl`
+- `ops/launchd/com.fx-codex.virtual-portfolio.plist.tmpl`
+- `ops/launchd/com.fx-codex.virtual-portfolio-close.plist.tmpl`
+- `ops/launchd/com.fx-codex.virtual-portfolio-learning.plist.tmpl`
+- `ops/launchd/com.fx-codex.virtual-portfolio-read.plist.tmpl`
+- `ops/launchd/com.fx-codex.dashboard-state.plist.tmpl`
+
+writerは3サービス間で同じ`fx-virtual-portfolio`排他ロックを使用する。既存のcron、
+heartbeat、手動常駐処理が同じ台帳writerを起動していないことを確認してから導入する。
+quote-indexは`collect/log/quotes.jsonl`をquery-onlyで読み、`collect/index/quotes.sqlite3`
+だけを単一writerで更新する。原本のdevice/inode、前回完全行hash、byte offsetを照合し、
+置換・切詰め・prefix改変・15分超の索引staleを検出した場合は仮想取引をfail closedにする。
+初回だけ原本全体を索引化し、以後は前回offset以降の完全行だけを処理する。
+各cycleは`runs/virtual_portfolio/<JST日付>/<run-id>/cycle.json`へ台帳照合付きの
+create-only監査成果物を保存する。readサービスは127.0.0.1:8771だけへbindし、
+SQLite `query_only`で台帳を読み、書込み・残高変更・昇格操作を提供しない。
+日次決済完了後は`runs/virtual_portfolio_daily/<JST日付>/daily_report.json`をcreate-onlyで
+生成し、損益恒等式を再照合してからDiscordへ送る。配信成功は別のcreate-only receiptへ
+記録し、遅延決済・一時的な送信失敗は次の5分サイクルで安全に再試行する。
+日次reportの取引・損益窓はrequest-scoped completion時刻までを封印し、同じJST日付の
+完了後再開取引を混ぜない。再試行では既存reportの自己hashを再計算し、request/completion、
+取引、損益帰属、残高・照合を含むcanonical部分が一致するときだけ既存artifactを返す。
+完了後に遅延分類されたobserver件数だけの変化では既存reportを書き換えず、canonical部分の
+変化または自己hash不一致はfail-closedとする。
+dashboard-stateは重い既存ログ集計を15分ごとに1回だけ実行し、
+`logs/dashboard_state_cache.json`をatomic replaceする。8788の`/api/state`はこの固定
+キャッシュだけを読み、HTTP request内で巨大JSONLを再走査しない。
+
+工程完成度はコードの存在だけで判断せず、次のread-only監査で確認する。
+
+```bash
+.venv/bin/python tools/virtual_portfolio_readiness.py \
+  --check-launchd \
+  --dashboard-url http://127.0.0.1:8788 \
+  --output logs/virtual_portfolio_readiness.json
+```
+
+出力は`engineering_score_pct`と`empirical_evidence_score_pct`を分ける。終了取引0件、
+日報0件、検証済みChallenger無しを、実装済みという理由で95%へ補完してはならない。
+
+V2 event chainのcheckpointは、SQLiteのtransactionally consistentなread-only backupを
+作って全V2恒等式を再監査し、event count/head、DB snapshot SHA-256、schemaを
+create-only JSONへ固定する。
+
+```bash
+.venv/bin/python tools/virtual_portfolio_checkpoint.py create \
+  --database logs/fx_virtual_portfolio.sqlite3 \
+  --output "$HOME/fx-codex-checkpoints/<run-id>/checkpoint.json"
+
+.venv/bin/python tools/virtual_portfolio_checkpoint.py verify \
+  --database logs/fx_virtual_portfolio.sqlite3 \
+  --checkpoint "$HOME/fx-codex-checkpoints/<run-id>/checkpoint.json" \
+  --expected-checkpoint-file-sha256 "<create出力を別経路で保全したraw file SHA-256>"
+```
+
+同じホスト内のcheckpointはwhole-database replacementに対する独立custodyではない。
+別ホストへcheckpoint bytesをコピーし、その別ホスト上で最新の整合DB copyに対して
+`prefix_preserved=true`、`out_of_band_digest_match=true`、
+`different_host_copy_observed=true`を確認する。期待digestをcheckpointと同じ経路だけから
+取得してはならない。ホスト名の相違は暗号署名や組織的な独立権限を意味しないため、
+`independent_custody_verified`は常にfalseであり、結果は
+「別ホストcopyと別経路digestを観測」を超えて主張しない。checkpoint生成・検証は台帳を
+変更せず、broker、注文、口座操作を持たない。
