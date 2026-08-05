@@ -78,8 +78,8 @@ main (3595582)  [trader/ 現存]
 
 > 【2026-07-29 訂正】本監査は作成時点の記録として残すが、上表と本文の2点が現行コードと乖離したため注記する。
 >
-> 1. `ml.py` に付していた「同一validation setを early stopping/較正/Brier に使い回す」は**現在は当てはまらない**。`ml.py` は train/tune/calibration/test/lockbox を時刻分離し、3者を別区画で行う（`ml.py::train_artifact`、各境界に72時間 embargo）。補助用途に留めるという結論は変わらないが、根拠は**単一経路の原則**である。
-> 2. 上表の `promotion.py`「shadow→paper→live 状態機械」は**誤り**。現行は `STAGES = ("shadow",)` の1段階のみで、保存済みの paper/live 段階も shadow へ fail closed し、`require_live_ack` が渡されても遷移しない（`promotion.py` の `STAGES` 定義と `update_stages`）。本システムは恒久的に研究・意思決定支援専用であり、paper/live broker execution への昇格経路は存在しない（[AUTOMATED_TRADING_POLICY.md](../AUTOMATED_TRADING_POLICY.md)）。
+> 1. `ml.py` に付していた「同一validation setを early stopping/較正/Brier に使い回す」は**現在は当てはまらない**。`ml.py` は train/tune/calibration/test/lockbox を時刻分離し、3者を別区画で行う（`ml.py:872 / 875 / 902-904`、各境界に72時間 embargo）。補助用途に留めるという結論は変わらないが、根拠は**単一経路の原則**である。
+> 2. 上表の `promotion.py`「shadow→paper→live 状態機械」は**誤り**。現行は `STAGES = ("shadow",)` の1段階のみで、保存済みの paper/live 段階も shadow へ fail closed し、`require_live_ack` が渡されても遷移しない（`promotion.py:41 / 409-413`）。本システムは恒久的に研究・意思決定支援専用であり、paper/live broker execution への昇格経路は存在しない（[AUTOMATED_TRADING_POLICY.md](../AUTOMATED_TRADING_POLICY.md)）。
 
 ## 5. 70点に対する具体的ギャップ（何が足りないか）
 
