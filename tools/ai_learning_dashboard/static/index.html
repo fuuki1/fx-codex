@@ -13,8 +13,12 @@
           <p class="eyebrow">fx_intel learning monitor</p>
           <h1>AI 学習ダッシュボード</h1>
         </div>
-        <nav class="sidebar-nav" role="tablist" aria-label="6つの分析画面">
-          <button type="button" class="nav-item active" data-view="now" role="tab" aria-selected="true">
+        <nav class="sidebar-nav" role="tablist" aria-label="7つの分析画面">
+          <button type="button" class="nav-item active" data-view="portfolio" role="tab" aria-selected="true">
+            <span class="nav-icon" aria-hidden="true">💴</span>
+            <span class="nav-label">仮想口座と純損益</span>
+          </button>
+          <button type="button" class="nav-item" data-view="now" role="tab" aria-selected="false">
             <span class="nav-icon" aria-hidden="true">📊</span>
             <span class="nav-label">現在の予測と運用判断</span>
           </button>
@@ -43,18 +47,292 @@
       <main class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow" id="topbarEyebrow">現在の状況</p>
-          <h2 id="topbarTitle" class="topbar-title">現在の予測と運用判断</h2>
+          <p class="eyebrow" id="topbarEyebrow">分析専用シミュレーション</p>
+          <h2 id="topbarTitle" class="topbar-title">仮想口座と純損益</h2>
         </div>
         <div class="toolbar">
-          <input id="logDir" aria-label="ログディレクトリ" />
           <button id="refreshBtn" type="button" title="最新状態を読み込む">更新</button>
         </div>
       </header>
+      <section class="view" id="view-portfolio" data-view="portfolio" aria-label="仮想口座と純損益">
+        <div class="view-head">
+          <h2 class="view-title">仮想口座と純損益</h2>
+        </div>
+        <section id="portfolioReality" class="portfolio-banner is-waiting" aria-live="polite">
+          <div>
+            <span id="portfolioMode" class="badge">offline simulation</span>
+            <h2 id="portfolioRealityTitle">仮想台帳を確認中</h2>
+            <p id="portfolioRealityBody" class="note">
+              ブローカーへ接続しない分析専用シミュレーションです。
+            </p>
+          </div>
+          <div class="portfolio-contract">
+            <strong>1日7万円は必須タスク</strong>
+            <span>未達は継続表示 / 安全上限を優先 / 達成保証ではありません</span>
+          </div>
+        </section>
+        <div class="portfolio-account-guide" role="note">
+          <strong>画面の見方</strong>
+          <span>現在評価額 ＝ 確定残高 ＋ 含み損益</span>
+          <small>保有中は含み損益だけが動き、確定残高は決済した時に更新されます。</small>
+        </div>
+        <div class="status-grid portfolio-kpis">
+          <article class="metric portfolio-primary-metric">
+            <span>現在評価額（含み込み）</span>
+            <strong id="portfolioBalance">--</strong>
+            <small id="portfolioBalanceChange">確定残高 -- / 含み --</small>
+          </article>
+          <article class="metric">
+            <span>本日確定損益（必須タスク）</span>
+            <strong id="portfolioTodayPnl">--</strong>
+            <small id="portfolioTargetText">残額を確認中</small>
+          </article>
+          <article class="metric">
+            <span>20日ローリング純R</span>
+            <strong id="portfolioTargetProgress">--</strong>
+            <div class="bar-track portfolio-progress"><div id="portfolioTargetBar" class="bar-fill green"></div></div>
+            <small id="portfolioTargetBasis">コスト控除後期待値・95% CIを計算中</small>
+          </article>
+          <article class="metric">
+            <span>評価額ドローダウン</span>
+            <strong id="portfolioDrawdown">--</strong>
+            <small id="portfolioDrawdownLimit">確定DD -- / 停止上限 --</small>
+          </article>
+          <article class="metric">
+            <span>確定残高（決済済み）</span>
+            <strong id="portfolioCash">--</strong>
+            <small id="portfolioEquity">初期 -- / 累計確定 --</small>
+          </article>
+          <article class="metric">
+            <span>確定日次損失の余力</span>
+            <strong id="portfolioRemainingRisk">--</strong>
+            <small id="portfolioNextTradeRisk">次回リスク --</small>
+          </article>
+          <article class="metric">
+            <span>保有規模（レバレッジ）</span>
+            <strong id="portfolioLeverage">--</strong>
+            <small id="portfolioNotional">想定元本 --</small>
+          </article>
+          <article class="metric">
+            <span>現在の取引状態</span>
+            <strong id="portfolioDataState">確認中</strong>
+            <small id="portfolioReconciliation">照合 --</small>
+            <small id="portfolioDataQuality" class="metric-meta">データ --</small>
+          </article>
+        </div>
+        <div class="view-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>リスクゲート</h2>
+              <span id="portfolioRiskBadge" class="badge">確認中</span>
+            </div>
+            <div class="portfolio-risk-grid">
+              <div><span>日次（確定損益 / 上限）</span><strong id="portfolioDailyRisk">--</strong></div>
+              <div><span>週次（確定損益 / 上限）</span><strong id="portfolioWeeklyRisk">--</strong></div>
+              <div><span>月次（確定損益 / 上限）</span><strong id="portfolioMonthlyRisk">--</strong></div>
+              <div><span>保有枠（現在 / 上限）</span><strong id="portfolioOpenCount">0 / --</strong></div>
+            </div>
+            <p id="portfolioRiskReason" class="note"></p>
+            <p class="note portfolio-risk-basis">
+              評価額ドローダウンは含み損益込みです。自動停止判定は現在、確定損益と保有上限を基準にしています。
+            </p>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h2>学習への還流</h2>
+              <span id="portfolioLearningBadge" class="badge">0 / 150</span>
+            </div>
+            <div class="portfolio-learning-copy">
+              <strong id="portfolioLearningState">検証データ待ち</strong>
+              <p id="portfolioLearningBody" class="note"></p>
+              <small id="portfolioCanonicalNetR">正準net-R 0 / 0 (--)</small>
+              <small>即時: 同一区分の成熟損失から安全停止のみ / 週次: オフラインChallenger検証</small>
+            </div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>8軸AI学習</h2>
+              <span id="portfolioMultiAxisBadge" class="badge">入力を確認中</span>
+            </div>
+            <p class="note">
+              成熟したPIT行だけを使うresearch-only候補です。公開気配は流動性proxyであり、
+              dealer注文フローではありません。lockboxと独立レビュー完了までは判断に使いません。
+            </p>
+            <div id="portfolioMultiAxisGrid" class="portfolio-axis-grid"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>日次純損益</h2>
+              <span class="subtle">円 / コスト控除後</span>
+            </div>
+            <div id="portfolioDailySeries" class="portfolio-series"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>残高・ドローダウン曲線</h2>
+              <span class="subtle">正規台帳からサーバー計算 / 日次タスクは数値カードで追跡</span>
+            </div>
+            <canvas id="portfolioCurveCanvas" height="260" aria-label="残高・ドローダウン曲線"></canvas>
+            <p id="portfolioCurveEmpty" class="note">台帳イベントを確認中です。</p>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>判断キュー</h2>
+              <span id="portfolioPendingCount" class="subtle">0件待機</span>
+            </div>
+            <p class="note">判断を先に固定し、後から届く履歴bid/askで仮想約定します。実時間・paper約定ではありません。</p>
+            <div id="portfolioPendingDecisions" class="portfolio-card-list"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>仮想ポジション</h2>
+              <span class="subtle">15m/1hのみポリシー上限内 / 4h/1dは観測専用</span>
+            </div>
+            <div id="portfolioOpenPositions" class="portfolio-card-list"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>取引明細と損益分解</h2>
+              <span id="portfolioTradeCount" class="subtle">0件</span>
+            </div>
+            <div class="portfolio-filters" aria-label="取引明細の絞り込み">
+              <label>
+                <span>検索</span>
+                <input id="portfolioTradeSearch" type="search" placeholder="decision_id / ペア / 理由" />
+              </label>
+              <label>
+                <span>方向</span>
+                <select id="portfolioDirectionFilter">
+                  <option value="">すべて</option>
+                  <option value="long">long</option>
+                  <option value="short">short</option>
+                </select>
+              </label>
+              <label>
+                <span>状態</span>
+                <select id="portfolioStatusFilter">
+                  <option value="">すべて</option>
+                  <option value="closed">終了</option>
+                  <option value="open">保有</option>
+                </select>
+              </label>
+            </div>
+            <div class="table-wrap">
+              <table class="portfolio-table">
+                <thead>
+                  <tr>
+                    <th>判断・開始</th>
+                    <th>ペア / 足 / 方向</th>
+                    <th>数量・リスク・レバレッジ</th>
+                    <th>判断Bid / Ask</th>
+                    <th>模擬約定 / 決済</th>
+                    <th>状態</th>
+                    <th>粗損益 / コスト</th>
+                    <th>純損益 / 純R</th>
+                    <th>MFE / MAE</th>
+                    <th>品質・理由</th>
+                  </tr>
+                </thead>
+                <tbody id="portfolioTradeRows"></tbody>
+              </table>
+            </div>
+            <div id="portfolioTradeDetail" class="portfolio-trade-detail"></div>
+          </article>
+          <article class="panel wide">
+            <div class="panel-head">
+              <h2>最近の判断と見送り理由</h2>
+              <span class="subtle">PIT・価格・コスト不足は取引しない</span>
+            </div>
+            <div id="portfolioDecisionList" class="portfolio-card-list"></div>
+          </article>
+        </div>
+      </section>
       <section class="view" id="view-now" data-view="now" aria-label="現在の予測と運用判断">
         <div class="view-head">
           <h2 class="view-title">現在の予測と運用判断</h2>
         </div>
+        <section id="forecastChartPanel" class="panel forecast-chart-panel" aria-label="実測価格と予測">
+          <div class="panel-head forecast-chart-head">
+            <div>
+              <h2>実測価格と予測</h2>
+              <p class="chart-note">ホイールで拡大・縮小、ドラッグで時間軸を移動、ダブルクリックで全体表示に戻ります。</p>
+            </div>
+            <span id="forecastChartStatus" class="subtle">価格データを確認中</span>
+          </div>
+          <div class="forecast-quote-bar" aria-live="polite">
+            <strong id="forecastChartLastPrice">--</strong>
+            <span id="forecastChartChange" class="forecast-chart-change">--</span>
+            <span id="forecastChartHoverOhlc" class="forecast-chart-hover-ohlc">最新値を表示中</span>
+          </div>
+          <div class="forecast-chart-controls">
+            <label class="chart-select-label">
+              <span>通貨ペア</span>
+              <select id="forecastChartSymbol" aria-label="チャートの通貨ペア">
+                <option value="USDJPY">USDJPY</option>
+                <option value="EURUSD">EURUSD</option>
+                <option value="GBPUSD">GBPUSD</option>
+              </select>
+            </label>
+            <div class="chart-control-group" role="group" aria-label="分析時間足">
+              <span>分析時間足</span>
+              <div id="forecastChartTimeframes" class="chart-segmented">
+                <button type="button" data-chart-timeframe="15m">15分</button>
+                <button type="button" data-chart-timeframe="1h" class="active">1時間</button>
+                <button type="button" data-chart-timeframe="4h">4時間</button>
+                <button type="button" data-chart-timeframe="1d">日足</button>
+              </div>
+            </div>
+            <div class="chart-control-group" role="group" aria-label="表示範囲">
+              <span>表示範囲</span>
+              <div id="forecastChartRanges" class="chart-segmented">
+                <button type="button" data-chart-range="6h">6h</button>
+                <button type="button" data-chart-range="24h" class="active">24h</button>
+                <button type="button" data-chart-range="3d">3d</button>
+                <button type="button" data-chart-range="7d">7d</button>
+              </div>
+            </div>
+            <div class="chart-control-group chart-action-group" role="group" aria-label="チャート操作">
+              <span>チャート操作</span>
+              <div class="chart-segmented">
+                <button id="forecastChartZoomOut" type="button" aria-label="縮小">−</button>
+                <button id="forecastChartZoomIn" type="button" aria-label="拡大">＋</button>
+                <button id="forecastChartReset" type="button">全体</button>
+                <button id="forecastChartFullscreen" type="button" aria-pressed="false">拡大表示</button>
+              </div>
+            </div>
+          </div>
+          <div id="forecastChartQuality" class="forecast-chart-quality" aria-live="polite"></div>
+          <div class="forecast-chart-legend" aria-label="チャート凡例">
+            <span><i class="legend-line price"></i>実測価格</span>
+            <button type="button" data-chart-layer="decisions" aria-pressed="true">
+              <i class="legend-marker action"></i>判断（塗り=本番／点付き=中強気shadow／枠=分析）
+            </button>
+            <button type="button" data-chart-layer="forecast" aria-pressed="true">
+              <i class="legend-band"></i>予想帯
+            </button>
+            <button type="button" data-chart-layer="targets" aria-pressed="true">
+              <i class="legend-line target"></i>stop/target
+            </button>
+            <button type="button" data-chart-layer="spread" aria-pressed="true">
+              <i class="legend-band spread"></i>bid/ask
+            </button>
+          </div>
+          <div class="forecast-chart-wrap">
+            <canvas id="forecastChartCanvas" role="img" tabindex="0"
+              aria-label="実測価格と予測位置のチャート。ホイールで拡大縮小、左右キーで移動できます。"
+              aria-describedby="forecastChartHelp"></canvas>
+            <div id="forecastChartHover" class="forecast-chart-hover" hidden></div>
+            <div id="forecastChartEmpty" class="forecast-chart-empty">
+              価格チャートを読み込んでいます。
+            </div>
+          </div>
+          <p id="forecastChartHelp" class="forecast-chart-help">
+            操作: ホイール 拡大縮小 / ドラッグ 移動 / ← → 移動 / ＋ − 拡大縮小 / 0 全体表示。判断マーカーは最寄りの価格時刻へ表示し、元の正確な判断時刻はツールチップに保持します。中強気shadowは比較専用で、本番判断には使いません。
+          </p>
+          <div id="forecastChartDetail" class="forecast-chart-detail" aria-live="polite">
+            予測マーカーを選ぶと、方向・ゲート・予想水準を表示します。
+          </div>
+        </section>
         <section id="realityPanel" class="reality-panel is-waiting" aria-label="現在の学習判定">
           <div>
             <span id="realityBadge" class="badge amber">monitor</span>
@@ -241,7 +519,7 @@
           <div class="flow-step" id="flowPromotion">
             <span>5</span>
             <strong>昇格</strong>
-            <small>shadow / paper / live</small>
+            <small>research / validated / shadow</small>
           </div>
         </section>
         <div class="view-grid">
@@ -448,6 +726,6 @@
       </section>
       </main>
     </div>
-    <script src="app.js"></script>
+    <script src="app.js?v=canonical-net-r-v3"></script>
   </body>
 </html>

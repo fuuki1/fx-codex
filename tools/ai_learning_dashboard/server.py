@@ -10,18 +10,22 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_left
 from collections.abc import Mapping
+from functools import lru_cache
 import json
 import math
 import mimetypes
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
@@ -37,6 +41,7 @@ from fx_intel.evaluation_labels import (  # noqa: E402
     KNOWN_NET_LABEL_VERSIONS,
     canonical_net_label_contract_flags,
 )
+from fx_intel.virtual_portfolio import portfolio_snapshot, unavailable_snapshot  # noqa: E402
 
 JOURNAL_FILE = "briefing_journal.jsonl"
 LEARNING_FILE = "briefing_learning.json"
@@ -58,7 +63,23 @@ TF_LEARNING_FILE = "briefing_tf_learning.json"
 TF_PRICES_FILE = "briefing_tf_prices.jsonl"
 HORIZON_JOURNAL_FILE = "briefing_horizon_forecasts.jsonl"
 HORIZON_LEARNING_FILE = "briefing_horizon_learning.json"
+JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 TF_PRICES_STALE_MINUTES = 15
+DEFAULT_OPERATIONAL_READ_API_URL = "http://127.0.0.1:8770"
+DEFAULT_VIRTUAL_PORTFOLIO_API_URL = "http://127.0.0.1:8771"
+DEFAULT_VIRTUAL_PORTFOLIO_DB = DEFAULT_LOG_DIR / "fx_virtual_portfolio.sqlite3"
+# portfolio_snapshot() は CPU 律速で、実機の負荷に強く依存する。
+# 2026-08-05 の実測 (load 6-9): ttfb 7.0/7.8/10.9/11.5/13.4/30.1 秒。
+# 旧値の 5 秒は最良ケースでも届かず、ダッシュボードは常時 503 を返して
+# 仮想口座パネル全体が空になっていた。実測の最悪値に余裕を持たせて 45 秒とする。
+# 環境変数で上書きできるため、負荷特性の違う実機では調整可能。
+VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS = float(
+    os.environ.get("FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS", "45")
+)
+DEFAULT_DASHBOARD_STATE_CACHE = DEFAULT_LOG_DIR / "dashboard_state_cache.json"
+CHART_SYMBOLS = frozenset({"USDJPY", "EURUSD", "GBPUSD"})
+CHART_TIMEFRAMES = frozenset({"15m", "1h", "4h", "1d"})
+CHART_RANGES = {"6h": 6, "24h": 24, "3d": 72, "7d": 168}
 _TIMEFRAME_ORDER = {"15m": 0, "1h": 1, "4h": 2, "1d": 3}
 _HORIZON_ORDER = {
     label: index
@@ -77,7 +98,7 @@ LAUNCHD_SERVICES = (
 # been created without importing the research pipeline.
 ML_MIN_TRAIN_ROWS = 150
 ML_THIN_MIN_GAP_HOURS = 4.0
-ML_ARTIFACT_SCHEMA = 4
+ML_ARTIFACT_SCHEMA = 6
 ML_TRAINING_CONTRACT = "decision-journal-pit-v2"
 DECISION_JOURNAL_PIT_CONTRACT = ML_TRAINING_CONTRACT
 DECISION_PRODUCER_IDENTITIES = {
@@ -85,19 +106,49 @@ DECISION_PRODUCER_IDENTITIES = {
     "per_timeframe": ("timeframe_raw", "timeframe-journal-v2"),
 }
 
-# 週末クローズ(金曜21:00 UTC → 日曜22:00 UTC)。fx_intel.market と同じ近似。
+# OANDA週末クローズ(New York金曜16:59→日曜17:05)。
 # ダッシュボードは fx_intel に依存しない方針なのでここに独立して持つ。
+_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 _CLOSE_WEEKDAY = 4  # 金曜
-_CLOSE_HOUR_UTC = 21
-_WEEKEND_CLOSURE = timedelta(hours=49)
+_CLOSE_LOCAL_HOUR = 16
+_CLOSE_LOCAL_MINUTE = 59
+_REOPEN_WEEKDAY = 6  # 日曜
+_REOPEN_LOCAL_HOUR = 17
+_REOPEN_LOCAL_MINUTE = 5
+# 将来価格探索padding。DST終了週末の49時間6分も包含する。
+_WEEKEND_CLOSURE = timedelta(hours=50)
 
 
-def _closure_start_on_or_before(moment: datetime) -> datetime:
-    anchor = moment.replace(hour=_CLOSE_HOUR_UTC, minute=0, second=0, microsecond=0)
-    anchor -= timedelta(days=(moment.weekday() - _CLOSE_WEEKDAY) % 7)
-    if anchor > moment:
-        anchor -= timedelta(days=7)
-    return anchor
+@lru_cache(maxsize=256)
+def _closure_for_friday(friday: date) -> tuple[datetime, datetime]:
+    close_local = datetime(
+        friday.year,
+        friday.month,
+        friday.day,
+        _CLOSE_LOCAL_HOUR,
+        _CLOSE_LOCAL_MINUTE,
+        tzinfo=_MARKET_TIMEZONE,
+    )
+    sunday = friday + timedelta(days=_REOPEN_WEEKDAY - _CLOSE_WEEKDAY)
+    reopen_local = datetime(
+        sunday.year,
+        sunday.month,
+        sunday.day,
+        _REOPEN_LOCAL_HOUR,
+        _REOPEN_LOCAL_MINUTE,
+        tzinfo=_MARKET_TIMEZONE,
+    )
+    return close_local.astimezone(UTC), reopen_local.astimezone(UTC)
+
+
+def _closure_on_or_before(moment: datetime) -> tuple[datetime, datetime]:
+    utc = moment.astimezone(UTC)
+    local_date = utc.astimezone(_MARKET_TIMEZONE).date()
+    friday = local_date - timedelta(days=(local_date.weekday() - _CLOSE_WEEKDAY) % 7)
+    close, reopen = _closure_for_friday(friday)
+    if close > utc:
+        close, reopen = _closure_for_friday(friday - timedelta(days=7))
+    return close, reopen
 
 
 def _open_hours_between(start: datetime, end: datetime) -> float:
@@ -112,13 +163,31 @@ def _open_hours_between(start: datetime, end: datetime) -> float:
     start_utc = start.astimezone(UTC)
     end_utc = end.astimezone(UTC)
     closed = timedelta()
-    cursor = _closure_start_on_or_before(end_utc)
-    while cursor + _WEEKEND_CLOSURE > start_utc:
-        overlap = min(cursor + _WEEKEND_CLOSURE, end_utc) - max(cursor, start_utc)
+    close, reopen = _closure_on_or_before(end_utc)
+    while reopen > start_utc:
+        overlap = min(reopen, end_utc) - max(close, start_utc)
         if overlap > timedelta():
             closed += overlap
-        cursor -= timedelta(days=7)
+        previous_friday = close.astimezone(_MARKET_TIMEZONE).date() - timedelta(days=7)
+        close, reopen = _closure_for_friday(previous_friday)
     return (end_utc - start_utc - closed).total_seconds() / 3600.0
+
+
+def _add_market_open_hours(start: datetime, hours: float) -> datetime:
+    if not math.isfinite(hours) or hours <= 0:
+        raise ValueError("horizon hours must be positive")
+    normalized = start.astimezone(UTC)
+    low = normalized
+    high = normalized + timedelta(hours=hours + 72)
+    while _open_hours_between(normalized, high) < hours:
+        high += timedelta(days=7)
+    for _ in range(64):
+        midpoint = low + (high - low) / 2
+        if _open_hours_between(normalized, midpoint) >= hours:
+            high = midpoint
+        else:
+            low = midpoint
+    return high
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -205,6 +274,8 @@ def _read_journal(path: Path) -> list[dict[str, Any]]:
     except OSError:
         return []
     rows: list[dict[str, Any]] = []
+    pending_id = ""
+    pending_rows: list[dict[str, Any]] = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -213,8 +284,32 @@ def _read_journal(path: Path) -> list[dict[str, Any]]:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, dict):
-            rows.append(payload)
+        if not isinstance(payload, dict):
+            continue
+        batch_id = str(payload.get("journal_batch_id") or "")
+        if payload.get("event_type") == JOURNAL_BATCH_COMMIT:
+            expected_size = payload.get("journal_batch_size")
+            indices = [row.get("journal_batch_index") for row in pending_rows]
+            if (
+                batch_id
+                and batch_id == pending_id
+                and isinstance(expected_size, int)
+                and expected_size == len(pending_rows)
+                and indices == list(range(expected_size))
+            ):
+                rows.extend(pending_rows)
+            pending_id = ""
+            pending_rows = []
+            continue
+        if batch_id:
+            if batch_id != pending_id:
+                pending_id = batch_id
+                pending_rows = []
+            pending_rows.append(payload)
+            continue
+        pending_id = ""
+        pending_rows = []
+        rows.append(payload)
     return rows
 
 
@@ -501,7 +596,12 @@ def _future_close(
     window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + _WEEKEND_CLOSURE
     best: tuple[float, float] | None = None
     start_index = bisect_left(series, (window_lower, -math.inf))
-    for point_ts, close in series[start_index:]:
+    # Do not slice the tail here.  On the Mac mini this series has tens of
+    # thousands of rows and this function is called for every decision.  The
+    # slice copied almost the entire remaining history on each call, turning a
+    # bounded bisect lookup into quadratic allocation/CPU work.
+    for index in range(start_index, len(series)):
+        point_ts, close = series[index]
         if point_ts > window_upper:
             break
         age = _open_hours_between(ts, point_ts)
@@ -746,12 +846,19 @@ def _evaluate_journal(entries: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         # その足の主ホライズンで採点(旧スキーマ行=24h)
         horizon = _number(entry.get("horizon_hours")) or 24.0
-        future = _future_close(
-            (pit_prices if ml_pit_eligible else prices).get((symbol, timeframe), []),
-            ts,
-            horizon_hours=horizon,
-            tolerance_hours=_tolerance_for(horizon),
-        )
+        # Analysis scoring immediately above already resolved the same
+        # timeframe price path.  Reuse its raw move for all non-fusion-PIT
+        # rows; only fusion PIT rows need the stricter pit_prices series.
+        if not ml_pit_eligible and analysis_result is not None:
+            analysis_move = _number(analysis_result.get("move"))
+            future = close + analysis_move if analysis_move is not None else None
+        else:
+            future = _future_close(
+                (pit_prices if ml_pit_eligible else prices).get((symbol, timeframe), []),
+                ts,
+                horizon_hours=horizon,
+                tolerance_hours=_tolerance_for(horizon),
+            )
         if future is None:
             pending += 1
             if ml_pit_eligible:
@@ -1894,6 +2001,26 @@ def _horizon_summary(payload: dict[str, Any], entries: list[dict[str, Any]]) -> 
             "p_down": _number(row.get("p_down")),
             "p_flat": _number(row.get("p_flat")),
             "calibrated": bool(row.get("calibrated")),
+            "horizon_hours": _number(row.get("horizon_hours")),
+            "close": _number(row.get("close")),
+            "band_p10": _number(row.get("band_p10")),
+            "band_p50": _number(row.get("band_p50")),
+            "band_p90": _number(row.get("band_p90")),
+            "band_source": str(row.get("band_source") or "unavailable"),
+            "expected_range": _number(row.get("expected_range")),
+            "data_quality": _number(row.get("data_quality")),
+            "warnings": (
+                [str(value) for value in row.get("warnings", [])]
+                if isinstance(row.get("warnings"), list)
+                else []
+            ),
+            "due_time": (
+                _add_market_open_hours(ts, hours).isoformat()
+                if (ts := _parse_ts(row.get("ts"))) is not None
+                and (hours := _number(row.get("horizon_hours"))) is not None
+                and hours > 0
+                else None
+            ),
             "ts": row.get("ts"),
         }
         for (symbol, horizon), row in latest.items()
@@ -1916,6 +2043,8 @@ def _horizon_summary(payload: dict[str, Any], entries: list[dict[str, Any]]) -> 
 def build_state(
     log_dir: Path,
     *,
+    portfolio_db: Path | None = None,
+    portfolio_api_url: str | None = None,
     now: datetime | None = None,
     ps_output: str | None = None,
     launchctl_outputs: Mapping[str, str] | None = None,
@@ -1998,6 +2127,18 @@ def build_state(
         HORIZON_LEARNING_FILE: _file_status(horizon_learning_path),
     }
 
+    portfolio_path = portfolio_db or log_dir / "fx_virtual_portfolio.sqlite3"
+    if portfolio_api_url is None:
+        virtual_portfolio = portfolio_snapshot(portfolio_path, now=now)
+    else:
+        try:
+            virtual_portfolio = _virtual_portfolio_proxy_payload(portfolio_api_url)
+        except RuntimeError as error:
+            virtual_portfolio = unavailable_snapshot(portfolio_path, now=now)
+            virtual_portfolio["risk_gate"] = {
+                "can_open": False,
+                "reason": f"loopback仮想口座APIを検証できない: {error}",
+            }
     return {
         "generated_at": now.isoformat(),
         "read_only": True,
@@ -2032,7 +2173,125 @@ def build_state(
             else {}
         ),
         "input_context": _input_context_summary(entries + tf_entries, decision_events),
+        "virtual_portfolio": virtual_portfolio,
     }
+
+
+def _validated_read_api_url(value: str) -> str:
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("operational read API must be a loopback http origin")
+    port = parsed.port
+    if port is None or not 1 <= port <= 65_535:
+        raise ValueError("operational read API requires an explicit valid port")
+    return value.rstrip("/")
+
+
+def _chart_proxy_payload(
+    read_api_url: str,
+    query: dict[str, list[str]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    allowed = {"symbol", "timeframe", "range"}
+    unexpected = set(query) - allowed
+    if unexpected:
+        raise ValueError(f"unsupported chart query parameter: {sorted(unexpected)[0]}")
+    for key in allowed:
+        values = query.get(key)
+        if values is None or len(values) != 1 or not values[0].strip():
+            raise ValueError(f"chart query parameter must appear once: {key}")
+    symbol = query["symbol"][0].strip().upper()
+    timeframe = query["timeframe"][0].strip()
+    range_name = query["range"][0].strip()
+    if symbol not in CHART_SYMBOLS:
+        raise ValueError("unsupported chart symbol")
+    if timeframe not in CHART_TIMEFRAMES:
+        raise ValueError("unsupported chart timeframe")
+    hours = CHART_RANGES.get(range_name)
+    if hours is None:
+        raise ValueError("unsupported chart range")
+
+    as_of = (now or datetime.now(UTC)).astimezone(UTC)
+    start = as_of - timedelta(hours=hours)
+    parameters = urlencode(
+        {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "start": start.isoformat(),
+            "end": as_of.isoformat(),
+            "as_of": as_of.isoformat(),
+        }
+    )
+    request = Request(
+        f"{_validated_read_api_url(read_api_url)}/v1/chart?{parameters}",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=4) as response:
+            payload = json.loads(response.read())
+    except HTTPError as error:
+        try:
+            detail = json.loads(error.read()).get("error")
+        except (AttributeError, json.JSONDecodeError):
+            detail = None
+        raise RuntimeError(str(detail or f"read API HTTP {error.code}")) from error
+    except (OSError, URLError, json.JSONDecodeError) as error:
+        raise RuntimeError("operational chart read API is unavailable") from error
+    if not isinstance(payload, dict) or payload.get("kind") != "chart":
+        raise RuntimeError("operational chart read API returned an invalid payload")
+    payload["range"] = range_name
+    return payload
+
+
+def _virtual_portfolio_proxy_bytes(api_url: str) -> bytes:
+    request = Request(
+        f"{_validated_read_api_url(api_url)}/v1/snapshot",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS) as response:
+            data = response.read()
+    except HTTPError as error:
+        raise RuntimeError(f"virtual portfolio read API HTTP {error.code}") from error
+    except (OSError, URLError) as error:
+        raise RuntimeError("virtual portfolio read API is unavailable") from error
+    if not data.startswith(b"{"):
+        raise RuntimeError("virtual portfolio read API returned invalid JSON")
+    return data
+
+
+def _virtual_portfolio_proxy_payload(api_url: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(_virtual_portfolio_proxy_bytes(api_url))
+    except json.JSONDecodeError as error:
+        raise RuntimeError("virtual portfolio read API returned invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("virtual portfolio read API returned a non-object")
+    return payload
+
+
+def _dashboard_state_cache(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise RuntimeError("dashboard state cache is not initialized") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("dashboard state cache is invalid") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("dashboard state cache must contain an object")
+    metadata = payload.get("dashboard_cache")
+    if not isinstance(metadata, dict) or metadata.get("contract") != "fx-dashboard-state-cache-v1":
+        raise RuntimeError("dashboard state cache contract mismatch")
+    return payload
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2040,11 +2299,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
+        if parsed.path == "/api/virtual-portfolio":
+            if parsed.query:
+                self._send_json_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "virtual portfolio endpoint does not accept query parameters",
+                )
+                return
+            try:
+                data = _virtual_portfolio_proxy_bytes(
+                    self.server.portfolio_api_url,  # type: ignore[attr-defined]
+                )
+            except RuntimeError as error:
+                self._send_json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+                return
+            self._send_json_bytes(data)
+            return
         if parsed.path == "/api/state":
-            query = parse_qs(parsed.query)
-            raw_log_dir = query.get("logDir", [str(self.server.log_dir)])[0]  # type: ignore[attr-defined]
-            log_dir = Path(raw_log_dir).expanduser().resolve()
-            self._send_json(build_state(log_dir))
+            if parsed.query:
+                self._send_json_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "state endpoint does not accept filesystem paths",
+                )
+                return
+            try:
+                payload = _dashboard_state_cache(
+                    self.server.state_cache_path,  # type: ignore[attr-defined]
+                )
+            except RuntimeError as error:
+                self._send_json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+                return
+            self._send_json(payload)
+            return
+        if parsed.path == "/api/chart":
+            try:
+                payload = _chart_proxy_payload(
+                    self.server.read_api_url,  # type: ignore[attr-defined]
+                    parse_qs(parsed.query, keep_blank_values=True, max_num_fields=3),
+                )
+            except ValueError as error:
+                self._send_json_error(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            except RuntimeError as error:
+                self._send_json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+                return
+            self._send_json(payload)
             return
         if parsed.path in {"", "/"}:
             self._send_file(STATIC_DIR / "index.html")
@@ -2061,7 +2360,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_json_bytes(data)
+
+    def _send_json_bytes(self, data: bytes) -> None:
         self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json_error(self, status: HTTPStatus, message: str) -> None:
+        data = json.dumps(
+            {"ok": False, "status": int(status), "error": message},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
@@ -2091,13 +2405,60 @@ def main() -> int:
         default=Path(os.environ.get("FX_LEARNING_LOG_DIR", DEFAULT_LOG_DIR)),
         help="Directory containing briefing_journal.jsonl / briefing_learning.json / ml_model.json",
     )
+    parser.add_argument(
+        "--read-api-url",
+        default=os.environ.get(
+            "FX_OPERATIONAL_READ_API_URL",
+            DEFAULT_OPERATIONAL_READ_API_URL,
+        ),
+        help="Loopback operational read API origin used by /api/chart",
+    )
+    parser.add_argument(
+        "--portfolio-db",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "FX_VIRTUAL_PORTFOLIO_DB",
+                DEFAULT_VIRTUAL_PORTFOLIO_DB,
+            )
+        ),
+        help="Read-only virtual portfolio SQLite database",
+    )
+    parser.add_argument(
+        "--portfolio-api-url",
+        default=os.environ.get(
+            "FX_VIRTUAL_PORTFOLIO_API_URL",
+            DEFAULT_VIRTUAL_PORTFOLIO_API_URL,
+        ),
+        help="Loopback query-only virtual portfolio API origin",
+    )
+    parser.add_argument(
+        "--state-cache",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "FX_DASHBOARD_STATE_CACHE",
+                DEFAULT_DASHBOARD_STATE_CACHE,
+            )
+        ),
+        help="Fixed server-side cache generated by dashboard_state_snapshot.py",
+    )
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     server.log_dir = args.log_dir.expanduser().resolve()  # type: ignore[attr-defined]
+    server.portfolio_db = args.portfolio_db.expanduser().resolve()  # type: ignore[attr-defined]
+    server.read_api_url = _validated_read_api_url(args.read_api_url)  # type: ignore[attr-defined]
+    server.portfolio_api_url = _validated_read_api_url(  # type: ignore[attr-defined]
+        args.portfolio_api_url
+    )
+    server.state_cache_path = args.state_cache.expanduser().resolve()  # type: ignore[attr-defined]
     url = f"http://{args.host}:{args.port}/"
     print(f"AI learning dashboard: {url}")
     print(f"Reading logs from: {server.log_dir}")  # type: ignore[attr-defined]
+    print(f"Reading virtual portfolio from: {server.portfolio_db}")  # type: ignore[attr-defined]
+    print(f"Virtual portfolio query API: {server.portfolio_api_url}")  # type: ignore[attr-defined]
+    print(f"Dashboard state cache: {server.state_cache_path}")  # type: ignore[attr-defined]
     print("Read-only mode. Press Ctrl-C to stop.")
     try:
         server.serve_forever()

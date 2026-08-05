@@ -28,8 +28,10 @@ from .effective_samples import (
 from .evaluation_labels import (
     DEFAULT_COST_STATUS,
     KNOWN_EXECUTABLE_COST_MODEL_IDS,
-    KNOWN_NET_LABEL_PROVENANCES,
-    KNOWN_NET_LABEL_VERSIONS,
+    NET_LABEL_PROVENANCE,
+    NET_LABEL_VERSION,
+    PROMOTION_NET_LABEL_PROVENANCES,
+    PROMOTION_NET_LABEL_VERSIONS,
     CostModelResult,
     canonical_net_label_contract_flags,
     cost_model_contract_flags,
@@ -171,24 +173,44 @@ class CanonicalTradeOutcome:
     direction: str
     prediction_time: str | None = None
     holding_end_time: str | None = None
+    label_available_time: str | None = None
+    label_ingested_time: str | None = None
     first_touch: str = "unavailable"
     first_touch_ts: str | None = None
     entry_bid: float | None = None
     entry_ask: float | None = None
     entry_executable: float | None = None
     planned_risk_distance: float | None = None
+    planned_risk_jpy: int | None = None
+    units: float | None = None
+    entry_quote_to_jpy_rate: float | None = None
+    entry_quote_conversion_source: str = ""
+    exit_bid: float | None = None
+    exit_ask: float | None = None
     exit_executable: float | None = None
     exit_mid: float | None = None
+    exit_quote_to_jpy_rate: float | None = None
+    exit_quote_conversion_source: str = ""
     gross_realized_r: float | None = None
     quote_realized_r: float | None = None
     planned_payoff_r: float | None = None
     slippage_r: float | None = None
     commission_r: float | None = None
     financing_r: float | None = None
+    conversion_r: float | None = None
     entry_spread_r: float | None = None
+    realized_spread_cost_r: float | None = None
     additional_cost_r: float | None = None
     execution_cost_r: float | None = None
     realized_net_r: float | None = None
+    gross_market_pnl_jpy: int | None = None
+    executable_pnl_jpy: int | None = None
+    spread_quote_cost_jpy: int | None = None
+    slippage_cost_jpy: int | None = None
+    commission_jpy: int | None = None
+    financing_jpy: int | None = None
+    conversion_cost_jpy: int | None = None
+    net_pnl_jpy: int | None = None
     cost_model_id: str = "missing"
     cost_model_version: str = ""
     cost_status: str = "missing"
@@ -196,6 +218,30 @@ class CanonicalTradeOutcome:
     spread_source: str = ""
     slippage_model_id: str = ""
     commission_model_id: str = ""
+    conversion_model_id: str = ""
+    cost_source: str = ""
+    exit_quote_source: str = ""
+    execution_observation_mode: str = ""
+    entry_source_record_id: str = ""
+    exit_source_record_id: str = ""
+    entry_quote_event_time: str | None = None
+    entry_quote_available_time: str | None = None
+    entry_quote_ingested_time: str | None = None
+    entry_quote_revision_id: str = ""
+    exit_quote_event_time: str | None = None
+    exit_quote_available_time: str | None = None
+    exit_quote_ingested_time: str | None = None
+    exit_quote_revision_id: str = ""
+    decision_record_sha256: str = ""
+    open_record_sha256: str = ""
+    open_observation_sha256: str = ""
+    close_record_sha256: str = ""
+    close_observation_sha256: str = ""
+    entry_knowledge_basis: str = ""
+    label_knowledge_basis: str = ""
+    costs_complete: bool = False
+    research_only: bool = False
+    promotion_eligible: bool = False
     cost_quality_flags: tuple[str, ...] = field(default_factory=tuple)
     net_label_eligible: bool = False
     path_quality: float | None = None
@@ -218,24 +264,44 @@ class CanonicalTradeOutcome:
             "direction": self.direction,
             "prediction_time": self.prediction_time,
             "holding_end_time": self.holding_end_time,
+            "label_available_time": self.label_available_time,
+            "label_ingested_time": self.label_ingested_time,
             "first_touch": self.first_touch,
             "first_touch_ts": self.first_touch_ts,
             "entry_bid": self.entry_bid,
             "entry_ask": self.entry_ask,
             "entry_executable": self.entry_executable,
             "planned_risk_distance": self.planned_risk_distance,
+            "planned_risk_jpy": self.planned_risk_jpy,
+            "units": self.units,
+            "entry_quote_to_jpy_rate": self.entry_quote_to_jpy_rate,
+            "entry_quote_conversion_source": self.entry_quote_conversion_source,
+            "exit_bid": self.exit_bid,
+            "exit_ask": self.exit_ask,
             "exit_executable": self.exit_executable,
             "exit_mid": self.exit_mid,
+            "exit_quote_to_jpy_rate": self.exit_quote_to_jpy_rate,
+            "exit_quote_conversion_source": self.exit_quote_conversion_source,
             "gross_realized_r": self.gross_realized_r,
             "quote_realized_r": self.quote_realized_r,
             "planned_payoff_r": self.planned_payoff_r,
             "slippage_r": self.slippage_r,
             "commission_r": self.commission_r,
             "financing_r": self.financing_r,
+            "conversion_r": self.conversion_r,
             "entry_spread_r": self.entry_spread_r,
+            "realized_spread_cost_r": self.realized_spread_cost_r,
             "additional_cost_r": self.additional_cost_r,
             "execution_cost_r": self.execution_cost_r,
             "realized_net_r": self.realized_net_r,
+            "gross_market_pnl_jpy": self.gross_market_pnl_jpy,
+            "executable_pnl_jpy": self.executable_pnl_jpy,
+            "spread_quote_cost_jpy": self.spread_quote_cost_jpy,
+            "slippage_cost_jpy": self.slippage_cost_jpy,
+            "commission_jpy": self.commission_jpy,
+            "financing_jpy": self.financing_jpy,
+            "conversion_cost_jpy": self.conversion_cost_jpy,
+            "net_pnl_jpy": self.net_pnl_jpy,
             "cost_model_id": self.cost_model_id,
             "cost_model_version": self.cost_model_version,
             "cost_status": self.cost_status,
@@ -243,6 +309,30 @@ class CanonicalTradeOutcome:
             "spread_source": self.spread_source,
             "slippage_model_id": self.slippage_model_id,
             "commission_model_id": self.commission_model_id,
+            "conversion_model_id": self.conversion_model_id,
+            "cost_source": self.cost_source,
+            "exit_quote_source": self.exit_quote_source,
+            "execution_observation_mode": self.execution_observation_mode,
+            "entry_source_record_id": self.entry_source_record_id,
+            "exit_source_record_id": self.exit_source_record_id,
+            "entry_quote_event_time": self.entry_quote_event_time,
+            "entry_quote_available_time": self.entry_quote_available_time,
+            "entry_quote_ingested_time": self.entry_quote_ingested_time,
+            "entry_quote_revision_id": self.entry_quote_revision_id,
+            "exit_quote_event_time": self.exit_quote_event_time,
+            "exit_quote_available_time": self.exit_quote_available_time,
+            "exit_quote_ingested_time": self.exit_quote_ingested_time,
+            "exit_quote_revision_id": self.exit_quote_revision_id,
+            "decision_record_sha256": self.decision_record_sha256,
+            "open_record_sha256": self.open_record_sha256,
+            "open_observation_sha256": self.open_observation_sha256,
+            "close_record_sha256": self.close_record_sha256,
+            "close_observation_sha256": self.close_observation_sha256,
+            "entry_knowledge_basis": self.entry_knowledge_basis,
+            "label_knowledge_basis": self.label_knowledge_basis,
+            "costs_complete": self.costs_complete,
+            "research_only": self.research_only,
+            "promotion_eligible": self.promotion_eligible,
             "cost_quality_flags": list(self.cost_quality_flags),
             "net_label_eligible": self.net_label_eligible,
             "path_quality": self.path_quality,
@@ -408,9 +498,9 @@ def _canonical_request_flags(request: CanonicalTradeRequest) -> tuple[str, ...]:
     flags: list[str] = list(request.quality_flags)
     if not request.decision_id.strip():
         flags.append("missing_decision_id")
-    if request.label_version not in KNOWN_NET_LABEL_VERSIONS:
+    if request.label_version != NET_LABEL_VERSION:
         flags.append("unknown_label_version")
-    if request.label_provenance not in KNOWN_NET_LABEL_PROVENANCES:
+    if request.label_provenance != NET_LABEL_PROVENANCE:
         flags.append("unknown_label_provenance")
     if request.direction not in {"long", "short"}:
         flags.append("invalid_direction")
@@ -3624,8 +3714,8 @@ def _candidate_from_variant(
 
 def _variant_has_canonical_net_evidence(variant: Mapping[str, object]) -> bool:
     return (
-        variant.get("label_version") in KNOWN_NET_LABEL_VERSIONS
-        and variant.get("label_provenance") in KNOWN_NET_LABEL_PROVENANCES
+        variant.get("label_version") in PROMOTION_NET_LABEL_VERSIONS
+        and variant.get("label_provenance") in PROMOTION_NET_LABEL_PROVENANCES
         and variant.get("cost_model_id") in KNOWN_EXECUTABLE_COST_MODEL_IDS
         and _stat_int(variant, "net_label_samples") >= MIN_EXPECTANCY_SAMPLES
         and math.isclose(
@@ -3935,8 +4025,8 @@ def _prospective_approval_gate(
     provenances = metrics.get("label_provenances")
     cost_models = metrics.get("cost_model_ids")
     if (
-        versions != sorted(KNOWN_NET_LABEL_VERSIONS)
-        or provenances != sorted(KNOWN_NET_LABEL_PROVENANCES)
+        versions != sorted(PROMOTION_NET_LABEL_VERSIONS)
+        or provenances != sorted(PROMOTION_NET_LABEL_PROVENANCES)
         or not isinstance(cost_models, list)
         or len(cost_models) != 1
         or cost_models[0] not in KNOWN_EXECUTABLE_COST_MODEL_IDS
@@ -3960,8 +4050,8 @@ def _approval_improvement_gate(record: Mapping[str, object]) -> tuple[bool, str]
     net_samples = _stat_int(proposed, "net_label_samples")
     net_coverage = _stat_float(proposed, "net_label_coverage")
     if (
-        label_version not in KNOWN_NET_LABEL_VERSIONS
-        or label_provenance not in KNOWN_NET_LABEL_PROVENANCES
+        label_version not in PROMOTION_NET_LABEL_VERSIONS
+        or label_provenance not in PROMOTION_NET_LABEL_PROVENANCES
         or cost_model_id not in KNOWN_EXECUTABLE_COST_MODEL_IDS
     ):
         return False, "TP/SL候補のcanonical純R来歴が不明なため昇格できません"

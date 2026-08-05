@@ -1,5 +1,19 @@
 const state = {
-  logDir: "",
+  chart: {
+    symbol: "USDJPY",
+    timeframe: "1h",
+    range: "24h",
+    lastLoadedAt: 0,
+    zoom: 1,
+    pan: 0,
+    hover: null,
+    layers: {
+      decisions: true,
+      forecast: true,
+      targets: true,
+      spread: true,
+    },
+  },
 };
 
 const JOURNAL_FILE = "briefing_journal.jsonl";
@@ -19,6 +33,15 @@ function pct(value, fallback = "--") {
     : fallback;
 }
 
+function precisePct(value, fallback = "--") {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${(value * 100).toLocaleString("ja-JP", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })}%`
+    : fallback;
+}
+
 function num(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -32,6 +55,21 @@ function shortDate(value) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+  });
+}
+
+function preciseDate(value) {
+  if (!value) return "未記録";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString("ja-JP", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
   });
 }
 
@@ -380,6 +418,1254 @@ let lastCurve = [];
 function cssVar(name, fallback) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   return value || fallback;
+}
+
+const CHART_PRIMARY_HORIZON = { "15m": "15m", "1h": "1h", "4h": null, "1d": "24h" };
+const FORECAST_CHART_CACHE_TTL_MS = 55_000;
+const FORECAST_CHART_CACHE_LIMIT = 8;
+const FORECAST_CHART_REFRESH_MS = 60_000;
+const FORECAST_CHART_REFRESH_OFFSET_MS = 45_000;
+const FORECAST_CHART_WHEEL_LINE_PIXELS = 34;
+const FORECAST_CHART_WHEEL_MAX_DELTA = 120;
+const FORECAST_CHART_WHEEL_SENSITIVITY = 0.002;
+let lastForecastChart = null;
+let lastDashboardState = null;
+let forecastChartHitTargets = [];
+let forecastChartGeometry = null;
+let forecastChartDrag = null;
+let forecastChartAnimationFrame = 0;
+let forecastChartWheelAnimationFrame = 0;
+let forecastChartWheelDelta = 0;
+let forecastChartWheelAnchorRatio = 0.5;
+let forecastChartRequest = null;
+let forecastChartRequestSequence = 0;
+const forecastChartCache = new Map();
+
+function forecastChartSelection() {
+  return {
+    symbol: state.chart.symbol,
+    timeframe: state.chart.timeframe,
+    range: state.chart.range,
+  };
+}
+
+function forecastChartKey(selection = forecastChartSelection()) {
+  return `${selection.symbol}:${selection.timeframe}:${selection.range}`;
+}
+
+function cachedForecastChart(key) {
+  const cached = forecastChartCache.get(key);
+  if (!cached) return null;
+  forecastChartCache.delete(key);
+  forecastChartCache.set(key, cached);
+  return cached;
+}
+
+function cacheForecastChart(key, payload, loadedAt = Date.now()) {
+  forecastChartCache.delete(key);
+  forecastChartCache.set(key, { payload, loadedAt });
+  while (forecastChartCache.size > FORECAST_CHART_CACHE_LIMIT) {
+    const oldestKey = forecastChartCache.keys().next().value;
+    forecastChartCache.delete(oldestKey);
+  }
+}
+
+function setForecastChartBusy(busy) {
+  const panel = $("forecastChartPanel");
+  if (panel) panel.setAttribute("aria-busy", String(Boolean(busy)));
+}
+
+function chartDigits(symbol) {
+  return String(symbol || "").endsWith("JPY") ? 3 : 5;
+}
+
+function chartNumber(value, symbol) {
+  const parsed = num(value);
+  return parsed === null ? "--" : parsed.toFixed(chartDigits(symbol));
+}
+
+function chartClamp(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function chartPanLimit(zoom = state.chart.zoom) {
+  return Math.max(0, (1 - 1 / zoom) / 2);
+}
+
+function resetForecastViewport({ redraw = true } = {}) {
+  if (forecastChartWheelAnimationFrame) {
+    window.cancelAnimationFrame(forecastChartWheelAnimationFrame);
+    forecastChartWheelAnimationFrame = 0;
+    forecastChartWheelDelta = 0;
+  }
+  state.chart.zoom = 1;
+  state.chart.pan = 0;
+  state.chart.hover = null;
+  forecastChartGeometry = null;
+  const hover = $("forecastChartHover");
+  if (hover) hover.hidden = true;
+  if (redraw) scheduleForecastChartRedraw();
+}
+
+function scheduleForecastChartRedraw() {
+  if (!lastForecastChart || forecastChartAnimationFrame) return;
+  forecastChartAnimationFrame = window.requestAnimationFrame(() => {
+    forecastChartAnimationFrame = 0;
+    const canvas = $("forecastChartCanvas");
+    if (canvas) drawForecastChart(canvas, lastForecastChart);
+  });
+}
+
+function setForecastChartZoom(nextZoom, anchorRatio = 0.5) {
+  const geometry = forecastChartGeometry;
+  const oldZoom = state.chart.zoom;
+  const zoom = chartClamp(nextZoom, 1, 24);
+  if (!geometry || zoom === oldZoom) {
+    state.chart.zoom = zoom;
+    state.chart.pan = chartClamp(state.chart.pan, -chartPanLimit(), chartPanLimit());
+    scheduleForecastChartRedraw();
+    return;
+  }
+  const ratio = chartClamp(anchorRatio, 0, 1);
+  const oldSpan = geometry.maxTime - geometry.minTime;
+  const anchorTime = geometry.minTime + oldSpan * ratio;
+  const newSpan = (geometry.fullMaxTime - geometry.fullMinTime) / zoom;
+  const newCenter = anchorTime + (0.5 - ratio) * newSpan;
+  const fullCenter = (geometry.fullMinTime + geometry.fullMaxTime) / 2;
+  state.chart.zoom = zoom;
+  state.chart.pan = (newCenter - fullCenter) / (geometry.fullMaxTime - geometry.fullMinTime);
+  state.chart.pan = chartClamp(state.chart.pan, -chartPanLimit(), chartPanLimit());
+  scheduleForecastChartRedraw();
+}
+
+function normalizedForecastWheelDelta(event) {
+  const multiplier =
+    event.deltaMode === 1
+      ? FORECAST_CHART_WHEEL_LINE_PIXELS
+      : event.deltaMode === 2
+        ? window.innerHeight
+        : 1;
+  return event.deltaY * multiplier;
+}
+
+function queueForecastWheelZoom(event, anchorRatio) {
+  forecastChartWheelDelta += normalizedForecastWheelDelta(event);
+  forecastChartWheelAnchorRatio = chartClamp(anchorRatio, 0, 1);
+  if (forecastChartWheelAnimationFrame) return;
+  forecastChartWheelAnimationFrame = window.requestAnimationFrame(() => {
+    forecastChartWheelAnimationFrame = 0;
+    const delta = chartClamp(
+      forecastChartWheelDelta,
+      -FORECAST_CHART_WHEEL_MAX_DELTA,
+      FORECAST_CHART_WHEEL_MAX_DELTA,
+    );
+    forecastChartWheelDelta = 0;
+    const factor = Math.exp(-delta * FORECAST_CHART_WHEEL_SENSITIVITY);
+    setForecastChartZoom(
+      state.chart.zoom * factor,
+      forecastChartWheelAnchorRatio,
+    );
+  });
+}
+
+function nearestForecastPrice(prices, timeMs) {
+  if (!prices.length) return null;
+  let low = 0;
+  let high = prices.length - 1;
+  while (low < high) {
+    const midpoint = Math.floor((low + high) / 2);
+    if (prices[midpoint].timeMs < timeMs) low = midpoint + 1;
+    else high = midpoint;
+  }
+  if (low === 0) return prices[0];
+  const before = prices[low - 1];
+  const after = prices[low];
+  return Math.abs(before.timeMs - timeMs) <= Math.abs(after.timeMs - timeMs) ? before : after;
+}
+
+function snapDecisionToPrice(decision, prices) {
+  const predictionTimeMs = new Date(decision.prediction_time).getTime();
+  const snappedPrice = Number.isFinite(predictionTimeMs)
+    ? nearestForecastPrice(prices, predictionTimeMs)
+    : null;
+  return {
+    ...decision,
+    predictionTimeMs,
+    markerTimeMs: snappedPrice?.timeMs ?? predictionTimeMs,
+    marker_price_time: snappedPrice?.event_time ?? null,
+    marker_time_offset_ms: snappedPrice
+      ? snappedPrice.timeMs - predictionTimeMs
+      : null,
+  };
+}
+
+function chartWindowDecisions(chart) {
+  const startMs = new Date(chart?.window?.start).getTime();
+  const endMs = new Date(chart?.window?.end).getTime();
+  const rows = Array.isArray(chart?.decisions) ? chart.decisions : [];
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return rows;
+  return rows.filter((row) => {
+    const predictionTimeMs = new Date(row.prediction_time).getTime();
+    return (
+      Number.isFinite(predictionTimeMs) &&
+      predictionTimeMs >= startMs &&
+      predictionTimeMs <= endMs
+    );
+  });
+}
+
+function markerTimeOffsetLabel(offsetMs) {
+  if (!Number.isFinite(offsetMs)) return "--";
+  const seconds = Math.round(offsetMs / 1000);
+  if (seconds === 0) return "同時刻";
+  return `${seconds > 0 ? "+" : ""}${seconds}秒`;
+}
+
+function renderForecastQuote(prices, selected = null) {
+  if (!prices.length) return;
+  const latest = prices.at(-1);
+  const row = selected || latest;
+  const close = num(row.close);
+  const previousIndex = Math.max(0, prices.indexOf(row) - 1);
+  const previous = num(prices[previousIndex]?.close);
+  const change = close !== null && previous !== null ? close - previous : null;
+  const changePct = change !== null && previous ? change / previous : null;
+  setText("forecastChartLastPrice", chartNumber(close, state.chart.symbol));
+  const changeEl = $("forecastChartChange");
+  if (changeEl) {
+    changeEl.classList.toggle("up", change !== null && change > 0);
+    changeEl.classList.toggle("down", change !== null && change < 0);
+    changeEl.textContent =
+      change === null
+        ? "--"
+        : `${change >= 0 ? "+" : ""}${change.toFixed(chartDigits(state.chart.symbol))} (${
+            changePct === null ? "--" : `${changePct >= 0 ? "+" : ""}${(changePct * 100).toFixed(3)}%`
+          })`;
+  }
+  const open = num(row.open);
+  const high = num(row.high);
+  const low = num(row.low);
+  const bid = num(row.bid);
+  const ask = num(row.ask);
+  setText(
+    "forecastChartHoverOhlc",
+    `${shortDate(row.event_time)}  O ${chartNumber(open, state.chart.symbol)}  H ${chartNumber(
+      high,
+      state.chart.symbol,
+    )}  L ${chartNumber(low, state.chart.symbol)}  C ${chartNumber(
+      close,
+      state.chart.symbol,
+    )}  Bid ${chartNumber(bid, state.chart.symbol)}  Ask ${chartNumber(
+      ask,
+      state.chart.symbol,
+    )}`,
+  );
+}
+
+function renderForecastHoverCard(row) {
+  const target = $("forecastChartHover");
+  if (!target) return;
+  if (!row) {
+    target.hidden = true;
+    return;
+  }
+  target.hidden = false;
+  target.textContent = `${shortDate(row.event_time)}  O ${chartNumber(
+    row.open,
+    state.chart.symbol,
+  )}  H ${chartNumber(row.high, state.chart.symbol)}  L ${chartNumber(
+    row.low,
+    state.chart.symbol,
+  )}  C ${chartNumber(row.close, state.chart.symbol)}  Bid ${chartNumber(
+    row.bid,
+    state.chart.symbol,
+  )}  Ask ${chartNumber(row.ask, state.chart.symbol)}`;
+}
+
+function restoreChartSelection() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem("fxForecastChart") || "{}");
+    if (["USDJPY", "EURUSD", "GBPUSD"].includes(saved.symbol)) state.chart.symbol = saved.symbol;
+    if (TIMEFRAME_ORDER.includes(saved.timeframe)) state.chart.timeframe = saved.timeframe;
+    if (["6h", "24h", "3d", "7d"].includes(saved.range)) state.chart.range = saved.range;
+    if (saved.layers && typeof saved.layers === "object") {
+      Object.keys(state.chart.layers).forEach((key) => {
+        if (typeof saved.layers[key] === "boolean") state.chart.layers[key] = saved.layers[key];
+      });
+    }
+  } catch (error) {
+    // 保存値が壊れていても既定値で継続する。
+  }
+}
+
+function saveChartSelection() {
+  try {
+    window.localStorage.setItem(
+      "fxForecastChart",
+      JSON.stringify({
+        symbol: state.chart.symbol,
+        timeframe: state.chart.timeframe,
+        range: state.chart.range,
+        layers: state.chart.layers,
+      }),
+    );
+  } catch (error) {
+    // localStorageが使えない場合もチャート表示は継続する。
+  }
+}
+
+function syncChartControls() {
+  const symbol = $("forecastChartSymbol");
+  if (symbol) symbol.value = state.chart.symbol;
+  document.querySelectorAll("[data-chart-timeframe]").forEach((button) => {
+    const active = button.dataset.chartTimeframe === state.chart.timeframe;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-chart-range]").forEach((button) => {
+    const active = button.dataset.chartRange === state.chart.range;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-chart-layer]").forEach((button) => {
+    const active = state.chart.layers[button.dataset.chartLayer] !== false;
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+}
+
+function qualityChip(text, tone = "") {
+  const chip = document.createElement("span");
+  chip.className = `chart-quality-chip${tone ? ` ${tone}` : ""}`;
+  chip.textContent = text;
+  return chip;
+}
+
+function renderForecastChartQuality(chart) {
+  const target = $("forecastChartQuality");
+  if (!target) return;
+  target.replaceChildren();
+  const quality = chart?.quality || {};
+  const latest = quality.latest_available_time;
+  const latestMs = new Date(latest).getTime();
+  const ageSeconds = Number.isFinite(latestMs)
+    ? Math.max(0, Math.round((Date.now() - latestMs) / 1000))
+    : null;
+  target.appendChild(
+    qualityChip(
+      quality.status === "ok"
+        ? `価格 ${shortDate(latest)}${ageSeconds === null ? "" : ` / ${ageSeconds}秒前`}`
+        : "価格データ stale",
+      quality.status !== "ok" ? "bad" : ageSeconds !== null && ageSeconds > 360 ? "warn" : "good",
+    ),
+  );
+  target.appendChild(
+    qualityChip(
+      chart?.price_mode === "completed_candles"
+        ? "完成bid/ask足"
+        : "約5分間隔の形成中スナップショット線",
+      chart?.price_mode === "completed_candles" ? "good" : "warn",
+    ),
+  );
+  const coverage = num(quality.bid_ask_coverage);
+  target.appendChild(
+    qualityChip(
+      `bid/ask ${coverage === null ? "--" : Math.round(coverage * 100)}%`,
+      coverage && coverage > 0 ? "good" : "warn",
+    ),
+  );
+  const excluded = Number(quality.pit_excluded || 0);
+  target.appendChild(
+    qualityChip(`PIT除外 ${excluded}`, excluded ? "warn" : "good"),
+  );
+  const decisionCount = chartWindowDecisions(chart).length;
+  const decisionTotal = Number(quality.decisions_total);
+  const sampled = quality.decisions_sampled === true;
+  target.appendChild(
+    qualityChip(
+      sampled && Number.isFinite(decisionTotal)
+        ? `判断 ${decisionTotal}件(表示${decisionCount}件に間引き)`
+        : `判断 ${decisionCount}件`,
+      decisionCount ? "good" : "warn",
+    ),
+  );
+  if (!CHART_PRIMARY_HORIZON[state.chart.timeframe]) {
+    target.appendChild(qualityChip("4hと一致する予想帯なし", "warn"));
+  }
+}
+
+function matchingForecasts() {
+  const latest = lastDashboardState?.horizon?.latest;
+  if (!Array.isArray(latest)) return [];
+  return latest.filter((row) => row.symbol === state.chart.symbol);
+}
+
+function primaryForecast() {
+  const wanted = CHART_PRIMARY_HORIZON[state.chart.timeframe];
+  if (!wanted) return null;
+  const matches = matchingForecasts().filter((row) => row.horizon === wanted);
+  return matches.sort((a, b) => new Date(a.ts) - new Date(b.ts)).at(-1) || null;
+}
+
+function forecastBandPrices(forecast) {
+  const close = num(forecast?.close);
+  const p10 = num(forecast?.band_p10);
+  const p50 = num(forecast?.band_p50);
+  const p90 = num(forecast?.band_p90);
+  if ([close, p10, p50, p90].some((value) => value === null)) return null;
+  return {
+    p10: close + p10,
+    p50: close + p50,
+    p90: close + p90,
+  };
+}
+
+function setForecastChartUnavailable(message) {
+  const canvas = $("forecastChartCanvas");
+  const emptyEl = $("forecastChartEmpty");
+  if (canvas) canvas.hidden = true;
+  if (emptyEl) {
+    emptyEl.hidden = false;
+    emptyEl.textContent = message;
+  }
+  setText("forecastChartStatus", message);
+  forecastChartHitTargets = [];
+  forecastChartGeometry = null;
+  state.chart.hover = null;
+  renderForecastHoverCard(null);
+  setText("forecastChartLastPrice", "--");
+  setText("forecastChartChange", "--");
+  setText("forecastChartHoverOhlc", message);
+}
+
+function renderForecastDecisionDetail(decision) {
+  const target = $("forecastChartDetail");
+  if (!target) return;
+  if (!decision) {
+    target.textContent =
+      "表示範囲内にPIT適格な判断がありません。価格と最新ホライズン帯だけを表示しています。";
+    return;
+  }
+  const action = ["long", "short"].includes(decision.direction)
+    ? `運用判断 ${DIRECTION_LABEL[decision.direction] || decision.direction}`
+    : `運用判断 ${DIRECTION_LABEL[decision.direction] || decision.direction || "中立"}`;
+  const analysis = ["long", "short"].includes(decision.analysis_direction)
+    ? `分析 ${DIRECTION_LABEL[decision.analysis_direction]}`
+    : "分析方向なし";
+  const moderateShadow = ["long", "short"].includes(decision.moderate_shadow_direction)
+    ? `中強気shadow ${DIRECTION_LABEL[decision.moderate_shadow_direction]}`
+    : decision.moderate_shadow_direction === "neutral"
+      ? "中強気shadow 見送り"
+      : "中強気shadow 記録なし";
+  const score = num(decision.analysis_score);
+  const levels = [
+    `価格 ${chartNumber(decision.prediction_close, state.chart.symbol)}`,
+    `stop ${chartNumber(decision.stop, state.chart.symbol)}`,
+    `target1 ${chartNumber(decision.target1, state.chart.symbol)}`,
+    `target2 ${chartNumber(decision.target2, state.chart.symbol)}`,
+  ].join(" / ");
+  const snapped = decision.marker_price_time
+    ? ` / 表示位置 ${preciseDate(decision.marker_price_time)} (${markerTimeOffsetLabel(
+        decision.marker_time_offset_ms,
+      )})`
+    : "";
+  target.textContent = `判断時刻 ${preciseDate(decision.prediction_time)}${snapped} / ${
+    state.chart.symbol
+  } ${
+    TIMEFRAME_LABEL[state.chart.timeframe]
+  } — ${analysis}${score === null ? "" : ` score ${score >= 0 ? "+" : ""}${score.toFixed(3)}`} / ${
+    moderateShadow
+  }（本番不使用） / ${action}${
+    decision.primary_gate ? ` / 見送りゲート ${decision.primary_gate}` : ""
+  } / ${levels} / ${decision.outcome_status || "pending"}`;
+}
+
+function drawForecastChart(canvas, chart) {
+  const prices = (chart?.prices || [])
+    .map((row) => ({ ...row, timeMs: new Date(row.event_time).getTime() }))
+    .filter((row) => Number.isFinite(row.timeMs) && num(row.close) !== null)
+    .sort((a, b) => a.timeMs - b.timeMs);
+  const quality = chart?.quality || {};
+  if (!prices.length) {
+    setForecastChartUnavailable("選択範囲の実測価格がありません");
+    return;
+  }
+  if (quality.status !== "ok") {
+    setForecastChartUnavailable("価格データがstaleのためチャートを停止しました");
+    return;
+  }
+
+  canvas.hidden = false;
+  const emptyEl = $("forecastChartEmpty");
+  if (emptyEl) emptyEl.hidden = true;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const ratio = window.devicePixelRatio || 1;
+  const cssWidth = Math.max(
+    320,
+    Math.floor(canvas.getBoundingClientRect().width || canvas.parentElement?.clientWidth || 900),
+  );
+  const expanded = $("forecastChartPanel")?.classList.contains("is-expanded");
+  const cssHeight = expanded
+    ? Math.max(460, window.innerHeight - 250)
+    : window.innerWidth <= 720
+      ? 340
+      : 430;
+  canvas.width = Math.round(cssWidth * ratio);
+  canvas.height = Math.round(cssHeight * ratio);
+  canvas.style.height = `${cssHeight}px`;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const pad = { left: 14, right: 88, top: 22, bottom: 36 };
+  const plotW = Math.max(10, cssWidth - pad.left - pad.right);
+  const plotH = Math.max(10, cssHeight - pad.top - pad.bottom);
+  const axisLeft = pad.left + plotW;
+  const axisWidth = Math.max(1, cssWidth - axisLeft);
+  const decisions = chartWindowDecisions(chart).map((row) =>
+    snapDecisionToPrice(row, prices),
+  );
+  const forecast = primaryForecast();
+  const band = forecastBandPrices(forecast);
+  const forecastStart = forecast ? new Date(forecast.ts).getTime() : NaN;
+  const forecastDue = forecast ? new Date(forecast.due_time).getTime() : NaN;
+  const decisionTimes = decisions.flatMap((row) => [
+    row.markerTimeMs,
+    new Date(row.due_time).getTime(),
+  ]);
+  const times = [
+    ...prices.map((row) => row.timeMs),
+    ...decisionTimes.filter(Number.isFinite),
+    ...(Number.isFinite(forecastStart) ? [forecastStart] : []),
+    ...(Number.isFinite(forecastDue) ? [forecastDue] : []),
+  ];
+  let fullMinTime = Math.min(...times);
+  let fullMaxTime = Math.max(...times);
+  if (fullMinTime === fullMaxTime) fullMaxTime += 1;
+  const fullSpan = fullMaxTime - fullMinTime;
+  state.chart.zoom = chartClamp(state.chart.zoom, 1, 24);
+  state.chart.pan = chartClamp(state.chart.pan, -chartPanLimit(), chartPanLimit());
+  const viewSpan = fullSpan / state.chart.zoom;
+  const fullCenter = (fullMinTime + fullMaxTime) / 2;
+  const viewCenter = fullCenter + state.chart.pan * fullSpan;
+  const minTime = viewCenter - viewSpan / 2;
+  const maxTime = viewCenter + viewSpan / 2;
+  const visiblePrices = prices.filter(
+    (row) => row.timeMs >= minTime && row.timeMs <= maxTime,
+  );
+  const plottedPrices = visiblePrices.length ? visiblePrices : prices;
+  const visibleDecisions = decisions.filter((row) => {
+    const timeMs = row.markerTimeMs;
+    return Number.isFinite(timeMs) && timeMs >= minTime && timeMs <= maxTime;
+  });
+  const latestVisibleDecision = visibleDecisions.at(-1) || null;
+  const latestDecision = latestVisibleDecision || decisions.at(-1) || null;
+
+  const levels = plottedPrices.flatMap((row) => [
+    num(row.low) ?? num(row.close),
+    num(row.high) ?? num(row.close),
+    num(row.bid),
+    num(row.ask),
+  ]).filter((value) => value !== null);
+  if (state.chart.layers.decisions) {
+    visibleDecisions.forEach((row) => {
+      const value = num(row.prediction_close);
+      if (value !== null) levels.push(value);
+    });
+  }
+  if (latestVisibleDecision && state.chart.layers.targets) {
+    ["stop", "target1", "target2"].forEach((key) => {
+      const value = num(latestVisibleDecision[key]);
+      if (value !== null) levels.push(value);
+    });
+  }
+  const bandInView =
+    band &&
+    Number.isFinite(forecastStart) &&
+    Number.isFinite(forecastDue) &&
+    forecastDue >= minTime &&
+    forecastStart <= maxTime;
+  if (bandInView && state.chart.layers.forecast) levels.push(band.p10, band.p50, band.p90);
+  let minPrice = Math.min(...levels);
+  let maxPrice = Math.max(...levels);
+  const priceMargin = Math.max((maxPrice - minPrice) * 0.08, Math.abs(maxPrice) * 0.00005);
+  minPrice -= priceMargin;
+  maxPrice += priceMargin;
+  const x = (timeMs) => pad.left + ((timeMs - minTime) / (maxTime - minTime)) * plotW;
+  const y = (price) => pad.top + ((maxPrice - price) / (maxPrice - minPrice)) * plotH;
+  forecastChartGeometry = {
+    pad,
+    plotW,
+    plotH,
+    axisLeft,
+    axisWidth,
+    minTime,
+    maxTime,
+    fullMinTime,
+    fullMaxTime,
+    minPrice,
+    maxPrice,
+    prices,
+  };
+
+  const line = cssVar("--line", "#3c3f37");
+  const muted = cssVar("--muted", "#aaa79c");
+  const text = cssVar("--text", "#f3f1e9");
+  const cyan = cssVar("--cyan", "#66b7c9");
+  const amber = cssVar("--amber", "#d6a64b");
+  const green = cssVar("--green", "#5dc98c");
+  const red = cssVar("--red", "#de6e64");
+  const longColor = cssVar("--viz-1", "#3987e5");
+  const shortColor = cssVar("--viz-2", "#d95926");
+
+  ctx.fillStyle = "#191a17";
+  ctx.fillRect(axisLeft, 0, axisWidth, cssHeight);
+  ctx.strokeStyle = line;
+  ctx.beginPath();
+  ctx.moveTo(axisLeft + 0.5, 0);
+  ctx.lineTo(axisLeft + 0.5, cssHeight);
+  ctx.stroke();
+
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  for (let index = 0; index <= 4; index += 1) {
+    const fraction = index / 4;
+    const price = maxPrice - (maxPrice - minPrice) * fraction;
+    const py = pad.top + plotH * fraction;
+    ctx.strokeStyle = line;
+    ctx.globalAlpha = 0.45;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, py);
+    ctx.lineTo(pad.left + plotW, py);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = muted;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(chartNumber(price, state.chart.symbol), axisLeft + 8, py);
+  }
+  for (let index = 0; index <= 5; index += 1) {
+    const timeMs = minTime + ((maxTime - minTime) * index) / 5;
+    const px = x(timeMs);
+    ctx.strokeStyle = line;
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath();
+    ctx.moveTo(px, pad.top);
+    ctx.lineTo(px, pad.top + plotH);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = muted;
+    ctx.textAlign = index === 0 ? "left" : index === 5 ? "right" : "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(shortDate(new Date(timeMs).toISOString()), px, pad.top + plotH + 8);
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.left, pad.top, plotW, plotH);
+  ctx.clip();
+
+  if (bandInView && state.chart.layers.forecast) {
+    const left = x(forecastStart);
+    const right = x(forecastDue);
+    ctx.fillStyle = "rgba(57, 135, 229, 0.15)";
+    ctx.strokeStyle = "rgba(57, 135, 229, 0.65)";
+    ctx.fillRect(left, y(band.p90), Math.max(1, right - left), y(band.p10) - y(band.p90));
+    ctx.strokeRect(left, y(band.p90), Math.max(1, right - left), y(band.p10) - y(band.p90));
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(left, y(band.p50));
+    ctx.lineTo(right, y(band.p50));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = text;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(
+      `${forecast.horizon} p10–p90${forecast.calibrated ? "" : "（未較正）"}`,
+      left + 5,
+      y(band.p90) - 5,
+    );
+  }
+
+  const allQuotes = plottedPrices.every(
+    (row) => num(row.bid) !== null && num(row.ask) !== null,
+  );
+  if (state.chart.layers.spread && allQuotes) {
+    ctx.fillStyle = "rgba(102, 183, 201, 0.10)";
+    ctx.beginPath();
+    plottedPrices.forEach((row, index) => {
+      const px = x(row.timeMs);
+      const py = y(num(row.ask));
+      if (index === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    [...plottedPrices]
+      .reverse()
+      .forEach((row) => ctx.lineTo(x(row.timeMs), y(num(row.bid))));
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  if (chart.price_mode === "completed_candles") {
+    const candleWidth = Math.max(2, Math.min(11, (plotW / plottedPrices.length) * 0.65));
+    plottedPrices.forEach((row) => {
+      const open = num(row.open);
+      const high = num(row.high);
+      const low = num(row.low);
+      const close = num(row.close);
+      if ([open, high, low, close].some((value) => value === null)) return;
+      const color = close >= open ? green : red;
+      const px = x(row.timeMs);
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(px, y(high));
+      ctx.lineTo(px, y(low));
+      ctx.stroke();
+      ctx.fillRect(
+        px - candleWidth / 2,
+        Math.min(y(open), y(close)),
+        candleWidth,
+        Math.max(1, Math.abs(y(close) - y(open))),
+      );
+    });
+  } else {
+    ctx.strokeStyle = cyan;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    plottedPrices.forEach((row, index) => {
+      const px = x(row.timeMs);
+      const py = y(num(row.close));
+      if (index === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+
+  forecastChartHitTargets = [];
+  if (latestVisibleDecision && state.chart.layers.targets) {
+    const startX = x(latestVisibleDecision.markerTimeMs);
+    const endX = x(new Date(latestVisibleDecision.due_time).getTime());
+    ["stop", "target1", "target2"].forEach((key) => {
+      const value = num(latestVisibleDecision[key]);
+      if (value === null) return;
+      ctx.strokeStyle = key === "stop" ? red : amber;
+      ctx.globalAlpha = 0.75;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(startX, y(value));
+      ctx.lineTo(endX, y(value));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = key === "stop" ? red : amber;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(
+        `${key} ${chartNumber(value, state.chart.symbol)}`,
+        pad.left + plotW - 8,
+        y(value) - 2,
+      );
+    });
+  }
+
+  const decisionMarkerBuckets = new Map();
+  const markerSpacing = state.chart.zoom < 2 ? 20 : state.chart.zoom < 5 ? 12 : 7;
+  visibleDecisions.forEach((decision) => {
+    const timeMs = decision.markerTimeMs;
+    if (!Number.isFinite(timeMs)) return;
+    const bucket = Math.floor((x(timeMs) - pad.left) / markerSpacing);
+    decisionMarkerBuckets.set(bucket, decision);
+  });
+  const plottedDecisions = [...decisionMarkerBuckets.values()];
+  if (state.chart.layers.decisions) plottedDecisions.forEach((decision) => {
+    const timeMs = decision.markerTimeMs;
+    const price = num(decision.prediction_close);
+    if (!Number.isFinite(timeMs) || price === null) return;
+    const px = x(timeMs);
+    const py = y(price);
+    const actionDirection = ["long", "short"].includes(decision.direction)
+      ? decision.direction
+      : null;
+    const analysisDirection = ["long", "short"].includes(decision.analysis_direction)
+      ? decision.analysis_direction
+      : null;
+    const moderateDirection = ["long", "short"].includes(
+      decision.moderate_shadow_direction,
+    )
+      ? decision.moderate_shadow_direction
+      : null;
+    const direction = actionDirection || moderateDirection || analysisDirection;
+    const color = direction === "short" ? shortColor : direction === "long" ? longColor : muted;
+    const up = direction !== "short";
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (up) {
+      ctx.moveTo(px, py - 8);
+      ctx.lineTo(px - 6, py + 5);
+      ctx.lineTo(px + 6, py + 5);
+    } else {
+      ctx.moveTo(px, py + 8);
+      ctx.lineTo(px - 6, py - 5);
+      ctx.lineTo(px + 6, py - 5);
+    }
+    ctx.closePath();
+    if (actionDirection) ctx.fill();
+    else if (moderateDirection) {
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (analysisDirection) ctx.stroke();
+    else {
+      ctx.beginPath();
+      ctx.arc(px, py, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.lineWidth = 1;
+    forecastChartHitTargets.push({ x: px, y: py, decision });
+  });
+
+  const current = plottedPrices.at(-1);
+  const currentY = y(num(current.close));
+  ctx.strokeStyle = cyan;
+  ctx.globalAlpha = 0.5;
+  ctx.setLineDash([3, 4]);
+  ctx.beginPath();
+  ctx.moveTo(pad.left, currentY);
+  ctx.lineTo(pad.left + plotW, currentY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = cyan;
+  ctx.beginPath();
+  ctx.arc(x(current.timeMs), y(num(current.close)), 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  const currentLabel = chartNumber(current.close, state.chart.symbol);
+  ctx.font = "600 11px system-ui, sans-serif";
+  ctx.fillStyle = cyan;
+  ctx.fillRect(axisLeft, currentY - 9, axisWidth, 18);
+  ctx.fillStyle = "#071015";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(currentLabel, axisLeft + axisWidth / 2, currentY);
+
+  const hover = state.chart.hover;
+  if (
+    hover &&
+    hover.x >= pad.left &&
+    hover.x <= pad.left + plotW &&
+    hover.y >= pad.top &&
+    hover.y <= pad.top + plotH
+  ) {
+    const hoverTime = minTime + ((hover.x - pad.left) / plotW) * (maxTime - minTime);
+    const hoverPrice = maxPrice - ((hover.y - pad.top) / plotH) * (maxPrice - minPrice);
+    ctx.strokeStyle = muted;
+    ctx.globalAlpha = 0.8;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(hover.x, pad.top);
+    ctx.lineTo(hover.x, pad.top + plotH);
+    ctx.moveTo(pad.left, hover.y);
+    ctx.lineTo(pad.left + plotW, hover.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+
+    ctx.font = "11px system-ui, sans-serif";
+    const timeLabel = shortDate(new Date(hoverTime).toISOString());
+    const timeWidth = Math.max(92, ctx.measureText(timeLabel).width + 14);
+    const timeX = chartClamp(hover.x - timeWidth / 2, pad.left, pad.left + plotW - timeWidth);
+    ctx.fillStyle = cssVar("--surface-strong", "#252821");
+    ctx.fillRect(timeX, pad.top + plotH, timeWidth, 22);
+    ctx.fillStyle = text;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(timeLabel, timeX + timeWidth / 2, pad.top + plotH + 11);
+
+    ctx.fillStyle = cssVar("--surface-strong", "#252821");
+    ctx.fillRect(axisLeft, hover.y - 9, axisWidth, 18);
+    ctx.fillStyle = text;
+    ctx.fillText(
+      chartNumber(hoverPrice, state.chart.symbol),
+      axisLeft + axisWidth / 2,
+      hover.y,
+    );
+  }
+
+  renderForecastQuote(prices, hover?.row || current);
+  setText(
+    "forecastChartStatus",
+    `${state.chart.symbol} ${TIMEFRAME_LABEL[state.chart.timeframe]} / ${
+      plottedPrices.length
+    }/${prices.length}点 / 表示 ${Math.round(state.chart.zoom * 100)}% / ${shortDate(
+      current.event_time,
+    )}`,
+  );
+  renderForecastDecisionDetail(latestDecision);
+}
+
+function renderForecastChart(chart) {
+  lastForecastChart = chart;
+  renderForecastChartQuality(chart);
+  const canvas = $("forecastChartCanvas");
+  if (canvas) drawForecastChart(canvas, chart);
+}
+
+async function loadForecastChart({ force = false } = {}) {
+  const selection = forecastChartSelection();
+  const key = forecastChartKey(selection);
+  if (forecastChartRequest && forecastChartRequest.key !== key) {
+    forecastChartRequest.controller.abort();
+  }
+  const cached = cachedForecastChart(key);
+  const now = Date.now();
+  if (cached) {
+    state.chart.lastLoadedAt = cached.loadedAt;
+    renderForecastChart(cached.payload);
+    if (!force && now - cached.loadedAt < FORECAST_CHART_CACHE_TTL_MS) {
+      if (!forecastChartRequest || forecastChartRequest.key !== key) {
+        setForecastChartBusy(false);
+      }
+      return cached.payload;
+    }
+  }
+
+  if (forecastChartRequest?.key === key) {
+    return forecastChartRequest.promise;
+  }
+  if (forecastChartRequest) {
+    forecastChartRequest.controller.abort();
+  }
+
+  const requestId = ++forecastChartRequestSequence;
+  const controller = new AbortController();
+  if (!cached) {
+    lastForecastChart = null;
+    setForecastChartUnavailable("価格データを読み込み中");
+  }
+  setForecastChartBusy(true);
+  const parameters = new URLSearchParams({
+    symbol: selection.symbol,
+    timeframe: selection.timeframe,
+    range: selection.range,
+  });
+
+  const promise = (async () => {
+    try {
+      const response = await fetch(`/api/chart?${parameters}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      if (
+        requestId !== forecastChartRequestSequence ||
+        key !== forecastChartKey()
+      ) {
+        return null;
+      }
+      const loadedAt = Date.now();
+      cacheForecastChart(key, payload, loadedAt);
+      state.chart.lastLoadedAt = loadedAt;
+      renderForecastChart(payload);
+      return payload;
+    } catch (error) {
+      if (controller.signal.aborted || error?.name === "AbortError") return null;
+      if (
+        requestId !== forecastChartRequestSequence ||
+        key !== forecastChartKey()
+      ) {
+        return null;
+      }
+      const quality = $("forecastChartQuality");
+      if (cached) {
+        console.warn(error);
+        if (quality) {
+          quality.appendChild(qualityChip("更新失敗・キャッシュ表示", "warn"));
+        }
+      } else {
+        console.error(error);
+        setForecastChartUnavailable(`価格チャートを表示できません: ${error.message}`);
+      }
+      if (!cached && quality) {
+        quality.replaceChildren(qualityChip("read-only価格API未接続", "bad"));
+      }
+      return null;
+    } finally {
+      if (forecastChartRequest?.requestId === requestId) {
+        forecastChartRequest = null;
+      }
+      if (key === forecastChartKey()) setForecastChartBusy(false);
+    }
+  })();
+  forecastChartRequest = { key, requestId, controller, promise };
+  return promise;
+}
+
+function bindForecastChartControls() {
+  const toggleExpanded = (force) => {
+    const panel = $("forecastChartPanel");
+    const button = $("forecastChartFullscreen");
+    if (!panel) return;
+    const expanded =
+      typeof force === "boolean" ? force : !panel.classList.contains("is-expanded");
+    panel.classList.toggle("is-expanded", expanded);
+    document.body.classList.toggle("chart-expanded", expanded);
+    if (button) {
+      button.textContent = expanded ? "通常表示" : "拡大表示";
+      button.setAttribute("aria-pressed", String(expanded));
+    }
+    scheduleForecastChartRedraw();
+    if (expanded) {
+      $("forecastChartCanvas")?.focus({ preventScroll: true });
+      panel.scrollTop = 0;
+    }
+  };
+  const prepareReload = () => {
+    state.chart.lastLoadedAt = 0;
+    resetForecastViewport({ redraw: false });
+    saveChartSelection();
+    syncChartControls();
+    loadForecastChart();
+  };
+  const symbol = $("forecastChartSymbol");
+  if (symbol) {
+    symbol.addEventListener("change", () => {
+      state.chart.symbol = symbol.value;
+      prepareReload();
+    });
+  }
+  document.querySelectorAll("[data-chart-timeframe]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.chart.timeframe = button.dataset.chartTimeframe;
+      prepareReload();
+    });
+  });
+  document.querySelectorAll("[data-chart-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.chart.range = button.dataset.chartRange;
+      prepareReload();
+    });
+  });
+  document.querySelectorAll("[data-chart-layer]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const layer = button.dataset.chartLayer;
+      if (!(layer in state.chart.layers)) return;
+      state.chart.layers[layer] = !state.chart.layers[layer];
+      saveChartSelection();
+      syncChartControls();
+      scheduleForecastChartRedraw();
+    });
+  });
+  $("forecastChartZoomOut")?.addEventListener("click", () => {
+    setForecastChartZoom(state.chart.zoom / 1.35);
+  });
+  $("forecastChartZoomIn")?.addEventListener("click", () => {
+    setForecastChartZoom(state.chart.zoom * 1.35);
+  });
+  $("forecastChartReset")?.addEventListener("click", () => resetForecastViewport());
+  $("forecastChartFullscreen")?.addEventListener("click", () => toggleExpanded());
+
+  const showDecisionTooltip = (event, px, py) => {
+    const hit = forecastChartHitTargets.find(
+      (target) => Math.hypot(target.x - px, target.y - py) <= 10,
+    );
+    if (!hit) {
+      hideTooltip();
+      return null;
+    }
+    const row = hit.decision;
+    showTooltip(event, `${state.chart.symbol} 判断マーカー`, [
+      {
+        label: "元の判断時刻",
+        value: preciseDate(row.prediction_time),
+      },
+      {
+        label: "表示価格時刻",
+        value: row.marker_price_time
+          ? `${preciseDate(row.marker_price_time)} (${markerTimeOffsetLabel(
+              row.marker_time_offset_ms,
+            )})`
+          : "--",
+        muted: true,
+      },
+      {
+        label: "分析",
+        value: DIRECTION_LABEL[row.analysis_direction] || row.analysis_direction || "--",
+        color: cssVar("--viz-1", "#3987e5"),
+      },
+      {
+        label: "中強気shadow（本番不使用）",
+        value:
+          DIRECTION_LABEL[row.moderate_shadow_direction] ||
+          (row.moderate_shadow_direction === "neutral" ? "見送り" : null) ||
+          "記録なし",
+        color: cssVar("--viz-1", "#3987e5"),
+      },
+      {
+        label: "運用判断",
+        value: DIRECTION_LABEL[row.direction] || row.direction || "--",
+      },
+      {
+        label: "価格",
+        value: chartNumber(row.prediction_close, state.chart.symbol),
+      },
+      {
+        label: "ゲート",
+        value: row.primary_gate || "なし",
+        muted: !row.primary_gate,
+      },
+    ]);
+    return hit;
+  };
+
+  const canvas = $("forecastChartCanvas");
+  if (canvas) {
+    const pointerPosition = (event) => {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        px: event.clientX - rect.left,
+        py: event.clientY - rect.top,
+      };
+    };
+    canvas.addEventListener(
+      "wheel",
+      (event) => {
+        if (!forecastChartGeometry) return;
+        event.preventDefault();
+        const { px } = pointerPosition(event);
+        const ratio =
+          (px - forecastChartGeometry.pad.left) / forecastChartGeometry.plotW;
+        state.chart.hover = null;
+        renderForecastHoverCard(null);
+        queueForecastWheelZoom(event, ratio);
+      },
+      { passive: false },
+    );
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || !forecastChartGeometry) return;
+      canvas.focus();
+      const { px } = pointerPosition(event);
+      forecastChartDrag = {
+        pointerId: event.pointerId,
+        startX: px,
+        startPan: state.chart.pan,
+        moved: false,
+      };
+      canvas.setPointerCapture(event.pointerId);
+      canvas.classList.add("is-dragging");
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      const geometry = forecastChartGeometry;
+      if (!geometry) return;
+      const { px, py } = pointerPosition(event);
+      if (forecastChartDrag?.pointerId === event.pointerId) {
+        const dx = px - forecastChartDrag.startX;
+        if (Math.abs(dx) > 3) forecastChartDrag.moved = true;
+        state.chart.pan = chartClamp(
+          forecastChartDrag.startPan - dx / (geometry.plotW * state.chart.zoom),
+          -chartPanLimit(),
+          chartPanLimit(),
+        );
+        state.chart.hover = null;
+        renderForecastHoverCard(null);
+        hideTooltip();
+        scheduleForecastChartRedraw();
+        return;
+      }
+      const inside =
+        px >= geometry.pad.left &&
+        px <= geometry.pad.left + geometry.plotW &&
+        py >= geometry.pad.top &&
+        py <= geometry.pad.top + geometry.plotH;
+      if (!inside) {
+        state.chart.hover = null;
+        renderForecastHoverCard(null);
+        hideTooltip();
+        scheduleForecastChartRedraw();
+        return;
+      }
+      const timeMs =
+        geometry.minTime +
+        ((px - geometry.pad.left) / geometry.plotW) *
+          (geometry.maxTime - geometry.minTime);
+      const row = nearestForecastPrice(geometry.prices, timeMs);
+      state.chart.hover = { x: px, y: py, row };
+      renderForecastHoverCard(row);
+      renderForecastQuote(geometry.prices, row);
+      showDecisionTooltip(event, px, py);
+      scheduleForecastChartRedraw();
+    });
+    const endDrag = (event) => {
+      if (forecastChartDrag?.pointerId !== event.pointerId) return;
+      const drag = forecastChartDrag;
+      const { px, py } = pointerPosition(event);
+      if (canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+      forecastChartDrag = null;
+      canvas.classList.remove("is-dragging");
+      if (!drag.moved) {
+        const hit = forecastChartHitTargets.find(
+          (target) => Math.hypot(target.x - px, target.y - py) <= 12,
+        );
+        if (hit) renderForecastDecisionDetail(hit.decision);
+      }
+    };
+    canvas.addEventListener("pointerup", endDrag);
+    canvas.addEventListener("pointercancel", endDrag);
+    canvas.addEventListener("pointerleave", () => {
+      if (forecastChartDrag) return;
+      state.chart.hover = null;
+      renderForecastHoverCard(null);
+      if (forecastChartGeometry) {
+        renderForecastQuote(forecastChartGeometry.prices);
+      }
+      hideTooltip();
+      scheduleForecastChartRedraw();
+    });
+    canvas.addEventListener("dblclick", () => resetForecastViewport());
+    canvas.addEventListener("keydown", (event) => {
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        setForecastChartZoom(state.chart.zoom * 1.35);
+      } else if (event.key === "-") {
+        event.preventDefault();
+        setForecastChartZoom(state.chart.zoom / 1.35);
+      } else if (event.key === "0") {
+        event.preventDefault();
+        resetForecastViewport();
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        const direction = event.key === "ArrowLeft" ? -1 : 1;
+        state.chart.pan = chartClamp(
+          state.chart.pan + direction * (0.08 / state.chart.zoom),
+          -chartPanLimit(),
+          chartPanLimit(),
+        );
+        scheduleForecastChartRedraw();
+      } else if (event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        toggleExpanded();
+      } else if (event.key === "Escape") {
+        toggleExpanded(false);
+      }
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (
+      event.key === "Escape" &&
+      $("forecastChartPanel")?.classList.contains("is-expanded")
+    ) {
+      toggleExpanded(false);
+    }
+  });
 }
 
 function renderCurve(data) {
@@ -2219,9 +3505,19 @@ function renderMl(data) {
   setText("mlBrier", brier === null ? "--" : brier.toFixed(3));
   setText("mlBaseBrier", base === null ? "--" : base.toFixed(3));
   const returnHead = data.ml.return_head || {};
+  const sourceHash = String(returnHead.source_dataset_hash || "");
+  const returnReasons = Array.isArray(returnHead.reasons) ? returnHead.reasons : [];
   const returnSummary = returnHead.model
-    ? `純R shadow=${Boolean(returnHead.usable)} / RMSE ${num(returnHead.val_rmse)?.toFixed(3) || "--"} / DSR ${num(returnHead.dsr)?.toFixed(3) || "--"}`
-    : "純Rモデル未学習";
+    ? `純R shadow=${Boolean(returnHead.usable)} / RMSE ${
+        num(returnHead.val_rmse)?.toFixed(3) || "--"
+      } / DSR ${num(returnHead.dsr)?.toFixed(3) || "--"} / teacher ${
+        returnHead.label_version || "--"
+      } / cost ${returnHead.cost_model_id || "--"} / effective ${
+        returnHead.effective_samples || 0
+      } / dataset ${sourceHash ? sourceHash.slice(0, 12) : "--"}`
+    : `純Rモデル未学習${
+        returnReasons.length ? ` (${returnReasons.slice(0, 3).join("; ")})` : ""
+      }`;
   const reasons = data.ml.reasons || [];
   const training = data.ml.training || {};
   const progress = data.ml.has_model
@@ -2427,9 +3723,762 @@ function renderRecent(data) {
   });
 }
 
+const yenFormatter = new Intl.NumberFormat("ja-JP", {
+  style: "currency",
+  currency: "JPY",
+  maximumFractionDigits: 0,
+});
+
+function yen(value) {
+  const parsed = num(value);
+  return parsed === null ? "--" : yenFormatter.format(parsed);
+}
+
+function signedYen(value) {
+  const parsed = num(value);
+  if (parsed === null) return "--";
+  return `${parsed > 0 ? "+" : ""}${yenFormatter.format(parsed)}`;
+}
+
+function portfolioTone(node, value) {
+  node.classList.remove("is-positive", "is-negative");
+  if (typeof value !== "number") return;
+  node.classList.add(value >= 0 ? "is-positive" : "is-negative");
+}
+
+function detailLine(label, value) {
+  const row = document.createElement("div");
+  const key = document.createElement("span");
+  const text = document.createElement("strong");
+  key.textContent = label;
+  text.textContent = value;
+  row.append(key, text);
+  return row;
+}
+
+function portfolioObjectRows(title, value) {
+  const section = document.createElement("div");
+  section.className = "portfolio-structured";
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  section.appendChild(heading);
+  const entries = value && typeof value === "object" ? Object.entries(value) : [];
+  if (!entries.length) {
+    section.appendChild(empty("記録なし"));
+    return section;
+  }
+  entries.forEach(([key, raw]) => {
+    const row = document.createElement("p");
+    row.textContent = `${key}: ${
+      raw && typeof raw === "object" ? JSON.stringify(raw) : String(raw ?? "--")
+    }`;
+    section.appendChild(row);
+  });
+  return section;
+}
+
+function drawPortfolioCurve(portfolio) {
+  const canvas = $("portfolioCurveCanvas");
+  const emptyNote = $("portfolioCurveEmpty");
+  if (!canvas) return;
+  const rows = Array.isArray(portfolio.balance_curve) ? portfolio.balance_curve : [];
+  if (!rows.length) {
+    canvas.hidden = true;
+    emptyNote.hidden = false;
+    emptyNote.textContent = "正規台帳イベントがまだありません。";
+    return;
+  }
+  canvas.hidden = false;
+  emptyNote.hidden = true;
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(320, canvas.clientWidth || 900);
+  const height = 260;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+
+  const left = 58;
+  const right = 18;
+  const top = 18;
+  const balanceBottom = 182;
+  const drawdownTop = 205;
+  const bottom = 245;
+  const balances = rows.map((row) => Number(row.balance_jpy || 0));
+  const drawdowns = rows.map((row) => Number(row.drawdown_jpy || 0));
+  const minimum = Math.min(...balances, Number(portfolio.initial_capital_jpy || 0));
+  const maximum = Math.max(...balances, minimum + 1);
+  const range = maximum - minimum || 1;
+  const x = (index) =>
+    left + (rows.length === 1 ? 0 : (index / (rows.length - 1)) * (width - left - right));
+  const balanceY = (value) =>
+    balanceBottom - ((value - minimum) / range) * (balanceBottom - top);
+  const maxDrawdown = Math.max(...drawdowns, 1);
+  const drawdownY = (value) =>
+    drawdownTop + (value / maxDrawdown) * (bottom - drawdownTop);
+
+  context.strokeStyle = "rgba(255,255,255,0.12)";
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(left, balanceBottom);
+  context.lineTo(width - right, balanceBottom);
+  context.moveTo(left, drawdownTop);
+  context.lineTo(width - right, drawdownTop);
+  context.stroke();
+
+  context.strokeStyle = "#5dc98c";
+  context.lineWidth = 2;
+  context.beginPath();
+  balances.forEach((value, index) => {
+    const px = x(index);
+    const py = balanceY(value);
+    if (index === 0) context.moveTo(px, py);
+    else context.lineTo(px, py);
+  });
+  if (rows.length === 1) {
+    context.lineTo(width - right, balanceY(balances[0]));
+  }
+  context.stroke();
+
+  context.strokeStyle = "#de6e64";
+  context.lineWidth = 2;
+  context.beginPath();
+  drawdowns.forEach((value, index) => {
+    const px = x(index);
+    const py = drawdownY(value);
+    if (index === 0) context.moveTo(px, py);
+    else context.lineTo(px, py);
+  });
+  if (rows.length === 1) {
+    context.lineTo(width - right, drawdownY(drawdowns[0]));
+  }
+  context.stroke();
+
+  context.fillStyle = "rgba(235,235,225,0.72)";
+  context.font = "11px system-ui, sans-serif";
+  context.fillText("残高", 8, top + 4);
+  context.fillText(yen(maximum), 8, top + 18);
+  context.fillText("DD", 8, drawdownTop + 12);
+  context.fillText(yen(maxDrawdown), 8, bottom);
+}
+
+function renderPortfolioTradeDetail(trade) {
+  const target = $("portfolioTradeDetail");
+  target.replaceChildren();
+  if (!trade) {
+    target.appendChild(empty("表示できる取引明細はまだありません"));
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "portfolio-detail-head";
+  const title = document.createElement("strong");
+  title.textContent = `${trade.symbol || "--"} ${trade.direction || "--"} / ${trade.trade_id || "--"}`;
+  const status = document.createElement("span");
+  status.className = "badge";
+  status.textContent = trade.status === "closed" ? "終了" : "保有中";
+  head.append(title, status);
+
+  const rationale = document.createElement("p");
+  rationale.className = "note";
+  rationale.textContent = `判断理由: ${trade.rationale?.reason || "構造化理由なし"}`;
+  target.append(head, rationale);
+
+  const grid = document.createElement("div");
+  grid.className = "portfolio-detail-grid";
+  grid.append(
+    detailLine("decision_id", trade.decision_id || "--"),
+    detailLine("時間足", trade.timeframe || "--"),
+    detailLine("数量", String(trade.units ?? "--")),
+    detailLine("判断Bid / Ask", `${trade.entry_bid ?? "--"} / ${trade.entry_ask ?? "--"}`),
+    detailLine("開始価格", String(trade.entry_executable ?? "--")),
+    detailLine("ストップ", String(trade.stop_price ?? "--")),
+    detailLine("目標", String(trade.target_price ?? "--")),
+    detailLine("計画リスク", yen(trade.planned_risk_jpy)),
+    detailLine("想定元本", yen(trade.notional_jpy)),
+    detailLine("JPY換算", `${trade.quote_to_jpy_rate ?? "--"} / ${trade.quote_conversion_source || "--"}`),
+  );
+  if (trade.status === "closed") {
+    grid.append(
+      detailLine("終了理由", trade.close_reason || "--"),
+      detailLine("決済Bid / Ask", `${trade.exit_bid ?? "--"} / ${trade.exit_ask ?? "--"}`),
+      detailLine("決済価格", String(trade.exit_executable ?? "--")),
+      detailLine("市場損益(mid)", signedYen(trade.gross_market_pnl_jpy)),
+      detailLine("bid/askコスト", yen(trade.spread_quote_cost_jpy)),
+      detailLine("スリッページ", yen(trade.slippage_cost_jpy)),
+      detailLine("手数料", yen(trade.commission_jpy)),
+      detailLine("金利", yen(trade.financing_jpy)),
+      detailLine("換算コスト", yen(trade.conversion_cost_jpy)),
+      detailLine("純損益", signedYen(trade.net_pnl_jpy)),
+      detailLine(
+        "純R",
+        typeof trade.realized_net_r === "number" ? trade.realized_net_r.toFixed(2) : "--",
+      ),
+      detailLine(
+        "最大含み益",
+        typeof trade.maximum_favorable_excursion_r === "number"
+          ? `${trade.maximum_favorable_excursion_r.toFixed(2)}R`
+          : "--",
+      ),
+      detailLine(
+        "最大含み損",
+        typeof trade.maximum_adverse_excursion_r === "number"
+          ? `${trade.maximum_adverse_excursion_r.toFixed(2)}R`
+          : "--",
+      ),
+      detailLine(
+        "約定観測",
+        trade.attribution?.execution_observation_mode ||
+          "contemporaneous_quote",
+      ),
+    );
+  } else {
+    grid.append(
+      detailLine("評価Bid / Ask", `${trade.mark_bid ?? "--"} / ${trade.mark_ask ?? "--"}`),
+      detailLine("評価実行価格", String(trade.mark_executable ?? "--")),
+      detailLine("評価時刻", shortDate(trade.mark_time)),
+      detailLine("含み市場損益(mid)", signedYen(trade.gross_unrealized_pnl_jpy)),
+      detailLine("含み純損益(bid/ask)", signedYen(trade.unrealized_pnl_jpy)),
+      detailLine("評価bid/askコスト", yen(trade.mark_spread_quote_cost_jpy)),
+      detailLine("評価状態", trade.valuation_status || "unavailable"),
+    );
+  }
+  target.appendChild(grid);
+  target.appendChild(portfolioObjectRows("判断時の寄与要因", trade.components));
+  target.appendChild(portfolioObjectRows("判断時の構造化特徴", trade.features));
+
+  const counterfactuals = trade.attribution?.counterfactuals;
+  if (counterfactuals && typeof counterfactuals === "object") {
+    const comparable = Object.fromEntries(
+      Object.entries(counterfactuals).filter(
+        ([key]) => !["contract", "causal_claim", "interpretation"].includes(key),
+      ),
+    );
+    target.appendChild(portfolioObjectRows("反実仮想（因果断定なし）", comparable));
+    const explanation = document.createElement("p");
+    explanation.className = "note";
+    explanation.textContent =
+      counterfactuals.interpretation || "同一観測価格に対する機械的比較です。";
+    target.appendChild(explanation);
+  }
+
+  const failures = Array.isArray(trade.failures) ? trade.failures : [];
+  const failureBox = document.createElement("div");
+  failureBox.className = "portfolio-failures";
+  const failureTitle = document.createElement("strong");
+  failureTitle.textContent = failures.length ? "失敗分類" : "失敗分類なし";
+  failureBox.appendChild(failureTitle);
+  failures.forEach((failure) => {
+    const item = document.createElement("p");
+    item.textContent = `${failure.category || "unknown"} / ${failure.code || "unknown"}: ${
+      failure.evidence || "--"
+    }（${failure.confidence || "unknown"} / ${failure.classifier_version || "unversioned"}）`;
+    failureBox.appendChild(item);
+  });
+  target.appendChild(failureBox);
+
+  const hashes = document.createElement("small");
+  hashes.className = "portfolio-hashes";
+  hashes.textContent = `data ${trade.data_sha256 || "--"} / model ${
+    trade.model_sha256 || "--"
+  } / policy ${trade.policy_sha256 || "--"}`;
+  target.appendChild(hashes);
+}
+
+function renderVirtualPortfolio(data) {
+  const portfolio = data.virtual_portfolio || {};
+  const configured = portfolio.configured === true;
+  const banner = $("portfolioReality");
+  banner.classList.toggle("is-good", configured);
+  banner.classList.toggle("is-waiting", !configured);
+  setText("portfolioMode", "delayed bid/ask replay / broker disconnected");
+  setText(
+    "portfolioRealityTitle",
+    configured ? "100万円の仮想口座を追記専用台帳で監視中" : "仮想口座はまだ初期化されていません",
+  );
+  setText(
+    "portfolioRealityBody",
+    configured
+      ? "15m/1hだけを既存リスク上限内の仮想取引評価枠にし、4h/1dはポジションを持たない観測専用として記録します。遅延履歴bid/askによる分析で、実時間約定ではありません。"
+      : portfolio.risk_gate?.reason || "tools/virtual_portfolio.py init を実行してください。",
+  );
+
+  setText("portfolioBalance", yen(portfolio.equity_jpy));
+  portfolioTone($("portfolioBalance"), num(portfolio.unrealized_pnl_jpy));
+  setText(
+    "portfolioBalanceChange",
+    portfolio.equity_jpy === null
+      ? "評価額: 実行可能Bid/Ask不足"
+      : `確定残高 ${yen(portfolio.balance_jpy)} / 含み ${signedYen(
+          portfolio.unrealized_pnl_jpy,
+        )}`,
+  );
+  setText("portfolioTodayPnl", signedYen(portfolio.today_pnl_jpy));
+  portfolioTone($("portfolioTodayPnl"), num(portfolio.today_pnl_jpy));
+  const horizonAllocation = portfolio.horizon_allocation || {};
+  const dailyTask = portfolio.daily_profit_task || {};
+  const dailyTaskStatus =
+    dailyTask.status === "completed"
+      ? "必須タスク完了"
+      : dailyTask.status === "unavailable"
+        ? "進捗取得不可"
+        : "必須タスク進行中";
+  setText(
+    "portfolioTargetText",
+    `${dailyTaskStatus} / 残り ${yen(
+      dailyTask.remaining_jpy ?? portfolio.remaining_daily_target_jpy,
+    )} / 目標 ${yen(dailyTask.target_jpy ?? portfolio.daily_target_jpy)}`,
+  );
+  const researchKpis = portfolio.research_kpis || {};
+  const rollingKpi = researchKpis.rolling_20d || {};
+  const rollingNetR = Number(rollingKpi.net_r);
+  const rollingTradeCount = Number(rollingKpi.trade_count || 0);
+  const minimumLearningRows = Number(researchKpis.minimum_learning_rows || 150);
+  setText(
+    "portfolioTargetProgress",
+    Number.isFinite(rollingNetR) ? `${rollingNetR.toFixed(2)} R` : "--",
+  );
+  setBar(
+    "portfolioTargetBar",
+    minimumLearningRows > 0 ? rollingTradeCount / minimumLearningRows : 0,
+  );
+  const expectancy =
+    typeof rollingKpi.cost_adjusted_expectancy_net_r === "number"
+      ? rollingKpi.cost_adjusted_expectancy_net_r
+      : null;
+  const confidence = rollingKpi.expectancy_95pct_ci || {};
+  const ciAvailable =
+    confidence.status === "available" &&
+    typeof confidence.lower === "number" &&
+    typeof confidence.upper === "number";
+  setText(
+    "portfolioTargetBasis",
+    `期待値 ${
+      expectancy !== null ? `${expectancy.toFixed(2)} R` : "--"
+    } / 95% CI ${
+      ciAvailable
+        ? `${Number(confidence.lower).toFixed(2)}〜${Number(confidence.upper).toFixed(2)} R`
+        : "データ不足"
+    } / n=${rollingTradeCount}`,
+  );
+  setText(
+    "portfolioDrawdown",
+    `${yen(portfolio.equity_drawdown_jpy)} ${
+      typeof portfolio.equity_drawdown_pct === "number"
+        ? `(${precisePct(portfolio.equity_drawdown_pct)})`
+        : ""
+    }`,
+  );
+  setText(
+    "portfolioDrawdownLimit",
+    `確定DD ${yen(portfolio.drawdown_jpy)} / 停止上限 ${yen(
+      portfolio.hard_drawdown_limit_jpy,
+    )}`,
+  );
+  setText("portfolioCash", yen(portfolio.cash_jpy));
+  setText(
+    "portfolioEquity",
+    `初期 ${yen(portfolio.initial_capital_jpy)} / 累計確定 ${signedYen(
+      portfolio.cumulative_net_pnl_jpy,
+    )}`,
+  );
+
+  const risk = portfolio.risk_gate || {};
+  setText("portfolioRemainingRisk", yen(risk.remaining_daily_loss_budget_jpy));
+  setText("portfolioNextTradeRisk", `次回リスク ${yen(risk.next_trade_risk_jpy)}`);
+  setText(
+    "portfolioLeverage",
+    typeof portfolio.gross_leverage === "number"
+      ? `${portfolio.gross_leverage.toFixed(2)}x`
+      : "0.00x",
+  );
+  setText("portfolioNotional", `想定元本 ${yen(portfolio.gross_notional_jpy)}`);
+  const qualityLabels = {
+    waiting_for_session_close_quote: "日次決済気配待ち",
+    waiting_for_delayed_quotes: "判断の履歴気配待ち",
+    waiting_for_position_marks: "評価用気配待ち",
+    eligible_inputs_consumed: "取込・評価済み",
+    session_close_lifecycle_error: "日次決済ライフサイクル不整合",
+  };
+  const qualityState = qualityLabels[portfolio.data_quality_state?.status] || "確認不能";
+  const openPositionCount = portfolio.open_position_count || 0;
+  const intradayOpenCount = horizonAllocation.intraday_open_positions || 0;
+  const legacyOpenCount = horizonAllocation.legacy_positions_outside_policy || 0;
+  const maxOpenPositions =
+    portfolio.horizon_allocation?.capacity_limit ??
+    portfolio.policy?.max_open_positions ??
+    "--";
+  setText(
+    "portfolioDataState",
+    risk.can_open ? "新規取引可" : "新規停止",
+  );
+  $("portfolioDataState").classList.toggle("is-positive", risk.can_open === true);
+  $("portfolioDataState").classList.toggle("is-negative", risk.can_open !== true);
+  setText(
+    "portfolioReconciliation",
+    portfolio.reconciliation?.passed
+      ? `容量対象 ${intradayOpenCount}/${maxOpenPositions}件${
+          legacyOpenCount ? ` / 移行前長期 ${legacyOpenCount}件` : ""
+        } / 台帳照合OK`
+      : `容量対象 ${intradayOpenCount}/${maxOpenPositions}件 / 台帳照合NG`,
+  );
+  setText("portfolioDataQuality", `データ: ${qualityState}`);
+  const riskBadge = $("portfolioRiskBadge");
+  riskBadge.textContent = risk.can_open ? "新規可" : "新規停止";
+  riskBadge.classList.toggle("is-good", risk.can_open === true);
+  riskBadge.classList.toggle("is-bad", risk.can_open !== true);
+  setText(
+    "portfolioDailyRisk",
+    `${signedYen(portfolio.today_pnl_jpy)} / -${yen(risk.daily_loss_limit_jpy)}`,
+  );
+  setText(
+    "portfolioWeeklyRisk",
+    `${signedYen(portfolio.weekly_pnl_jpy)} / -${yen(risk.weekly_loss_limit_jpy)}`,
+  );
+  setText(
+    "portfolioMonthlyRisk",
+    `${signedYen(portfolio.monthly_pnl_jpy)} / -${yen(risk.monthly_loss_limit_jpy)}`,
+  );
+  setText(
+    "portfolioOpenCount",
+    `${intradayOpenCount} / ${maxOpenPositions}${
+      legacyOpenCount ? `（移行前長期 ${legacyOpenCount}）` : ""
+    }`,
+  );
+  setText("portfolioRiskReason", risk.reason || "全リスクゲート内です");
+  const pendingClose = portfolio.pending_session_close_request;
+  if (pendingClose) {
+    setText(
+      "portfolioRiskReason",
+      `日次決済要求 ${shortDate(pendingClose.cutoff_time)} を保持中。実行可能な遅延Bid/Ask到着後に全建玉を決済します。`,
+    );
+  }
+  drawPortfolioCurve(portfolio);
+
+  const learning = portfolio.learning || {};
+  const canonicalNetR = learning.canonical_net_r || {};
+  const canonicalEligible = Number(canonicalNetR.eligible_rows || 0);
+  const canonicalSamples = Number(canonicalNetR.net_label_samples || 0);
+  const canonicalCoverage = num(canonicalNetR.net_label_coverage);
+  const canonicalConnected =
+    (canonicalEligible === 0 && canonicalNetR.status === "no_eligible_rows") ||
+    (canonicalNetR.status === "connected" &&
+      canonicalSamples === canonicalEligible &&
+      canonicalCoverage === 1);
+  setText(
+    "portfolioLearningBadge",
+    `${learning.eligible_rows || 0} / ${learning.minimum_rows || 150}`,
+  );
+  setText(
+    "portfolioLearningState",
+    !canonicalConnected
+      ? "正準ラベル接続エラー"
+      : learning.ready_for_validation
+        ? "週次検証を開始可能"
+        : "検証データ待ち",
+  );
+  setText(
+    "portfolioLearningBody",
+    !canonicalConnected
+      ? "bid/ask・全費用・時刻証跡・正準JSONLストア接続のいずれかが欠けたため、学習をfail-closedで停止しています。"
+      : learning.ready_for_validation
+      ? "成熟したPITサンプルをtrain/tune/calibration/test/lockboxへ分離します。安全停止以外の方針変更は検証ゲートを通過するまで適用しません。"
+      : "確定損失は同一区分の安全停止へ還流します。収益方針は最低件数と時間分割を満たすまで変更しません。",
+  );
+  setText(
+    "portfolioCanonicalNetR",
+    `正準store ${canonicalSamples} / ${canonicalEligible} (${pct(canonicalCoverage)}) / ${
+      canonicalNetR.label_version || "--"
+    } / bid/ask・全費用後 / research-only`,
+  );
+  const multiAxis = learning.multi_axis || {};
+  const multiAxisBadge = $("portfolioMultiAxisBadge");
+  const axisInputsReady = multiAxis.status === "axis_inputs_ready";
+  multiAxisBadge.textContent = axisInputsReady
+    ? "入力準備済み / 判断不使用"
+    : "PIT入力を収集中";
+  multiAxisBadge.classList.toggle("is-good", axisInputsReady);
+  const axisGrid = $("portfolioMultiAxisGrid");
+  axisGrid.replaceChildren();
+  const axisOrder = [
+    "net_return_distribution",
+    "market_regime",
+    "liquidity_proxy",
+    "macro_surprise",
+    "cross_asset_relationship",
+    "uncertainty",
+    "execution_quality",
+    "portfolio_risk",
+  ];
+  const axisFallbackLabels = {
+    net_return_distribution: "コスト控除後の収益分布",
+    market_regime: "市場レジーム",
+    liquidity_proxy: "流動性・公開気配proxy",
+    macro_surprise: "マクロサプライズ",
+    cross_asset_relationship: "クロスアセット関係",
+    uncertainty: "不確実性",
+    execution_quality: "執行品質",
+    portfolio_risk: "ポートフォリオリスク",
+  };
+  axisOrder.forEach((name) => {
+    const axis = multiAxis.axes?.[name] || {};
+    const card = document.createElement("div");
+    card.className = "portfolio-axis-card";
+    const head = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = axis.label_ja || axisFallbackLabels[name];
+    const status = document.createElement("span");
+    status.className = `badge ${axis.ready ? "is-good" : ""}`;
+    status.textContent = axis.ready ? "入力あり" : "収集中";
+    head.append(title, status);
+    const coverage = document.createElement("span");
+    coverage.textContent =
+      typeof axis.coverage === "number"
+        ? `coverage ${(axis.coverage * 100).toFixed(0)}%（${axis.available_rows || 0}/${
+            axis.development_rows || 0
+          }）`
+        : "成熟PIT行を待機中";
+    const role = document.createElement("small");
+    role.textContent =
+      axis.role === "prediction_head"
+        ? "予測出力"
+        : axis.role === "auxiliary_target"
+          ? "補助教師（予測特徴には不使用）"
+          : "判断時点の入力特徴";
+    card.append(head, coverage, role);
+    axisGrid.appendChild(card);
+  });
+
+  const series = $("portfolioDailySeries");
+  series.replaceChildren();
+  const dailyRows = Array.isArray(portfolio.daily_series) ? portfolio.daily_series.slice(-30) : [];
+  if (!dailyRows.length) {
+    series.appendChild(empty("終了済み取引がないため、日次純損益はまだありません"));
+  } else {
+    const maximum = Math.max(...dailyRows.map((row) => Math.abs(Number(row.net_pnl_jpy || 0))), 1);
+    dailyRows.forEach((row) => {
+      const item = document.createElement("div");
+      item.className = "portfolio-series-row";
+      const date = document.createElement("span");
+      date.textContent = row.session_date_jst || "--";
+      const track = document.createElement("div");
+      track.className = "portfolio-series-track";
+      const bar = document.createElement("i");
+      const value = Number(row.net_pnl_jpy || 0);
+      bar.className = value >= 0 ? "positive" : "negative";
+      bar.style.width = `${Math.max(2, Math.round((Math.abs(value) / maximum) * 100))}%`;
+      track.appendChild(bar);
+      const amount = document.createElement("strong");
+      amount.textContent = signedYen(value);
+      portfolioTone(amount, value);
+      item.append(date, track, amount);
+      series.appendChild(item);
+    });
+  }
+
+  const pending = $("portfolioPendingDecisions");
+  pending.replaceChildren();
+  const pendingRows = Array.isArray(portfolio.pending_decisions)
+    ? portfolio.pending_decisions
+    : [];
+  setText("portfolioPendingCount", `${portfolio.pending_decision_count || 0}件待機`);
+  if (!pendingRows.length) {
+    pending.appendChild(empty("履歴bid/ask待ちの判断はありません"));
+  } else {
+    pendingRows.forEach((decision) => {
+      const card = document.createElement("div");
+      card.className = "portfolio-decision-card";
+      const title = document.createElement("strong");
+      title.textContent = `${shortDate(decision.decision_time)} ${
+        decision.symbol || "--"
+      } / ${decision.timeframe || "--"}`;
+      const detail = document.createElement("p");
+      detail.textContent = "遅延履歴bid/askの到着と価格経路の成熟を待機中";
+      card.append(title, detail);
+      pending.appendChild(card);
+    });
+  }
+
+  const positions = $("portfolioOpenPositions");
+  positions.replaceChildren();
+  const openPositions = Array.isArray(portfolio.open_positions)
+    ? portfolio.open_positions
+    : [];
+  if (!openPositions.length) {
+    positions.appendChild(empty("現在の仮想ポジションはありません"));
+  } else {
+    openPositions.forEach((trade) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "portfolio-position-card";
+      const main = document.createElement("strong");
+      main.textContent = `${trade.symbol || "--"} ${trade.direction || "--"} / ${
+        trade.timeframe || "--"
+      }`;
+      const detail = document.createElement("span");
+      detail.textContent = `開始 ${trade.entry_executable ?? "--"} / 現在 ${
+        trade.mark_executable ?? "--"
+      } / 含み ${signedYen(trade.unrealized_pnl_jpy)} / stop ${
+        trade.stop_price ?? "--"
+      } / target ${trade.target_price ?? "--"} / 評価 ${shortDate(trade.mark_time)}`;
+      card.append(main, detail);
+      card.addEventListener("click", () => renderPortfolioTradeDetail(trade));
+      positions.appendChild(card);
+    });
+  }
+
+  const allTrades = Array.isArray(portfolio.trades) ? portfolio.trades : [];
+  const search = String($("portfolioTradeSearch")?.value || "").trim().toLowerCase();
+  const directionFilter = String($("portfolioDirectionFilter")?.value || "");
+  const statusFilter = String($("portfolioStatusFilter")?.value || "");
+  const trades = allTrades.filter((trade) => {
+    if (directionFilter && trade.direction !== directionFilter) return false;
+    if (statusFilter && trade.status !== statusFilter) return false;
+    if (!search) return true;
+    const searchable = [
+      trade.trade_id,
+      trade.decision_id,
+      trade.symbol,
+      trade.timeframe,
+      trade.direction,
+      trade.close_reason,
+      trade.rationale?.reason,
+      ...(Array.isArray(trade.failures)
+        ? trade.failures.flatMap((failure) => [failure.category, failure.code, failure.evidence])
+        : []),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return searchable.includes(search);
+  });
+  setText("portfolioTradeCount", `${portfolio.closed_trade_count || 0}件終了`);
+  const tradeRows = $("portfolioTradeRows");
+  tradeRows.replaceChildren();
+  if (!trades.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 10;
+    cell.textContent = allTrades.length
+      ? "条件に一致する取引明細はありません"
+      : "仮想取引明細はまだありません";
+    row.appendChild(cell);
+    tradeRows.appendChild(row);
+    renderPortfolioTradeDetail(null);
+  } else {
+    trades.forEach((trade) => {
+      const row = document.createElement("tr");
+      const failureCodes = (Array.isArray(trade.failures) ? trade.failures : [])
+        .map((failure) => failure.code)
+        .join(", ");
+      const totalCosts =
+        Number(trade.spread_quote_cost_jpy || 0) +
+        Number(trade.slippage_cost_jpy || 0) +
+        Number(trade.commission_jpy || 0) +
+        Number(trade.financing_jpy || 0) +
+        Number(trade.conversion_cost_jpy || 0);
+      const leverage =
+        Number(portfolio.balance_jpy || 0) > 0
+          ? Number(trade.notional_jpy || 0) / Number(portfolio.balance_jpy)
+          : null;
+      const values = [
+        `${shortDate(trade.open_time)}\n${trade.decision_id || "--"}`,
+        `${trade.symbol || "--"} / ${trade.timeframe || "--"} / ${trade.direction || "--"}`,
+        `${trade.units ?? "--"} / ${yen(trade.planned_risk_jpy)} / ${
+          leverage === null ? "--" : `${leverage.toFixed(2)}x`
+        }`,
+        `${trade.entry_bid ?? "--"} / ${trade.entry_ask ?? "--"}`,
+        `${trade.entry_executable ?? "--"} / ${trade.exit_executable ?? "--"}`,
+        trade.status === "closed" ? "終了" : "保有",
+        trade.status === "closed"
+          ? `${signedYen(trade.gross_market_pnl_jpy)} / -${yen(totalCosts)}`
+          : `${signedYen(trade.gross_unrealized_pnl_jpy)} / -${yen(
+              trade.mark_spread_quote_cost_jpy,
+            )}`,
+        trade.status === "closed"
+          ? `${signedYen(trade.net_pnl_jpy)} / ${
+              typeof trade.realized_net_r === "number"
+                ? `${trade.realized_net_r.toFixed(2)}R`
+                : "--"
+            }`
+          : `${signedYen(trade.unrealized_pnl_jpy)} / 評価中`,
+        trade.status === "closed"
+          ? `${trade.maximum_favorable_excursion_r ?? "--"} / ${
+              trade.maximum_adverse_excursion_r ?? "--"
+            }`
+          : "--",
+        `${trade.data_sha256 ? "PIT hashあり" : "PIT証拠不足"} / ${
+          trade.status === "closed"
+            ? trade.attribution?.cost_contract?.costs_complete
+              ? "コスト完全"
+              : "コスト未確定"
+            : trade.valuation_status === "delayed_executable_mark"
+              ? "実行可能評価あり"
+              : "評価気配待ち"
+        }`,
+      ];
+      values.forEach((value, index) => {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        if (index === 7) portfolioTone(cell, num(trade.net_pnl_jpy));
+        row.appendChild(cell);
+      });
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "portfolio-detail-button";
+      action.textContent = `${trade.close_reason || "詳細"}${
+        failureCodes ? ` / ${failureCodes}` : ""
+      }`;
+      action.addEventListener("click", () => renderPortfolioTradeDetail(trade));
+      row.lastElementChild?.appendChild(document.createElement("br"));
+      row.lastElementChild?.appendChild(action);
+      tradeRows.appendChild(row);
+    });
+    renderPortfolioTradeDetail(trades[0]);
+  }
+
+  const decisions = $("portfolioDecisionList");
+  decisions.replaceChildren();
+  const decisionRows = Array.isArray(portfolio.recent_decisions)
+    ? portfolio.recent_decisions.slice(0, 20)
+    : [];
+  if (!decisionRows.length) {
+    decisions.appendChild(empty("判断サイクルの記録はまだありません"));
+  } else {
+    decisionRows.forEach((decision) => {
+      const card = document.createElement("div");
+      card.className = "portfolio-decision-card";
+      const head = document.createElement("div");
+      const title = document.createElement("strong");
+      title.textContent = `${shortDate(decision.decision_time)} ${decision.symbol || "--"} ${
+        decision.direction || "--"
+      } / ${decision.timeframe || "--"}`;
+      const disposition = document.createElement("span");
+      disposition.className = "badge";
+      const allocationClass = decision.horizon_allocation?.allocation_class;
+      disposition.textContent =
+        allocationClass === "observation_only"
+          ? "観測専用"
+          : allocationClass === "unsupported"
+            ? "対象外"
+            : decision.disposition === "opened"
+              ? "開始"
+              : "見送り";
+      head.append(title, disposition);
+      const reason = document.createElement("p");
+      const rejection = Array.isArray(decision.rejection_reasons)
+        ? decision.rejection_reasons.join(" / ")
+        : "";
+      reason.textContent = rejection || decision.reason || "理由なし";
+      card.append(head, reason);
+      decisions.appendChild(card);
+    });
+  }
+}
+
 function render(data) {
-  state.logDir = data.log_dir || state.logDir;
-  $("logDir").value = state.logDir;
+  lastDashboardState = data;
+  renderVirtualPortfolio(data);
   renderReality(data);
   renderLearnedSummary(data);
   renderMetrics(data);
@@ -2454,6 +4503,10 @@ function render(data) {
   renderInputContext(data);
   renderFiles(data);
   renderRecent(data);
+  if (lastForecastChart) {
+    renderForecastChart(lastForecastChart);
+  }
+  loadForecastChart();
 }
 
 async function load() {
@@ -2470,14 +4523,25 @@ async function load() {
     });
     return;
   }
-  const logDir = $("logDir").value.trim();
-  const url = logDir ? `/api/state?logDir=${encodeURIComponent(logDir)}` : "/api/state";
   $("refreshBtn").disabled = true;
   try {
-    const response = await fetch(url, { cache: "no-store" });
+    const activeView = document.querySelector(".nav-item.active")?.dataset.view;
+    const portfolioOnly = activeView === "portfolio";
+    const response = await fetch(
+      portfolioOnly ? "/api/virtual-portfolio" : "/api/state",
+      { cache: "no-store" },
+    );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    render(data);
+    if (portfolioOnly) {
+      lastDashboardState = {
+        ...(lastDashboardState || {}),
+        virtual_portfolio: data,
+      };
+      renderVirtualPortfolio(lastDashboardState);
+    } else {
+      render(data);
+    }
   } catch (error) {
     console.error(error);
     alert(`読み込みに失敗しました: ${error.message}`);
@@ -2487,9 +4551,15 @@ async function load() {
 }
 
 $("refreshBtn").addEventListener("click", load);
+["portfolioTradeSearch", "portfolioDirectionFilter", "portfolioStatusFilter"].forEach((id) => {
+  $(id)?.addEventListener(id === "portfolioTradeSearch" ? "input" : "change", () => {
+    if (lastDashboardState) renderVirtualPortfolio(lastDashboardState);
+  });
+});
 
-// ===== 左サイドバーによる6画面の切り替え =====
+// ===== 左サイドバーによる7画面の切り替え =====
 const VIEW_EYEBROW = {
+  portfolio: "分析専用シミュレーション",
   now: "現在の状況",
   performance: "精度の検証",
   learning: "学習の中身",
@@ -2518,33 +4588,52 @@ function switchView(key) {
   }
   // hidden の間は幅が 0 で canvas を描けないため、表示された時点で描き直す
   if (lastCurve.length) drawCurve($("curveCanvas"), lastCurve);
+  if (key === "now" && lastForecastChart) {
+    drawForecastChart($("forecastChartCanvas"), lastForecastChart);
+  }
+  if (key === "portfolio" && lastDashboardState?.virtual_portfolio) {
+    drawPortfolioCurve(lastDashboardState.virtual_portfolio);
+  }
   window.scrollTo({ top: 0 });
 }
 
 document.querySelectorAll(".nav-item").forEach((button) => {
-  button.addEventListener("click", () => switchView(button.dataset.view));
+  button.addEventListener("click", () => {
+    switchView(button.dataset.view);
+    load();
+  });
 });
 
 // ウィンドウ幅が変わったら学習推移グラフだけ再描画(canvasは物理px依存のため)
 let curveResizeTimer = null;
 window.addEventListener("resize", () => {
-  if (!lastCurve.length) return;
   window.clearTimeout(curveResizeTimer);
-  curveResizeTimer = window.setTimeout(() => drawCurve($("curveCanvas"), lastCurve), 150);
+  curveResizeTimer = window.setTimeout(() => {
+    if (lastCurve.length) drawCurve($("curveCanvas"), lastCurve);
+    if (lastForecastChart) drawForecastChart($("forecastChartCanvas"), lastForecastChart);
+    if (lastDashboardState?.virtual_portfolio) {
+      drawPortfolioCurve(lastDashboardState.virtual_portfolio);
+    }
+  }, 150);
 });
-$("logDir").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") load();
-});
-
 // 前回開いていた画面を復元する(再読み込みのたびに先頭画面へ戻らないように)
-let initialView = "now";
+let initialView = "portfolio";
 try {
   const saved = window.localStorage.getItem("fxDashboardView");
   if (saved && document.querySelector(`.view[data-view="${saved}"]`)) initialView = saved;
 } catch (error) {
   // 読めなければ既定の画面のまま
 }
+restoreChartSelection();
+syncChartControls();
+bindForecastChartControls();
 switchView(initialView);
 
 load();
 setInterval(load, 30000);
+setTimeout(() => {
+  if (!document.hidden) loadForecastChart({ force: true });
+  setInterval(() => {
+    if (!document.hidden) loadForecastChart({ force: true });
+  }, FORECAST_CHART_REFRESH_MS);
+}, FORECAST_CHART_REFRESH_OFFSET_MS);

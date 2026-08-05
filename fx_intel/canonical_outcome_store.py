@@ -4,23 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, UTC
 import fcntl
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import tempfile
 from typing import Any
 
 from .evaluation_labels import (
-    DEFAULT_COST_STATUS,
-    KNOWN_EXECUTABLE_COST_MODEL_IDS,
     KNOWN_NET_LABEL_PROVENANCES,
     KNOWN_NET_LABEL_VERSIONS,
-    CostModelResult,
-    cost_model_contract_flags,
+    canonical_net_label_contract_flags,
 )
 from .trade_outcome import (
     CanonicalTradeOutcome,
@@ -267,10 +262,7 @@ def _validate_outcome(
     if outcome.net_label_eligible and (
         outcome.label_version not in KNOWN_NET_LABEL_VERSIONS
         or outcome.label_provenance not in KNOWN_NET_LABEL_PROVENANCES
-        or outcome.cost_model_id not in KNOWN_EXECUTABLE_COST_MODEL_IDS
-        or not outcome.cost_model_version.strip()
-        or outcome.cost_status != DEFAULT_COST_STATUS
-        or not _eligible_accounting_complete(outcome)
+        or bool(canonical_net_label_contract_flags(outcome.to_dict()))
     ):
         raise CanonicalOutcomeStoreCorruption(
             f"eligible canonical outcome is incomplete at {location}"
@@ -315,101 +307,3 @@ def _sha256(value: object) -> str:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant: {value}")
-
-
-def _eligible_accounting_complete(outcome: CanonicalTradeOutcome) -> bool:
-    prediction = _aware_iso(outcome.prediction_time)
-    holding_end = _aware_iso(outcome.holding_end_time)
-    if prediction is None or holding_end is None or holding_end <= prediction:
-        return False
-    required_values = (
-        outcome.gross_realized_r,
-        outcome.quote_realized_r,
-        outcome.entry_bid,
-        outcome.entry_ask,
-        outcome.planned_risk_distance,
-        outcome.slippage_r,
-        outcome.commission_r,
-        outcome.financing_r,
-        outcome.entry_spread_r,
-        outcome.additional_cost_r,
-        outcome.execution_cost_r,
-        outcome.realized_net_r,
-        outcome.path_quality,
-    )
-    if not all(
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        for value in required_values
-    ):
-        return False
-    if outcome.planned_payoff_r is not None and (
-        isinstance(outcome.planned_payoff_r, bool)
-        or not isinstance(outcome.planned_payoff_r, (int, float))
-        or not math.isfinite(float(outcome.planned_payoff_r))
-    ):
-        return False
-    assert outcome.slippage_r is not None
-    assert outcome.commission_r is not None
-    assert outcome.financing_r is not None
-    assert outcome.additional_cost_r is not None
-    assert outcome.quote_realized_r is not None
-    assert outcome.realized_net_r is not None
-    assert outcome.gross_realized_r is not None
-    assert outcome.execution_cost_r is not None
-    assert outcome.entry_bid is not None
-    assert outcome.entry_ask is not None
-    assert outcome.planned_risk_distance is not None
-    assert outcome.entry_spread_r is not None
-    cost = CostModelResult(
-        cost_model_id=outcome.cost_model_id,
-        cost_model_version=outcome.cost_model_version,
-        entry_quote_source=outcome.entry_quote_source,
-        spread_source=outcome.spread_source,
-        slippage_model_id=outcome.slippage_model_id,
-        commission_model_id=outcome.commission_model_id,
-        entry_spread_r=outcome.entry_spread_r,
-        slippage_r=outcome.slippage_r,
-        commission_r=outcome.commission_r,
-        financing_r=outcome.financing_r,
-        cost_status=outcome.cost_status,
-        quality_flags=outcome.cost_quality_flags,
-    )
-    return (
-        not cost_model_contract_flags(cost)
-        and 0 < outcome.entry_bid <= outcome.entry_ask
-        and outcome.planned_risk_distance > 0
-        and math.isclose(
-            outcome.entry_spread_r,
-            (outcome.entry_ask - outcome.entry_bid) / outcome.planned_risk_distance,
-            abs_tol=1e-8,
-        )
-        and math.isclose(
-            outcome.additional_cost_r,
-            outcome.slippage_r + outcome.commission_r + outcome.financing_r,
-            abs_tol=1e-8,
-        )
-        and math.isclose(
-            outcome.realized_net_r,
-            outcome.quote_realized_r - outcome.additional_cost_r,
-            abs_tol=1e-8,
-        )
-        and math.isclose(
-            outcome.execution_cost_r,
-            outcome.gross_realized_r - outcome.realized_net_r,
-            abs_tol=1e-8,
-        )
-    )
-
-
-def _aware_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return parsed.astimezone(UTC)
