@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
 from itertools import count
+import json
 
 import pytest
 
@@ -918,3 +919,163 @@ def test_settled_match_cache_can_be_disabled(monkeypatch) -> None:
     """空文字を指定したらキャッシュを一切読み書きしない。"""
     monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, "")
     assert learning._settled_match_cache_path() is None
+
+
+def test_settled_match_cache_separates_pit_and_non_pit_populations(tmp_path, monkeypatch) -> None:
+    """require_pit は価格系列の母集団を変えるので、キャッシュを共有してはならない。
+
+    非PIT実行の答えがPIT実行へ漏れると、PIT不適格な将来価格で採点した結果を
+    PIT学習が使うことになり、point-in-time整合性が壊れる。
+    """
+    entries = [
+        pit_entry(NOW, symbol="USDJPY", direction="long", close=100.0),
+        # PIT不適格の将来価格(下落)。require_pit=False のときだけ見える
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=80.0),
+        # PIT適格の将来価格(上昇)
+        pit_entry(
+            NOW + DAY + timedelta(minutes=1),
+            symbol="USDJPY",
+            direction="neutral",
+            close=120.0,
+        ),
+        pit_entry(NOW + DAY * 8, symbol="USDJPY", direction="neutral", close=120.0),
+        entry(NOW + DAY * 8, symbol="USDJPY", direction="neutral", close=120.0),
+    ]
+
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, "")
+    truth_raw = [call.outcome for call in learning.evaluate_history(entries)]
+    truth_pit = [call.outcome for call in learning.evaluate_history(entries, require_pit=True)]
+    assert truth_raw != truth_pit, "この入力ではPIT有無で真値が変わる必要がある"
+
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(tmp_path / "c.json"))
+    # 非PITで先にキャッシュを作ってから、PITで読む
+    assert [call.outcome for call in learning.evaluate_history(entries)] == truth_raw
+    assert [
+        call.outcome for call in learning.evaluate_history(entries, require_pit=True)
+    ] == truth_pit
+
+
+def test_settled_match_cache_waits_for_late_arriving_prices(tmp_path, monkeypatch) -> None:
+    """窓上限を越えた直後は確定扱いにしない(価格は遅れて到着する)。
+
+    取込ラグの実績があるため、窓上限を1秒でも越えたら確定としてしまうと
+    「まだ届いていなかった窓内の価格」が後から入った時に誤った結果が残る。
+    """
+    cache = tmp_path / "c.json"
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(cache))
+
+    # 探索窓の上限は horizon+tolerance に週末クローズぶんのpaddingを足した値。
+    # その「わずかに先」までしか価格が無い状態では確定扱いにしてはいけない。
+    window_upper = NOW + timedelta(hours=26) + learning.WEEKEND_CLOSURE
+    barely = [
+        entry(NOW, symbol="USDJPY", direction="long", close=100.0),
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=101.0),
+        entry(
+            window_upper + timedelta(minutes=1),
+            symbol="USDJPY",
+            direction="neutral",
+            close=101.0,
+        ),
+    ]
+    learning.evaluate_history(barely)
+    assert not cache.is_file(), "遅延マージン内なのに確定扱いされている"
+
+    # マージンを十分に越えたら確定扱いになる
+    settled = [
+        *barely,
+        entry(
+            window_upper + learning.SETTLED_MATCH_LATE_ARRIVAL_MARGIN + DAY,
+            symbol="USDJPY",
+            direction="neutral",
+            close=101.0,
+        ),
+    ]
+    learning.evaluate_history(settled)
+    assert cache.is_file()
+
+
+def test_settled_match_cache_is_discarded_when_scoring_logic_changes(tmp_path, monkeypatch) -> None:
+    """採点ロジック版が変わったキャッシュは読み捨てる。
+
+    突き合わせ規則を変えた後に古い結果が生き残ると、新旧の規則が混在した
+    学習データになる。版が違えば丸ごと無効化されなければならない。
+    """
+    cache = tmp_path / "c.json"
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(cache))
+    entries = [
+        entry(NOW, symbol="USDJPY", direction="long", close=100.0),
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=101.0),
+        entry(NOW + DAY * 10, symbol="USDJPY", direction="neutral", close=101.0),
+    ]
+    learning.evaluate_history(entries)
+    assert cache.is_file()
+
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    assert payload["logic_version"] == learning.SETTLED_MATCH_LOGIC_VERSION
+    payload["logic_version"] = learning.SETTLED_MATCH_LOGIC_VERSION + 1
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = learning._settled_match_cache()
+    assert len(reloaded) == 0, "版違いのキャッシュを読み込んでいる"
+
+
+def test_settled_match_cache_survives_truncated_file_from_crash(tmp_path, monkeypatch) -> None:
+    """クラッシュで壊れたキャッシュでも採点は正しく継続する。"""
+    cache = tmp_path / "c.json"
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(cache))
+    entries = [
+        entry(NOW, symbol="USDJPY", direction="long", close=100.0),
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=101.0),
+        entry(NOW + DAY * 10, symbol="USDJPY", direction="neutral", close=101.0),
+    ]
+    expected = [call.outcome for call in learning.evaluate_history(entries)]
+
+    # 途中で電源が落ちた想定でJSONを切り詰める
+    cache.write_text(
+        cache.read_text(encoding="utf-8")[: len(cache.read_text()) // 2], encoding="utf-8"
+    )
+    assert learning._settled_match_cache() == {}
+    assert [call.outcome for call in learning.evaluate_history(entries)] == expected
+
+    # 1行だけ壊れていても他の行は使える
+    learning.evaluate_history(entries)
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    payload["entries"].append(["USDJPY", "not-a-timestamp", 24.0, 2.0, False, 0.0, 1.0])
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    assert [call.outcome for call in learning.evaluate_history(entries)] == expected
+
+
+def test_settled_match_cache_keeps_previous_file_intact_when_write_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """保存中に落ちても、既存キャッシュが半端な内容に置き換わってはならない。
+
+    直接書き(open(path,"w"))だと truncate した瞬間に落ちれば本体が壊れる。
+    一時ファイル+原子的置換なら、失敗しても前回の完全な内容が残る。
+    書き込み途中の例外を注入して、本体が読めるままかを確かめる。
+    """
+    cache = tmp_path / "c.json"
+    monkeypatch.setenv(learning.SETTLED_MATCH_CACHE_ENV, str(cache))
+    entries = [
+        entry(NOW, symbol="USDJPY", direction="long", close=100.0),
+        entry(NOW + DAY, symbol="USDJPY", direction="neutral", close=101.0),
+        entry(NOW + DAY * 10, symbol="USDJPY", direction="neutral", close=101.0),
+    ]
+    learning.evaluate_history(entries)
+    original = cache.read_text(encoding="utf-8")
+    assert json.loads(original)["contract"] == learning.SETTLED_MATCH_CACHE_CONTRACT
+
+    def explode(*_args, **_kwargs):
+        raise OSError("simulated crash while writing")
+
+    monkeypatch.setattr(json, "dump", explode)
+    more = [
+        *entries,
+        entry(NOW + DAY * 2, symbol="EURUSD", direction="long", close=1.0),
+        entry(NOW + DAY * 3, symbol="EURUSD", direction="neutral", close=1.1),
+        entry(NOW + DAY * 12, symbol="EURUSD", direction="neutral", close=1.1),
+    ]
+    learning.evaluate_history(more)  # 保存は失敗するが採点は完走する
+
+    assert cache.read_text(encoding="utf-8") == original, "既存キャッシュが壊された"
+    assert not list(tmp_path.glob("*.tmp")), "一時ファイルが残っている"

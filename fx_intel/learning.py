@@ -90,6 +90,17 @@ DEFAULT_SETTLED_MATCH_CACHE = Path("logs/learning_match_cache.json")
 # 超過分は判断時刻の古い順に落とす(古い判断ほど再利用価値が低い)。
 SETTLED_MATCH_CACHE_MAX_ENTRIES = 400_000
 
+# 採点ロジックを変えたらキャッシュ全体を捨てるための版番号。
+# ⚠️ evaluate_history の突き合わせ規則(窓の取り方・age の定義・best の選び方)を
+# 変更したら必ずこの値を上げること。上げ忘れると古い規則で採点した結果が
+# 生き残り、新旧が混在した学習データになる。
+SETTLED_MATCH_LOGIC_VERSION = 2
+
+# 確定判定に使う安全余裕。価格は遅延して到着する(取込ラグ中央値97分の実績あり)
+# ため、「最終価格時刻 > 窓上限」だけでは、後から窓内に入る価格が届いた時に
+# 確定済みの結果が誤りになる。窓上限からこの時間ぶん過ぎて初めて確定とみなす。
+SETTLED_MATCH_LATE_ARRIVAL_MARGIN = timedelta(hours=6)
+
 # 重み再推定のガード
 MIN_WEIGHT_SAMPLES = 20  # テクニカル/ニュース両方の評価がこの件数未満なら既定重みのまま
 WEIGHT_SHRINK_HALFWAY = 40  # シュリンク係数 n/(n+この値)。40件で半分だけ動く
@@ -465,8 +476,13 @@ def horizon_report_ja(
     return "ホライズン別の方向的中率(学習には24hのみ使用): " + " / ".join(parts)
 
 
-MatchKey = tuple[str, datetime, float, float]
+# (ペア, 判断時刻, ホライズン, 許容幅, PIT母集団か)。
+# ⚠️require_pit は「価格系列を作る母集団」を変えるため、同じ判断でも真値が違う。
+# キーに含めないと非PIT実行の結果がPIT実行へ漏れ、PIT違反になる。
+MatchKey = tuple[str, datetime, float, float, bool]
 MatchValue = tuple[float, float] | None
+
+SETTLED_MATCH_CACHE_CONTRACT = "learning-match-cache-v2"
 
 
 def _settled_match_cache_path() -> Path | None:
@@ -481,8 +497,15 @@ def _settled_match_cache_path() -> Path | None:
 class _SettledMatchCache(dict[MatchKey, MatchValue]):
     """判断ごとの確定済み突き合わせ結果を保持する dict。
 
-    「確定済み」= 最終価格時刻が判断の探索窓上限を越えた状態。以後どれだけ
-    価格が追記されても結果は変わらないため、再計算せず再利用してよい。
+    「確定済み」の条件は2つとも満たすこと:
+
+    1. 最終価格時刻が「探索窓上限 + 遅延到着マージン」を越えている
+    2. 採点ロジック版(SETTLED_MATCH_LOGIC_VERSION)が保存時と一致する
+
+    (1)は遅延データ対策。価格は後から到着しうるので、窓上限を1秒でも越えたら
+    確定、とすると「まだ届いていなかった窓内の価格」が後で入った時に誤る。
+    (2)は採点ロジック更新対策。規則が変われば過去の結果も無効になる。
+
     未確定の判断は呼び出し側が毎回計算するので、全走査と常に同値になる。
     """
 
@@ -496,23 +519,35 @@ class _SettledMatchCache(dict[MatchKey, MatchValue]):
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # 壊れたキャッシュは黙って捨てる。再計算すれば必ず正しい値になる。
+        except (OSError, json.JSONDecodeError, ValueError):
+            # クラッシュで途中まで書かれた/壊れたキャッシュは黙って捨てる。
+            # 全走査へフォールバックするだけで、結果は必ず正しい。
             return
-        if not isinstance(raw, dict) or raw.get("contract") != "learning-match-cache-v1":
+        if not isinstance(raw, dict):
             return
-        for row in raw.get("entries") or []:
+        if raw.get("contract") != SETTLED_MATCH_CACHE_CONTRACT:
+            return
+        # 採点ロジックが変わっていたら中身を丸ごと無効化する
+        if raw.get("logic_version") != SETTLED_MATCH_LOGIC_VERSION:
+            return
+        entries = raw.get("entries")
+        if not isinstance(entries, list):
+            return
+        for row in entries:
             try:
-                symbol, ts_text, horizon, tolerance, gap, close = row
+                symbol, ts_text, horizon, tolerance, pit_only, gap, close = row
                 key = (
                     str(symbol),
                     datetime.fromisoformat(str(ts_text)),
                     float(horizon),
                     float(tolerance),
+                    bool(pit_only),
                 )
+                value = None if gap is None or close is None else (float(gap), float(close))
             except (TypeError, ValueError):
+                # 1行だけ壊れていても他は使える。壊れた行は捨てて続行する。
                 continue
-            self[key] = None if gap is None or close is None else (float(gap), float(close))
+            self[key] = value
         self._loaded_size = len(self)
 
     def save(self) -> None:
@@ -522,31 +557,40 @@ class _SettledMatchCache(dict[MatchKey, MatchValue]):
         if len(items) > SETTLED_MATCH_CACHE_MAX_ENTRIES:
             items = items[-SETTLED_MATCH_CACHE_MAX_ENTRIES:]
         payload = {
-            "contract": "learning-match-cache-v1",
+            "contract": SETTLED_MATCH_CACHE_CONTRACT,
+            "logic_version": SETTLED_MATCH_LOGIC_VERSION,
             "entries": [
                 [
                     key[0],
                     key[1].isoformat(),
                     key[2],
                     key[3],
+                    key[4],
                     None if value is None else value[0],
                     None if value is None else value[1],
                 ]
                 for key, value in items
             ],
         }
+        # クラッシュ耐性: 同一ディレクトリの一時ファイルへ書き、fsync してから
+        # 原子的に置換する。途中で落ちても本体は前回の完全な内容のまま残り、
+        # 半端な .tmp が残っても次回 load はそれを読まない。
+        # プロセス固有名にするのは、複数のbriefingが並走しても互いの
+        # 一時ファイルを壊さないため。
+        temporary = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            # 別プロセスが読んでいる最中に壊れた中身を見せないため置換で公開する
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
             temporary.replace(self._path)
         except OSError:
             # 保存できなくても採点結果は正しい。次回また計算するだけ。
-            return
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _settled_match_cache() -> _SettledMatchCache:
@@ -610,9 +654,9 @@ def evaluate_history(
 
     # 判断×価格点の突き合わせは履歴が伸びるほど重くなる(実機で age() が
     # 1回のbriefingあたり3,272万回、実行時間の54%)。突き合わせ結果は
-    # 「判断時刻・ペア・ホライズン」と、その窓に入る価格系列だけで決まり、
-    # 窓が閉じた(=最終価格時刻が window_upper を越えた)判断は将来の追記で
-    # 二度と変化しない。よって確定済みの結果だけを永続キャッシュに載せる。
+    # 「判断時刻・ペア・ホライズン・PIT母集団か」と、その窓に入る価格系列だけで
+    # 決まる。窓が閉じ、かつ遅延到着マージンぶん過ぎた判断は将来の追記で
+    # 二度と変化しないため、その結果だけを永続キャッシュに載せる。
     # 未確定の判断は毎回計算し直すため、値は常に全走査と一致する。
     match_cache = _settled_match_cache()
     latest_price_ts = {symbol: series[-1][0] for symbol, series in prices.items() if series}
@@ -633,12 +677,15 @@ def evaluate_history(
         window_lower = ts + timedelta(hours=horizon_hours - tolerance_hours)
         window_upper = ts + timedelta(hours=horizon_hours + tolerance_hours) + WEEKEND_CLOSURE
         newest = latest_price_ts.get(symbol_key)
-        settled = newest is not None and newest > window_upper
+        # 遅延到着マージンぶん過ぎるまで確定扱いにしない。窓上限を越えた直後は
+        # 「まだ届いていない窓内の価格」が後から入りうるため。
+        settled = newest is not None and newest > window_upper + SETTLED_MATCH_LATE_ARRIVAL_MARGIN
         cache_key = (
             symbol_key,
             ts,
             horizon_hours,
             tolerance_hours,
+            require_pit,
         )
         best: tuple[float, float] | None
         if settled and cache_key in match_cache:
