@@ -9,7 +9,7 @@ cells that can explain why confidence was boosted, dampened, or blocked.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, UTC
 import fcntl
 import hashlib
@@ -19,8 +19,10 @@ import os
 from pathlib import Path
 import tempfile
 
-from . import journal
+from . import decision_commit, journal
+from .price_path_adapter import ADAPTER_TIMEFRAME as SHARED_PRICE_PATH_TIMEFRAME
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
+
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe, summarize_expectancy
 from .shadow_learning import (
     SHADOW_LABEL_PROVENANCE,
@@ -31,6 +33,8 @@ from .shadow_learning import (
 )
 
 SCHEMA_VERSION = 1
+# full decision log の batch envelope 種別。テスト・外部監査から参照される公開名。
+DECISION_BATCH_EVENT_TYPE = decision_commit.DECISION_BATCH_EVENT_TYPE
 EVENT_TYPE = "chart_decision"
 # One run builds one market_context and embeds it into every decision of that
 # run, so a single news batch is duplicated once per symbol/timeframe. Folding
@@ -393,13 +397,22 @@ def append_decision_events(
     events: Iterable[Mapping[str, object]],
     *,
     normalize_news: bool = True,
-) -> None:
+    transaction_id: str | None = None,
+) -> dict[str, object] | None:
     """Durably append one locked audit batch; one line is one immutable event.
 
     News text is folded into hash references before the decision line is
     written, and the referenced items are persisted to the sidecar first — so a
     crash between the two writes can only leave an unreferenced news row, never
     a decision whose references cannot be resolved.
+
+    ``transaction_id`` を渡すと、行を個別に書く代わりに **1行の batch envelope**
+    (`event_type=decision_batch`)として書き、その位置とハッシュを返す。
+    返り値は `decision_commit.append_commit` へそのまま渡すためのもので、
+    commit が付くまで `read_decision_events` からは見えない(fail-closed)。
+
+    ⚠️ transaction_id 無しの呼び出しは従来どおり1行1イベントで追記し None を返す。
+    既存の呼び出し元を壊さないための後方互換経路。
     """
 
     target = Path(path)
@@ -417,6 +430,9 @@ def append_decision_events(
     if normalize_news:
         _append_news_sidecar(news_sidecar_path(target), news_rows)
 
+    if transaction_id is not None:
+        return _append_decision_batch(target, prepared, transaction_id=transaction_id)
+
     payload = "".join(
         json.dumps(_json_ready(event), ensure_ascii=False, allow_nan=False) + "\n"
         for event in prepared
@@ -430,6 +446,69 @@ def append_decision_events(
                 os.fsync(handle.fileno())
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return None
+
+
+def _append_decision_batch(
+    target: Path,
+    events: Sequence[Mapping[str, object]],
+    *,
+    transaction_id: str,
+) -> dict[str, object]:
+    """Append one hidden ``decision_batch`` line and describe it for the commit.
+
+    Reader 側(`decision_commit._full_batch_descriptor`)が要求する4項目
+    (decision_transaction_id / decision_ids / decision_ids_sha256 /
+    decision_batch_sha256)を必ず載せる。1つでも欠けるとバッチ全体が
+    無効判定になり、以後 commit を付けても可視化されない。
+    """
+
+    if not events:
+        raise ValueError("decision batch must contain at least one event")
+    # _json_ready の戻り値は object 型なので、dict であることを確認してから使う
+    ready: list[dict[str, object]] = []
+    for event in events:
+        prepared = _json_ready(event)
+        if not isinstance(prepared, dict):
+            raise ValueError("decision batch events must serialize to JSON objects")
+        ready.append(prepared)
+    decision_ids = decision_commit.normalize_decision_ids(
+        [event.get("decision_id") for event in ready]
+    )
+    expected = decision_commit.transaction_id_for(decision_ids)
+    if transaction_id != expected:
+        raise ValueError(
+            f"decision transaction id does not match its decision ids: {transaction_id}"
+        )
+    record = {
+        "schema_version": decision_commit.SCHEMA_VERSION,
+        "event_type": decision_commit.DECISION_BATCH_EVENT_TYPE,
+        "decision_transaction_id": expected,
+        "decision_ids": decision_ids,
+        "decision_ids_sha256": decision_commit.decision_ids_sha256(decision_ids),
+        "decision_batch_sha256": decision_commit.canonical_sha256(ready),
+        "events": ready,
+    }
+    line = json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+    encoded = line.encode("utf-8")
+    with target.open("a+b", buffering=0) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0, os.SEEK_END)
+            start_offset = handle.tell()
+            handle.write(encoded)
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return {
+        "decision_transaction_id": expected,
+        "decision_ids": decision_ids,
+        "batch_sha256": record["decision_batch_sha256"],
+        "line_start_offset": start_offset,
+        "byte_length": len(encoded),
+        "line_sha256": hashlib.sha256(encoded).hexdigest(),
+        "payload_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def save_latest_snapshot(
@@ -486,8 +565,23 @@ def save_latest_snapshot(
             temporary_path.unlink()
 
 
-def read_decision_events(path: str | Path):
-    """Stream append-only decision events. Corrupt lines are skipped.
+@dataclass(frozen=True)
+class DecisionSourceLine:
+    """One physical log line with its validated events, or why they are hidden."""
+
+    line_number: int
+    events: tuple[dict[str, object], ...] = ()
+    error: str | None = None
+
+
+def iter_raw_decision_events(path: str | Path):
+    """Stream every well-formed decision event without any commit verification.
+
+    Low-level transport reader. It performs no PIT or cross-log commit checks,
+    so callers also receive uncommitted events and unopened batch wrappers. Use
+    it only for provisional diagnostics; never for scoring, learning,
+    calibration, promotion, or any published PIT-eligible statistic. Prefer
+    :func:`iter_committed_decision_events` for those.
 
     A production audit log can exceed one gigabyte. Reading it with
     ``read_text().splitlines()`` duplicates the complete corpus in memory before
@@ -509,6 +603,189 @@ def read_decision_events(path: str | Path):
                 continue
             if isinstance(event, dict):
                 yield event
+
+
+def _committed_batch_events(
+    batch: Mapping[str, object],
+    commits: Mapping[str, Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Return a batch's events only when a matching commit publishes them."""
+
+    if batch.get("schema_version") != SCHEMA_VERSION:
+        return []
+    raw_events = batch.get("events")
+    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes)):
+        return []
+    events = [dict(event) for event in raw_events if isinstance(event, Mapping)]
+    if not events or len(events) != len(raw_events):
+        return []
+    try:
+        decision_ids = decision_commit.normalize_decision_ids(
+            [event.get("decision_id") for event in events]
+        )
+        batch_sha256 = decision_commit.canonical_sha256(events)
+    except (decision_commit.DecisionCommitError, TypeError, ValueError):
+        return []
+    if (
+        batch.get("decision_ids") != decision_ids
+        or batch.get("decision_ids_sha256") != decision_commit.decision_ids_sha256(decision_ids)
+        or batch.get("decision_batch_sha256") != batch_sha256
+    ):
+        return []
+    requires_commit = bool(batch.get("requires_cross_log_commit")) or any(
+        journal.is_pit_eligible_entry(event) for event in events
+    )
+    if not requires_commit:
+        return events
+    modes = {str(event.get("mode") or "") for event in events}
+    if len(modes) != 1:
+        return []
+    if not decision_commit.matching_commit(
+        commits,
+        transaction_id=str(batch.get("decision_transaction_id") or ""),
+        decision_ids=decision_ids,
+        batch_kind="full",
+        batch_sha256=batch_sha256,
+        mode=modes.pop(),
+    ):
+        return []
+    return events
+
+
+def iter_committed_decision_events(
+    path: str | Path,
+    *,
+    commit_path: str | Path | None = None,
+):
+    """Stream only decision events whose cross-log commit contract is satisfied.
+
+    Fail-closed canonical reader. A PIT-eligible event is withheld unless a
+    ``decision_batch`` wrapper carries it and a matching commit record publishes
+    that exact wrapper. Standalone PIT events, missing commits, decision-id set
+    mismatches and digest mismatches are all invisible rather than partly
+    trusted.
+
+    Legacy non-PIT rows predate the cross-log contract and stay visible so the
+    historical corpus keeps scoring.
+    """
+
+    # iter_decision_source と同じ判定を使う。batch の可視性は「commit が固定した
+    # バイトオフセットの行か」で決まり、行の内容だけでは決められない
+    # (同一 transaction を再書き込みするとバイト列まで一致するため)。
+    # 判定を2箇所に書くと必ず食い違うので、こちらを診断側へ委譲する。
+    for source_line in iter_decision_source(path, commit_path=commit_path):
+        if source_line.error:
+            continue
+        yield from source_line.events
+
+
+def read_decision_events(
+    path: str | Path,
+    *,
+    commit_path: str | Path | None = None,
+):
+    """Canonical PIT reader: alias of :func:`iter_committed_decision_events`."""
+
+    yield from iter_committed_decision_events(path, commit_path=commit_path)
+
+
+def _batch_line_is_published(
+    batch: Mapping[str, object],
+    line_start_offset: int,
+    commits: Mapping[str, Mapping[str, object]],
+) -> bool:
+    """Return whether this physical batch line is the one the commit published.
+
+    ⚠️ 行の内容ハッシュでは判定できない。同一 transaction を再書き込みすると
+    バイト列まで完全に一致するため、sha256 は両方の行で同じになる。
+    commit が一意に固定できるのは **バイトオフセット** だけ。
+
+    ⚠️ commit 側にオフセットが無い旧形式では判定材料が無いので True を返す
+    (後方互換。可視性を勝手に減らさない)。
+    """
+
+    transaction_id = str(batch.get("decision_transaction_id") or "")
+    commit_record = commits.get(transaction_id)
+    if not isinstance(commit_record, Mapping):
+        return False
+    verified = commit_record.get("_verified_full_batch_line_start_offset")
+    if not isinstance(verified, int) or isinstance(verified, bool):
+        return True
+    return verified == line_start_offset
+
+
+def iter_decision_source(
+    path: str | Path,
+    *,
+    commit_path: str | Path | None = None,
+):
+    """Stream physical log lines annotated with why each is visible or hidden.
+
+    Diagnostic companion to :func:`iter_committed_decision_events`. It applies
+    the identical commit contract but, instead of dropping withheld lines
+    silently, reports a reason so operators can measure provisional data.
+    """
+
+    target = Path(path)
+    commits = decision_commit.load_commits(commit_path or decision_commit.commit_path_for(target))
+    try:
+        handle = target.open(encoding="utf-8")
+    except OSError:
+        return
+    with handle:
+        line_number = 0
+        line_start_offset = 0
+        for line in handle:
+            line_number += 1
+            current_offset = line_start_offset
+            line_start_offset += len(line.encode("utf-8"))
+            stripped = line.strip()
+            if not stripped:
+                yield DecisionSourceLine(line_number=line_number, error="blank_line")
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                yield DecisionSourceLine(line_number=line_number, error="malformed_json")
+                continue
+            if not isinstance(event, dict):
+                yield DecisionSourceLine(line_number=line_number, error="non_object_json")
+                continue
+            event_type = event.get("event_type")
+            if event_type == decision_commit.DECISION_BATCH_EVENT_TYPE:
+                events = _committed_batch_events(event, commits)
+                if events:
+                    # 同一 transaction を再書き込みした場合、commit が指す行だけを
+                    # 可視にする。commit は full_batch_line_sha256 で「どの物理行を
+                    # 確定させたか」を固定しているため、内容が同一でも別の行は
+                    # superseded として明示する(黙って2重に見せない)。
+                    published = _batch_line_is_published(event, current_offset, commits)
+                    if published:
+                        yield DecisionSourceLine(
+                            line_number=line_number,
+                            events=tuple(events),
+                        )
+                    else:
+                        yield DecisionSourceLine(
+                            line_number=line_number,
+                            error="superseded_decision_batch",
+                        )
+                else:
+                    yield DecisionSourceLine(
+                        line_number=line_number,
+                        error="uncommitted_or_invalid_decision_batch",
+                    )
+                continue
+            if event_type == decision_commit.COMMIT_EVENT_TYPE:
+                yield DecisionSourceLine(line_number=line_number)
+                continue
+            if journal.is_pit_eligible_entry(event):
+                yield DecisionSourceLine(
+                    line_number=line_number,
+                    error="uncommitted_pit_event",
+                )
+                continue
+            yield DecisionSourceLine(line_number=line_number, events=(event,))
 
 
 def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, object] | None:
@@ -626,6 +903,11 @@ def decision_event_to_shadow_entries(
                     "direction": raw.get("direction"),
                     "final_direction": decision.get("direction"),
                     "score": raw.get("score"),
+                    "decision_threshold": raw.get("decision_threshold"),
+                    "production_threshold": raw.get("production_threshold"),
+                    "policy_id": raw.get("policy_id"),
+                    "policy_sha256": raw.get("policy_sha256"),
+                    "policy_vetoed_by": raw.get("policy_vetoed_by", []),
                     "blocked_by": raw.get("blocked_by", []),
                     "close": raw.get("close"),
                     "atr": raw.get("atr"),
@@ -816,6 +1098,11 @@ def score_decision_events(
                     "producer_version": shadow_row.get("producer_version"),
                     "stage_at_prediction": shadow_row.get("stage_at_prediction"),
                     "score": shadow_row.get("score"),
+                    "decision_threshold": shadow_row.get("decision_threshold"),
+                    "production_threshold": shadow_row.get("production_threshold"),
+                    "policy_id": shadow_row.get("policy_id"),
+                    "policy_sha256": shadow_row.get("policy_sha256"),
+                    "policy_vetoed_by": shadow_row.get("policy_vetoed_by", []),
                     "final_direction": shadow_row.get("final_direction"),
                     "blocked_by": shadow_row.get("blocked_by", []),
                     "mode": mode,
@@ -1522,9 +1809,32 @@ def _entry_matches_context(
 ) -> bool:
     entry_timeframe = str(entry.get("timeframe", "fusion") or "fusion")
     if entry_timeframe != timeframe:
-        return False
+        # 価格経路専用の確定足(price_path_adapter の 5m_datafeed)は、
+        # どの時間足の採点にも共通の経路として使う。判断行ではないので
+        # 採点対象を増やさず、TP/SL 先着判定に high/low を与えるだけ。
+        #
+        # 判断行と誤認しないことがこの分岐の前提なので、direction を持つ行は
+        # 通さない。実機の 5m_datafeed 1,980 行は direction=None かつ
+        # stop/target1 を持たず、経路としてしか使えないことを確認済み。
+        return _is_shared_price_path_entry(entry, entry_timeframe)
     entry_mode = str(entry.get("mode", "") or "")
     return not entry_mode or entry_mode == mode
+
+
+def _is_shared_price_path_entry(entry: Mapping[str, object], entry_timeframe: str) -> bool:
+    """全時間足で共有してよい価格経路専用行か。
+
+    `trade_outcome` は価格系列を symbol だけでキー化するため、経路行の
+    timeframe 名は本来どれでもよい。ここを通すことで、確定足 high/low が
+    15m/1h/4h/1d すべての TP/SL 先着判定に届く(close 終値だけの経路では
+    バー内の到達が見えず、実機では 100% が close_only_path だった)。
+    """
+
+    if entry_timeframe != SHARED_PRICE_PATH_TIMEFRAME:
+        return False
+    if str(entry.get("direction", "") or ""):
+        return False
+    return entry.get("stop") is None and entry.get("target1") is None
 
 
 def _meta_key(entry: Mapping[str, object]) -> tuple[str, str, str, str, str]:

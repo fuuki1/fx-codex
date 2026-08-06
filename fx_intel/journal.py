@@ -25,8 +25,12 @@ JSONLへ追記し、次回以降の実行で過去の方向判断が的中して
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
+import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -48,6 +52,8 @@ FUSION_PRODUCER = "fusion_raw"
 TIMEFRAME_PRODUCER = "timeframe_raw"
 FUSION_PRODUCER_VERSION = "fusion-journal-v2"
 TIMEFRAME_PRODUCER_VERSION = "timeframe-journal-v2"
+# compact journal の batch 終端マーカー種別。reader/監査ツールから参照される公開名。
+JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 
 
 class PointInTimeError(ValueError):
@@ -503,22 +509,170 @@ def _pre_guard_plan(plan: object) -> dict[str, object]:
     }
 
 
+def _append_journal_batch(
+    path: str | Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    decision_transaction_id: str,
+) -> dict[str, object]:
+    """Append one compact batch (N rows + marker) and describe it for the commit.
+
+    reader(`decision_commit._load_compact_receipts_from_handles`)は
+    「連続する行 + 末尾の `journal_batch_commit` marker」を1バッチとして読む。
+    marker には `compact_batch_descriptor` が要求する項目を**すべて**載せる:
+    journal_batch_id / journal_batch_size / decision_transaction_id /
+    decision_ids / decision_ids_sha256 / journal_batch_sha256 /
+    requires_cross_log_commit。1つでも欠けるとバッチ全体が無効判定になる。
+
+    各行にも journal_batch_id / journal_batch_index /
+    decision_transaction_id を埋め、marker と相互検証できるようにする。
+    """
+
+    from . import decision_commit
+
+    if not rows:
+        raise ValueError("journal batch must contain at least one row")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    decision_ids = decision_commit.normalize_decision_ids([row.get("decision_id") for row in rows])
+    expected = decision_commit.transaction_id_for(decision_ids)
+    if decision_transaction_id != expected:
+        raise ValueError(
+            f"decision transaction id does not match its decision ids: {decision_transaction_id}"
+        )
+    batch_id = uuid.uuid4().hex
+    prepared: list[dict[str, object]] = []
+    for index, row in enumerate(rows):
+        entry = dict(row)
+        entry["journal_batch_id"] = batch_id
+        entry["journal_batch_index"] = index
+        entry["journal_batch_size"] = len(rows)
+        entry["decision_transaction_id"] = expected
+        prepared.append(entry)
+    batch_sha256 = decision_commit.canonical_sha256(prepared)
+    marker = {
+        "event_type": JOURNAL_BATCH_COMMIT,
+        "journal_batch_id": batch_id,
+        "journal_batch_size": len(prepared),
+        "decision_transaction_id": expected,
+        "decision_ids": decision_ids,
+        "decision_ids_sha256": decision_commit.decision_ids_sha256(decision_ids),
+        "journal_batch_sha256": batch_sha256,
+        # commit が付くまで可視化しないことを reader へ明示する
+        "requires_cross_log_commit": True,
+    }
+    payload = "".join(
+        json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n"
+        for value in (*prepared, marker)
+    )
+    encoded = payload.encode("utf-8")
+    with target.open("a+b", buffering=0) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0, os.SEEK_END)
+            start_offset = handle.tell()
+            handle.write(encoded)
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return {
+        "decision_transaction_id": expected,
+        "decision_ids": decision_ids,
+        "journal_batch_id": batch_id,
+        "batch_sha256": batch_sha256,
+        "line_start_offset": start_offset,
+        "byte_length": len(encoded),
+        "payload_sha256": hashlib.sha256(encoded).hexdigest(),
+        "line_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def read_entries(path: str | Path):
-    """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。"""
+    """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。
+
+    ⚠️ `journal_batch_id` を持つ行は **cross-log commit が付くまで返さない**
+    (fail-closed)。commit の無いバッチは「full decision log 側に対応する
+    確定記録が無い」状態であり、採点・学習へ流すと PIT 整合が壊れるため。
+    batch を使わない従来の行はこれまでどおり無条件に返す。
+    """
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        handle = Path(path).open(encoding="utf-8")
     except OSError:
         return
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(entry, dict):
+
+    from . import decision_commit
+
+    committed: set[str] | None = None
+
+    def _committed_transactions() -> set[str]:
+        nonlocal committed
+        if committed is None:
+            try:
+                receipts = decision_commit.load_compact_receipts(path)
+            except Exception:  # noqa: BLE001 - 証跡が読めない時は隠す側へ倒す
+                receipts = {}
+            committed = set(receipts)
+        return committed
+
+    pending: list[dict[str, object]] = []
+
+    def _release(marker: Mapping[str, object]) -> list[dict[str, object]]:
+        """Return buffered rows only when the marker exactly describes them."""
+
+        batch_id = str(marker.get("journal_batch_id") or "")
+        if not batch_id or not pending:
+            return []
+        if marker.get("journal_batch_size") != len(pending):
+            return []
+        if any(row.get("journal_batch_id") != batch_id for row in pending):
+            return []
+        # index が 0..N-1 の順で揃っていること(欠落・並べ替えを弾く)
+        if [row.get("journal_batch_index") for row in pending] != list(range(len(pending))):
+            return []
+        transaction_ids = {str(row.get("decision_transaction_id") or "") for row in pending}
+        if len(transaction_ids) != 1:
+            return []
+        transaction_id = transaction_ids.pop()
+        # cross-log 契約に参加しているバッチは、full decision log 側の commit が
+        # 揃うまで見せない(fail-closed)。transaction_id を持たない旧形式の
+        # バッチは marker の整合だけで可視にする。
+        if transaction_id and transaction_id not in _committed_transactions():
+            return []
+        return list(pending)
+
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            event_type = entry.get("event_type")
+            if event_type == JOURNAL_BATCH_COMMIT:
+                yield from _release(entry)
+                pending.clear()
+                continue
+            if event_type in {
+                decision_commit.RECEIPT_EVENT_TYPE,
+                decision_commit.COMMIT_EVENT_TYPE,
+            }:
+                # receipt/commit は台帳の内部構造であって判断行ではない
+                continue
+            batch_id = entry.get("journal_batch_id")
+            if batch_id:
+                # 別バッチの行が来たら、marker を待たずに終わった前バッチは
+                # クラッシュ等で未確定のまま途切れたもの。捨てて捕捉し直す。
+                if pending and pending[-1].get("journal_batch_id") != batch_id:
+                    pending.clear()
+                pending.append(entry)
+                continue
             yield entry
+    # marker が来ないまま終端に達したバッチは未確定なので捨てる
 
 
 def blocked_gate_names(entry: Mapping[str, object]) -> set[str]:
