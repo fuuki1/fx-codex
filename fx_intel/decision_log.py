@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from typing import cast
 
 from . import decision_commit, journal
 from .price_path_adapter import ADAPTER_TIMEFRAME as SHARED_PRICE_PATH_TIMEFRAME
@@ -390,6 +391,86 @@ def _append_news_sidecar(path: Path, rows: Sequence[Mapping[str, object]]) -> No
             os.fsync(handle.fileno())
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def append_decision_transaction(
+    decision_events: Sequence[Mapping[str, object]],
+    compact_rows: Sequence[Mapping[str, object]],
+    *,
+    mode: str,
+    full_path: str | Path,
+    compact_path: str | Path,
+    normalize_news: bool = True,
+    committed_at: datetime | None = None,
+) -> dict[str, object]:
+    """Write full log, compact journal and the cross-log commit as one unit.
+
+    判断1回ぶんの書き込みを**唯一の入口**に集約する。分けて呼ぶと、
+    full/compact 両方のオフセットとハッシュが必要な `append_commit` を
+    呼び出せる場所が無く、commit を書けない(実際に本番は commit ゼロだった)。
+
+    順序は fail-closed を保つように固定する:
+
+    1. full を1行の batch envelope として書く(この時点では不可視)
+    2. compact を N行+marker として書く(この時点では不可視)
+    3. commit を書いて初めて両方が可視になる
+
+    途中のどこで落ちても、確定していない判断は reader から見えない。
+    ⚠️ すでに書かれた行は追記専用なので消さない。次回の再実行で新しい行を
+    書き、commit はそちらを指す(古い行は `superseded_decision_batch`)。
+    """
+
+    if not decision_events:
+        raise ValueError("decision transaction requires at least one decision event")
+    if len(decision_events) != len(compact_rows):
+        raise ValueError("decision events and compact rows must be one-to-one")
+
+    decision_ids = decision_commit.normalize_decision_ids(
+        [event.get("decision_id") for event in decision_events]
+    )
+    compact_ids = decision_commit.normalize_decision_ids(
+        [row.get("decision_id") for row in compact_rows]
+    )
+    if decision_ids != compact_ids:
+        raise ValueError("full and compact batches must carry the same decision ids")
+    transaction_id = decision_commit.transaction_id_for(decision_ids)
+
+    full_batch = append_decision_events(
+        full_path,
+        decision_events,
+        normalize_news=normalize_news,
+        transaction_id=transaction_id,
+    )
+    if full_batch is None:  # pragma: no cover - transaction_id を渡すので必ず返る
+        raise ValueError("full decision batch did not return a descriptor")
+
+    compact_batch = journal._append_journal_batch(  # noqa: SLF001
+        compact_path,
+        compact_rows,
+        decision_transaction_id=transaction_id,
+    )
+
+    commit_record = decision_commit.append_commit(
+        full_path,
+        decision_ids=decision_ids,
+        full_batch_sha256=str(full_batch["batch_sha256"]),
+        full_batch_line_start_offset=cast(int, full_batch["line_start_offset"]),
+        full_batch_line_sha256=str(full_batch["line_sha256"]),
+        compact_batch_sha256=str(compact_batch["batch_sha256"]),
+        compact_batch_line_start_offset=cast(int, compact_batch["line_start_offset"]),
+        compact_batch_byte_length=cast(int, compact_batch["byte_length"]),
+        compact_batch_payload_sha256=str(compact_batch["payload_sha256"]),
+        mode=mode,
+        committed_at=committed_at,
+    )
+    return {
+        "decision_transaction_id": transaction_id,
+        "decision_ids": decision_ids,
+        "mode": mode,
+        "full_batch": full_batch,
+        "compact_batch": compact_batch,
+        "commit_record": commit_record,
+    }
 
 
 def append_decision_events(
