@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -25,10 +26,13 @@ from fx_intel.virtual_portfolio import (
     TradeCloseRequest,
     VirtualPortfolioError,
     VirtualPortfolioPolicy,
+    _classify_label_quality,
+    classify_sizing_invariants,
     five_x_virtual_portfolio_policy,
     open_virtual_portfolio_reader,
     open_virtual_portfolio_writer,
     portfolio_snapshot,
+    summarize_net_r_robust,
 )
 from tools.virtual_portfolio import _set_five_x_limits
 from tools.virtual_portfolio_canonical_outcomes import connect as connect_canonical_outcomes
@@ -1249,6 +1253,22 @@ def test_open_close_reconciles_net_pnl_and_failure_evidence(tmp_path, monkeypatc
         assert opened["disposition"] == "opened"
         trade_id = str(opened["trade_id"])
         assert store.snapshot(now=START)["open_position_count"] == 1
+        # P0-D: a learning label requires an observed path. Without a mark the
+        # close is recorded but excluded from learning as `sparse_path_marks`.
+        store.record_position_mark(
+            PositionMarkRequest(
+                trade_id=trade_id,
+                mark_time=START + timedelta(seconds=30),
+                quote=_quote(
+                    moment=START + timedelta(seconds=30),
+                    bid=150.20,
+                    ask=150.22,
+                    record_id="mark-reconcile-1",
+                ),
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+            )
+        )
         closed = store.close_trade(
             TradeCloseRequest(
                 trade_id=trade_id,
@@ -1483,6 +1503,22 @@ def test_legacy_unassigned_close_is_excluded_from_intraday_learning_and_kpi(
             quote_to_jpy_rate=1,
             quote_conversion_source="JPY quote currency",
         )
+        # P0-D: observe the path so this close stays learning-eligible; the
+        # exclusion under test is the missing horizon assignment, not sparsity.
+        store.record_position_mark(
+            PositionMarkRequest(
+                trade_id=str(opened["trade_id"]),
+                mark_time=START + timedelta(seconds=30),
+                quote=_quote(
+                    moment=START + timedelta(seconds=30),
+                    bid=150.20,
+                    ask=150.22,
+                    record_id="legacy-mark",
+                ),
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+            )
+        )
         store.close_trade(
             TradeCloseRequest(
                 trade_id=str(opened["trade_id"]),
@@ -1695,6 +1731,22 @@ def test_mature_loss_memory_vetoes_only_the_same_future_segment(tmp_path) -> Non
                 quote_conversion_source="JPY quote currency",
             )
             assert opened["disposition"] == "opened"
+            # P0-D: only labelled losses feed the safety gate, so the path must
+            # be observed for these fixtures to remain learning-eligible.
+            store.record_position_mark(
+                PositionMarkRequest(
+                    trade_id=str(opened["trade_id"]),
+                    mark_time=moment + timedelta(seconds=30),
+                    quote=_quote(
+                        moment=moment + timedelta(seconds=30),
+                        bid=149.995,
+                        ask=150.015,
+                        record_id=f"loss-mark-{index}",
+                    ),
+                    quote_to_jpy_rate=1,
+                    quote_conversion_source="JPY quote currency",
+                )
+            )
             store.close_trade(
                 TradeCloseRequest(
                     trade_id=str(opened["trade_id"]),
@@ -1729,3 +1781,405 @@ def test_mature_loss_memory_vetoes_only_the_same_future_segment(tmp_path) -> Non
 
     assert next_trade["disposition"] == "abstained"
     assert any(reason.startswith("学習安全ゲート:") for reason in next_trade["rejection_reasons"])
+
+
+def test_sizing_invariants_quarantine_the_production_denominator_collapse() -> None:
+    """Reproduce sim-718c586007c93eec140f9dc6 exactly (2026-08-06 production).
+
+    The stop sat 0.491 pips from entry against a 0.400 pip spread, so a normal
+    22.7 pip move was reported as +46.4R. See
+    docs/audits/NET_R_OUTLIER_FORENSIC_20260806.md.
+    """
+
+    assessment = classify_sizing_invariants(
+        executable=Decimal("160.285"),
+        stop=Decimal("160.289908884407"),
+        target=Decimal("160.058091115593"),
+        bid=Decimal("160.285"),
+        ask=Decimal("160.289"),
+        units=Decimal("964170"),
+        conversion_rate=Decimal("1"),
+        planned_risk_jpy=Decimal("4733"),
+        equity_jpy=Decimal("1000000"),
+    )
+
+    assert assessment["canonical"] is False
+    assert assessment["allocation_stream"] == "quarantine_shadow"
+    assert assessment["denominator_unstable"] is True
+    # All three guards fire on this trade: the stop sat 0.491 pips from entry
+    # against a 0.400 pip spread, which forced 154x gross leverage and a
+    # planned reward-to-risk of 46.2.
+    assert "microstructure_floor" in assessment["violations"]
+    assert "gross_leverage" in assessment["violations"]
+    assert "planned_reward_to_risk" in assessment["violations"]
+
+
+def test_sizing_invariants_accept_a_normal_stop() -> None:
+    """A stop well outside the spread stays canonical."""
+
+    assessment = classify_sizing_invariants(
+        executable=Decimal("150.00"),
+        stop=Decimal("149.80"),
+        target=Decimal("150.30"),
+        bid=Decimal("150.00"),
+        ask=Decimal("150.02"),
+        units=Decimal("10000"),
+        conversion_rate=Decimal("1"),
+        planned_risk_jpy=Decimal("2000"),
+        equity_jpy=Decimal("1000000"),
+    )
+
+    assert assessment["canonical"] is True
+    assert assessment["allocation_stream"] == "canonical"
+    assert assessment["denominator_unstable"] is False
+    assert assessment["violations"] == ()
+
+
+def test_sizing_invariants_accept_an_ordinary_tight_stop() -> None:
+    """A 5 pip EURUSD stop must stay canonical.
+
+    Regression guard for a calibration error found by the 2026-08-06 dry-run: a
+    notional/planned-risk ceiling reduces algebraically to `price /
+    risk_distance`, so it rejected ordinary tight stops and quarantined 32 of 50
+    production trades. Gross leverage against equity is the correct measure.
+    """
+
+    assessment = classify_sizing_invariants(
+        executable=Decimal("1.15000"),
+        stop=Decimal("1.14950"),
+        target=Decimal("1.15100"),
+        bid=Decimal("1.14999"),
+        ask=Decimal("1.15001"),
+        units=Decimal("40000"),
+        conversion_rate=Decimal("150"),
+        planned_risk_jpy=Decimal("3000"),
+        equity_jpy=Decimal("1000000"),
+    )
+
+    assert assessment["canonical"] is True
+    assert assessment["violations"] == ()
+
+
+def test_sizing_invariants_reject_non_positive_risk_distance() -> None:
+    assessment = classify_sizing_invariants(
+        executable=Decimal("150.00"),
+        stop=Decimal("150.00"),
+        target=Decimal("150.30"),
+        bid=Decimal("150.00"),
+        ask=Decimal("150.02"),
+        units=Decimal("10000"),
+        conversion_rate=Decimal("1"),
+        planned_risk_jpy=Decimal("2000"),
+        equity_jpy=Decimal("1000000"),
+    )
+
+    assert assessment["canonical"] is False
+    assert assessment["denominator_unstable"] is True
+    assert "risk_distance_not_positive" in assessment["violations"]
+
+
+def test_robust_summary_detects_single_sample_domination() -> None:
+    """The production 50-trade shape: mean positive, every robust stat negative."""
+
+    values = [46.406085] + [-0.5] * 49
+    summary = summarize_net_r_robust(values)
+
+    assert summary["count"] == 50
+    assert summary["mean_unsafe"] > 0
+    assert summary["median"] < 0
+    assert summary["trimmed_mean_10pct"] < 0
+    assert summary["winsorized_mean_5r"] < 0
+    assert summary["single_sample_dominated"] is True
+
+
+def test_robust_summary_is_stable_without_outliers() -> None:
+    summary = summarize_net_r_robust([-0.5, -0.4, -0.6, -0.5, -0.45])
+
+    assert summary["single_sample_dominated"] is False
+    assert summary["median"] < 0
+    assert summary["winsorized_mean_5r"] == summary["mean_unsafe"]
+
+
+def test_robust_summary_handles_empty_input() -> None:
+    summary = summarize_net_r_robust([])
+
+    assert summary["count"] == 0
+    assert summary["mean_unsafe"] is None
+    assert summary["single_sample_dominated"] is False
+
+
+def _open_and_close(
+    store,
+    policy,
+    *,
+    decision_id: str,
+    moment: datetime,
+    stop: float,
+    target: float,
+    bid: float,
+    ask: float,
+    exit_bid: float,
+    exit_ask: float,
+    with_mark: bool = True,
+) -> dict:
+    """Open, optionally observe, and close one trade. Returns the close result."""
+
+    decision = _decision(policy, decision_id=decision_id, prediction_time=moment)
+    decision["stop"] = stop
+    decision["target1"] = target
+    opened = store.process_decision(
+        decision,
+        quote=_quote(moment=moment, bid=bid, ask=ask, record_id=f"entry-{decision_id}"),
+        observed_at=moment,
+        quote_to_jpy_rate=1,
+        quote_conversion_source="JPY quote currency",
+    )
+    assert opened["disposition"] == "opened", opened.get("rejection_reasons")
+    trade_id = str(opened["trade_id"])
+    if with_mark:
+        store.record_position_mark(
+            PositionMarkRequest(
+                trade_id=trade_id,
+                mark_time=moment + timedelta(seconds=30),
+                quote=_quote(
+                    moment=moment + timedelta(seconds=30),
+                    bid=bid,
+                    ask=ask,
+                    record_id=f"mark-{decision_id}",
+                ),
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+            )
+        )
+    store.close_trade(
+        TradeCloseRequest(
+            trade_id=trade_id,
+            close_time=moment + timedelta(minutes=1),
+            quote=_quote(
+                moment=moment + timedelta(minutes=1),
+                bid=exit_bid,
+                ask=exit_ask,
+                record_id=f"exit-{decision_id}",
+            ),
+            quote_to_jpy_rate=1,
+            quote_conversion_source="JPY quote currency",
+            close_reason="target1",
+            cost_model_id="explicit-test-costs-v1",
+            cost_model_version="1",
+            cost_source="test-fixture",
+            costs_complete=True,
+        )
+    )
+    return dict(opened)
+
+
+def test_quarantined_trade_is_excluded_from_every_evaluation_surface(tmp_path) -> None:
+    """Adding a denominator-unstable trade must not move any evaluation output.
+
+    This is the core P0-B guarantee: quarantine is exclusion from the canonical
+    population, not merely down-weighting. The added trade reproduces the
+    production +46.4R geometry (stop inside the spread), which under the old
+    behaviour moved the 50-trade mean from -0.357R to +0.579R.
+    """
+
+    baseline_path, policy = _initialized(tmp_path / "baseline")
+    with open_virtual_portfolio_writer(baseline_path, writer_id="test") as store:
+        _open_and_close(
+            store,
+            policy,
+            decision_id="canonical-1",
+            moment=START,
+            stop=149.50,
+            target=150.50,
+            bid=150.00,
+            ask=150.02,
+            exit_bid=150.30,
+            exit_ask=150.32,
+        )
+        baseline_learning = store.export_learning_rows(as_of=START + timedelta(minutes=5))
+        baseline_snapshot = store.snapshot(now=START + timedelta(minutes=5))
+
+    with_outlier_path, policy2 = _initialized(tmp_path / "with_outlier")
+    with open_virtual_portfolio_writer(with_outlier_path, writer_id="test") as store:
+        _open_and_close(
+            store,
+            policy2,
+            decision_id="canonical-1",
+            moment=START,
+            stop=149.50,
+            target=150.50,
+            bid=150.00,
+            ask=150.02,
+            exit_bid=150.30,
+            exit_ask=150.32,
+        )
+        # Stop 0.005 inside a 0.02 spread: the production denominator collapse.
+        outlier = _open_and_close(
+            store,
+            policy2,
+            decision_id="outlier-1",
+            moment=START + timedelta(minutes=2),
+            stop=150.015,
+            target=150.10,
+            bid=150.00,
+            ask=150.02,
+            exit_bid=150.10,
+            exit_ask=150.12,
+        )
+        outlier_learning = store.export_learning_rows(as_of=START + timedelta(minutes=5))
+        outlier_snapshot = store.snapshot(now=START + timedelta(minutes=5))
+
+    # The outlier really was opened and really was quarantined. The assessment
+    # is persisted on the open record (inside record_sha256), not returned.
+    with sqlite3.connect(with_outlier_path) as raw:
+        raw.row_factory = sqlite3.Row
+        stored = raw.execute(
+            "SELECT components_json FROM simulated_trade_opens WHERE trade_id = ?",
+            (str(outlier["trade_id"]),),
+        ).fetchone()
+    sizing = json.loads(stored["components_json"])["sizing_invariants"]
+    assert sizing["canonical"] is False
+    assert sizing["denominator_unstable"] is True
+
+    # Learning export: identical row count and identical net-R values.
+    assert outlier_learning["row_count"] == baseline_learning["row_count"]
+    assert [row["canonical_outcome"]["realized_net_r"] for row in outlier_learning["rows"]] == [
+        row["canonical_outcome"]["realized_net_r"] for row in baseline_learning["rows"]
+    ]
+
+    # Canonical KPI: the outlier's P&L must not enter research expectancy, and
+    # must not inflate the mature learning population.
+    baseline_kpi = baseline_snapshot["research_kpis"]
+    outlier_kpi = outlier_snapshot["research_kpis"]
+    assert (
+        outlier_kpi["rolling_20d"]["cost_adjusted_expectancy_net_r"]
+        == baseline_kpi["rolling_20d"]["cost_adjusted_expectancy_net_r"]
+    )
+    assert outlier_kpi["rolling_20d"]["net_r"] == baseline_kpi["rolling_20d"]["net_r"]
+    assert outlier_kpi["rolling_20d"]["trade_count"] == baseline_kpi["rolling_20d"]["trade_count"]
+    assert outlier_kpi["mature_learning_rows"] == baseline_kpi["mature_learning_rows"]
+
+    # Robust net-R aggregation over the canonical population is unchanged.
+    assert summarize_net_r_robust(
+        row["canonical_outcome"]["realized_net_r"] for row in outlier_learning["rows"]
+    ) == summarize_net_r_robust(
+        row["canonical_outcome"]["realized_net_r"] for row in baseline_learning["rows"]
+    )
+
+
+def test_quarantined_losses_do_not_arm_the_safety_gate(tmp_path) -> None:
+    """A quarantined loss must not count toward the consecutive-loss veto.
+
+    The gate exists to stop genuine losing streaks. Feeding it trades whose R
+    unit is meaningless would let sizing defects drive risk decisions.
+    """
+
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        for index in range(3):
+            _open_and_close(
+                store,
+                policy,
+                decision_id=f"quarantined-loss-{index}",
+                moment=START + timedelta(days=index),
+                stop=150.015,
+                target=150.10,
+                bid=150.00,
+                ask=150.02,
+                exit_bid=150.018,
+                exit_ask=150.038,
+            )
+        next_moment = START + timedelta(days=4)
+        following = store.process_decision(
+            _decision(policy, decision_id="after-quarantined", prediction_time=next_moment),
+            quote=_quote(moment=next_moment, record_id="after-quarantined-entry"),
+            observed_at=next_moment,
+            quote_to_jpy_rate=1,
+            quote_conversion_source="JPY quote currency",
+        )
+
+    assert not any(
+        reason.startswith("学習安全ゲート:") for reason in following["rejection_reasons"]
+    )
+
+
+def test_label_quality_reports_the_largest_unobserved_gap(tmp_path) -> None:
+    """The metric must expose how long the path went unwatched.
+
+    A high sampling ratio does not prove the path was observed: the production
+    +46.4R trade survived its stop by 0.09 pips between two marks. Recording the
+    largest gap keeps that limitation visible to any consumer of the label.
+    """
+
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision = _decision(policy, decision_id="gap-1")
+        opened = store.process_decision(
+            decision,
+            quote=_quote(),
+            observed_at=START,
+            quote_to_jpy_rate=1,
+            quote_conversion_source="JPY quote currency",
+        )
+        trade_id = str(opened["trade_id"])
+        store.record_position_mark(
+            PositionMarkRequest(
+                trade_id=trade_id,
+                mark_time=START + timedelta(seconds=10),
+                quote=_quote(moment=START + timedelta(seconds=10), record_id="gap-mark"),
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+            )
+        )
+        store.close_trade(
+            TradeCloseRequest(
+                trade_id=trade_id,
+                close_time=START + timedelta(minutes=1),
+                quote=_quote(
+                    moment=START + timedelta(minutes=1),
+                    bid=150.10,
+                    ask=150.12,
+                    record_id="gap-exit",
+                ),
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+                close_reason="target1",
+                cost_model_id="explicit-test-costs-v1",
+                cost_model_version="1",
+                cost_source="test-fixture",
+                costs_complete=True,
+            )
+        )
+
+    with sqlite3.connect(path) as raw:
+        raw.row_factory = sqlite3.Row
+        stored = raw.execute(
+            "SELECT attribution_json FROM simulated_trade_closes WHERE trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+    quality = json.loads(stored["attribution_json"])["label_quality"]
+
+    assert quality["contract"] == "virtual-trade-label-quality-v2"
+    assert quality["mark_count"] == 1
+    # open -> mark is 10s, mark -> close is 50s, so the largest gap is 50s.
+    assert quality["largest_observation_gap_seconds"] == 50.0
+    # The name and the disclaimer must both survive refactors.
+    assert "path_sampling_adequacy" in quality
+    assert "mark_coverage" not in quality
+    assert "does_not_guarantee" in quality
+
+
+def test_session_end_close_is_ambiguous_and_not_learning_eligible(tmp_path) -> None:
+    """Session bookkeeping exits do not reflect the hypothesis under test."""
+
+    quality = _classify_label_quality(
+        mark_count=10,
+        holding_seconds=60.0,
+        close_reason="session_end",
+        sizing_invariants={"canonical": True, "denominator_unstable": False},
+        largest_gap_seconds=6.0,
+    )
+
+    assert quality["path_evidence"] == "sufficient"
+    assert quality["learning_eligible"] is False
+    assert "ambiguous_close" in quality["exclusion_reasons"]

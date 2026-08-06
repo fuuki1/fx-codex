@@ -9,7 +9,7 @@ executable quote, costs, and governing artifact hashes are all explicit.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -159,6 +159,122 @@ class VirtualHorizonAllocationPolicy:
     @property
     def policy_sha256(self) -> str:
         return _sha256_json(asdict(self))
+
+
+@dataclass(frozen=True)
+class VirtualSizingInvariantPolicy:
+    """Reject sizing inputs that make the R denominator meaningless.
+
+    `realized_net_r = net_pnl / planned_risk_jpy` and `planned_risk_jpy` is
+    derived from `risk_distance = abs(executable - stop)`. When the stop sits
+    at or inside the quoted spread the denominator collapses toward zero, so a
+    normal price move is reported as an extreme R. That is not a tail profit —
+    it is a broken measurement unit. See
+    `docs/audits/NET_R_OUTLIER_FORENSIC_20260806.md`.
+
+    All thresholds are calibrated from the production 50-trade distribution
+    measured 2026-08-06 (see `docs/audits/P0_P1_IMPLEMENTATION_20260806.md`):
+
+    - `microstructure_floor_multiple`: rd/spread had median 11.03 and p25 4.89,
+      while the six trades below 2.0 were clearly separated from the body of
+      the distribution.
+    - `maximum_gross_leverage`: notional/equity had median 15.1x and p75 22.6x;
+      only three trades exceeded 100x, and those are the same trades whose stop
+      sat inside the spread. 100x is deliberately far above normal operation so
+      this guard catches denominator collapse rather than re-litigating sizing.
+      Note that a notional/planned-risk ratio would NOT work here: it reduces
+      algebraically to `price / risk_distance`, so it is redundant with the
+      microstructure floor and rejects ordinary 5-pip stops.
+    - `maximum_planned_reward_to_risk`: planned RR had median 0.98 and p90 4.02.
+      A planned RR above 10 means the stop is tiny relative to the target, which
+      is the signature of a collapsed denominator rather than a real setup.
+    """
+
+    policy_id: str = "virtual-sizing-invariant-v1"
+    microstructure_floor_multiple: Decimal = Decimal("2")
+    maximum_gross_leverage: Decimal = Decimal("100")
+    maximum_planned_reward_to_risk: Decimal = Decimal("10")
+    enforcement: str = "quarantine"
+
+    @property
+    def policy_sha256(self) -> str:
+        return _sha256_json(
+            {
+                "policy_id": self.policy_id,
+                "microstructure_floor_multiple": str(self.microstructure_floor_multiple),
+                "maximum_gross_leverage": str(self.maximum_gross_leverage),
+                "maximum_planned_reward_to_risk": str(self.maximum_planned_reward_to_risk),
+                "enforcement": self.enforcement,
+            }
+        )
+
+
+def classify_sizing_invariants(
+    *,
+    executable: Decimal,
+    stop: Decimal,
+    target: Decimal,
+    bid: Decimal,
+    ask: Decimal,
+    units: Decimal,
+    conversion_rate: Decimal,
+    planned_risk_jpy: Decimal,
+    equity_jpy: Decimal | None = None,
+    policy: VirtualSizingInvariantPolicy | None = None,
+) -> dict[str, object]:
+    """Classify one sizing proposal as canonical or quarantine (fail-closed).
+
+    Never deletes or rewrites raw values. Returns the violated invariants so
+    the caller can record the trade as shadow-only while keeping the ledger
+    intact.
+    """
+
+    sizing_policy = policy or VirtualSizingInvariantPolicy()
+    violations: list[str] = []
+
+    risk_distance = abs(executable - stop)
+    spread = ask - bid
+
+    if risk_distance <= 0:
+        violations.append("risk_distance_not_positive")
+    if planned_risk_jpy <= 0:
+        violations.append("planned_risk_not_positive")
+    if spread < 0:
+        violations.append("spread_negative")
+
+    floor = spread * sizing_policy.microstructure_floor_multiple
+    if risk_distance > 0 and spread > 0 and risk_distance < floor:
+        violations.append("microstructure_floor")
+
+    notional = abs(units) * executable * conversion_rate
+    gross_leverage: Decimal | None = None
+    if equity_jpy is not None and equity_jpy > 0:
+        gross_leverage = notional / equity_jpy
+        if gross_leverage > sizing_policy.maximum_gross_leverage:
+            violations.append("gross_leverage")
+
+    planned_rr: Decimal | None = None
+    if risk_distance > 0:
+        planned_rr = abs(target - executable) / risk_distance
+        if planned_rr > sizing_policy.maximum_planned_reward_to_risk:
+            violations.append("planned_reward_to_risk")
+
+    canonical = not violations
+    return {
+        "canonical": canonical,
+        "allocation_stream": "canonical" if canonical else "quarantine_shadow",
+        "denominator_unstable": "microstructure_floor" in violations
+        or "risk_distance_not_positive" in violations,
+        "violations": tuple(violations),
+        "risk_distance": str(risk_distance),
+        "spread": str(spread),
+        "risk_distance_to_spread": (str(risk_distance / spread) if spread > 0 else None),
+        "notional_jpy": str(notional),
+        "gross_leverage": (None if gross_leverage is None else str(gross_leverage)),
+        "planned_reward_to_risk": (None if planned_rr is None else str(planned_rr)),
+        "policy_id": sizing_policy.policy_id,
+        "policy_sha256": sizing_policy.policy_sha256,
+    }
 
 
 def classify_virtual_horizon(
@@ -1292,6 +1408,198 @@ def _period_start(now: datetime, period: str) -> datetime:
     else:
         raise ValueError(f"unknown period: {period}")
     return start.astimezone(UTC)
+
+
+def summarize_net_r_robust(values: Iterable[float]) -> dict[str, object]:
+    """Summarise net-R without ever exposing a bare arithmetic mean.
+
+    P0-A: the raw mean of net-R is not a safe summary statistic while
+    denominator-unstable trades exist in the ledger. On the production
+    50-trade sample the mean was +0.579R while the median was -0.598R and the
+    10% trimmed mean was -0.451R; a single trade accounted for the sign flip
+    (docs/audits/NET_R_OUTLIER_FORENSIC_20260806.md).
+
+    The raw mean is still returned, but only as `mean_unsafe`, alongside the
+    robust estimators and the leave-one-out influence needed to detect
+    single-sample domination. Callers must not render `mean_unsafe` on its own.
+    """
+
+    ordered = sorted(float(value) for value in values)
+    count = len(ordered)
+    if count == 0:
+        return {
+            "count": 0,
+            "mean_unsafe": None,
+            "median": None,
+            "trimmed_mean_10pct": None,
+            "winsorized_mean_5r": None,
+            "winsorized_mean_10r": None,
+            "max_abs_leave_one_out_delta": None,
+            "single_sample_dominated": False,
+        }
+
+    total = sum(ordered)
+    mean = total / count
+    mid = count // 2
+    median = ordered[mid] if count % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+    trim = int(count * 0.10)
+    trimmed_source = ordered[trim : count - trim] if count - 2 * trim > 0 else ordered
+    trimmed = sum(trimmed_source) / len(trimmed_source)
+
+    def _winsorized(cap: float) -> float:
+        return sum(min(max(value, -cap), cap) for value in ordered) / count
+
+    if count > 1:
+        deltas = [abs(((total - value) / (count - 1)) - mean) for value in ordered]
+        max_delta: float | None = max(deltas)
+    else:
+        max_delta = None
+
+    # A sample dominates when removing it moves the mean by more than the
+    # absolute mean itself, i.e. the location estimate is one observation deep.
+    dominated = max_delta is not None and max_delta > abs(mean)
+
+    return {
+        "count": count,
+        "mean_unsafe": mean,
+        "median": median,
+        "trimmed_mean_10pct": trimmed,
+        "winsorized_mean_5r": _winsorized(5.0),
+        "winsorized_mean_10r": _winsorized(10.0),
+        "max_abs_leave_one_out_delta": max_delta,
+        "single_sample_dominated": dominated,
+    }
+
+
+# P0-D: mark coverage, not a raw mark count, decides whether MFE/MAE can carry
+# a learning label. Production marks arrive on a ~5 minute cadence, so a trade
+# held 3.3 seconds legitimately has one mark while a trade held 8.7 minutes with
+# one mark has an unsampled path. Measured on the production 50-trade sample
+# (2026-08-06): 37 trades had 1 mark, and their median hold was well under one
+# mark interval. A fixed minimum count would have excluded 74% of an already
+# starved population without separating short trades from unsampled ones.
+PATH_MARK_INTERVAL_SECONDS = 300.0
+MINIMUM_PATH_SAMPLING_ADEQUACY = 0.5
+
+
+def _as_str_mapping(value: object) -> dict[str, object]:
+    """Coerce an untyped payload field into a string-keyed mapping."""
+
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    return {}
+
+
+def _as_object_list(value: object) -> list[object]:
+    """Coerce an untyped payload field into a list, treating scalars as empty."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return []
+    return list(value)
+
+
+def _sizing_invariants_of_open(opened: object) -> dict[str, object] | None:
+    """Recover the sizing assessment stored on the open record, if present.
+
+    Trades opened before the P0-C invariants existed have no assessment. They
+    are treated as unknown rather than as canonical, so pre-existing rows are
+    never silently promoted into the learning population.
+
+    Accepts either a mapping or a `sqlite3.Row`, which does not implement
+    `.get()`.
+    """
+
+    raw: object
+    try:
+        raw = opened["components_json"]  # type: ignore[index]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not raw:
+        return None
+    try:
+        components = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(components, dict):
+        return None
+    assessment = components.get("sizing_invariants")
+    return assessment if isinstance(assessment, dict) else None
+
+
+def _classify_label_quality(
+    *,
+    mark_count: int,
+    holding_seconds: float,
+    close_reason: str,
+    sizing_invariants: Mapping[str, object] | None,
+    largest_gap_seconds: float | None = None,
+) -> dict[str, object]:
+    """Decide whether one closed trade may be used as a learning label.
+
+    **What `path_sampling_adequacy` measures.** Observed marks divided by the
+    marks a ~5 minute cadence should have produced over the holding period. It
+    is a *sampling rate relative to the expected cadence*, nothing more.
+
+    **What it does NOT guarantee.** It is deliberately not called "coverage":
+    it does not establish that the price path was observed, that MFE/MAE are
+    the true extremes, or that a stop was never touched between marks. Marks
+    are point observations; any excursion strictly between two marks is
+    invisible regardless of how high this ratio is. The production +46.4R trade
+    scored 0.57 here while surviving its stop by 0.09 pips on a single mark —
+    an adequate-looking ratio that still proves nothing about the path. Treat
+    it as a necessary condition for a usable label, never a sufficient one.
+
+    **Sparse.** `path_sampling_adequacy` below
+    `MINIMUM_PATH_SAMPLING_ADEQUACY`: fewer observations than the cadence
+    implies, so MFE/MAE rest on too little evidence.
+
+    **Ambiguous.** `close_reason == "session_end"`: the exit was forced by
+    session bookkeeping rather than the trade's own stop/target/time rule, so
+    the realised outcome does not reflect the hypothesis under test.
+
+    **Effect on learning eligibility.** Any exclusion reason makes
+    `learning_eligible` False, which removes the trade from learning export,
+    the safety gate, promotion, canonical KPIs, and robust net-R aggregation.
+    The row itself is never deleted or altered; only its eligibility changes.
+    """
+
+    expected_marks = max(1.0, holding_seconds / PATH_MARK_INTERVAL_SECONDS)
+    sampling_adequacy = mark_count / expected_marks
+
+    exclusions: list[str] = []
+    if sampling_adequacy < MINIMUM_PATH_SAMPLING_ADEQUACY:
+        exclusions.append("sparse_path_marks")
+    if sizing_invariants is None:
+        exclusions.append("sizing_invariants_unknown")
+    else:
+        if sizing_invariants.get("denominator_unstable") is True:
+            exclusions.append("denominator_unstable")
+        elif sizing_invariants.get("canonical") is not True:
+            exclusions.append("sizing_quarantined")
+    if close_reason == "session_end":
+        exclusions.append("ambiguous_close")
+
+    return {
+        "contract": "virtual-trade-label-quality-v2",
+        "measures": "observed marks relative to the expected ~5 minute cadence",
+        "does_not_guarantee": (
+            "that the price path was observed; excursions between marks are invisible"
+        ),
+        "mark_count": mark_count,
+        "expected_mark_count": expected_marks,
+        "path_sampling_adequacy": sampling_adequacy,
+        "minimum_path_sampling_adequacy": MINIMUM_PATH_SAMPLING_ADEQUACY,
+        "largest_observation_gap_seconds": largest_gap_seconds,
+        "holding_seconds": holding_seconds,
+        "close_reason": close_reason,
+        "path_evidence": (
+            "sufficient" if sampling_adequacy >= MINIMUM_PATH_SAMPLING_ADEQUACY else "sparse"
+        ),
+        "denominator_unstable": "denominator_unstable" in exclusions,
+        "exclusion_reasons": tuple(exclusions),
+        "learning_eligible": not exclusions,
+    }
 
 
 def _moving_block_mean_ci(
@@ -2654,6 +2962,38 @@ class VirtualPortfolioStore:
             "replay_evidence": dict(request.replay_evidence or {}),
             "counterfactuals": counterfactuals,
         }
+        # P0-D: MFE/MAE are only trustworthy when the path was actually
+        # sampled. The +46.4R production trade survived its stop by 0.09 pips
+        # on a single intra-trade mark, so a sparse path cannot support a
+        # learning label. Sizing instability disqualifies the label as well:
+        # the R unit itself is meaningless when the denominator collapsed.
+        mark_times = [
+            int(row["mark_time_ns"])
+            for row in self.connection.execute(
+                """
+                SELECT mark_time_ns FROM simulated_position_marks
+                WHERE trade_id = ? ORDER BY mark_time_ns
+                """,
+                (trade_id,),
+            ).fetchall()
+        ]
+        open_ns = int(opened["open_time_ns"])
+        close_ns = _to_ns(close_time)
+        # The largest unobserved stretch, including the open->first-mark and
+        # last-mark->close legs, is the most honest available statement about
+        # how long the path went unwatched.
+        boundaries = [open_ns, *mark_times, close_ns]
+        largest_gap_seconds = max(
+            (later - earlier) / 1_000_000_000
+            for earlier, later in zip(boundaries, boundaries[1:], strict=False)
+        )
+        label_quality = _classify_label_quality(
+            mark_count=len(mark_times),
+            holding_seconds=max(0.0, (close_ns - open_ns) / 1_000_000_000),
+            close_reason=close_reason,
+            sizing_invariants=_sizing_invariants_of_open(opened),
+            largest_gap_seconds=largest_gap_seconds,
+        )
         quote_payload = _quote_payload(request.quote)
         close_payload: dict[str, object] = {
             "trade_id": trade_id,
@@ -2677,9 +3017,9 @@ class VirtualPortfolioStore:
             "maximum_favorable_excursion_r": mfe,
             "maximum_adverse_excursion_r": mae,
             "quote": quote_payload,
-            "attribution": attribution,
+            "attribution": {**attribution, "label_quality": label_quality},
             "failures": failures,
-            "learning_eligible": True,
+            "learning_eligible": bool(label_quality["learning_eligible"]),
         }
         close_hash = _record_hash(close_payload)
         existing_close = self.connection.execute(
@@ -2758,9 +3098,9 @@ class VirtualPortfolioStore:
                     mfe,
                     mae,
                     _json(quote_payload),
-                    _json(attribution),
+                    _json(close_payload["attribution"]),
                     _json(failures),
-                    1,
+                    int(bool(label_quality["learning_eligible"])),
                     close_hash,
                     writer_id,
                 ),
@@ -3640,6 +3980,7 @@ class VirtualPortfolioStore:
             WHERE c.close_time_ns >= ? AND c.close_time_ns <= ?
               AND ck.close_known_at_ns <= ?
               AND h.allocation_class = 'intraday_capacity'
+              AND c.learning_eligible = 1
             ORDER BY c.close_time_ns, o.trade_id
             """,
             (
@@ -3660,7 +4001,8 @@ class VirtualPortfolioStore:
             WHERE c.close_time_ns >= ? AND c.close_time_ns <= ?
               AND ck.close_known_at_ns <= ?
               AND (h.allocation_class IS NULL
-                   OR h.allocation_class <> 'intraday_capacity')
+                   OR h.allocation_class <> 'intraday_capacity'
+                   OR c.learning_eligible <> 1)
             """,
             (
                 _to_ns(rolling_start_local.astimezone(UTC)),
@@ -3948,7 +4290,7 @@ class VirtualPortfolioStore:
                         "trade_count": int(excluded_rolling_row["trade_count"]),
                         "net_pnl_jpy": int(excluded_rolling_row["net_pnl_jpy"]),
                         "net_r": float(excluded_rolling_row["net_r"]),
-                        "reason": "legacy_unassigned_or_non_intraday",
+                        "reason": "legacy_unassigned_or_non_intraday_or_label_ineligible",
                     },
                 },
                 "drawdown_jpy": peak - balance,
@@ -4430,6 +4772,27 @@ class VirtualPortfolioStore:
         if units_decimal <= 0:
             raise InvalidVirtualRecord("calculated units are zero")
         planned_risk = _round_jpy(units_decimal * risk_distance * conversion_rate)
+        # P0-B / P0-C: classify the sizing before the trade is written. Raw
+        # values are preserved either way; quarantined trades are recorded as
+        # shadow so the ledger stays complete but they never feed learning,
+        # promotion or safety statistics.
+        sizing_assessment = classify_sizing_invariants(
+            executable=executable,
+            stop=stop,
+            target=target,
+            bid=bid,
+            ask=ask,
+            units=units_decimal,
+            conversion_rate=conversion_rate,
+            planned_risk_jpy=Decimal(planned_risk),
+            equity_jpy=Decimal(current_balance),
+        )
+        sizing_violations = sizing_assessment["violations"]
+        sizing_violation_warnings: list[str] = (
+            []
+            if sizing_assessment["canonical"] is True or not isinstance(sizing_violations, tuple)
+            else ["sizing invariant violation: " + ",".join(str(v) for v in sizing_violations)]
+        )
         decision_id = str(decision["decision_id"])
         trade_identity: dict[str, object] = {
             "decision_id": decision_id,
@@ -4465,8 +4828,18 @@ class VirtualPortfolioStore:
             "quote_json": _json(quote_payload),
             "rationale_json": _json(rationale),
             "features_json": _json(decision.get("features") or {}),
-            "components_json": _json(decision.get("components") or {}),
-            "warnings_json": _json(decision.get("warnings") or []),
+            "components_json": _json(
+                {
+                    **_as_str_mapping(decision.get("components")),
+                    "sizing_invariants": sizing_assessment,
+                }
+            ),
+            "warnings_json": _json(
+                [
+                    *_as_object_list(decision.get("warnings")),
+                    *sizing_violation_warnings,
+                ]
+            ),
             "data_sha256": str(decision["data_sha256"]),
             "model_sha256": str(decision["model_sha256"]),
             "policy_sha256": str(decision["policy_sha256"]),
@@ -4599,11 +4972,18 @@ class VirtualPortfolioStore:
                 f"{safety.consecutive_loss_limit}連続純損失のため新規仮想建てを停止"
             )
         if len(rows) >= safety.rolling_window:
-            mean_net_r = sum(float(row["realized_net_r"]) for row in rows) / len(rows)
-            if mean_net_r <= safety.minimum_window_mean_net_r:
+            # P0-A: the raw mean is not usable as a safety statistic. A single
+            # denominator-unstable trade moved the production 50-trade mean from
+            # -0.357R to +0.579R (docs/audits/NET_R_OUTLIER_FORENSIC_20260806.md),
+            # i.e. it can silently disarm this gate. Summarise robustly instead.
+            summary = summarize_net_r_robust(float(row["realized_net_r"]) for row in rows)
+            robust_value = summary["winsorized_mean_5r"]
+            robust_net_r = float(robust_value) if isinstance(robust_value, (int, float)) else None
+            if robust_net_r is not None and robust_net_r <= safety.minimum_window_mean_net_r:
                 return (
                     "学習安全ゲート:同一区分の直近"
-                    f"{safety.rolling_window}件平均が{mean_net_r:.2f}Rのため停止"
+                    f"{safety.rolling_window}件のwinsorized平均が"
+                    f"{robust_net_r:.2f}Rのため停止"
                 )
         return None
 
