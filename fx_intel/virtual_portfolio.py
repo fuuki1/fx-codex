@@ -48,7 +48,7 @@ from fx_intel.virtual_portfolio_v2 import (
     record_synchronized_valuation,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 APPLICATION_ID = 0x46585650  # "FXVP"
 DEFAULT_PORTFOLIO_ID = "virtual-jpy-1m"
 DEFAULT_WRITER_ID = "virtual-portfolio-daily"
@@ -599,6 +599,22 @@ CREATE TABLE IF NOT EXISTS simulated_trade_close_observations (
 CREATE INDEX IF NOT EXISTS simulated_trade_close_observations_known_idx
 ON simulated_trade_close_observations(close_known_at_ns, trade_id);
 
+CREATE TABLE IF NOT EXISTS simulated_trade_sizing_assessments (
+    trade_id TEXT PRIMARY KEY,
+    canonical INTEGER NOT NULL CHECK (canonical IN (0, 1)),
+    denominator_unstable INTEGER NOT NULL CHECK (denominator_unstable IN (0, 1)),
+    allocation_stream TEXT NOT NULL,
+    assessment_basis TEXT NOT NULL,
+    policy_sha256 TEXT NOT NULL,
+    assessment_json TEXT NOT NULL,
+    record_sha256 TEXT NOT NULL,
+    writer_id TEXT NOT NULL,
+    FOREIGN KEY(trade_id) REFERENCES simulated_trade_opens(trade_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS simulated_trade_sizing_assessments_stream_idx
+ON simulated_trade_sizing_assessments(allocation_stream, trade_id);
+
 CREATE TABLE IF NOT EXISTS session_close_requests (
     request_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL UNIQUE,
@@ -708,6 +724,7 @@ _APPEND_ONLY_TABLES = (
     "simulated_trade_open_observations",
     "simulated_trade_closes",
     "simulated_trade_close_observations",
+    "simulated_trade_sizing_assessments",
     "session_close_requests",
     "session_close_completions",
     "simulated_position_marks",
@@ -1020,6 +1037,84 @@ def _install_close_observation_schema(
         )
 
 
+def _install_sizing_assessment_schema(
+    connection: sqlite3.Connection,
+    *,
+    writer_id: str,
+) -> None:
+    """Backfill sizing verdicts for trades opened before the P0-C guards existed.
+
+    The guards added in `classify_sizing_invariants` only stamp new opens, so
+    every pre-existing trade is `sizing_invariants_unknown` and therefore
+    excluded from learning. That leaves the canonical population empty even
+    though the verdict is fully derivable from the stored open record.
+
+    This writes verdicts to a **separate append-only table**. The original
+    `simulated_trade_opens` rows are never rewritten: they carry a
+    `record_sha256` and are protected by an append-only trigger, and rewriting
+    them would destroy the provenance the audit depends on.
+
+    Equity is taken from the last `portfolio_marks` balance at or before the
+    open, which is the same quantity the sizing path used at the time.
+    """
+
+    rows = connection.execute("""
+        SELECT o.trade_id, o.units, o.entry_bid, o.entry_ask, o.entry_executable,
+               o.stop_price, o.target_price, o.quote_to_jpy_rate, o.planned_risk_jpy,
+               (
+                   SELECT m.cash_balance_jpy
+                   FROM portfolio_marks m
+                   WHERE m.effective_time_ns <= o.open_time_ns
+                   ORDER BY m.effective_time_ns DESC, m.mark_id DESC
+                   LIMIT 1
+               ) AS equity_jpy
+        FROM simulated_trade_opens o
+        LEFT JOIN simulated_trade_sizing_assessments s ON s.trade_id = o.trade_id
+        WHERE s.trade_id IS NULL
+        ORDER BY o.open_time_ns, o.trade_id
+        """).fetchall()
+    for row in rows:
+        equity_raw = row["equity_jpy"]
+        assessment = classify_sizing_invariants(
+            executable=Decimal(str(row["entry_executable"])),
+            stop=Decimal(str(row["stop_price"])),
+            target=Decimal(str(row["target_price"])),
+            bid=Decimal(str(row["entry_bid"])),
+            ask=Decimal(str(row["entry_ask"])),
+            units=Decimal(str(row["units"])),
+            conversion_rate=Decimal(str(row["quote_to_jpy_rate"])),
+            planned_risk_jpy=Decimal(int(row["planned_risk_jpy"])),
+            # A trade with no prior balance mark cannot have its leverage
+            # judged; the remaining invariants still apply.
+            equity_jpy=None if equity_raw is None else Decimal(int(equity_raw)),
+        )
+        payload = {
+            "trade_id": str(row["trade_id"]),
+            "assessment": assessment,
+            "basis": "legacy_open_record_backfill",
+        }
+        connection.execute(
+            """
+            INSERT INTO simulated_trade_sizing_assessments(
+                trade_id, canonical, denominator_unstable, allocation_stream,
+                assessment_basis, policy_sha256, assessment_json,
+                record_sha256, writer_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(row["trade_id"]),
+                int(assessment["canonical"] is True),
+                int(assessment["denominator_unstable"] is True),
+                str(assessment["allocation_stream"]),
+                "legacy_open_record_backfill",
+                str(assessment["policy_sha256"]),
+                _json(assessment),
+                _record_hash(payload),
+                writer_id,
+            ),
+        )
+
+
 def _initialize(
     connection: sqlite3.Connection,
     *,
@@ -1036,7 +1131,7 @@ def _initialize(
         )
     if current_version == SCHEMA_VERSION:
         _verify_schema(connection)
-    elif current_version not in {0, 1, 3, 4, 5, 6}:
+    elif current_version not in {0, 1, 3, 4, 5, 6, 7}:
         raise VirtualPortfolioError(
             f"unsupported virtual portfolio schema: "
             f"app={current_application_id}, version={current_version}"
@@ -1047,6 +1142,7 @@ def _initialize(
         install_v2_schema(connection)
         _install_open_observation_schema(connection, writer_id=writer_id)
         _install_close_observation_schema(connection, writer_id=writer_id)
+        _install_sizing_assessment_schema(connection, writer_id=writer_id)
         for trigger in _immutable_triggers():
             connection.execute(trigger)
         connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
@@ -1481,6 +1577,23 @@ def summarize_net_r_robust(values: Iterable[float]) -> dict[str, object]:
 # starved population without separating short trades from unsampled ones.
 PATH_MARK_INTERVAL_SECONDS = 300.0
 MINIMUM_PATH_SAMPLING_ADEQUACY = 0.5
+
+# Every evaluation surface must agree on what counts as a usable label.
+#
+# `simulated_trade_closes.learning_eligible` is append-only and was written
+# before the P0-C sizing guards existed, so legacy rows carry a stale 1 even
+# when the trade is now known to be denominator-unstable. Rewriting them is not
+# an option: they are hash-protected append-only records. Instead every query
+# additionally consults the backfilled sidecar, which is authoritative when
+# present. Trades with no sidecar row fall back to the stored column.
+#
+# Assumes the closes table is aliased `c`.
+_LEARNING_ELIGIBLE_SQL = """
+            c.learning_eligible = 1
+            AND NOT EXISTS (
+                SELECT 1 FROM simulated_trade_sizing_assessments sa
+                WHERE sa.trade_id = c.trade_id AND sa.canonical = 0
+            )"""
 
 
 def _as_str_mapping(value: object) -> dict[str, object]:
@@ -2991,7 +3104,7 @@ class VirtualPortfolioStore:
             mark_count=len(mark_times),
             holding_seconds=max(0.0, (close_ns - open_ns) / 1_000_000_000),
             close_reason=close_reason,
-            sizing_invariants=_sizing_invariants_of_open(opened),
+            sizing_invariants=self._sizing_assessment_for(trade_id, opened),
             largest_gap_seconds=largest_gap_seconds,
         )
         quote_payload = _quote_payload(request.quote)
@@ -3244,19 +3357,19 @@ class VirtualPortfolioStore:
 
         moment = _as_utc(as_of or datetime.now(UTC), "learning as_of")
         eligible_row = self.connection.execute(
-            """
+            f"""
             SELECT COUNT(*) AS row_count
             FROM simulated_trade_opens o
             JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
             JOIN decision_horizon_assignments h ON h.decision_id = o.decision_id
-            WHERE c.learning_eligible = 1 AND c.close_time_ns <= ?
+            WHERE {_LEARNING_ELIGIBLE_SQL} AND c.close_time_ns <= ?
               AND h.allocation_class = 'intraday_capacity'
             """,
             (_to_ns(moment),),
         ).fetchone()
         eligible_rows = int(eligible_row["row_count"])
         rows = self.connection.execute(
-            """
+            f"""
             SELECT
                 o.trade_id, o.decision_id, d.decision_time_ns, o.open_time_ns,
                 o.symbol, o.timeframe,
@@ -3288,7 +3401,7 @@ class VirtualPortfolioStore:
             JOIN simulated_trade_open_observations ok ON ok.trade_id = o.trade_id
             JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
             JOIN simulated_trade_close_observations ck ON ck.trade_id = c.trade_id
-            WHERE c.learning_eligible = 1 AND c.close_time_ns <= ?
+            WHERE {_LEARNING_ELIGIBLE_SQL} AND c.close_time_ns <= ?
               AND ok.open_known_at_ns <= ? AND ck.close_known_at_ns <= ?
               AND h.allocation_class = 'intraday_capacity'
             ORDER BY c.close_time_ns, o.trade_id
@@ -3409,13 +3522,13 @@ class VirtualPortfolioStore:
             learning_row["canonical_outcome_sha256"] = canonical_outcome_sha256(canonical)
             dataset.append(learning_row)
         excluded_row = self.connection.execute(
-            """
+            f"""
             SELECT COUNT(*) AS row_count
             FROM simulated_trade_opens o
             JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
             JOIN simulated_trade_close_observations ck ON ck.trade_id = c.trade_id
             LEFT JOIN decision_horizon_assignments h ON h.decision_id = o.decision_id
-            WHERE c.learning_eligible = 1 AND c.close_time_ns <= ?
+            WHERE {_LEARNING_ELIGIBLE_SQL} AND c.close_time_ns <= ?
               AND ck.close_known_at_ns <= ?
               AND (h.allocation_class IS NULL
                    OR h.allocation_class <> 'intraday_capacity')
@@ -3758,12 +3871,12 @@ class VirtualPortfolioStore:
             )
         learning_count = int(
             self.connection.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                 FROM simulated_trade_opens o
                 JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
                 JOIN decision_horizon_assignments h ON h.decision_id = o.decision_id
-                WHERE c.learning_eligible = 1 AND c.close_time_ns <= ?
+                WHERE {_LEARNING_ELIGIBLE_SQL} AND c.close_time_ns <= ?
                   AND h.allocation_class = 'intraday_capacity'
                 """,
                 (_to_ns(moment),),
@@ -3971,7 +4084,7 @@ class VirtualPortfolioStore:
             hour=0, minute=0, second=0, microsecond=0
         ) - timedelta(days=19)
         rolling_rows = self.connection.execute(
-            """
+            f"""
             SELECT o.trade_id, c.net_pnl_jpy, c.realized_net_r
             FROM simulated_trade_opens o
             JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
@@ -3980,7 +4093,7 @@ class VirtualPortfolioStore:
             WHERE c.close_time_ns >= ? AND c.close_time_ns <= ?
               AND ck.close_known_at_ns <= ?
               AND h.allocation_class = 'intraday_capacity'
-              AND c.learning_eligible = 1
+              AND {_LEARNING_ELIGIBLE_SQL}
             ORDER BY c.close_time_ns, o.trade_id
             """,
             (
@@ -4928,6 +5041,31 @@ class VirtualPortfolioStore:
                 return f"{label}損失上限に到達"
         return None
 
+    def _sizing_assessment_for(
+        self,
+        trade_id: str,
+        opened: object,
+    ) -> dict[str, object] | None:
+        """Return the sizing verdict, preferring the backfilled sidecar.
+
+        New opens carry the verdict inline on the open record; trades opened
+        before P0-C only have the backfilled sidecar row. Consulting the
+        sidecar first means both populations resolve identically.
+        """
+
+        row = self.connection.execute(
+            "SELECT assessment_json FROM simulated_trade_sizing_assessments WHERE trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+        if row is not None:
+            try:
+                assessment = json.loads(str(row["assessment_json"]))
+            except (TypeError, ValueError):
+                assessment = None
+            if isinstance(assessment, dict):
+                return assessment
+        return _sizing_invariants_of_open(opened)
+
     def _safety_learning_gate_reason(
         self,
         decision: Mapping[str, object],
@@ -4944,13 +5082,13 @@ class VirtualPortfolioStore:
         if not symbol or not timeframe or direction not in {"long", "short"}:
             return None
         rows = self.connection.execute(
-            """
+            f"""
             SELECT c.net_pnl_jpy, c.realized_net_r
             FROM simulated_trade_opens o
             JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
             JOIN simulated_trade_close_observations ck ON ck.trade_id = c.trade_id
             WHERE o.symbol = ? AND o.timeframe = ? AND o.direction = ?
-              AND c.learning_eligible = 1 AND c.close_time_ns <= ?
+              AND {_LEARNING_ELIGIBLE_SQL} AND c.close_time_ns <= ?
               AND ck.close_known_at_ns <= ?
             ORDER BY c.close_time_ns DESC, o.trade_id DESC
             LIMIT ?

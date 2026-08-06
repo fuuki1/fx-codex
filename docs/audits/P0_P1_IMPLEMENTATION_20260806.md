@@ -20,13 +20,15 @@ PROD の `fx_intel/virtual_portfolio.py` は [DEV] と md5 不一致であり、
 | P0-D ラベル品質 | 実装済（**第2次で指標名と定義を是正**） |
 | P0-E 1d建玉経路 | **調査完了・コード欠陥ではない**（下記） |
 | P1 collector可視化 | 実装済 + **真因を特定**（**第2次で工程別追跡を追加**） |
-| テスト | **1,279 passed**（既存failure 1件はbaselineでも失敗） |
+| 既存レコードのバックフィル | 実装済（**追記2**。canonical 44件・期待値 −0.2489R） |
+| テスト | **1,289 passed**（既存failure 1件はbaselineでも失敗） |
 | ruff / black / mypy | 全て green |
 
-> **⚠️ 本文書は2部構成である。** 以下「第1次」の記述のうち、
+> **⚠️ 本文書は3部構成である。** 以下「第1次」の記述のうち、
 > P0-C の閾値（`notional/risk ≤ 2000`, `RR ≤ 20`）と P0-D の指標名（`mark_coverage`）は
 > **後半の追記で是正済み**であり、現在のコードとは一致しない。
-> 最終的な仕様は「追記: コミット前の完了作業（第2次）」を正とする。
+> また「未実施: 既存50件への遡及適用」は**追記2で完了**している。
+> 最終的な仕様は第2次・追記2を正とする。
 
 ---
 
@@ -625,3 +627,121 @@ lag=4 失敗 → lag=3/2/1 成功の順で実行し、lag=4 の失敗が残る�
 6. **ラッパー全体をカバーするロック** — 現状は余裕3,270秒で重複しないため優先度低
 
 **追記終端**
+
+---
+
+# 追記2: 既存レコードのバックフィル（2026-08-07）
+
+## 背景
+
+P0-C の判定は**新規建玉にしか付かない**ため、既存レコードはすべて
+`sizing_invariants_unknown` となり `learning_eligible = False` へ落ちる。
+結果として **canonical 母集団が実質空**になり、エッジの符号を測れない状態が続いていた。
+
+## 設計: サイドカー表（元帳を書き換えない）
+
+`simulated_trade_opens` は `record_sha256` を持つ append-only 表であり、
+**追記専用トリガで UPDATE / DELETE が禁止**されている。遡及付与のために
+元行を書き換えることは、監査が依拠する来歴そのものを壊す。
+
+したがって既存の `simulated_trade_open_observations` /
+`simulated_trade_close_observations` と**同じ設計パターン**を採用した。
+
+新表 `simulated_trade_sizing_assessments`:
+
+| 列 | 内容 |
+|---|---|
+| `trade_id` | PK, FK → `simulated_trade_opens` |
+| `canonical` / `denominator_unstable` | 0/1 |
+| `allocation_stream` | `canonical` または `quarantine_shadow` |
+| `assessment_basis` | `legacy_open_record_backfill` |
+| `policy_sha256` | 判定に使ったポリシーの同定 |
+| `assessment_json` | 判定の全内容 |
+| `record_sha256` / `writer_id` | 既存表と同じ来歴契約 |
+
+`_APPEND_ONLY_TABLES` へ登録し、追記専用トリガの対象とした。
+`SCHEMA_VERSION` を **7 → 8** へ更新。
+
+判定は建玉時に保存済みの値（bid/ask/executable/stop/target/units/planned_risk）
+から再計算する。equity は建玉時点以前の直近 `portfolio_marks.cash_balance_jpy`
+を用いる（実測: 建玉53件すべてに先行 mark が存在）。
+
+## ⚠️ 実測で発見した追加の欠陥
+
+サイドカーを入れただけでは**不十分だった**。
+
+`simulated_trade_closes.learning_eligible` は append-only 列であり、
+P0-C 導入前に書かれた行は**古い `1` を保持し続ける**。実測:
+
+```sql
+SELECT s.allocation_stream, c.learning_eligible, COUNT(*) ...
+-- canonical        |1|46
+-- quarantine_shadow|1|7   ← +46.4R を含む7件が依然として eligible
+```
+
+つまり quarantine 判定が出ていても、評価クエリには到達してしまう。
+
+**対策:** 全6箇所の適格性フィルタを共有述語 `_LEARNING_ELIGIBLE_SQL` へ統一し、
+サイドカーに `canonical = 0` の行があれば除外する `NOT EXISTS` を追加した。
+サイドカー行が無い取引は従来どおり保存列にフォールバックする。
+
+## 実測結果（実機DBのコピーに対して実行。PRODは未変更）
+
+実機 `logs/fx_virtual_portfolio.sqlite3`（687MB）を `.backup` で整合スナップショット
+取得し、ローカルコピーへ適用した。
+
+| 項目 | 結果 |
+|---|---|
+| 移行時間 | **2.9秒**（687MB, 53建玉） |
+| サイドカー行数 | 53 / 53（欠落なし） |
+| canonical | **46** |
+| quarantine | **7**（うち `denominator_unstable` 6） |
+| +46.4R の判定 | `canonical=0`, `denominator_unstable=1` |
+
+**元行の不変性（md5で照合）:**
+
+```
+vp_prod opens:  066c0b298e21e77ef47a7fb5edb0d61c
+vp_test opens:  066c0b298e21e77ef47a7fb5edb0d61c   ← 一致
+vp_prod closes: 524ebed4286a1b40cadf11f99933bcca
+vp_test closes: 524ebed4286a1b40cadf11f99933bcca   ← 一致
+```
+
+**冪等性:** 移行を追加で3回実行してもサイドカーは53行のまま。
+
+### バックフィル後の canonical 母集団
+
+| 指標 | バックフィル前(全53件) | **バックフィル後(canonical)** |
+|---|---:|---:|
+| n | 53 | **44** |
+| mean | +0.5786 相当 | **−0.2489** |
+| median | −0.5978 | −0.5762 |
+| winsorized@5R | −0.2495 | −0.2489 |
+| **LOO最大影響度** | **0.9353** | **0.0616** |
+| **単一サンプル支配** | **True** | **False** |
+
+`rolling_20d` KPI も `trade_count=44` / `expectancy=−0.2489` を返し、
+除外2件は legacy 1d（horizon 未割当）である。
+
+→ **単一サンプル支配が解消され、母集団としてエッジの符号を議論できる状態になった。**
+現時点の canonical 期待値は **−0.2489R**（負）。
+
+## 検証
+
+| 項目 | 結果 |
+|---|---|
+| 全tracked test | **1,289 passed**, 1 failed（baseline由来・確認済） |
+| ruff / black / mypy | 全て green |
+| 変異テスト | サイドカー override を削除すると
+`test_backfilled_verdict_excludes_legacy_trades_from_evaluation` が失敗 |
+| 元行の改変 | **なし**（md5一致で実証） |
+| PROD | **未変更**（コピーに対してのみ実行） |
+
+## 未実施（次工程）
+
+1. **PROD への適用** — 移行はDBを開いた時点で自動実行される。
+   実機適用は人間の承認が必要。実測2.9秒だがバックアップ取得を推奨
+2. **`learning_exports` の生成** — 母集団は整ったが、学習ジョブは週次（金18:00）
+3. **plist 変更 / +46.4R の実tick再生** — 従来どおり未着手
+
+**追記2終端**

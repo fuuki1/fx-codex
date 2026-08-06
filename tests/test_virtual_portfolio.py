@@ -2183,3 +2183,102 @@ def test_session_end_close_is_ambiguous_and_not_learning_eligible(tmp_path) -> N
     assert quality["path_evidence"] == "sufficient"
     assert quality["learning_eligible"] is False
     assert "ambiguous_close" in quality["exclusion_reasons"]
+
+
+def test_backfilled_verdict_excludes_legacy_trades_from_evaluation(tmp_path) -> None:
+    """A trade opened before P0-C must still be excluded once backfilled.
+
+    `simulated_trade_closes.learning_eligible` is append-only, so legacy rows
+    keep a stale 1. The backfilled sidecar has to override that, otherwise the
+    production +46.4R trade keeps reaching learning export and KPIs.
+    """
+
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        _open_and_close(
+            store,
+            policy,
+            decision_id="legacy-unstable",
+            moment=START,
+            stop=150.015,
+            target=150.10,
+            bid=150.00,
+            ask=150.02,
+            exit_bid=150.10,
+            exit_ask=150.12,
+        )
+
+    # Simulate a pre-P0-C row: drop the sidecar verdict and force the stored
+    # column back to eligible, which is exactly the legacy on-disk shape.
+    with sqlite3.connect(path) as raw:
+        raw.execute("DROP TRIGGER simulated_trade_closes_no_update")
+        raw.execute("DELETE FROM simulated_trade_sizing_assessments")
+        raw.execute("UPDATE simulated_trade_closes SET learning_eligible = 1")
+        raw.commit()
+
+    with sqlite3.connect(path) as raw:
+        raw.row_factory = sqlite3.Row
+        assert (
+            int(raw.execute("SELECT learning_eligible FROM simulated_trade_closes").fetchone()[0])
+            == 1
+        )
+        assert (
+            int(
+                raw.execute("SELECT COUNT(*) FROM simulated_trade_sizing_assessments").fetchone()[0]
+            )
+            == 0
+        )
+
+    # Reopening runs the backfill, which must restore the exclusion.
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        exported = store.export_learning_rows(as_of=START + timedelta(minutes=5))
+
+    with sqlite3.connect(path) as raw:
+        raw.row_factory = sqlite3.Row
+        verdict = raw.execute(
+            "SELECT canonical, denominator_unstable FROM simulated_trade_sizing_assessments"
+        ).fetchone()
+
+    assert int(verdict["canonical"]) == 0
+    assert int(verdict["denominator_unstable"]) == 1
+    assert exported["row_count"] == 0
+
+
+def test_backfill_is_idempotent_and_leaves_source_rows_untouched(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        _open_and_close(
+            store,
+            policy,
+            decision_id="stable-1",
+            moment=START,
+            stop=149.50,
+            target=150.50,
+            bid=150.00,
+            ask=150.02,
+            exit_bid=150.30,
+            exit_ask=150.32,
+        )
+
+    def _fingerprint() -> tuple[str, ...]:
+        with sqlite3.connect(path) as raw:
+            raw.row_factory = sqlite3.Row
+            return tuple(
+                str(row["record_sha256"])
+                for row in raw.execute(
+                    "SELECT record_sha256 FROM simulated_trade_opens ORDER BY trade_id"
+                )
+            )
+
+    before = _fingerprint()
+    for _ in range(3):
+        with open_virtual_portfolio_writer(path, writer_id="test"):
+            pass
+
+    with sqlite3.connect(path) as raw:
+        rows = int(
+            raw.execute("SELECT COUNT(*) FROM simulated_trade_sizing_assessments").fetchone()[0]
+        )
+
+    assert rows == 1
+    assert _fingerprint() == before
