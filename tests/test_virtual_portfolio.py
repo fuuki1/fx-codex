@@ -2282,3 +2282,134 @@ def test_backfill_is_idempotent_and_leaves_source_rows_untouched(tmp_path) -> No
 
     assert rows == 1
     assert _fingerprint() == before
+
+
+def _anchor_payload(**overrides: object) -> dict:
+    payload: dict = {
+        "contract": "decision-price-anchor-v1",
+        "status": "anchored",
+        "anchor_basis": "first_canonical_tick_at_or_after_decision",
+        "canonical_source": "dukascopy",
+        "entry": "150.02",
+        "stop": "149.52",
+        "target": "150.52",
+        "risk_distance": "0.5",
+        "spread_at_anchor": "0.02",
+        "risk_distance_to_spread": "25",
+        "anchor_event_time": (START + timedelta(seconds=2)).isoformat(),
+        "anchor_lag_seconds": 2.0,
+        "stop_atr_multiple": "2.5",
+        "target_rr": "1.0",
+        "reference_atr": "0.2",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _one_decision(store, policy) -> str:
+    decision = _decision(policy, decision_id="anchor-1")
+    store.process_decision(
+        decision,
+        quote=_quote(),
+        observed_at=START,
+        quote_to_jpy_rate=1,
+        quote_conversion_source="JPY quote currency",
+    )
+    return str(decision["decision_id"])
+
+
+def test_decision_price_anchor_round_trips(tmp_path) -> None:
+    """S1: the canonical-frame verdict is stored beside the decision."""
+
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision_id = _one_decision(store, policy)
+        result = store.record_decision_price_anchor(decision_id, _anchor_payload())
+        loaded = store.load_decision_price_anchor(decision_id)
+
+    assert result == {
+        "inserted": True,
+        "decision_id": decision_id,
+        "anchor_status": "anchored",
+    }
+    assert loaded is not None
+    assert loaded["entry"] == "150.02"
+    assert loaded["canonical_source"] == "dukascopy"
+
+
+def test_rejected_anchors_are_recorded_not_discarded(tmp_path) -> None:
+    """The rejection count is the S1 measurement; dropping it destroys it."""
+
+    path, policy = _initialized(tmp_path)
+    rejected = {
+        "contract": "decision-price-anchor-v1",
+        "status": "rejected",
+        "reason": "microstructure_floor",
+        "risk_distance": "0.00001",
+        "spread": "0.0002",
+    }
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision_id = _one_decision(store, policy)
+        store.record_decision_price_anchor(decision_id, rejected)
+        loaded = store.load_decision_price_anchor(decision_id)
+
+    with sqlite3.connect(path) as raw:
+        raw.row_factory = sqlite3.Row
+        row = raw.execute(
+            "SELECT anchor_status, rejection_reason, entry FROM decision_price_anchors"
+        ).fetchone()
+
+    assert loaded is not None and loaded["status"] == "rejected"
+    assert row["anchor_status"] == "rejected"
+    assert row["rejection_reason"] == "microstructure_floor"
+    # A rejected anchor has no levels; the column must stay NULL rather than "".
+    assert row["entry"] is None
+
+
+def test_recording_the_same_anchor_twice_is_idempotent(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision_id = _one_decision(store, policy)
+        first = store.record_decision_price_anchor(decision_id, _anchor_payload())
+        second = store.record_decision_price_anchor(decision_id, _anchor_payload())
+
+    with sqlite3.connect(path) as raw:
+        rows = int(raw.execute("SELECT COUNT(*) FROM decision_price_anchors").fetchone()[0])
+
+    assert first["inserted"] is True
+    assert second["inserted"] is False
+    assert rows == 1
+
+
+def test_a_conflicting_anchor_for_the_same_decision_is_refused(tmp_path) -> None:
+    """Anchoring resolves once and is immutable afterwards."""
+
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision_id = _one_decision(store, policy)
+        store.record_decision_price_anchor(decision_id, _anchor_payload())
+
+        with pytest.raises(ImmutableVirtualRecordConflict):
+            store.record_decision_price_anchor(decision_id, _anchor_payload(entry="151.00"))
+
+
+def test_anchor_requires_a_known_decision(tmp_path) -> None:
+    path, _policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        with pytest.raises(InvalidVirtualRecord):
+            store.record_decision_price_anchor("no-such-decision", _anchor_payload())
+
+
+def test_anchor_rejects_an_unsupported_status(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision_id = _one_decision(store, policy)
+        with pytest.raises(InvalidVirtualRecord):
+            store.record_decision_price_anchor(decision_id, _anchor_payload(status="pending"))
+
+
+def test_missing_anchor_reads_as_none(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        decision_id = _one_decision(store, policy)
+        assert store.load_decision_price_anchor(decision_id) is None

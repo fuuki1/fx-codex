@@ -48,7 +48,7 @@ from fx_intel.virtual_portfolio_v2 import (
     record_synchronized_valuation,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 APPLICATION_ID = 0x46585650  # "FXVP"
 DEFAULT_PORTFOLIO_ID = "virtual-jpy-1m"
 DEFAULT_WRITER_ID = "virtual-portfolio-daily"
@@ -615,6 +615,26 @@ CREATE TABLE IF NOT EXISTS simulated_trade_sizing_assessments (
 CREATE INDEX IF NOT EXISTS simulated_trade_sizing_assessments_stream_idx
 ON simulated_trade_sizing_assessments(allocation_stream, trade_id);
 
+CREATE TABLE IF NOT EXISTS decision_price_anchors (
+    decision_id TEXT PRIMARY KEY,
+    anchor_status TEXT NOT NULL CHECK (anchor_status IN ('anchored', 'rejected')),
+    rejection_reason TEXT NOT NULL,
+    anchor_event_time_ns INTEGER,
+    anchor_lag_seconds REAL,
+    entry TEXT,
+    stop TEXT,
+    target TEXT,
+    risk_distance TEXT,
+    spread_at_anchor TEXT,
+    anchor_json TEXT NOT NULL,
+    record_sha256 TEXT NOT NULL,
+    writer_id TEXT NOT NULL,
+    FOREIGN KEY(decision_id) REFERENCES decision_records(decision_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS decision_price_anchors_status_idx
+ON decision_price_anchors(anchor_status, decision_id);
+
 CREATE TABLE IF NOT EXISTS session_close_requests (
     request_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL UNIQUE,
@@ -725,6 +745,7 @@ _APPEND_ONLY_TABLES = (
     "simulated_trade_closes",
     "simulated_trade_close_observations",
     "simulated_trade_sizing_assessments",
+    "decision_price_anchors",
     "session_close_requests",
     "session_close_completions",
     "simulated_position_marks",
@@ -793,6 +814,19 @@ def _required_text(value: object, name: str) -> str:
     if not normalized:
         raise InvalidVirtualRecord(f"{name} is required")
     return normalized
+
+
+def _optional_text(value: object) -> str | None:
+    """Return trimmed text, or None for absent values.
+
+    Used for nullable columns where a rejected record legitimately has no
+    value; an empty string would be indistinguishable from a real one.
+    """
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _as_utc(value: datetime, name: str) -> datetime:
@@ -1131,7 +1165,7 @@ def _initialize(
         )
     if current_version == SCHEMA_VERSION:
         _verify_schema(connection)
-    elif current_version not in {0, 1, 3, 4, 5, 6, 7}:
+    elif current_version not in {0, 1, 3, 4, 5, 6, 7, 8}:
         raise VirtualPortfolioError(
             f"unsupported virtual portfolio schema: "
             f"app={current_application_id}, version={current_version}"
@@ -2738,6 +2772,107 @@ class VirtualPortfolioStore:
             "rejection_reasons": rejection_reasons,
             "horizon_allocation": horizon_assignment,
         }
+
+    def record_decision_price_anchor(
+        self,
+        decision_id: str,
+        anchor: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Append one canonical-frame anchor verdict for a decision.
+
+        S1 of docs/design/CANONICAL_PRICE_FRAME_DATA_TRUTH_20260807.md. The
+        `anchor` mapping comes from `fx_intel.decision_price_anchor`, which is
+        a pure function over a decision and one canonical tick. This store does
+        not fetch ticks itself: keeping the tape dependency out of the
+        portfolio writer is what lets the anchoring rule stay testable and lets
+        shadow and production share it.
+
+        Rejected anchors are recorded too. The rejection count is the S1
+        measurement, so discarding them would destroy the result.
+
+        Append-only and idempotent: re-recording the same verdict returns the
+        stored row, while a conflicting verdict for the same decision raises.
+        An anchor is resolved once and is immutable thereafter.
+        """
+
+        writer_id = self._require_writer()
+        identifier = _required_text(decision_id, "decision_id")
+        status = _required_text(anchor.get("status"), "anchor status")
+        if status not in {"anchored", "rejected"}:
+            raise InvalidVirtualRecord(f"unsupported anchor status: {status}")
+        known = self.connection.execute(
+            "SELECT decision_id FROM decision_records WHERE decision_id = ?",
+            (identifier,),
+        ).fetchone()
+        if known is None:
+            raise InvalidVirtualRecord(f"decision record not found: {identifier}")
+
+        event_time_ns: int | None = None
+        raw_event_time = anchor.get("anchor_event_time")
+        if raw_event_time is not None:
+            event_time_ns = _to_ns(_parse_aware(raw_event_time, "anchor_event_time"))
+        lag_raw = anchor.get("anchor_lag_seconds")
+        lag_seconds = float(lag_raw) if isinstance(lag_raw, (int, float)) else None
+
+        payload: dict[str, object] = {
+            "decision_id": identifier,
+            "anchor": dict(anchor),
+        }
+        record_hash = _record_hash(payload)
+        existing = self.connection.execute(
+            "SELECT record_sha256, anchor_status FROM decision_price_anchors WHERE decision_id = ?",
+            (identifier,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["record_sha256"]) != record_hash:
+                raise ImmutableVirtualRecordConflict(
+                    f"decision price anchor already exists with different content: {identifier}"
+                )
+            return {
+                "inserted": False,
+                "decision_id": identifier,
+                "anchor_status": str(existing["anchor_status"]),
+            }
+
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO decision_price_anchors(
+                    decision_id, anchor_status, rejection_reason,
+                    anchor_event_time_ns, anchor_lag_seconds,
+                    entry, stop, target, risk_distance, spread_at_anchor,
+                    anchor_json, record_sha256, writer_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identifier,
+                    status,
+                    str(anchor.get("reason") or ""),
+                    event_time_ns,
+                    lag_seconds,
+                    _optional_text(anchor.get("entry")),
+                    _optional_text(anchor.get("stop")),
+                    _optional_text(anchor.get("target")),
+                    _optional_text(anchor.get("risk_distance")),
+                    _optional_text(anchor.get("spread_at_anchor")),
+                    _json(dict(anchor)),
+                    record_hash,
+                    writer_id,
+                ),
+            )
+        return {"inserted": True, "decision_id": identifier, "anchor_status": status}
+
+    def load_decision_price_anchor(self, decision_id: str) -> dict[str, object] | None:
+        """Return the stored anchor verdict, or None when a decision has none."""
+
+        row = self.connection.execute(
+            "SELECT anchor_json FROM decision_price_anchors WHERE decision_id = ?",
+            (_required_text(decision_id, "decision_id"),),
+        ).fetchone()
+        if row is None:
+            return None
+        decoded = _decoded_json(row["anchor_json"], "decision price anchor", dict)
+        return dict(decoded)
 
     def record_position_mark(self, request: PositionMarkRequest) -> dict[str, object]:
         """Append one quote-backed unrealized P&L mark without changing cash."""
