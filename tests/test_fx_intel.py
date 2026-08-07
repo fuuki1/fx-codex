@@ -893,3 +893,73 @@ def test_price_formatting_by_symbol() -> None:
     assert briefing.format_price("USDJPY", 150.123456) == "150.123"
     assert briefing.format_price("EURUSD", 1.123456) == "1.12346"
     assert briefing.format_price("EURUSD", None) == "—"
+
+
+def test_price_frame_records_the_reference_frame_without_changing_levels() -> None:
+    """S0: recording only. Every existing level must be byte-identical.
+
+    The decision's close/stop/target come from the TradingView scanner while
+    scoring reads the Dukascopy tape (docs/audits/PRICE_SOURCE_DIVERGENCE_20260807.md).
+    S0 records which frame each price belongs to and nothing else.
+    """
+
+    currencies = {
+        "USD": CurrencySentiment("USD", score=0.5),
+        "JPY": CurrencySentiment("JPY", score=-0.3),
+    }
+    plan = briefing.build_trade_plan(
+        "USDJPY", bullish_tech(), currencies, [], [], now=NOW, atr_multiple=2.5
+    )
+
+    # Existing contract is untouched.
+    assert plan.stop == pytest.approx(150.0 - 0.5 * 2.5)
+    assert plan.target1 == pytest.approx(150.0 + 0.5 * 2.5)
+    assert plan.target2 == pytest.approx(150.0 + 0.5 * 5.0)
+
+    frame = plan.price_frame
+    assert frame["contract"] == "decision-price-frame-v1"
+    assert frame["reference_source"] == "tradingview_oanda_scanner"
+    assert frame["canonical_source"] == "dukascopy"
+    # Anchoring needs a canonical tick, which arrives ~73 minutes later (S1).
+    assert frame["anchor_status"] == "pending"
+    assert frame["reference_close"] == pytest.approx(150.0)
+    assert frame["stop_atr_multiple"] == pytest.approx(2.5)
+    assert frame["reference_risk_distance"] == pytest.approx(0.5 * 2.5)
+
+
+def test_price_frame_carries_the_effective_target_rr() -> None:
+    """The frame-independent parts must survive re-anchoring.
+
+    stop_atr_multiple and target_rr are what S1 replays onto the canonical
+    frame; the absolute prices are discarded there.
+    """
+
+    frame = briefing.build_price_frame(
+        reference_close=1.15382,
+        reference_observed_at="2026-08-03T01:18:12Z",
+        atr=0.00135,
+        atr_multiple=0.25,
+        target_policy={"target1_r": 1.5, "target2_r": 3.0},
+        planned_risk_distance=0.0003375,
+    )
+
+    assert frame["stop_atr_multiple"] == pytest.approx(0.25)
+    assert frame["target_rr"] == pytest.approx(1.5)
+    assert frame["reference_atr"] == pytest.approx(0.00135)
+
+
+def test_price_frame_tolerates_a_missing_target_policy() -> None:
+    """A neutral/blocked decision has no frozen targets; recording must not fail."""
+
+    frame = briefing.build_price_frame(
+        reference_close=None,
+        reference_observed_at=None,
+        atr=None,
+        atr_multiple=2.5,
+        target_policy={},
+        planned_risk_distance=None,
+    )
+
+    assert frame["anchor_status"] == "pending"
+    assert frame["target_rr"] is None
+    assert frame["reference_close"] is None

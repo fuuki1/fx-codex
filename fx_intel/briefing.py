@@ -84,6 +84,59 @@ DEFAULT_TARGET2_R = 2.0
 TargetRAdjustment = tuple[float, float, str] | tuple[float, float, str, Mapping[str, object]]
 TargetRAdjuster = Callable[[str, str, int], TargetRAdjustment | None]
 
+# S0 of the canonical price frame migration
+# (docs/design/CANONICAL_PRICE_FRAME_DATA_TRUTH_20260807.md).
+#
+# A decision's close/stop/target come from the TradingView scanner while every
+# downstream stage (fill, scoring, replay) reads the Dukascopy tick tape. The
+# two disagree by a median 1.6 pips, which is 38% of a 15m/1h stop distance and
+# leaves 4.9% of decisions already past their own stop or target at t0
+# (docs/audits/PRICE_SOURCE_DIVERGENCE_20260807.md).
+#
+# S0 only *records* which frame each price came from. It changes no value and
+# no behaviour: `anchor_status` is always "pending" here because anchoring
+# needs a canonical tick, which arrives ~73 minutes later (S1).
+PRICE_FRAME_CONTRACT = "decision-price-frame-v1"
+REFERENCE_PRICE_SOURCE = "tradingview_oanda_scanner"
+CANONICAL_PRICE_SOURCE = "dukascopy"
+
+
+def build_price_frame(
+    *,
+    reference_close: float | None,
+    reference_observed_at: str | None,
+    atr: float | None,
+    atr_multiple: float,
+    target_policy: Mapping[str, object],
+    planned_risk_distance: float | None,
+) -> dict[str, object]:
+    """Describe which price frame a decision's levels were derived in.
+
+    Recording only. The returned mapping never feeds sizing, gating or
+    scoring; it exists so a later stage can re-anchor these levels onto the
+    canonical frame and so any consumer can tell the two frames apart.
+
+    `stop_atr_multiple` and `target_rr` are the frame-independent parts of the
+    plan: they survive re-anchoring, whereas the absolute prices do not.
+    """
+
+    target_rr = target_policy.get("target1_r")
+    return {
+        "contract": PRICE_FRAME_CONTRACT,
+        "reference_source": REFERENCE_PRICE_SOURCE,
+        "reference_close": reference_close,
+        "reference_observed_at": reference_observed_at,
+        "reference_risk_distance": planned_risk_distance,
+        "canonical_source": CANONICAL_PRICE_SOURCE,
+        # S1 performs the anchoring; at decision time the canonical tick for
+        # this timestamp does not exist yet.
+        "anchor_status": "pending",
+        "stop_atr_multiple": atr_multiple,
+        "target_rr": target_rr if isinstance(target_rr, (int, float)) else None,
+        "reference_atr": atr,
+    }
+
+
 COLOR_LONG = 0x2ECC71
 COLOR_SHORT = 0xE74C3C
 COLOR_NEUTRAL = 0x95A5A6
@@ -190,6 +243,8 @@ class TradePlan:
     interval_summary: str = ""
     ma_note: str = ""
     target_policy: dict[str, object] = field(default_factory=dict)
+    # S0: which price frame close/stop/target were derived in. Recording only.
+    price_frame: dict[str, object] = field(default_factory=dict)
     # 期待値ガード直前の完全プラン。ガードがneutralへ変更した後にraw scoreから
     # 再計算せず、反実仮想はこの判断時凍結値だけを使用する。
     pre_guard_direction: str = "neutral"
@@ -904,6 +959,14 @@ def build_trade_plan(
         interval_summary=_interval_summary(tech),
         ma_note=ma_note,
         target_policy=target_policy,
+        price_frame=build_price_frame(
+            reference_close=close,
+            reference_observed_at=quote_observed_at,
+            atr=atr,
+            atr_multiple=atr_multiple,
+            target_policy=final_targets.target_policy,
+            planned_risk_distance=final_targets.planned_risk_distance,
+        ),
         pre_guard_direction=pre_guard_direction,
         pre_guard_conviction=pre_guard_conviction,
         pre_guard_stop=pre_guard_targets.stop,
