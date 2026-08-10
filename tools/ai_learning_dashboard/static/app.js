@@ -430,6 +430,9 @@ const FORECAST_CHART_WHEEL_MAX_DELTA = 120;
 const FORECAST_CHART_WHEEL_SENSITIVITY = 0.002;
 let lastForecastChart = null;
 let lastDashboardState = null;
+// 状態キャッシュが失効して 503 で届いたときのメタデータ(生成何分前か)。
+// 正常時は null。運用状態パネルの先頭に警告として出す。
+let staleStateNotice = null;
 let forecastChartHitTargets = [];
 let forecastChartGeometry = null;
 let forecastChartDrag = null;
@@ -1849,9 +1852,13 @@ function renderMetrics(data) {
     `融合 ${data.journal.fusion_total || 0} / 時間足 ${data.journal.timeframe_total || 0}`,
   );
   setText("evaluatedTotal", String(data.learning.evaluated || 0));
+  // 採点済み・小動きは融合24h(learning)の母集団。採点待ちは
+  // evaluation(融合+時間足別+価格行)の母集団しか持たないため、同じ行に
+  // 並べると「採点済み155 / 採点待ち256」と分母が逆転して見える。
+  // 母集団が違うことを明示して、取り違えを防ぐ。
   setText(
     "pendingTotal",
-    `採点待ち ${data.evaluation.pending || 0} / 小動き ${data.learning.flat || 0}`,
+    `小動き ${data.learning.flat || 0} / 全系統の採点待ち ${data.evaluation.pending || 0}`,
   );
   setText("hitRate", pct(data.learning.hit_rate));
   setText("hitCount", `${data.learning.hits || 0} / ${data.learning.evaluated || 0}`);
@@ -2529,7 +2536,18 @@ function renderRecentOutcomes(data) {
 
 function renderOps(data) {
   const ops = data.ops || {};
-  setText("opsHealth", ops.status || "unknown");
+  // 失効キャッシュを描画しているときは ops.status(生成時点の "ok")を信じない。
+  // 更新が止まっていること自体が最優先の運用事実なので見出しを上書きする。
+  const staleMinutes =
+    staleStateNotice && num(staleStateNotice.age_seconds) !== null
+      ? Math.round(staleStateNotice.age_seconds / 60)
+      : null;
+  setText(
+    "opsHealth",
+    staleMinutes === null
+      ? ops.status || "unknown"
+      : `stale / ${staleMinutes}分前の値`,
+  );
 
   const processList = $("opsProcessList");
   processList.replaceChildren();
@@ -2591,8 +2609,21 @@ function renderOps(data) {
   const alertList = $("opsAlertList");
   alertList.replaceChildren();
   const alerts = ops.alerts || [];
+  // 失効の告知は ops.alerts(生成時点の内容)より前に出す。alerts が空でも
+  // 早期 return する前に積むこと。止まっている事実が最優先の確認点になる。
+  if (staleMinutes !== null) {
+    alertList.appendChild(
+      tradeItem(
+        `状態キャッシュが${staleMinutes}分前で停止しています`,
+        "com.fx-codex.dashboard-state が停止した可能性。launchd への登録を確認してください。",
+        "fail",
+      ),
+    );
+  }
   if (!alerts.length) {
-    alertList.appendChild(empty("追加対応が必要な項目はありません"));
+    if (staleMinutes === null) {
+      alertList.appendChild(empty("追加対応が必要な項目はありません"));
+    }
     return;
   }
   alerts.slice(0, 6).forEach((alert) => {
@@ -4531,7 +4562,23 @@ async function load() {
       portfolioOnly ? "/api/virtual-portfolio" : "/api/state",
       { cache: "no-store" },
     );
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    // 状態キャッシュが失効すると server は 503 + stale_state を返す。
+    // 本体は届いているので、古い値であることを明示したうえで描画する。
+    // ここで throw すると画面が真っ白になり、かえって状況が分からなくなる。
+    if (!response.ok) {
+      const stalePayload = await response
+        .clone()
+        .json()
+        .then((body) => body?.stale_state)
+        .catch(() => null);
+      if (!portfolioOnly && stalePayload) {
+        staleStateNotice = stalePayload.dashboard_cache || null;
+        render(stalePayload);
+        return;
+      }
+      throw new Error(`HTTP ${response.status}`);
+    }
+    staleStateNotice = null;
     const data = await response.json();
     if (portfolioOnly) {
       lastDashboardState = {

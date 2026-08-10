@@ -77,6 +77,15 @@ VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS = float(
     os.environ.get("FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS", "45")
 )
 DEFAULT_DASHBOARD_STATE_CACHE = DEFAULT_LOG_DIR / "dashboard_state_cache.json"
+# 状態キャッシュは com.fx-codex.dashboard-state が15分周期(:07/:22/:37/:52)で
+# 再生成する。2026-08-10、このジョブが launchd から消えた際、/api/state は
+# キャッシュをそのまま返し続けたため、画面は約50分前の値を「ok」として表示し、
+# ファイル経過時間まで負値(-7.1分など)になった。無警告で古い判断を見せるのは
+# 鮮度契約の違反なので、生成時刻が古すぎるキャッシュは配信側で失効扱いにする。
+# 2周期分(30分)は正常な遅延・スキップの余地として許容し、それを超えたら停止と見なす。
+DASHBOARD_STATE_MAX_AGE_SECONDS = float(
+    os.environ.get("FX_DASHBOARD_STATE_MAX_AGE_SECONDS", "2100")
+)
 CHART_SYMBOLS = frozenset({"USDJPY", "EURUSD", "GBPUSD"})
 CHART_TIMEFRAMES = frozenset({"15m", "1h", "4h", "1d"})
 CHART_RANGES = {"6h": 6, "24h": 24, "3d": 72, "7d": 168}
@@ -188,6 +197,18 @@ def _add_market_open_hours(start: datetime, hours: float) -> datetime:
         else:
             low = midpoint
     return high
+
+
+class StaleStateCacheError(RuntimeError):
+    """状態キャッシュが古すぎるときに送出する。
+
+    payload には失効したキャッシュ本体を保持する。画面側が「何分前の値か」を
+    表示して縮退できるよう、破棄せずに 503 応答へ載せるための保険。
+    """
+
+    def __init__(self, message: str, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.payload = payload
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -323,6 +344,31 @@ def _file_status(path: Path) -> dict[str, Any]:
         "mtime": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
         "path": str(path),
     }
+
+
+def _refresh_runtime_log_ages(payload: dict[str, Any], now: datetime) -> None:
+    """配信時点で ops の経過時間を測り直す(mtime は絶対時刻なので再計算できる)。
+
+    キャッシュ内の age_minutes は生成時刻を now として計算されている。生成後に
+    更新されたログはその時点より新しくなるため、そのまま表示すると負値になる
+    (2026-08-10 実測: -7.1 / -4.4 / -1.1 分)。mtime は保存済みの絶対時刻なので、
+    ここで now を当て直せば正しい経過時間に戻せる。
+    """
+    ops = payload.get("ops")
+    if not isinstance(ops, dict):
+        return
+    targets: list[dict[str, Any]] = []
+    runtime_logs = ops.get("runtime_logs")
+    if isinstance(runtime_logs, list):
+        targets.extend(row for row in runtime_logs if isinstance(row, dict))
+    tf_prices = ops.get("tf_prices")
+    if isinstance(tf_prices, dict):
+        targets.append(tf_prices)
+    for row in targets:
+        mtime = _parse_ts(row.get("mtime"))
+        if mtime is None:
+            continue
+        row["age_minutes"] = round((now - mtime).total_seconds() / 60.0, 1)
 
 
 def _file_status_with_age(path: Path, now: datetime) -> dict[str, Any]:
@@ -2279,7 +2325,11 @@ def _virtual_portfolio_proxy_payload(api_url: str) -> dict[str, Any]:
     return payload
 
 
-def _dashboard_state_cache(path: Path) -> dict[str, Any]:
+def _dashboard_state_cache(
+    path: Path,
+    now: datetime | None = None,
+    max_age_seconds: float = DASHBOARD_STATE_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
@@ -2291,6 +2341,31 @@ def _dashboard_state_cache(path: Path) -> dict[str, Any]:
     metadata = payload.get("dashboard_cache")
     if not isinstance(metadata, dict) or metadata.get("contract") != "fx-dashboard-state-cache-v1":
         raise RuntimeError("dashboard state cache contract mismatch")
+
+    # 生成時刻からの経過を配信時点で測り直す。キャッシュ内の age_minutes は
+    # すべて生成時刻を now として計算済みで、配信時点では古い(かつ生成後に
+    # 更新されたファイルでは負値になる)ため、鮮度は必ずここで再評価する。
+    generated_at = _parse_ts(metadata.get("generated_at"))
+    if generated_at is None:
+        raise RuntimeError("dashboard state cache has no usable generated_at")
+    current = now if now is not None else datetime.now(UTC)
+    age_seconds = (current - generated_at).total_seconds()
+    metadata = dict(metadata)
+    metadata["age_seconds"] = round(age_seconds, 1)
+    metadata["served_at"] = current.isoformat()
+    metadata["max_age_seconds"] = max_age_seconds
+    metadata["stale"] = age_seconds > max_age_seconds
+    payload = dict(payload)
+    payload["dashboard_cache"] = metadata
+    _refresh_runtime_log_ages(payload, current)
+    if metadata["stale"]:
+        raise StaleStateCacheError(
+            "dashboard state cache is stale: generated "
+            f"{round(age_seconds / 60.0, 1)} minutes ago "
+            f"(limit {round(max_age_seconds / 60.0, 1)} minutes). "
+            "com.fx-codex.dashboard-state may have stopped.",
+            payload=payload,
+        )
     return payload
 
 
@@ -2326,6 +2401,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 payload = _dashboard_state_cache(
                     self.server.state_cache_path,  # type: ignore[attr-defined]
                 )
+            except StaleStateCacheError as error:
+                # 失効しても本体は返す。画面は「何分前の値か」を明示したうえで
+                # 縮退表示でき、古い値を最新として見せることだけを防ぐ。
+                self._send_json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    str(error),
+                    extra={"stale_state": error.payload},
+                )
+                return
             except RuntimeError as error:
                 self._send_json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
                 return
@@ -2370,9 +2454,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_json_error(self, status: HTTPStatus, message: str) -> None:
+    def _send_json_error(
+        self,
+        status: HTTPStatus,
+        message: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"ok": False, "status": int(status), "error": message}
+        if extra:
+            body.update(extra)
         data = json.dumps(
-            {"ok": False, "status": int(status), "error": message},
+            body,
             ensure_ascii=False,
         ).encode("utf-8")
         self.send_response(status)

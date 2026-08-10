@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
 from pathlib import Path
@@ -139,18 +139,108 @@ def test_virtual_portfolio_proxy_timeout_covers_observed_snapshot_latency() -> N
     assert server.VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS >= 30.0
 
 
+def _state_cache_payload(generated: datetime) -> dict:
+    """dashboard_state_snapshot.py が実際に書く形。generated_at は常に入る。"""
+    return {
+        "generated_at": generated.isoformat(),
+        "dashboard_cache": {
+            "contract": "fx-dashboard-state-cache-v1",
+            "generated_at": generated.isoformat(),
+            "read_only": True,
+        },
+    }
+
+
+def test_dashboard_ui_surfaces_stale_state_instead_of_failing_closed() -> None:
+    """失効時に画面を落とさず、古い値であることを明示する。
+
+    503 で throw すると alert だけ出て画面が空になり、「更新が止まっている」
+    という一番重要な事実が伝わらない。stale_state を描画したうえで、
+    運用状態の見出しと確認点に停止を出すことを固定する。
+    """
+    app = APP_PATH.read_text(encoding="utf-8")
+
+    assert "stale_state" in app
+    assert "staleStateNotice" in app
+    # ops.status(生成時点の "ok")をそのまま見出しにしない。
+    assert "分前の値" in app
+    assert "com.fx-codex.dashboard-state" in app
+
+
+def test_dashboard_metrics_do_not_mix_scoring_populations() -> None:
+    """融合24h(155件)の行に全系統(9919件)の採点待ちを混ぜない。
+
+    旧実装は「採点済み 155 / 採点待ち 256」と並べており、母集団が違うため
+    採点待ちが採点済みを上回って見えた。どちらの母集団かを明示する。
+    """
+    app = APP_PATH.read_text(encoding="utf-8")
+
+    assert "全系統の採点待ち" in app
+
+
 def test_dashboard_state_endpoint_reads_only_prebuilt_cache(tmp_path) -> None:
     server = _server_module()
     cache = tmp_path / "dashboard_state_cache.json"
-    payload = {
-        "generated_at": START.isoformat(),
-        "dashboard_cache": {
-            "contract": "fx-dashboard-state-cache-v1",
-            "read_only": True,
+    payload = _state_cache_payload(START)
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+
+    served = server._dashboard_state_cache(cache, now=START + timedelta(minutes=1))
+    assert served["generated_at"] == payload["generated_at"]
+    assert served["dashboard_cache"]["stale"] is False
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        server._dashboard_state_cache(tmp_path / "missing.json")
+
+
+def test_dashboard_state_cache_rejects_stale_snapshot(tmp_path) -> None:
+    """更新が止まったキャッシュを "ok" として配信しない。
+
+    2026-08-10、com.fx-codex.dashboard-state が launchd から消え、
+    /api/state はキャッシュをそのまま返し続けた。画面は約50分前の値を
+    最新として表示し、ops.status も "ok" のままで、停止に気づけなかった。
+    """
+    server = _server_module()
+    cache = tmp_path / "dashboard_state_cache.json"
+    cache.write_text(json.dumps(_state_cache_payload(START)), encoding="utf-8")
+
+    # 2周期(30分)以内は許容する。遅延やスキップ1回で落とさない。
+    served = server._dashboard_state_cache(cache, now=START + timedelta(minutes=30))
+    assert served["dashboard_cache"]["stale"] is False
+
+    with pytest.raises(server.StaleStateCacheError) as excinfo:
+        server._dashboard_state_cache(cache, now=START + timedelta(minutes=60))
+    # 失効時も本体は保持する(画面が真っ白にならないよう503へ載せる)。
+    assert excinfo.value.payload["dashboard_cache"]["stale"] is True
+    assert excinfo.value.payload["dashboard_cache"]["age_seconds"] == pytest.approx(3600.0)
+
+
+def test_dashboard_state_cache_recomputes_log_ages_at_serve_time(tmp_path) -> None:
+    """配信時点で経過時間を測り直す。
+
+    キャッシュ内の age_minutes は生成時刻を now として計算済みのため、
+    生成後に更新されたログでは負値になる(実測 -7.1 / -4.4 / -1.1 分)。
+    mtime は絶対時刻なので、配信時に測り直せば正しい値へ戻る。
+    """
+    server = _server_module()
+    cache = tmp_path / "dashboard_state_cache.json"
+    payload = _state_cache_payload(START)
+    # 生成の5分"後"に更新されたログ = キャッシュ内では負値になっていたもの。
+    payload["ops"] = {
+        "runtime_logs": [
+            {
+                "name": "briefing_tf_journal.jsonl",
+                "mtime": (START + timedelta(minutes=5)).isoformat(),
+                "age_minutes": -5.0,
+            }
+        ],
+        "tf_prices": {
+            "mtime": (START + timedelta(minutes=5)).isoformat(),
+            "age_minutes": -5.0,
         },
     }
     cache.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert server._dashboard_state_cache(cache) == payload
-    with pytest.raises(RuntimeError, match="not initialized"):
-        server._dashboard_state_cache(tmp_path / "missing.json")
+    served = server._dashboard_state_cache(cache, now=START + timedelta(minutes=20))
+
+    assert served["ops"]["runtime_logs"][0]["age_minutes"] == pytest.approx(15.0)
+    assert served["ops"]["tf_prices"]["age_minutes"] == pytest.approx(15.0)
