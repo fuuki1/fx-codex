@@ -161,6 +161,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if not any(plan.values()):
+        state.update(
+            {
+                "schema_version": 1,
+                "completed_hours": raw_completed,
+                "heartbeat_at": datetime.now(UTC).isoformat(),
+                "heartbeat_ok": True,
+                "broker_connected": False,
+                "collection_mode": "historical_download",
+            }
+        )
+        _write_state(state_path, state)
         print(
             json.dumps(
                 {
@@ -226,6 +237,17 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             _write_state(state_path, state)
+    state.update(
+        {
+            "schema_version": 1,
+            "completed_hours": raw_completed,
+            "heartbeat_at": datetime.now(UTC).isoformat(),
+            "heartbeat_ok": not errors,
+            "broker_connected": False,
+            "collection_mode": "historical_download",
+        }
+    )
+    _write_state(state_path, state)
     print(
         json.dumps(
             {

@@ -41,3 +41,37 @@ def test_aware_now_is_required(tmp_path) -> None:
         assert "timezone-aware" in str(error)
     else:
         raise AssertionError("naive --now must fail closed")
+
+
+def test_idle_run_refreshes_a_healthy_service_heartbeat(tmp_path, capsys) -> None:
+    output_root = tmp_path / "collect"
+    state_path = output_root / "state" / "dukascopy_history.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "completed_hours": {
+                    symbol: "2026-08-10T10:00:00+00:00" for symbol in ("USDJPY", "EURUSD", "GBPUSD")
+                },
+                "updated_at": "2026-08-10T10:05:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = main(
+        [
+            "--output-root",
+            str(output_root),
+            "--now",
+            "2026-08-10T12:34:00+00:00",
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "idle_no_new_completed_hour"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["heartbeat_ok"] is True
+    assert datetime.fromisoformat(state["heartbeat_at"]).tzinfo is not None
+    assert state["updated_at"] == "2026-08-10T10:05:00+00:00"

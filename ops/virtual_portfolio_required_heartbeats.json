@@ -15,8 +15,10 @@
     },
     {
       "service_id": "com.fx-codex.dukascopy-history",
-      "path": "collect/log/quotes.jsonl",
-      "max_age_seconds": 900
+      "path": "collect/state/dukascopy_history.json",
+      "max_age_seconds": 900,
+      "status_field": "heartbeat_ok",
+      "status_value": true
     },
     {
       "service_id": "com.fx-codex.quote-index",
