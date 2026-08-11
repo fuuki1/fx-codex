@@ -37,7 +37,7 @@ import sys
 from datetime import datetime, UTC
 from pathlib import Path
 
-from fx_intel import price_history, technicals
+from fx_intel import price_history, technical_cache, technicals
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SYMBOLS = ["GBPUSD", "EURUSD", "USDJPY"]
@@ -95,19 +95,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument(
+        "--refresh-technical-cache",
+        action="store_true",
+        help="共有technical cacheの唯一のnetwork producerとして更新する",
+    )
+    parser.add_argument(
+        "--technical-cache",
+        type=Path,
+        default=technical_cache.DEFAULT_CACHE_PATH,
+        help="検証済み共有technical cacheの保存先",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="ファイルへ追記せず記録内容を表示する"
     )
     args = parser.parse_args(argv)
 
     symbols = [s.upper().replace("/", "") for s in args.symbols]
-    tech_map, warnings = technicals.fetch_pair_technicals(symbols)
+    if args.refresh_technical_cache:
+        tech_map, warnings = technical_cache.refresh_pair_technicals(
+            symbols, cache_path=args.technical_cache
+        )
+    else:
+        tech_map, warnings = technicals.fetch_pair_technicals(symbols)
     for warning in warnings:
         print(f"[warn] {warning}", file=sys.stderr)
 
     snapshots_by_interval = collect_price_snapshots(tech_map)
     # Acquisition completion is the earliest instant this process can use the
     # snapshot. Timestamping before the network call would create false PIT history.
-    now = datetime.now(UTC)
+    now = technicals.latest_observed_at(tech_map) or datetime.now(UTC)
     rows = price_history.snapshot_entries(snapshots_by_interval, now=now)
     expected_points = len(symbols) * len(technicals.DEFAULT_INTERVALS)
     if not rows:

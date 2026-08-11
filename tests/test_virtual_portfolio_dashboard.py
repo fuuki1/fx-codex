@@ -55,7 +55,9 @@ def test_build_state_reads_virtual_portfolio_from_fixed_path(tmp_path) -> None:
     assert portfolio["configured"] is True
     assert portfolio["balance_jpy"] == 1_000_000
     assert portfolio["daily_target_jpy"] == 70_000
-    assert portfolio["execution_mode"] == "offline_simulation"
+    assert portfolio["execution_mode"] == "five_minute_snapshot_simulation"
+    assert portfolio["free_snapshot_simulation"]["cadence_seconds"] == 300
+    assert portfolio["free_snapshot_simulation"]["learning_eligible"] is False
     assert portfolio["broker_connected"] is False
     assert portfolio["performance_claim_status"] == "evaluation_unavailable"
     assert portfolio["daily_profit_task"]["required"] is True
@@ -85,7 +87,7 @@ def test_dashboard_defaults_to_virtual_portfolio_and_has_no_live_stage() -> None
     assert '<script src="portfolio.js"></script>' not in index
     assert 'let initialView = "portfolio"' in app
     assert 'portfolioOnly ? "/api/virtual-portfolio" : "/api/state"' in app
-    assert "delayed bid/ask replay / broker disconnected" in app
+    assert "無料5分スナップショット仮想取引 / ブローカー未接続" in app
     assert "反実仮想（因果断定なし）" in app
     assert "日次決済気配待ち" in app
     assert "実行可能評価あり" in app
@@ -125,6 +127,28 @@ def test_virtual_portfolio_api_is_loopback_query_only() -> None:
     assert server._validated_read_api_url("http://127.0.0.1:8771") == ("http://127.0.0.1:8771")
     with pytest.raises(ValueError, match="loopback"):
         server._validated_read_api_url("http://100.118.242.40:8771")
+
+
+def test_virtual_portfolio_read_cache_reuses_snapshot_until_sqlite_changes(
+    tmp_path, monkeypatch
+) -> None:
+    read_api = _read_api_module()
+    database = tmp_path / "virtual.sqlite3"
+    database.write_bytes(b"database-v1")
+    calls: list[int] = []
+
+    def fake_snapshot(_path: Path) -> dict[str, object]:
+        calls.append(len(calls) + 1)
+        return {"call": calls[-1]}
+
+    monkeypatch.setattr(read_api, "portfolio_snapshot", fake_snapshot)
+    cache = read_api.PortfolioSnapshotCache()
+
+    assert cache.get(database) == {"call": 1}
+    assert cache.get(database) == {"call": 1}
+
+    Path(f"{database}-wal").write_bytes(b"wal-v1")
+    assert cache.get(database) == {"call": 2}
 
 
 def test_virtual_portfolio_proxy_timeout_covers_observed_snapshot_latency() -> None:

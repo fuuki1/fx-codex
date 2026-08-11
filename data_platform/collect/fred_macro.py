@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -56,6 +57,21 @@ SERIES_REGISTRY: dict[str, dict[str, str]] = {
 
 class MacroPITError(RuntimeError):
     """Malformed macro capture — fail closed, keep the raw for forensics."""
+
+
+class MacroPITCaptureError(MacroPITError):
+    """Capture failure carrying the retained raw identity when one exists."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_uri: str,
+        raw_payload_sha256: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.source_uri = source_uri
+        self.raw_payload_sha256 = raw_payload_sha256
 
 
 @dataclass(frozen=True)
@@ -109,6 +125,14 @@ class MacroObservation:
         }
 
 
+@dataclass(frozen=True)
+class MacroPITCaptureResult:
+    source_uri: str
+    raw_payload_sha256: str
+    observations: tuple[MacroObservation, ...]
+    appended_count: int
+
+
 def vintage_url(series_id: str, vintage: date, start: date, end: date) -> str:
     if end < start:
         raise MacroPITError("end must not precede start")
@@ -144,6 +168,8 @@ def parse_vintage_csv(
     (``SERIES_YYYYMMDD``) is REQUIRED — it proves the endpoint honoured the
     vintage instead of silently returning current data."""
 
+    if received_at.tzinfo is None or received_at.utcoffset() is None:
+        raise MacroPITError("received_at must be timezone-aware")
     registry = SERIES_REGISTRY.get(series_id)
     if registry is None:
         raise MacroPITError(f"series {series_id!r} is not in the registry")
@@ -199,19 +225,140 @@ class MacroPITLog:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def append(self, observations: Sequence[MacroObservation]) -> int:
+    @staticmethod
+    def _decode_rows(payload: str) -> list[dict[str, Any]]:
+        if payload and not payload.endswith("\n"):
+            raise MacroPITError("macro log has an incomplete trailing row")
+        rows: list[dict[str, Any]] = []
+        identities: set[str] = set()
+        for line_number, line in enumerate(payload.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError) as error:
+                raise MacroPITError(f"macro log row {line_number} is malformed JSON") from error
+            if not isinstance(row, dict) or not isinstance(row.get("event_id"), str):
+                raise MacroPITError(f"macro log row {line_number} has no event_id")
+            event_id = str(row["event_id"])
+            if event_id in identities:
+                raise MacroPITError(f"duplicate event_id in macro log: {event_id}")
+            identities.add(event_id)
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _observation_identity_payload(row: dict[str, Any]) -> str:
+        """Compare provider content while preserving the first local availability clock."""
+
+        stable = {
+            key: value
+            for key, value in row.items()
+            if key not in {"received_at", "available_at", "writer_id"}
+        }
+        return json.dumps(stable, sort_keys=True, separators=(",", ":"))
+
+    def append_new(self, observations: Sequence[MacroObservation]) -> int:
+        """Append unique natural keys under one process-level exclusive lock."""
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as handle:
+        with open(self.path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            existing_rows = self._decode_rows(handle.read())
+            existing = {
+                str(row["event_id"]): self._observation_identity_payload(row)
+                for row in existing_rows
+            }
+            pending: dict[str, dict[str, Any]] = {}
             for observation in observations:
-                handle.write(json.dumps(observation.to_dict(), sort_keys=True) + "\n")
+                row = observation.to_dict()
+                event_id = str(row["event_id"])
+                encoded = self._observation_identity_payload(row)
+                previous = pending.get(event_id)
+                if previous is not None:
+                    previous_encoded = self._observation_identity_payload(previous)
+                    if previous_encoded != encoded:
+                        raise MacroPITError(
+                            f"conflicting duplicate event_id in append batch: {event_id}"
+                        )
+                    continue
+                if event_id in existing:
+                    if existing[event_id] != encoded:
+                        raise MacroPITError(
+                            f"existing event_id has conflicting content: {event_id}"
+                        )
+                    continue
+                pending[event_id] = row
+            handle.seek(0, os.SEEK_END)
+            for row in pending.values():
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        return len(observations)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return len(pending)
+
+    def append(self, observations: Sequence[MacroObservation]) -> int:
+        return self.append_new(observations)
 
     def rows(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
             return []
-        return [json.loads(line) for line in self.path.read_text().splitlines() if line.strip()]
+        with open(self.path, encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            payload = handle.read()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return self._decode_rows(payload)
+
+
+def capture_vintage_result(
+    series_id: str,
+    vintage: date,
+    start: date,
+    end: date,
+    *,
+    fetcher: Fetcher,
+    store: ImmutableRawStore,
+    log: MacroPITLog,
+    now: Callable[[], datetime] | None = None,
+) -> MacroPITCaptureResult:
+    """Fetch raw first and return provenance even when parsing later fails."""
+
+    clock = now or (lambda: datetime.now(UTC))
+    url = vintage_url(series_id, vintage, start, end)
+    status, body = fetcher(url)
+    if status != 200 or not body:
+        raise MacroPITCaptureError(
+            f"{url} -> HTTP {status}; refusing to substitute a default",
+            source_uri=url,
+        )
+    ref = store.put(body)
+    stored = store.get(ref.sha256)
+    if hashlib.sha256(stored).hexdigest() != ref.sha256:
+        raise MacroPITCaptureError(
+            "raw hash verification failed for macro capture",
+            source_uri=url,
+            raw_payload_sha256=ref.sha256,
+        )
+    try:
+        observations = parse_vintage_csv(
+            body,
+            series_id=series_id,
+            vintage=vintage,
+            source_uri=url,
+            received_at=clock(),
+        )
+        appended = log.append_new(observations)
+    except MacroPITError as error:
+        raise MacroPITCaptureError(
+            str(error), source_uri=url, raw_payload_sha256=ref.sha256
+        ) from error
+    return MacroPITCaptureResult(
+        source_uri=url,
+        raw_payload_sha256=ref.sha256,
+        observations=tuple(observations),
+        appended_count=appended,
+    )
 
 
 def capture_vintage(
@@ -227,20 +374,18 @@ def capture_vintage(
 ) -> list[MacroObservation]:
     """Fetch one vintage, raw-first, parse, append. Fail closed on any error."""
 
-    clock = now or (lambda: datetime.now(UTC))
-    url = vintage_url(series_id, vintage, start, end)
-    status, body = fetcher(url)
-    if status != 200 or not body:
-        raise MacroPITError(f"{url} -> HTTP {status}; refusing to substitute a default")
-    ref = store.put(body)
-    stored = store.get(ref.sha256)
-    if hashlib.sha256(stored).hexdigest() != ref.sha256:
-        raise MacroPITError("raw hash verification failed for macro capture")
-    observations = parse_vintage_csv(
-        body, series_id=series_id, vintage=vintage, source_uri=url, received_at=clock()
+    return list(
+        capture_vintage_result(
+            series_id,
+            vintage,
+            start,
+            end,
+            fetcher=fetcher,
+            store=store,
+            log=log,
+            now=now,
+        ).observations
     )
-    log.append(observations)
-    return observations
 
 
 def as_of(

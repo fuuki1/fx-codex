@@ -30,7 +30,7 @@ from tools.data_freshness_monitor import load_webhook_url  # noqa: E402
 
 TOKYO = ZoneInfo("Asia/Tokyo")
 REPORT_CONTRACT = "virtual-portfolio-daily-report-v2"
-DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio.sqlite3"
+DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio_canonical_v2.sqlite3"
 DEFAULT_RUN_ROOT = REPO_ROOT / "runs" / "virtual_portfolio_daily"
 DEFAULT_OUTBOX = REPO_ROOT / "logs" / "virtual_portfolio_daily_discord_outbox.json"
 

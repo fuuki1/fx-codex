@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from fx_intel.tv_scanner import ScannerError, get_multiple_analysis
 
@@ -82,6 +83,8 @@ class PairTechnicals:
     views: dict[str, IntervalView] = field(default_factory=dict)
     fast_window: int = 20
     slow_window: int = 100
+    observed_at: datetime | None = None
+    source_snapshot_hash: str | None = None
     # 一時的な取得失敗(ネットワーク/429/HTTP/非JSON)が起きた時間足。
     # 恒久的な「データなし」(空dataでの None)とは区別し、全滅時の終了コード判定に使う。
     transient_failures: list[str] = field(default_factory=list)
@@ -165,6 +168,20 @@ class PairTechnicals:
     def atr(self, interval: str = "1h") -> float | None:
         view = self.views.get(interval)
         return view.atr if view else None
+
+
+def latest_observed_at(values: dict[str, PairTechnicals]) -> datetime | None:
+    """Return the latest source acquisition clock without inventing one."""
+
+    observed: list[datetime] = []
+    for technical in values.values():
+        moment = technical.observed_at
+        if moment is None:
+            continue
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("technical observed_at must be timezone-aware")
+        observed.append(moment.astimezone(UTC))
+    return max(observed) if observed else None
 
 
 def _to_float(value: object) -> float | None:

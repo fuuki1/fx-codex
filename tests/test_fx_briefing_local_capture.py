@@ -353,7 +353,14 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
     rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
     new_rows = rows[20:]
     assert new_rows, "今回のプランがジャーナルへ追記されていること"
-    assert any(row["direction"] in ("long", "short") for row in new_rows)
+    assert all(row["direction"] == "neutral" for row in new_rows)
+    assert any(
+        str(trace.get("gate", "")).startswith("decision_pipeline:")
+        and trace.get("terminal") is True
+        for row in new_rows
+        for trace in row.get("gate_trace", [])
+        if isinstance(trace, dict)
+    )
     for row in new_rows:
         assert row["target_policy"] == {}, (
             "自動停止したTP/SLポリシーが同一実行のプランに適用されている: "

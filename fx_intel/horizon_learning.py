@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import tempfile
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -136,22 +136,62 @@ def _price_series(rows: Iterable[Mapping[str, object]]) -> dict[str, list[PriceP
 
 
 def _future_point_and_path(
-    points: Sequence[PricePoint], ts: datetime, spec: HorizonSpec
+    points: Sequence[PricePoint],
+    ts: datetime,
+    spec: HorizonSpec,
+    stamps: Sequence[datetime] | None = None,
 ) -> tuple[PricePoint | None, list[PricePoint]]:
-    stamps = [point.ts for point in points]
+    """Pick the priced point closest to ``spec.hours`` of open market time after ``ts``.
+
+    ``stamps`` is the caller's cached list of ``point.ts``. Scoring walks the same
+    per-symbol series once per journal entry, so rebuilding it here made the scan
+    O(entries × points) in list construction alone.
+
+    Market-open age is non-decreasing in ``point.ts`` (closed weekend spans only
+    ever subtract), so the accepted ages form one contiguous run. Bisecting for
+    that run's edges keeps the number of ``age`` calls logarithmic in the series
+    instead of visiting every candidate.
+    """
+
+    if stamps is None:
+        stamps = [point.ts for point in points]
     lower = ts + timedelta(hours=max(0.0, spec.hours - spec.tolerance_hours))
     upper = ts + timedelta(hours=spec.hours + spec.tolerance_hours) + WEEKEND_CLOSURE
-    best: tuple[float, PricePoint] | None = None
     start_index = bisect_left(stamps, ts)
     open_hours = WeekendOpenHours(ts, upper)
-    for point in points[bisect_left(stamps, lower) :]:
-        if point.ts > upper:
-            break
-        age = open_hours.age(point.ts)
-        if spec.hours - spec.tolerance_hours <= age <= spec.hours + spec.tolerance_hours:
-            gap = abs(age - spec.hours)
-            if best is None or gap < best[0]:
-                best = (gap, point)
+    low_bound = spec.hours - spec.tolerance_hours
+    high_bound = spec.hours + spec.tolerance_hours
+
+    # Candidates are bounded below by wall-clock `lower` (open age never exceeds
+    # wall-clock elapsed) and above by `upper`.
+    first = bisect_left(stamps, lower)
+    last = bisect_right(stamps, upper)
+
+    # Leftmost index whose age reaches the tolerance window.
+    left, right = first, last
+    while left < right:
+        middle = (left + right) // 2
+        if open_hours.age(stamps[middle]) < low_bound:
+            left = middle + 1
+        else:
+            right = middle
+    window_start = left
+
+    # Leftmost index whose age passes beyond the window; the run ends just before.
+    left, right = window_start, last
+    while left < right:
+        middle = (left + right) // 2
+        if open_hours.age(stamps[middle]) <= high_bound:
+            left = middle + 1
+        else:
+            right = middle
+    window_end = left
+
+    best: tuple[float, PricePoint] | None = None
+    for index in range(window_start, window_end):
+        gap = abs(open_hours.age(stamps[index]) - spec.hours)
+        if best is None or gap < best[0]:
+            best = (gap, points[index])
     if best is None:
         return None, []
     path = [point for point in points[start_index:] if ts < point.ts <= best[1].ts]
@@ -167,6 +207,9 @@ def score_horizon_history(
 ) -> HorizonScoreResult:
     now = now or datetime.now(UTC)
     series = _price_series(price_rows)
+    # Every entry for a symbol searches that symbol's identical price series, so
+    # the timestamp list is built once per symbol rather than once per entry.
+    stamps_by_symbol = {symbol: [point.ts for point in points] for symbol, points in series.items()}
     result = HorizonScoreResult()
     quality: dict[tuple[str, str], list[datetime]] = defaultdict(list)
     for entry in entries:
@@ -189,7 +232,9 @@ def score_horizon_history(
         if open_hours_between(ts, now) < spec.hours + spec.tolerance_hours:
             result.immature += 1
             continue
-        future, path = _future_point_and_path(series.get(symbol, []), ts, spec)
+        future, path = _future_point_and_path(
+            series.get(symbol, []), ts, spec, stamps_by_symbol.get(symbol)
+        )
         if future is None:
             result.unresolved += 1
             continue

@@ -67,14 +67,15 @@ JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 TF_PRICES_STALE_MINUTES = 15
 DEFAULT_OPERATIONAL_READ_API_URL = "http://127.0.0.1:8770"
 DEFAULT_VIRTUAL_PORTFOLIO_API_URL = "http://127.0.0.1:8771"
-DEFAULT_VIRTUAL_PORTFOLIO_DB = DEFAULT_LOG_DIR / "fx_virtual_portfolio.sqlite3"
+DEFAULT_VIRTUAL_PORTFOLIO_DB = DEFAULT_LOG_DIR / "fx_virtual_portfolio_canonical_v2.sqlite3"
 # portfolio_snapshot() は CPU 律速で、実機の負荷に強く依存する。
 # 2026-08-05 の実測 (load 6-9): ttfb 7.0/7.8/10.9/11.5/13.4/30.1 秒。
 # 旧値の 5 秒は最良ケースでも届かず、ダッシュボードは常時 503 を返して
 # 仮想口座パネル全体が空になっていた。実測の最悪値に余裕を持たせて 45 秒とする。
 # 環境変数で上書きできるため、負荷特性の違う実機では調整可能。
-VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS = float(
-    os.environ.get("FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS", "45")
+VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS = max(
+    45.0,
+    float(os.environ.get("FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS", "45")),
 )
 DEFAULT_DASHBOARD_STATE_CACHE = DEFAULT_LOG_DIR / "dashboard_state_cache.json"
 # 状態キャッシュは com.fx-codex.dashboard-state が15分周期(:07/:22/:37/:52)で
@@ -2173,7 +2174,7 @@ def build_state(
         HORIZON_LEARNING_FILE: _file_status(horizon_learning_path),
     }
 
-    portfolio_path = portfolio_db or log_dir / "fx_virtual_portfolio.sqlite3"
+    portfolio_path = portfolio_db or log_dir / "fx_virtual_portfolio_canonical_v2.sqlite3"
     if portfolio_api_url is None:
         virtual_portfolio = portfolio_snapshot(portfolio_path, now=now)
     else:

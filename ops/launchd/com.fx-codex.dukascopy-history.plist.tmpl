@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.dukascopy-history</string>
+  <!-- 無料の遅延Bid/Ask取得。口座・認証情報・注文APIは持たない。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string><string>fx-dukascopy-history</string>
+    <string>--locks-dir</string><string>__FX_ROOT__/logs/locks</string>
+    <string>--</string>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/fx_dukascopy_history_collector.py</string>
+    <string>--output-root</string><string>__FX_ROOT__/collect</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/dukascopy-history.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/dukascopy-history.err.log</string>
+</dict>
+</plist>

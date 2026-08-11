@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.operational-replay</string>
+  <!-- launchd calendar time is local. The scheduled command records intent
+       before acquiring the canonical SQLite writer lease. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__OPERATIONAL_PYTHON__</string>
+    <string>__FX_ROOT__/tools/operational_store_scheduled.py</string>
+    <string>full-replay</string>
+    <string>--db</string><string>__OPERATIONAL_DB__</string>
+    <string>--decisions</string><string>__FX_ROOT__/logs/briefing_decisions.jsonl</string>
+    <string>--prices</string><string>__FX_ROOT__/logs/briefing_tf_prices.jsonl</string>
+    <string>--evidence-dir</string><string>__OPERATIONAL_EVIDENCE_DIR__</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>46</integer>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/operational-replay.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/operational-replay.err.log</string>
+</dict>
+</plist>

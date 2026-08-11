@@ -102,6 +102,7 @@ from fx_intel import (
     signal_board,
     sentiment,
     technicals,
+    technical_cache,
     tf_briefing,
     tf_learning,
     tp_sl_learning,
@@ -753,14 +754,38 @@ def append_note(base: str, addition: str) -> str:
     return (base + "\n" + addition).strip()
 
 
+# One briefing loads the outcome report from several places, and the file is
+# large enough (476 MB on the Mac mini, 9.3 s per parse) that re-reading it
+# dominates the run. Memoize per (path, mtime_ns, size) so a report rewritten
+# mid-run — `save_outcome_report` does exactly that — is re-read rather than
+# served stale. Keyed on identity, not just the path, so the cache cannot
+# outlive the bytes it was built from.
+_OUTCOME_REPORT_CACHE: dict[tuple[str, int, int], dict[str, object]] = {}
+
+
 def load_pit_decision_outcome_report(path: Path) -> dict[str, object]:
     """Load only reports scored from complete decision PIT envelopes."""
 
+    try:
+        stat = Path(path).stat()
+        key: tuple[str, int, int] | None = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if key is not None:
+        cached = _OUTCOME_REPORT_CACHE.get(key)
+        if cached is not None:
+            return cached
+
     report = decision_feedback.load_decision_outcome_report(path)
     if report.get("pit_contract") != journal.DECISION_JOURNAL_PIT_CONTRACT:
-        return {}
-    if report.get("pit_required") is not True:
-        return {}
+        report = {}
+    elif report.get("pit_required") is not True:
+        report = {}
+    if key is not None:
+        # A single run reads at most a couple of distinct revisions; keeping only
+        # the newest avoids pinning several hundred MB of superseded reports.
+        _OUTCOME_REPORT_CACHE.clear()
+        _OUTCOME_REPORT_CACHE[key] = report
     return report
 
 
@@ -1299,6 +1324,17 @@ def main(argv: list[str] | None = None) -> int:
         help="signal-boardから価格系列へ追記しない(snapshot writer併走時に使用)",
     )
     parser.add_argument(
+        "--technical-cache-only",
+        action="store_true",
+        help="共有technical cacheだけを読み、取得失敗時もnetworkへfallbackしない",
+    )
+    parser.add_argument(
+        "--technical-cache",
+        type=Path,
+        default=technical_cache.DEFAULT_CACHE_PATH,
+        help="検証済み共有technical cacheのパス",
+    )
+    parser.add_argument(
         "--per-timeframe",
         action="store_true",
         help="時間足別モード: 15m/1h/4h/1d を独立に判断し、時間足ごとの主ホライズン"
@@ -1605,9 +1641,18 @@ def main(argv: list[str] | None = None) -> int:
     ).to_dict()
 
     # 5. テクニカル取得
-    tech_map, tech_warnings = technicals.fetch_pair_technicals(
-        data_symbols, fast_window=fast_window, slow_window=slow_window
-    )
+    if args.technical_cache_only:
+        tech_map, tech_warnings = technical_cache.load_pair_technicals(
+            data_symbols,
+            fast_window=fast_window,
+            slow_window=slow_window,
+            cache_path=args.technical_cache,
+            now=now,
+        )
+    else:
+        tech_map, tech_warnings = technicals.fetch_pair_technicals(
+            data_symbols, fast_window=fast_window, slow_window=slow_window
+        )
     fetch_warnings.extend(tech_warnings)
 
     # C input context: completed M5 history is used only as an as-of spread
@@ -1891,7 +1936,7 @@ def main(argv: list[str] | None = None) -> int:
             operational_data_ok=freshness_gate.allow_new_risk,
             operational_data_reason=freshness_gate.reason,
         )
-        plan.checklist = checklist.to_dict()
+        decision_pipeline.terminalize_blocked_plan(plan, checklist)
         plans.append(plan)
 
     # 9b. USDファクター整合監査(観測専用): 同一実行の判断群でUSD観が内部矛盾して

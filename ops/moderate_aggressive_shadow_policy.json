@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "policy_id": "moderate-aggressive-shadow-v1",
+  "stage": "shadow",
+  "activation_mode": "counterfactual_only",
+  "threshold": 0.12,
+  "fallback_threshold": 0.15,
+  "scope": "overall",
+  "source_score": "runtime_composite",
+  "producer_version": "runtime-composite-moderate-v1",
+  "primary_metric": "net_opportunity_expectancy_r",
+  "target_coverage_min": 0.7,
+  "target_coverage_max": 0.85,
+  "generated_at": "2026-07-29T03:57:42Z",
+  "evidence_status": "reused_test_negative_shadow_only",
+  "promotion_eligible": false,
+  "promotion_blockers": [
+    "reused_test_net_opportunity_expectancy_nonpositive",
+    "canonical_bid_ask_cost_coverage_missing",
+    "lockbox_unopened",
+    "runtime_composite_threshold_not_validated"
+  ]
+}

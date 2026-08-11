@@ -146,7 +146,7 @@ def test_clean_long_passes_all_nine_steps() -> None:
 
 def test_weekend_blocks_at_regime_step() -> None:
     plan, checklist = run_pipeline("USDJPY", _bullish_tech(), _scores(), [], [], now=CLOSED)
-    assert plan.direction == "closed"
+    assert plan.direction == "neutral"
     assert _step(checklist, "regime").status == "block"
     assert checklist.blocked
 
@@ -169,11 +169,19 @@ def test_huge_atr_warns_volatility() -> None:
 def test_wide_spread_blocks_at_spread_step() -> None:
     # SL距離 = atr*2.5 = 0.75。スプレッドをその25%超(=0.20)に。
     tech = _bullish_tech(spread=0.20, atr=0.30)
-    _, checklist = run_pipeline("USDJPY", tech, _scores(), [], [], now=OPEN)
+    plan, checklist = run_pipeline("USDJPY", tech, _scores(), [], [], now=OPEN)
     spread_step = _step(checklist, "spread")
     assert spread_step.status == "block"
     assert (0.20 / 0.75) >= SPREAD_BLOCK_FRACTION
     assert checklist.blocked
+    assert plan.direction == "neutral"
+    assert plan.stop is None
+    terminal = checklist.terminalization
+    assert {"spread", "expectancy", "execution_cost"} <= set(terminal["blocked_by"])
+    counterfactual = terminal["counterfactual"]
+    assert counterfactual["direction"] == "long"
+    assert counterfactual["stop"] is not None
+    assert any(row["gate"] == "decision_pipeline:spread" for row in plan.gate_trace)
 
 
 def test_wide_spread_makes_net_expectancy_negative_or_blocks() -> None:
@@ -219,7 +227,7 @@ def test_no_balance_still_ok_at_sizing() -> None:
 
 def test_realized_expectancy_overrides_theoretical() -> None:
     # 実測期待Rが非正なら期待値ステップでblock。
-    _, checklist = run_pipeline(
+    plan, checklist = run_pipeline(
         "USDJPY",
         _bullish_tech(),
         _scores(),
@@ -231,6 +239,7 @@ def test_realized_expectancy_overrides_theoretical() -> None:
     exp = _step(checklist, "expectancy")
     assert exp.status == "block"
     assert checklist.expected_r == -0.3
+    assert plan.direction == "neutral"
 
 
 def test_uncalibrated_conviction_cannot_pass_expectancy_gate() -> None:

@@ -39,7 +39,7 @@ from fx_intel.trade_outcome import CanonicalTradeOutcome  # noqa: E402
 from fx_intel.trade_outcome import assert_canonical_outcome_idempotent  # noqa: E402
 from fx_intel.virtual_portfolio import open_virtual_portfolio_reader  # noqa: E402
 
-DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio.sqlite3"
+DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio_canonical_v2.sqlite3"
 DEFAULT_STORE = REPO_ROOT / "logs" / "canonical_outcomes.jsonl"
 DEFAULT_LABEL_EVIDENCE_STORE = REPO_ROOT / "logs" / "canonical_label_evidence.jsonl"
 

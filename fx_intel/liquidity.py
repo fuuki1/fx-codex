@@ -114,7 +114,8 @@ def quote_from_mapping(value: object) -> QuoteSnapshot | None:
     ingested = str(value.get("ingested_time") or available)
     if not observed:
         return None
-    flags = _quote_flags(bid, ask)
+    structural_flags = _quote_flags(bid, ask)
+    flags = list(structural_flags)
     if value.get("tradeable") is False:
         flags.append("not_tradeable")
     return QuoteSnapshot(
@@ -127,7 +128,11 @@ def quote_from_mapping(value: object) -> QuoteSnapshot | None:
         role=str(value.get("role") or "decision_quote"),
         source_record_id=str(value.get("source_record_id") or ""),
         content_hash=str(value.get("content_hash") or ""),
-        quality_status="invalid" if flags else "measured",
+        quality_status=(
+            "invalid"
+            if structural_flags
+            else ("measured_not_tradable" if "not_tradeable" in flags else "measured")
+        ),
         quality_flags=tuple(flags),
     )
 

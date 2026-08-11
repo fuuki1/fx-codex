@@ -1141,6 +1141,22 @@ def _plan_embed(plan: TradePlan, fast: int, slow: int) -> dict:
     checklist_field = _checklist_field(plan)
     if checklist_field is not None:
         fields.append(checklist_field)
+    for prediction in plan.shadow_predictions:
+        if str(prediction.get("producer") or "") != "moderate_aggressive_policy":
+            continue
+        direction = str(prediction.get("direction") or "neutral")
+        candidate = {"long": "買い候補", "short": "売り候補"}.get(direction, "見送り")
+        fields.append(
+            {
+                "name": "🧪 中強気shadow（比較専用）",
+                "value": (
+                    f"{candidate} / score {prediction.get('score')} / "
+                    f"閾値 {prediction.get('decision_threshold')}\n"
+                    "本番判断・発注には使わず、反実仮想の比較だけに使用"
+                ),
+                "inline": False,
+            }
+        )
     if plan.warnings:
         fields.append({"name": "⚠️ 注意点", "value": "\n".join(plan.warnings), "inline": False})
     if plan.headlines:

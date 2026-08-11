@@ -20,6 +20,7 @@ per_timeframe_status=0
 "$PYTHON" fx_briefing.py \
   --per-timeframe \
   --no-price-write \
+  --technical-cache-only \
   --require-freshness \
   --symbols USDJPY EURUSD \
   </dev/null >> logs/fx_integrated_briefing.log 2>&1 || per_timeframe_status=$?
@@ -45,6 +46,7 @@ case "$schedule_status" in
     "$PYTHON" fx_briefing.py \
       --no-discord \
       --no-price-write \
+      --technical-cache-only \
       --require-freshness \
       --symbols USDJPY EURUSD GBPUSD \
       </dev/null >> logs/fx_fusion_capture.log 2>&1 || fusion_status=$?

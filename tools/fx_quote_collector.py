@@ -27,16 +27,25 @@ import json
 import os
 from pathlib import Path
 import signal
-import stat
 import sys
 import time
 from types import FrameType
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VENV_ROOT = REPO_ROOT / ".venv"
+VENV_SITE_PACKAGES = (
+    VENV_ROOT / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(VENV_SITE_PACKAGES) not in sys.path:
+    sys.path.append(str(VENV_SITE_PACKAGES))
 
+from data_platform.collect.collector_env import (  # noqa: E402
+    CollectorEnvironmentError,
+    load_private_collector_env,
+)
 from data_platform.collect.oanda import (  # noqa: E402
     ENV_ACCOUNT,
     ENV_ENVIRONMENT,
@@ -49,6 +58,20 @@ from data_platform.collect.oanda import (  # noqa: E402
 from data_platform.collect.raw_first import QuoteLog  # noqa: E402
 from data_platform.collect.reconnect import ConnectionState  # noqa: E402
 from data_platform.raw.immutable_store import ImmutableRawStore  # noqa: E402
+from data_platform.raw.event_ledger import RawEventLedger  # noqa: E402
+from data_platform.raw.runtime_identity import (  # noqa: E402
+    COLLECTOR_ENVIRONMENT_LOCK_PATH,
+    RuntimeIdentityError,
+    critical_collector_code_sha256,
+    file_sha256,
+    python_runtime_isolated,
+    verified_collector_environment_identity,
+)
+from data_platform.raw.shadow import (  # noqa: E402
+    RAW_LEDGER_FLAG,
+    RawLedgerShadowWriter,
+    raw_ledger_enabled,
+)
 from tools.run_exclusive import ExclusiveLock  # noqa: E402
 
 EX_OK = 0
@@ -60,6 +83,13 @@ EX_NOPERM = 77
 EX_CONFIG = 78
 
 DEFAULT_INSTRUMENTS = ("USD_JPY", "EUR_USD", "GBP_USD")
+COLLECTOR_ENV_KEYS = frozenset({ENV_TOKEN, ENV_ACCOUNT, ENV_ENVIRONMENT, RAW_LEDGER_FLAG})
+
+
+def isolated_requests_transport(url: str, token: str):
+    """Named production transport whose dependency closure is verified at startup."""
+
+    return requests_transport(url, token)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,41 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _load_env_file(path: Path) -> dict[str, str]:
     """Parse a narrow dotenv file without evaluating shell code."""
-
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except OSError as error:
-        raise CollectorConfigError(f"cannot read collector env file: {path}") from error
-    if mode != 0o600:
-        raise CollectorConfigError(f"collector env file must be mode 600, got {mode:o}: {path}")
-
-    allowed = {ENV_TOKEN, ENV_ACCOUNT, ENV_ENVIRONMENT}
-    values: dict[str, str] = {}
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        raise CollectorConfigError(f"cannot read collector env file: {path}") from error
-    for line_number, raw_line in enumerate(lines, start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise CollectorConfigError(
-                f"invalid collector env line {line_number}: expected KEY=VALUE"
-            )
-        key, raw_value = line.split("=", 1)
-        key = key.strip()
-        value = raw_value.strip()
-        if key not in allowed:
-            raise CollectorConfigError(
-                f"unsupported key in collector env file at line {line_number}: {key}"
-            )
-        if key in values:
-            raise CollectorConfigError(f"duplicate key in collector env file: {key}")
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        values[key] = value
-    return values
+        return load_private_collector_env(path, allowed_keys=COLLECTOR_ENV_KEYS)
+    except CollectorEnvironmentError as error:
+        raise CollectorConfigError(str(error)) from error
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -221,6 +220,27 @@ def _record_incident(
     )
 
 
+def _persist_shadow_metrics(
+    output_root: Path,
+    writer: RawLedgerShadowWriter,
+    *,
+    drained: bool,
+    runtime_identity: dict[str, str],
+) -> None:
+    _write_state(
+        output_root / "state" / "raw_ledger_shadow_metrics.json",
+        {
+            **writer.metrics(),
+            **runtime_identity,
+            "contract": "raw-ledger-shadow-metrics-v1",
+            "final": True,
+            "drained": drained,
+            "writer_pid": os.getpid(),
+            "observed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -243,6 +263,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
         return EX_OK
+
+    raw_shadow_enabled = raw_ledger_enabled(environment)
+    runtime_identity: dict[str, str] = {}
+    if raw_shadow_enabled:
+        if not python_runtime_isolated():
+            print("[collector] raw ledger requires isolated Python runtime", file=sys.stderr)
+            return EX_CONFIG
+        try:
+            environment_sha, environment_lock_sha = verified_collector_environment_identity(
+                REPO_ROOT / COLLECTOR_ENVIRONMENT_LOCK_PATH,
+                environment_root=VENV_ROOT,
+            )
+            runtime_identity = {
+                "critical_code_sha256": critical_collector_code_sha256(REPO_ROOT),
+                "interpreter_sha256": file_sha256(Path(sys.executable).resolve()),
+                "collector_environment_sha256": environment_sha,
+                "collector_environment_lock_sha256": environment_lock_sha,
+            }
+        except (OSError, RuntimeIdentityError) as error:
+            print(f"[collector] runtime identity rejected: {error}", file=sys.stderr)
+            return EX_CONFIG
+        args.output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        args.output_root.chmod(0o700)
 
     started = datetime.now(UTC)
     lock = ExclusiveLock("quote-collector", locks_dir=args.output_root / "state")
@@ -275,10 +318,17 @@ def main(argv: list[str] | None = None) -> int:
 
     state: ConnectionState | None = None
     results: list[Any] = []
+    raw_shadow_writer: RawLedgerShadowWriter | None = None
     stop_requested = {"flag": False}
     try:
         store = ImmutableRawStore(args.output_root / "raw")
         log = QuoteLog(args.output_root / "log")
+        if raw_shadow_enabled:
+            raw_shadow_writer = RawLedgerShadowWriter(
+                RawEventLedger(args.output_root / "raw-ledger", blob_store=store),
+                enabled=True,
+                failure_log=args.output_root / "state" / "raw_ledger_shadow_failures.jsonl",
+            )
 
         def _graceful(_signum: int, _frame: FrameType | None) -> None:
             stop_requested["flag"] = True
@@ -298,13 +348,24 @@ def main(argv: list[str] | None = None) -> int:
             args.instruments,
             store=store,
             log=log,
-            transport=requests_transport,
+            transport=isolated_requests_transport,
             max_messages=args.max_messages,
             sleeper=_sleep_interruptibly,
             should_stop=lambda: stop_requested["flag"],
             source_endpoint_class="streaming_pricing",
             collection_mode="live_stream",
+            raw_shadow_writer=raw_shadow_writer,
         )
+        if raw_shadow_writer is not None:
+            drained = raw_shadow_writer.drain()
+            _persist_shadow_metrics(
+                args.output_root,
+                raw_shadow_writer,
+                drained=drained,
+                runtime_identity=runtime_identity,
+            )
+            if not drained:
+                raise RuntimeError("raw ledger shadow queue did not drain")
         accepted = sum(result.accepted_count for result in results)
         quarantined = sum(len(result.quarantined) for result in results)
         stopped_reason = state.stopped_reason or "stream_returned"

@@ -8,4 +8,5 @@ mkdir -p logs
   --no-llm \
   --no-export-events \
   --no-event-archive \
+  --technical-cache-only \
   </dev/null >> logs/fx_horizon.log 2>&1

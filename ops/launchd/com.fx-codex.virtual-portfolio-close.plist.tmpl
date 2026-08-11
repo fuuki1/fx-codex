@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.virtual-portfolio-close</string>
+  <!-- 廃止済み。17:30 JSTの日次照合は単一writerの通常cycleへ統合した。 -->
+  <key>Disabled</key><true/>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/false</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/virtual-portfolio-close.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/virtual-portfolio-close.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "contract": "required-service-heartbeat-config-v1",
+  "comment_ja": "新規Canonical v2仮想建玉に必要なサービス出力。launchd登録の有無ではなく、成功出力の更新をheartbeatとしてfail-closed評価する。",
+  "services": [
+    {
+      "service_id": "com.fx-codex.snapshot",
+      "path": "logs/briefing_tf_prices.jsonl",
+      "max_age_seconds": 900
+    },
+    {
+      "service_id": "com.fx-codex.briefing",
+      "path": "logs/briefing_decisions_latest.json",
+      "max_age_seconds": 900
+    },
+    {
+      "service_id": "com.fx-codex.dukascopy-history",
+      "path": "collect/log/quotes.jsonl",
+      "max_age_seconds": 900
+    },
+    {
+      "service_id": "com.fx-codex.quote-index",
+      "path": "logs/quote_tape_index_status.json",
+      "max_age_seconds": 180
+    },
+    {
+      "service_id": "com.fx-codex.health",
+      "path": "logs/freshness_report.json",
+      "max_age_seconds": 600,
+      "status_field": "overall",
+      "status_value": "ok"
+    }
+  ]
+}

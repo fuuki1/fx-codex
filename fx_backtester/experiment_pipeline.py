@@ -50,6 +50,7 @@ from fx_backtester.experiment_manifest import (
 from fx_backtester.failures import FailureReason, TypedFailure
 from fx_backtester.lockbox import LockboxRegistry, LockboxState, verify_lockbox_file
 from fx_backtester.promotion_policy import load_promotion_policy
+from fx_backtester.regime_mixture import RegimeMixtureClassifier
 from fx_backtester.governance import (
     PromotionEvidence,
     PromotionPolicy,
@@ -78,7 +79,8 @@ from fx_backtester.time_series_validation import (
 from fx_backtester.trial_ledger import TrialLedger, TrialLedgerEntry
 from fx_intel.gbm import GradientBoostingClassifier
 
-PIPELINE_VERSION = "experiment_pipeline_v1"
+LEGACY_CALIBRATED_DECISION_VERSION = "experiment_pipeline_v1"
+PIPELINE_VERSION = "experiment_pipeline_v2"
 FEATURE_LEAKAGE_SAMPLES = 7
 
 DETERMINISTIC_ARTIFACTS = (
@@ -678,6 +680,17 @@ class _GbdtModel(_TrainedModel):
         return {"family": "gbdt", "model": self.classifier.to_dict()}
 
 
+class _RegimeMixtureModel(_TrainedModel):
+    def __init__(self, classifier: RegimeMixtureClassifier) -> None:
+        self.classifier = classifier
+
+    def predict_probability(self, features: np.ndarray) -> np.ndarray:
+        return np.asarray(self.classifier.predict_proba_many(features.tolist()), dtype=float)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"family": "regime_mixture_gbdt", "model": self.classifier.to_dict()}
+
+
 # baseline: transparent reference strategies; complex: learned candidates that
 # are admissible only when they strictly beat the best baseline on tune.
 MODEL_FAMILY_KIND: dict[str, str] = {
@@ -691,6 +704,7 @@ MODEL_FAMILY_KIND: dict[str, str] = {
     "logistic_ridge": "complex",
     "ridge_regression": "complex",
     "gbdt": "complex",
+    "regime_mixture_gbdt": "complex",
 }
 
 _RULE_FAMILY_FEATURE = {
@@ -706,6 +720,11 @@ _GBDT_HYPERS = {
     "subsample",
     "feature_fraction",
     "reg_lambda",
+}
+_REGIME_MIXTURE_HYPERS = _GBDT_HYPERS | {
+    "regime_feature",
+    "min_expert_samples",
+    "shrinkage_samples",
 }
 
 
@@ -836,6 +855,34 @@ def _train_candidate(
                 context={"candidate_id": candidate.candidate_id, "error": str(error)},
             ) from error
         return _GbdtModel(classifier)
+    if family == "regime_mixture_gbdt":
+        supplied = _require_hyper(candidate, _REGIME_MIXTURE_HYPERS)
+        regime_feature = str(supplied["regime_feature"])
+        regime_index = _feature_index(candidate, feature_names, regime_feature)
+        _require_two_classes(candidate, train_labels)
+        try:
+            regime_classifier = RegimeMixtureClassifier(
+                regime_feature_index=regime_index,
+                regime_feature_name=regime_feature,
+                min_expert_samples=int(supplied["min_expert_samples"]),
+                shrinkage_samples=float(supplied["shrinkage_samples"]),
+                n_estimators=int(supplied["n_estimators"]),
+                learning_rate=float(supplied["learning_rate"]),
+                max_depth=int(supplied["max_depth"]),
+                min_samples_leaf=int(supplied["min_samples_leaf"]),
+                subsample=float(supplied["subsample"]),
+                feature_fraction=float(supplied["feature_fraction"]),
+                reg_lambda=float(supplied["reg_lambda"]),
+                seed=seed,
+            )
+            regime_classifier.fit(train_features.tolist(), train_labels.tolist())
+        except ValueError as error:
+            raise TypedFailure(
+                FailureReason.INVALID,
+                "regime mixture training rejected its inputs",
+                context={"candidate_id": candidate.candidate_id, "error": str(error)},
+            ) from error
+        return _RegimeMixtureModel(regime_classifier)
     raise TypedFailure(
         FailureReason.INVALID,
         "unknown model family",
@@ -879,6 +926,69 @@ def _decide(probability: float, long_threshold: float, short_threshold: float) -
     if probability <= short_threshold:
         return "short"
     return "abstain"
+
+
+def _decision_probabilities(
+    raw: np.ndarray,
+    calibrated: np.ndarray,
+    *,
+    pipeline_version: str,
+) -> np.ndarray:
+    """Select the immutable decision score contract for a recorded pipeline version."""
+
+    if pipeline_version == PIPELINE_VERSION:
+        return raw
+    if pipeline_version == LEGACY_CALIBRATED_DECISION_VERSION:
+        return calibrated
+    raise TypedFailure(
+        FailureReason.INVALID,
+        "unknown experiment decision score contract",
+        context={"pipeline_version": pipeline_version},
+    )
+
+
+def _model_decisions(
+    model: Any,
+    features: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    long_threshold: float,
+    short_threshold: float,
+) -> tuple[list[str], np.ndarray | None]:
+    """Return sides, preferring a dual expected-net-R contract when provided."""
+
+    predictor = getattr(model, "predict_expected_net_r", None)
+    minimum = getattr(model, "minimum_expected_net_r", None)
+    if callable(predictor) and callable(minimum):
+        long_expected, short_expected = predictor(features)
+        long_values = np.asarray(long_expected, dtype=float)
+        short_values = np.asarray(short_expected, dtype=float)
+        if long_values.shape != probabilities.shape or short_values.shape != probabilities.shape:
+            raise TypedFailure(
+                FailureReason.INVALID,
+                "expected-net-R predictions do not match the feature rows",
+            )
+        floor = float(minimum())
+        sides: list[str] = []
+        selected_expected: list[float] = []
+        for long_value, short_value in zip(long_values, short_values):
+            if long_value >= floor and long_value > short_value:
+                sides.append("long")
+                selected_expected.append(float(long_value))
+            elif short_value >= floor and short_value > long_value:
+                sides.append("short")
+                selected_expected.append(float(short_value))
+            else:
+                sides.append("abstain")
+                selected_expected.append(max(float(long_value), float(short_value)))
+        return sides, np.asarray(selected_expected, dtype=float)
+    return (
+        [
+            _decide(float(probability), long_threshold, short_threshold)
+            for probability in probabilities
+        ],
+        None,
+    )
 
 
 def _evaluate_decisions(

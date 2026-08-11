@@ -133,7 +133,7 @@
       banner.classList.toggle("is-good", configured);
       banner.classList.toggle("is-waiting", !configured);
     }
-    text("portfolioMode", "offline simulation / broker disconnected");
+    text("portfolioMode", "無料5分スナップショット仮想取引 / ブローカー未接続");
     text(
       "portfolioRealityTitle",
       configured

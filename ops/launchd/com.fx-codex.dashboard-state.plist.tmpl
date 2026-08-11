@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.dashboard-state</string>
+  <!-- 重い総合状態集計をHTTP requestから分離する15分ワンショット。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/run_exclusive.py</string>
+    <string>--name</string><string>fx-dashboard-state</string>
+    <string>--locks-dir</string><string>__FX_ROOT__/logs/locks</string>
+    <string>--</string>
+    <string>__PYTHON__</string>
+    <string>__DASHBOARD_ROOT__/tools/dashboard_state_snapshot.py</string>
+    <string>--log-dir</string><string>__FX_ROOT__/logs</string>
+    <string>--portfolio-db</string><string>__FX_ROOT__/logs/fx_virtual_portfolio_canonical_v2.sqlite3</string>
+    <string>--direct-portfolio-db</string>
+    <string>--output</string><string>__FX_ROOT__/logs/dashboard_state_cache.json</string>
+  </array>
+  <key>WorkingDirectory</key><string>__DASHBOARD_ROOT__</string>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/dashboard-state.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/dashboard-state.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.dashboard-server</string>
+  <!-- Read-only dashboard bound only to the Mac mini Tailscale address. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/ai_learning_dashboard/server.py</string>
+    <string>--host</string><string>100.118.242.40</string>
+    <string>--port</string><string>8788</string>
+    <string>--read-api-url</string><string>http://127.0.0.1:8770</string>
+    <string>--log-dir</string><string>__FX_ROOT__/logs</string>
+    <string>--portfolio-db</string><string>__FX_ROOT__/logs/fx_virtual_portfolio_canonical_v2.sqlite3</string>
+    <string>--portfolio-api-url</string><string>http://127.0.0.1:8771</string>
+    <string>--state-cache</string><string>__FX_ROOT__/logs/dashboard_state_cache.json</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS</key><string>45</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/dashboard-server.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/dashboard-server.err.log</string>
+</dict>
+</plist>

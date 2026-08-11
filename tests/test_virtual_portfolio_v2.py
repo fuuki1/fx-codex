@@ -904,7 +904,7 @@ def test_migration_cli_requires_exact_confirmation_without_writing(tmp_path) -> 
     with open_virtual_portfolio_writer(path, writer_id="test") as store:
         unchanged = store.virtual_portfolio_v2_snapshot()
     accepted = subprocess.run(
-        [*command, "--confirm", "append-v2-accounting"],
+        [*command, "--writer-id", "test", "--confirm", "append-v2-accounting"],
         capture_output=True,
         check=False,
         text=True,

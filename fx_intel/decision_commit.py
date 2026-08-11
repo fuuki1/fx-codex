@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, UTC
 import fcntl
 import hashlib
@@ -274,20 +275,126 @@ def _append_locked_line(
     return line_start_offset
 
 
+COMMIT_SCAN_CACHE_SUFFIX = ".commit_scan_cache.json"
+COMMIT_SCAN_CACHE_CONTRACT = "decision-commit-scan-cache-v1"
+
+
+def commit_scan_cache_path_for(path: str | Path) -> Path:
+    return Path(f"{Path(path)}{COMMIT_SCAN_CACHE_SUFFIX}")
+
+
+def _load_commit_scan_cache(target: Path, cache_path: Path) -> tuple[CommitScanState, int] | None:
+    """Return a resumable state plus the byte offset it was built from.
+
+    Fail-open: any unreadable, malformed or stale cache returns ``None`` so the
+    caller falls back to a full scan. The cache is only trusted while the log has
+    grown purely by appending — a shrunk size or a rewound mtime means the bytes
+    behind the cached offset may have changed, so it is discarded.
+    """
+
+    try:
+        stat = target.stat()
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(raw, Mapping) or raw.get("contract") != COMMIT_SCAN_CACHE_CONTRACT:
+        return None
+    scanned = raw.get("scanned_bytes")
+    cached_mtime = raw.get("source_mtime_ns")
+    if not isinstance(scanned, int) or not isinstance(cached_mtime, int):
+        return None
+    # Appending only ever grows the file and moves mtime forward. Anything else
+    # (rotation, truncation, manual edit, clock rewind) invalidates the cache.
+    if scanned < 0 or scanned > stat.st_size or cached_mtime > stat.st_mtime_ns:
+        return None
+    pending, commits, conflicts = (
+        raw.get("pending"),
+        raw.get("commits"),
+        raw.get("conflicts"),
+    )
+    if not isinstance(pending, Mapping) or not isinstance(commits, Mapping):
+        return None
+    if not isinstance(conflicts, list):
+        return None
+    state = CommitScanState(
+        pending={str(key): dict(value) for key, value in pending.items()},
+        commits={str(key): dict(value) for key, value in commits.items()},
+        conflicts={str(item) for item in conflicts},
+    )
+    return state, scanned
+
+
+def _store_commit_scan_cache(
+    target: Path, cache_path: Path, state: CommitScanState, scanned_bytes: int
+) -> None:
+    """Persist the scan state next to the log; a failure only costs performance."""
+
+    payload = {
+        "contract": COMMIT_SCAN_CACHE_CONTRACT,
+        "source_mtime_ns": target.stat().st_mtime_ns,
+        "scanned_bytes": scanned_bytes,
+        "pending": state.pending,
+        "commits": state.commits,
+        "conflicts": sorted(state.conflicts),
+    }
+    temporary = cache_path.with_suffix(f"{cache_path.suffix}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, cache_path)
+    except (OSError, TypeError, ValueError):
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def _scan_commits_with_cache(target: Path) -> dict[str, dict[str, object]]:
+    """Scan only the bytes appended since the last scan, when that is provably safe."""
+
+    cache_path = commit_scan_cache_path_for(target)
+    cached = _load_commit_scan_cache(target, cache_path)
+    state, start_offset = cached if cached is not None else (CommitScanState(), 0)
+    # Read as bytes so the resume point is an exact byte offset. Iterating a text
+    # handle and calling tell() mixes decoded and raw positions, which would make
+    # the stored offset unusable on the next run.
+    try:
+        handle = target.open("rb")
+    except OSError:
+        return {}
+    scanned_bytes = start_offset
+    with handle:
+        if start_offset:
+            handle.seek(start_offset)
+
+        def _decoded_lines() -> Iterator[str]:
+            nonlocal scanned_bytes
+            for raw_line in handle:
+                scanned_bytes += len(raw_line)
+                yield raw_line.decode("utf-8", errors="replace")
+
+        advance_commit_scan(_iter_json_values(_decoded_lines()), state)
+    _store_commit_scan_cache(target, cache_path, state, scanned_bytes)
+    return state.commits
+
+
 def load_commits(
     path: str | Path,
     *,
     verify_compact: bool = True,
+    use_cache: bool = True,
 ) -> dict[str, dict[str, object]]:
     """Load commits backed by exact full wrappers and, optionally, compact batches."""
 
     target = Path(path)
-    try:
-        handle = target.open(encoding="utf-8")
-    except OSError:
-        return {}
-    with handle:
-        commits = commits_from_values(_iter_json_values(handle))
+    if use_cache:
+        commits = _scan_commits_with_cache(target)
+    else:
+        try:
+            handle = target.open(encoding="utf-8")
+        except OSError:
+            return {}
+        with handle:
+            commits = commits_from_values(_iter_json_values(handle))
     if not verify_compact:
         return commits
     verified_by_mode: dict[str, dict[str, dict[str, object]]] = {}
@@ -326,34 +433,58 @@ def _iter_json_values(lines: Iterable[str]) -> Iterator[object]:
             yield None
 
 
-def commits_from_values(values: Iterable[object]) -> dict[str, dict[str, object]]:
-    """Validate commits whose wrapper is the newest pending full batch."""
+@dataclass
+class CommitScanState:
+    """Resumable state of a commit scan.
 
-    pending: dict[str, dict[str, object]] = {}
-    output: dict[str, dict[str, object]] = {}
-    conflicts: set[str] = set()
+    ``commits_from_values`` is a state machine: a ``decision_batch`` wrapper is
+    held in ``pending`` until the commit line that publishes it arrives, and a
+    later duplicate demotes an already accepted transaction into ``conflicts``.
+    Resuming a scan therefore needs all three fields — carrying only ``commits``
+    silently drops any batch/commit pair straddling the resume point, and
+    carrying only ``commits``+``pending`` loses the duplicate demotion.
+    """
+
+    pending: dict[str, dict[str, object]] = field(default_factory=dict)
+    commits: dict[str, dict[str, object]] = field(default_factory=dict)
+    conflicts: set[str] = field(default_factory=set)
+
+
+def advance_commit_scan(values: Iterable[object], state: CommitScanState) -> CommitScanState:
+    """Fold more log values into ``state``, mutating and returning it.
+
+    Feeding the whole log to a fresh state is exactly equivalent to feeding it in
+    consecutive chunks, which is what makes an incremental cache safe.
+    """
+
     for raw in values:
         is_full_record = (
             isinstance(raw, Mapping) and raw.get("event_type") == DECISION_BATCH_EVENT_TYPE
         )
         if is_full_record:
-            pending.clear()
+            state.pending.clear()
             full = _full_batch_descriptor(raw)
             if full is not None:
                 transaction_id, descriptor = full
-                pending[transaction_id] = descriptor
+                state.pending[transaction_id] = descriptor
             continue
         record = _validated_record(raw)
         if record is None:
             continue
         transaction_id = str(record["decision_transaction_id"])
-        full_batch = pending.pop(transaction_id, None)
+        full_batch = state.pending.pop(transaction_id, None)
         if full_batch is not None and _commit_matches_full_batch(record, full_batch):
-            _accumulate_unique(output, conflicts, transaction_id, record)
-        elif output.get(transaction_id) != record:
-            conflicts.add(transaction_id)
-            output.pop(transaction_id, None)
-    return output
+            _accumulate_unique(state.commits, state.conflicts, transaction_id, record)
+        elif state.commits.get(transaction_id) != record:
+            state.conflicts.add(transaction_id)
+            state.commits.pop(transaction_id, None)
+    return state
+
+
+def commits_from_values(values: Iterable[object]) -> dict[str, dict[str, object]]:
+    """Validate commits whose wrapper is the newest pending full batch."""
+
+    return advance_commit_scan(values, CommitScanState()).commits
 
 
 def _full_batch_descriptor(

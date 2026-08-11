@@ -22,6 +22,7 @@ COLLECT_MODULES = [
     "data_platform.collect.raw_first",
     "data_platform.collect.reconnect",
     "data_platform.collect.oanda",
+    "data_platform.collect.massive",
     "data_platform.collect.dukascopy",
     "data_platform.collect.fred_macro",
     "data_platform.collect.divergence",

@@ -24,7 +24,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from data_platform.collect.contract import CollectedQuote, QuoteContractError
 from data_platform.quality.state import QualityState
@@ -61,6 +61,8 @@ class IngestResult:
     raw_sha256: str
     accepted: list[CollectedQuote] = field(default_factory=list)
     quarantined: list[QuarantineRecord] = field(default_factory=list)
+    raw_shadow_status: str | None = None
+    raw_shadow_event_id: str | None = None
 
     @property
     def accepted_count(self) -> int:
@@ -176,6 +178,12 @@ class QuoteLog:
 Parser = Callable[[bytes], Sequence[CollectedQuote]]
 
 
+class RawShadowHooks(Protocol):
+    def capture(self, raw_payload: bytes, *, raw_sha256: str, observed_at: datetime) -> object: ...
+
+    def quarantine(self, event_id: str, *, reason: str, observed_at: datetime) -> object: ...
+
+
 def ingest_payload(
     raw_payload: bytes,
     *,
@@ -184,6 +192,7 @@ def ingest_payload(
     log: QuoteLog,
     stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
     now: Callable[[], datetime] | None = None,
+    raw_shadow: RawShadowHooks | None = None,
 ) -> IngestResult:
     clock = now or (lambda: datetime.now(UTC))
     ref = store.put(raw_payload)
@@ -192,6 +201,19 @@ def ingest_payload(
     if observed != ref.sha256:
         raise RawFirstError(f"raw hash verification failed: {observed} != {ref.sha256}")
     result = IngestResult(raw_sha256=ref.sha256)
+    if raw_shadow is not None:
+        shadow_observed_at = clock()
+        try:
+            shadow_result = raw_shadow.capture(
+                raw_payload,
+                raw_sha256=ref.sha256,
+                observed_at=shadow_observed_at,
+            )
+            result.raw_shadow_status = str(getattr(shadow_result, "status", "failed"))
+            result.raw_shadow_event_id = str(getattr(shadow_result, "event_id", "")) or None
+        except Exception:
+            result.raw_shadow_status = "failed"
+            result.raw_shadow_event_id = None
     try:
         quotes = parser(raw_payload)
     except (QuoteContractError, ValueError, KeyError, TypeError) as error:
@@ -203,6 +225,15 @@ def ingest_payload(
         )
         log.quarantine(record)
         result.quarantined.append(record)
+        if raw_shadow is not None and result.raw_shadow_event_id is not None:
+            try:
+                raw_shadow.quarantine(
+                    result.raw_shadow_event_id,
+                    reason=record.reason,
+                    observed_at=record.occurred_at,
+                )
+            except Exception:
+                result.raw_shadow_status = "failed"
         return result
     for quote in quotes:
         if quote.raw_payload_sha256 != ref.sha256:

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.virtual-portfolio-read</string>
+  <!-- query-only SQLite reader。loopback以外へbindしない。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__FX_ROOT__/tools/virtual_portfolio_read_api.py</string>
+    <string>--host</string><string>127.0.0.1</string>
+    <string>--port</string><string>8771</string>
+    <string>--db</string><string>__FX_ROOT__/logs/fx_virtual_portfolio_canonical_v2.sqlite3</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/virtual-portfolio-read.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/virtual-portfolio-read.err.log</string>
+</dict>
+</plist>

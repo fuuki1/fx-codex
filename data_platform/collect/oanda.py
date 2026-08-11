@@ -38,12 +38,14 @@ from typing import Literal
 
 from data_platform.collect.contract import CollectedQuote
 from data_platform.collect.raw_first import IngestResult, QuoteLog, ingest_payload
+from data_platform.collect.oanda_raw_shadow import OandaRawShadowHooks
 from data_platform.collect.reconnect import (
     BackoffPolicy,
     ConnectionState,
     TokenExpiredError,
 )
 from data_platform.raw.immutable_store import ImmutableRawStore
+from data_platform.raw.shadow import RawLedgerShadowWriter
 
 ENV_TOKEN = "FX_OANDA_API_TOKEN"
 ENV_ACCOUNT = "FX_OANDA_ACCOUNT_ID"
@@ -217,6 +219,7 @@ def stream_quotes(
     max_messages: int | None = None,
     source_endpoint_class: EndpointClass = "replay_fixture",
     collection_mode: CollectionMode = "replay",
+    raw_shadow_writer: RawLedgerShadowWriter | None = None,
 ) -> tuple[ConnectionState, list[IngestResult]]:
     """Run the stream through raw-first ingest with reconnect semantics.
 
@@ -270,8 +273,28 @@ def stream_quotes(
                         collection_mode=collection_mode,
                     )
 
+                raw_shadow = (
+                    OandaRawShadowHooks(
+                        raw_shadow_writer,
+                        environment=config.environment,
+                        account_id=config.account_id,
+                        connection_id=connection_id,
+                        source_endpoint_class=source_endpoint_class,
+                        collection_mode=collection_mode,
+                        received_at=now,
+                    )
+                    if raw_shadow_writer is not None
+                    else None
+                )
                 results.append(
-                    ingest_payload(line, parser=_parser, store=store, log=log, now=lambda: now)
+                    ingest_payload(
+                        line,
+                        parser=_parser,
+                        store=store,
+                        log=log,
+                        now=now_fn,
+                        raw_shadow=raw_shadow,
+                    )
                 )
                 if not alive:
                     break

@@ -48,12 +48,14 @@ from fx_intel.virtual_portfolio_v2 import (
     record_synchronized_valuation,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 APPLICATION_ID = 0x46585650  # "FXVP"
 DEFAULT_PORTFOLIO_ID = "virtual-jpy-1m"
-DEFAULT_WRITER_ID = "virtual-portfolio-daily"
+DEFAULT_WRITER_ID = "com.fx-codex.virtual-portfolio-v2"
 FAILURE_CLASSIFIER_VERSION = "virtual-failure-rules-v2"
 COUNTERFACTUAL_CONTRACT = "virtual-trade-counterfactual-v1"
+MODELED_SNAPSHOT_EXECUTION_MODE = "five_minute_snapshot_modeled_fill"
+MODELED_SNAPSHOT_DELIVERY_GRACE_SECONDS = 90
 TOKYO = ZoneInfo("Asia/Tokyo")
 
 
@@ -194,7 +196,7 @@ class VirtualSizingInvariantPolicy:
     microstructure_floor_multiple: Decimal = Decimal("2")
     maximum_gross_leverage: Decimal = Decimal("100")
     maximum_planned_reward_to_risk: Decimal = Decimal("10")
-    enforcement: str = "quarantine"
+    enforcement: str = "reject"
 
     @property
     def policy_sha256(self) -> str:
@@ -385,6 +387,7 @@ class TradeCloseRequest:
     maximum_favorable_excursion_r: float | None = None
     maximum_adverse_excursion_r: float | None = None
     historical_replay: bool = False
+    modeled_snapshot: bool = False
     observed_at: datetime | None = None
     replay_evidence: Mapping[str, object] | None = None
 
@@ -399,6 +402,7 @@ class PositionMarkRequest:
     quote_to_jpy_rate: float
     quote_conversion_source: str
     historical_replay: bool = False
+    modeled_snapshot: bool = False
     observed_at: datetime | None = None
 
 
@@ -615,6 +619,47 @@ CREATE TABLE IF NOT EXISTS simulated_trade_sizing_assessments (
 CREATE INDEX IF NOT EXISTS simulated_trade_sizing_assessments_stream_idx
 ON simulated_trade_sizing_assessments(allocation_stream, trade_id);
 
+CREATE TABLE IF NOT EXISTS simulated_trade_execution_assessments (
+    trade_id TEXT PRIMARY KEY,
+    execution_mode TEXT NOT NULL,
+    measured_bid_ask INTEGER NOT NULL CHECK (measured_bid_ask IN (0, 1)),
+    learning_eligible INTEGER NOT NULL CHECK (learning_eligible IN (0, 1)),
+    assessment_json TEXT NOT NULL,
+    record_sha256 TEXT NOT NULL,
+    writer_id TEXT NOT NULL,
+    FOREIGN KEY(trade_id) REFERENCES simulated_trade_opens(trade_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS simulated_trade_execution_assessments_mode_idx
+ON simulated_trade_execution_assessments(execution_mode, trade_id);
+
+CREATE TABLE IF NOT EXISTS simulated_trade_quote_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    trade_id TEXT NOT NULL,
+    leg TEXT NOT NULL CHECK (leg IN ('entry', 'exit')),
+    modeled_event_time_ns INTEGER NOT NULL,
+    actual_event_time_ns INTEGER NOT NULL,
+    observed_at_ns INTEGER NOT NULL,
+    modeled_bid REAL NOT NULL CHECK (modeled_bid > 0),
+    modeled_ask REAL NOT NULL CHECK (modeled_ask > 0),
+    actual_bid REAL NOT NULL CHECK (actual_bid > 0),
+    actual_ask REAL NOT NULL CHECK (actual_ask > 0),
+    executable_delta_pips REAL NOT NULL,
+    spread_delta_pips REAL NOT NULL,
+    evidence_json TEXT NOT NULL,
+    record_sha256 TEXT NOT NULL,
+    writer_id TEXT NOT NULL,
+    FOREIGN KEY(trade_id) REFERENCES simulated_trade_opens(trade_id),
+    UNIQUE(trade_id, leg),
+    CHECK (modeled_bid <= modeled_ask),
+    CHECK (actual_bid <= actual_ask),
+    CHECK (modeled_event_time_ns <= actual_event_time_ns),
+    CHECK (actual_event_time_ns <= observed_at_ns)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS simulated_trade_quote_reconciliations_time_idx
+ON simulated_trade_quote_reconciliations(observed_at_ns, trade_id, leg);
+
 CREATE TABLE IF NOT EXISTS decision_price_anchors (
     decision_id TEXT PRIMARY KEY,
     anchor_status TEXT NOT NULL CHECK (anchor_status IN ('anchored', 'rejected')),
@@ -745,6 +790,8 @@ _APPEND_ONLY_TABLES = (
     "simulated_trade_closes",
     "simulated_trade_close_observations",
     "simulated_trade_sizing_assessments",
+    "simulated_trade_execution_assessments",
+    "simulated_trade_quote_reconciliations",
     "decision_price_anchors",
     "session_close_requests",
     "session_close_completions",
@@ -807,6 +854,32 @@ def _source_decision_payload(decision: Mapping[str, object]) -> dict[str, object
         result.pop("model_sha256", None)
     result.pop("policy_sha256", None)
     return result
+
+
+def _terminal_decision_block_reasons(decision: Mapping[str, object]) -> list[str]:
+    """Return producer-side terminal blocks that must survive every consumer."""
+
+    reasons: list[str] = []
+    checklist = decision.get("checklist")
+    if isinstance(checklist, Mapping):
+        steps = checklist.get("steps")
+        if isinstance(steps, list):
+            for raw in steps:
+                if not isinstance(raw, Mapping) or raw.get("status") != "block":
+                    continue
+                key = str(raw.get("key") or "unknown")
+                note = str(raw.get("note") or "producer checklist block")
+                reasons.append(f"decision_pipeline:{key}: {note}")
+    trace = decision.get("gate_trace")
+    if isinstance(trace, list):
+        for raw in trace:
+            if not isinstance(raw, Mapping) or raw.get("status") != "blocked":
+                continue
+            gate = str(raw.get("gate") or "unknown")
+            reason = f"terminal gate:{gate}"
+            if reason not in reasons:
+                reasons.append(reason)
+    return list(dict.fromkeys(reasons))
 
 
 def _required_text(value: object, name: str) -> str:
@@ -914,6 +987,27 @@ def _connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
     return connection
+
+
+def _assert_writer_authority(connection: sqlite3.Connection, writer_id: str) -> None:
+    """Bind an initialized ledger to the one service that created it."""
+
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'portfolio_config'"
+    ).fetchone()
+    if table is None:
+        return
+    row = connection.execute(
+        "SELECT writer_id FROM portfolio_config ORDER BY created_at_ns LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return
+    authorized = str(row["writer_id"])
+    if writer_id != authorized:
+        raise VirtualPortfolioError(
+            "virtual portfolio writer is not authorized: "
+            f"requested={writer_id}, authorized={authorized}"
+        )
 
 
 def _execute_schema_statements(connection: sqlite3.Connection, script: str) -> None:
@@ -1149,6 +1243,72 @@ def _install_sizing_assessment_schema(
         )
 
 
+def _install_execution_assessment_schema(
+    connection: sqlite3.Connection,
+    *,
+    writer_id: str,
+) -> None:
+    """Backfill execution provenance without rewriting immutable open rows."""
+
+    rows = connection.execute("""
+        SELECT o.trade_id, k.detail_json
+        FROM simulated_trade_opens o
+        JOIN simulated_trade_open_observations k ON k.trade_id = o.trade_id
+        LEFT JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
+        WHERE a.trade_id IS NULL
+        ORDER BY o.open_time_ns, o.trade_id
+        """).fetchall()
+    for row in rows:
+        try:
+            detail = json.loads(str(row["detail_json"]))
+        except (TypeError, ValueError) as error:
+            raise VirtualPortfolioError(
+                f"cannot derive execution mode for {row['trade_id']}"
+            ) from error
+        if not isinstance(detail, Mapping):
+            raise VirtualPortfolioError(f"cannot derive execution mode for {row['trade_id']}")
+        mode = str(detail.get("execution_observation_mode") or "")
+        if mode not in {
+            "contemporaneous_quote",
+            "delayed_historical_bid_ask_replay",
+            MODELED_SNAPSHOT_EXECUTION_MODE,
+        }:
+            mode = "legacy_execution_mode_unknown"
+        measured = mode in {
+            "contemporaneous_quote",
+            "delayed_historical_bid_ask_replay",
+        }
+        assessment = {
+            "contract": "virtual-execution-assessment-v1",
+            "execution_mode": mode,
+            "measured_bid_ask": measured,
+            "learning_eligible": measured,
+            "basis": "open_observation_backfill",
+            "research_only": True,
+        }
+        payload = {
+            "trade_id": str(row["trade_id"]),
+            "assessment": assessment,
+        }
+        connection.execute(
+            """
+            INSERT INTO simulated_trade_execution_assessments(
+                trade_id, execution_mode, measured_bid_ask, learning_eligible,
+                assessment_json, record_sha256, writer_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(row["trade_id"]),
+                mode,
+                int(measured),
+                int(measured),
+                _json(assessment),
+                _record_hash(payload),
+                writer_id,
+            ),
+        )
+
+
 def _initialize(
     connection: sqlite3.Connection,
     *,
@@ -1165,7 +1325,7 @@ def _initialize(
         )
     if current_version == SCHEMA_VERSION:
         _verify_schema(connection)
-    elif current_version not in {0, 1, 3, 4, 5, 6, 7, 8}:
+    elif current_version not in {0, 1, 3, 4, 5, 6, 7, 8, 9}:
         raise VirtualPortfolioError(
             f"unsupported virtual portfolio schema: "
             f"app={current_application_id}, version={current_version}"
@@ -1177,6 +1337,7 @@ def _initialize(
         _install_open_observation_schema(connection, writer_id=writer_id)
         _install_close_observation_schema(connection, writer_id=writer_id)
         _install_sizing_assessment_schema(connection, writer_id=writer_id)
+        _install_execution_assessment_schema(connection, writer_id=writer_id)
         for trigger in _immutable_triggers():
             connection.execute(trigger)
         connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
@@ -1217,7 +1378,18 @@ def _verify_schema(connection: sqlite3.Connection) -> None:
         raise VirtualPortfolioError(
             "virtual portfolio has missing or invalid close knowledge timestamps"
         )
+    missing_execution_assessments = int(connection.execute("""
+            SELECT COUNT(*)
+            FROM simulated_trade_opens o
+            LEFT JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
+            WHERE a.trade_id IS NULL
+            """).fetchone()[0])
+    if missing_execution_assessments:
+        raise VirtualPortfolioError(
+            "virtual portfolio has missing execution provenance assessments"
+        )
     _verify_policy_updates(connection)
+    _verify_execution_provenance(connection)
     observation_contracts = (
         (
             "simulated_trade_open_observations",
@@ -1227,6 +1399,7 @@ def _verify_schema(connection: sqlite3.Connection) -> None:
                 "legacy_provenance_backfill",
                 "historical_replay_as_of",
                 "decision_observed_at",
+                "five_minute_snapshot_observed_at",
             },
         ),
         (
@@ -1237,6 +1410,7 @@ def _verify_schema(connection: sqlite3.Connection) -> None:
                 "legacy_provenance_backfill",
                 "historical_close_observed_at",
                 "contemporaneous_close_observed_at",
+                "five_minute_snapshot_close_observed_at",
             },
         ),
     )
@@ -1525,6 +1699,45 @@ def _verify_policy_updates(connection: sqlite3.Connection) -> None:
             previous_known_ns = known_at_ns
 
 
+def _verify_execution_provenance(connection: sqlite3.Connection) -> None:
+    for row in connection.execute(
+        "SELECT * FROM simulated_trade_execution_assessments ORDER BY trade_id"
+    ):
+        assessment = _decoded_json(row["assessment_json"], "execution assessment", dict)
+        if (
+            str(assessment.get("execution_mode") or "") != str(row["execution_mode"])
+            or bool(assessment.get("measured_bid_ask")) != bool(row["measured_bid_ask"])
+            or bool(assessment.get("learning_eligible")) != bool(row["learning_eligible"])
+        ):
+            raise VirtualPortfolioError(
+                f"execution assessment columns do not match JSON: {row['trade_id']}"
+            )
+        payload = {"trade_id": str(row["trade_id"]), "assessment": assessment}
+        if _record_hash(payload) != str(row["record_sha256"]):
+            raise VirtualPortfolioError(f"execution assessment hash mismatch: {row['trade_id']}")
+    for row in connection.execute(
+        "SELECT * FROM simulated_trade_quote_reconciliations ORDER BY trade_id, leg"
+    ):
+        reconciliation_payload: dict[str, object] = {
+            "trade_id": str(row["trade_id"]),
+            "leg": str(row["leg"]),
+            "modeled_event_time": _from_ns(int(row["modeled_event_time_ns"])).isoformat(),
+            "actual_event_time": _from_ns(int(row["actual_event_time_ns"])).isoformat(),
+            "observed_at": _from_ns(int(row["observed_at_ns"])).isoformat(),
+            "modeled_bid": float(row["modeled_bid"]),
+            "modeled_ask": float(row["modeled_ask"]),
+            "actual_bid": float(row["actual_bid"]),
+            "actual_ask": float(row["actual_ask"]),
+            "executable_delta_pips": float(row["executable_delta_pips"]),
+            "spread_delta_pips": float(row["spread_delta_pips"]),
+            "evidence": _decoded_json(row["evidence_json"], "reconciliation evidence", dict),
+        }
+        if _record_hash(reconciliation_payload) != str(row["record_sha256"]):
+            raise VirtualPortfolioError(
+                "modeled quote reconciliation hash mismatch: " f"{row['trade_id']}:{row['leg']}"
+            )
+
+
 def _period_start(now: datetime, period: str) -> datetime:
     local = _as_utc(now, "period now").astimezone(TOKYO)
     if period == "day":
@@ -1627,6 +1840,10 @@ _LEARNING_ELIGIBLE_SQL = """
             AND NOT EXISTS (
                 SELECT 1 FROM simulated_trade_sizing_assessments sa
                 WHERE sa.trade_id = c.trade_id AND sa.canonical = 0
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM simulated_trade_execution_assessments ea
+                WHERE ea.trade_id = c.trade_id AND ea.learning_eligible = 0
             )"""
 
 
@@ -1680,6 +1897,7 @@ def _classify_label_quality(
     holding_seconds: float,
     close_reason: str,
     sizing_invariants: Mapping[str, object] | None,
+    execution_assessment: Mapping[str, object] | None = None,
     largest_gap_seconds: float | None = None,
 ) -> dict[str, object]:
     """Decide whether one closed trade may be used as a learning label.
@@ -1726,6 +1944,11 @@ def _classify_label_quality(
             exclusions.append("sizing_quarantined")
     if close_reason == "session_end":
         exclusions.append("ambiguous_close")
+    if (
+        execution_assessment is not None
+        and execution_assessment.get("learning_eligible") is not True
+    ):
+        exclusions.append("modeled_snapshot_fill")
 
     return {
         "contract": "virtual-trade-label-quality-v2",
@@ -2458,12 +2681,56 @@ class VirtualPortfolioStore:
         quote_to_jpy_rate: float | None = None,
         quote_conversion_source: str | None = None,
         historical_replay: bool = False,
+        modeled_snapshot: bool = False,
         replay_as_of: datetime | None = None,
         additional_rejection_reasons: list[str] | None = None,
+        price_anchor: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        """Record one decision and optionally open an offline simulated trade."""
+        """Atomically reserve capacity and append one offline simulated open.
+
+        ``BEGIN IMMEDIATE`` makes the risk/capacity reads, anchored level and
+        unit generation, decision row, anchor row, and open row one SQLite
+        transaction.  No other connection can pass an older capacity snapshot
+        between the check and the append.
+        """
+
+        self._require_writer()
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            return self._process_decision_transaction(
+                decision,
+                quote=quote,
+                observed_at=observed_at,
+                quote_to_jpy_rate=quote_to_jpy_rate,
+                quote_conversion_source=quote_conversion_source,
+                historical_replay=historical_replay,
+                modeled_snapshot=modeled_snapshot,
+                replay_as_of=replay_as_of,
+                additional_rejection_reasons=additional_rejection_reasons,
+                price_anchor=price_anchor,
+            )
+
+    def _process_decision_transaction(
+        self,
+        decision: Mapping[str, object],
+        *,
+        quote: QuoteSnapshot | None = None,
+        observed_at: datetime | None = None,
+        quote_to_jpy_rate: float | None = None,
+        quote_conversion_source: str | None = None,
+        historical_replay: bool = False,
+        modeled_snapshot: bool = False,
+        replay_as_of: datetime | None = None,
+        additional_rejection_reasons: list[str] | None = None,
+        price_anchor: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Implementation for :meth:`process_decision` under one transaction."""
 
         writer_id = self._require_writer()
+        if historical_replay and modeled_snapshot:
+            raise InvalidVirtualRecord(
+                "historical_replay and modeled_snapshot are mutually exclusive"
+            )
         observed = _as_utc(observed_at or datetime.now(UTC), "observed_at")
         decision_id = _required_text(decision.get("decision_id"), "decision_id")
         existing = self.connection.execute(
@@ -2492,6 +2759,9 @@ class VirtualPortfolioStore:
             raise InvalidVirtualRecord("decision time cannot be after observation")
         policy = self.policy(as_of=decision_time, known_at=decision_time)
         recorded_decision = dict(decision)
+        anchor_payload = dict(price_anchor) if isinstance(price_anchor, Mapping) else None
+        if anchor_payload is not None:
+            recorded_decision["canonical_price_anchor"] = anchor_payload
         authoritative_risk_snapshot = self.prediction_portfolio_risk_snapshot(as_of=decision_time)
         supplied_risk_snapshot = recorded_decision.get("portfolio_risk_snapshot")
         if isinstance(supplied_risk_snapshot, Mapping) and _json(supplied_risk_snapshot) != _json(
@@ -2515,7 +2785,11 @@ class VirtualPortfolioStore:
             and str(decision.get("policy_sha256")) != policy.policy_sha256
         ):
             pit_reasons.append("判断時の方針ハッシュが仮想口座方針と一致しない")
-        rejection_reasons = [*pit_reasons, *(additional_rejection_reasons or [])]
+        rejection_reasons = [
+            *pit_reasons,
+            *_terminal_decision_block_reasons(recorded_decision),
+            *(additional_rejection_reasons or []),
+        ]
         try:
             assert_legacy_accounting_projected(self.connection)
         except InvalidV2Record:
@@ -2537,17 +2811,26 @@ class VirtualPortfolioStore:
                 rejection_reasons.append("実行可能bid/askが無い")
             else:
                 try:
-                    if historical_replay:
+                    if historical_replay or modeled_snapshot:
                         replay_moment = _as_utc(
                             replay_as_of or observed,
-                            "historical replay as_of",
+                            "delayed simulation as_of",
                         )
                         quote.validate_replay(as_of=replay_moment)
                         quote_time = _as_utc(quote.event_time, "quote event_time")
                         delay = (quote_time - decision_time).total_seconds()
-                        if delay < 0 or delay > policy.quote_max_age_seconds:
+                        maximum_delay = policy.quote_max_age_seconds + (
+                            MODELED_SNAPSHOT_DELIVERY_GRACE_SECONDS if modeled_snapshot else 0
+                        )
+                        if delay < 0 or delay > maximum_delay:
                             raise InvalidVirtualRecord(
-                                "historical entry quote is outside the decision entry window"
+                                "entry quote is outside the decision entry window"
+                            )
+                        if modeled_snapshot and quote.source != (
+                            "free_five_minute_snapshot_spread_model"
+                        ):
+                            raise InvalidVirtualRecord(
+                                "modeled snapshot quote source is not approved"
                             )
                     else:
                         quote.validate(
@@ -2565,15 +2848,40 @@ class VirtualPortfolioStore:
             except InvalidVirtualRecord as error:
                 rejection_reasons.append(str(error))
             try:
-                stop = _positive_decimal(decision.get("stop"), "stop")
-                target = _positive_decimal(
-                    decision.get("target1") or decision.get("target"), "target"
-                )
+                if historical_replay and anchor_payload is None:
+                    raise InvalidVirtualRecord("canonical price anchor is missing")
+                if anchor_payload is not None:
+                    status = _required_text(anchor_payload.get("status"), "anchor status")
+                    if status == "rejected":
+                        raise InvalidVirtualRecord(
+                            "canonical price anchor rejected: "
+                            + str(anchor_payload.get("reason") or "unknown")
+                        )
+                    if status != "anchored":
+                        raise InvalidVirtualRecord(f"unsupported anchor status: {status}")
+                    if quote is None:
+                        raise InvalidVirtualRecord("canonical price anchor requires bid/ask")
+                    anchored_entry = _positive_decimal(anchor_payload.get("entry"), "anchor entry")
+                    executable = _positive_decimal(
+                        quote.ask if direction == "long" else quote.bid,
+                        "anchor executable",
+                    )
+                    if anchored_entry != executable:
+                        raise InvalidVirtualRecord(
+                            "canonical price anchor entry differs from executable bid/ask"
+                        )
+                    stop = _positive_decimal(anchor_payload.get("stop"), "anchor stop")
+                    target = _positive_decimal(anchor_payload.get("target"), "anchor target")
+                else:
+                    stop = _positive_decimal(decision.get("stop"), "stop")
+                    target = _positive_decimal(
+                        decision.get("target1") or decision.get("target"), "target"
+                    )
             except InvalidVirtualRecord as error:
                 rejection_reasons.append(str(error))
             open_time = (
-                _as_utc(quote.event_time, "historical open_time")
-                if historical_replay and quote is not None
+                _as_utc(quote.event_time, "delayed simulation open_time")
+                if (historical_replay or modeled_snapshot) and quote is not None
                 else decision_time
             )
             cutoff_reason = self._session_close_gate_reason(
@@ -2624,12 +2932,16 @@ class VirtualPortfolioStore:
                     observed=open_time,
                     policy=policy,
                 )
-                if historical_replay:
+                if historical_replay or modeled_snapshot:
                     open_known_at = _as_utc(
                         replay_as_of or observed,
-                        "historical open known_at",
+                        "delayed simulation open known_at",
                     )
-                    open_known_at_basis = "historical_replay_as_of"
+                    open_known_at_basis = (
+                        "five_minute_snapshot_observed_at"
+                        if modeled_snapshot
+                        else "historical_replay_as_of"
+                    )
                 else:
                     open_known_at = observed
                     open_known_at_basis = "decision_observed_at"
@@ -2652,9 +2964,13 @@ class VirtualPortfolioStore:
             "model_sha256": str(decision.get("model_sha256") or ""),
             "policy_sha256": str(decision.get("policy_sha256") or ""),
             "execution_observation_mode": (
-                "delayed_historical_bid_ask_replay"
-                if historical_replay
-                else "contemporaneous_quote"
+                MODELED_SNAPSHOT_EXECUTION_MODE
+                if modeled_snapshot
+                else (
+                    "delayed_historical_bid_ask_replay"
+                    if historical_replay
+                    else "contemporaneous_quote"
+                )
             ),
             "safety_learning_policy_sha256": VirtualSafetyLearningPolicy().policy_sha256,
             "horizon_allocation": horizon_assignment,
@@ -2715,6 +3031,12 @@ class VirtualPortfolioStore:
                     writer_id,
                 ),
             )
+            if anchor_payload is not None:
+                self.record_decision_price_anchor(
+                    decision_id,
+                    anchor_payload,
+                    _manage_transaction=False,
+                )
             if open_values is not None:
                 assert quote is not None
                 assert open_known_at is not None
@@ -2764,6 +3086,39 @@ class VirtualPortfolioStore:
                         writer_id,
                     ),
                 )
+                execution_assessment = {
+                    "contract": "virtual-execution-assessment-v1",
+                    "execution_mode": decision_payload["execution_observation_mode"],
+                    "measured_bid_ask": not modeled_snapshot,
+                    "learning_eligible": not modeled_snapshot,
+                    "basis": (
+                        "free five-minute midpoint snapshot plus versioned conservative spread"
+                        if modeled_snapshot
+                        else "observed bid/ask quote"
+                    ),
+                    "research_only": True,
+                }
+                execution_assessment_payload = {
+                    "trade_id": str(open_values["trade_id"]),
+                    "assessment": execution_assessment,
+                }
+                self.connection.execute(
+                    """
+                    INSERT INTO simulated_trade_execution_assessments(
+                        trade_id, execution_mode, measured_bid_ask, learning_eligible,
+                        assessment_json, record_sha256, writer_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(open_values["trade_id"]),
+                        str(decision_payload["execution_observation_mode"]),
+                        int(not modeled_snapshot),
+                        int(not modeled_snapshot),
+                        _json(execution_assessment),
+                        _record_hash(execution_assessment_payload),
+                        writer_id,
+                    ),
+                )
         return {
             "inserted": True,
             "decision_id": decision_id,
@@ -2777,6 +3132,8 @@ class VirtualPortfolioStore:
         self,
         decision_id: str,
         anchor: Mapping[str, object],
+        *,
+        _manage_transaction: bool = True,
     ) -> dict[str, object]:
         """Append one canonical-frame anchor verdict for a decision.
 
@@ -2834,7 +3191,7 @@ class VirtualPortfolioStore:
                 "anchor_status": str(existing["anchor_status"]),
             }
 
-        with self.connection:
+        def insert() -> None:
             self.connection.execute(
                 """
                 INSERT INTO decision_price_anchors(
@@ -2860,6 +3217,12 @@ class VirtualPortfolioStore:
                     writer_id,
                 ),
             )
+
+        if _manage_transaction:
+            with self.connection:
+                insert()
+        else:
+            insert()
         return {"inserted": True, "decision_id": identifier, "anchor_status": status}
 
     def load_decision_price_anchor(self, decision_id: str) -> dict[str, object] | None:
@@ -2900,12 +3263,18 @@ class VirtualPortfolioStore:
         if closed is not None and mark_time > _from_ns(int(closed["close_time_ns"])):
             raise InvalidVirtualRecord("position mark cannot follow close time")
         observed = _as_utc(request.observed_at or mark_time, "position mark observed_at")
-        if request.historical_replay:
+        if request.historical_replay and request.modeled_snapshot:
+            raise InvalidVirtualRecord(
+                "historical_replay and modeled_snapshot are mutually exclusive"
+            )
+        if request.historical_replay or request.modeled_snapshot:
             request.quote.validate_replay(as_of=observed)
             if _as_utc(request.quote.event_time, "mark quote event_time") != mark_time:
-                raise InvalidVirtualRecord(
-                    "historical mark_time must equal executable quote event_time"
-                )
+                raise InvalidVirtualRecord("mark_time must equal quote event_time")
+            if request.modeled_snapshot and request.quote.source != (
+                "free_five_minute_snapshot_spread_model"
+            ):
+                raise InvalidVirtualRecord("modeled mark quote source is not approved")
         else:
             request.quote.validate(
                 as_of=mark_time,
@@ -2951,9 +3320,13 @@ class VirtualPortfolioStore:
             "spread_quote_cost_jpy": spread_cost,
             "quote": quote_payload,
             "valuation_mode": (
-                "delayed_historical_bid_ask_replay"
-                if request.historical_replay
-                else "contemporaneous_quote"
+                MODELED_SNAPSHOT_EXECUTION_MODE
+                if request.modeled_snapshot
+                else (
+                    "delayed_historical_bid_ask_replay"
+                    if request.historical_replay
+                    else "contemporaneous_quote"
+                )
             ),
         }
         record_sha = _record_hash(payload)
@@ -3052,22 +3425,32 @@ class VirtualPortfolioStore:
             raise InvalidVirtualRecord("close observed_at cannot precede close_time")
         if close_known_at < _from_ns(int(opened["open_known_at_ns"])):
             raise InvalidVirtualRecord("close observed_at cannot precede open known_at")
+        if request.historical_replay and request.modeled_snapshot:
+            raise InvalidVirtualRecord(
+                "historical_replay and modeled_snapshot are mutually exclusive"
+            )
         close_known_at_basis = (
-            "historical_close_observed_at"
-            if request.historical_replay
-            else "contemporaneous_close_observed_at"
+            "five_minute_snapshot_close_observed_at"
+            if request.modeled_snapshot
+            else (
+                "historical_close_observed_at"
+                if request.historical_replay
+                else "contemporaneous_close_observed_at"
+            )
         )
         policy = self.policy(as_of=open_time, known_at=open_time)
-        if request.historical_replay:
+        if request.historical_replay or request.modeled_snapshot:
             if request.observed_at is None:
                 raise InvalidVirtualRecord(
-                    "historical close requires the replay observation timestamp"
+                    "delayed simulation close requires the observation timestamp"
                 )
             request.quote.validate_replay(as_of=request.observed_at)
             if _as_utc(request.quote.event_time, "exit quote event_time") != close_time:
-                raise InvalidVirtualRecord(
-                    "historical close_time must equal the executable quote event_time"
-                )
+                raise InvalidVirtualRecord("close_time must equal the executable quote event_time")
+            if request.modeled_snapshot and request.quote.source != (
+                "free_five_minute_snapshot_spread_model"
+            ):
+                raise InvalidVirtualRecord("modeled close quote source is not approved")
         else:
             request.quote.validate(
                 as_of=close_time,
@@ -3203,9 +3586,13 @@ class VirtualPortfolioStore:
                 "costs_complete": True,
             },
             "execution_observation_mode": (
-                "delayed_historical_bid_ask_replay"
-                if request.historical_replay
-                else "contemporaneous_quote"
+                MODELED_SNAPSHOT_EXECUTION_MODE
+                if request.modeled_snapshot
+                else (
+                    "delayed_historical_bid_ask_replay"
+                    if request.historical_replay
+                    else "contemporaneous_quote"
+                )
             ),
             "replay_evidence": dict(request.replay_evidence or {}),
             "counterfactuals": counterfactuals,
@@ -3240,6 +3627,7 @@ class VirtualPortfolioStore:
             holding_seconds=max(0.0, (close_ns - open_ns) / 1_000_000_000),
             close_reason=close_reason,
             sizing_invariants=self._sizing_assessment_for(trade_id, opened),
+            execution_assessment=self._execution_assessment_for(trade_id),
             largest_gap_seconds=largest_gap_seconds,
         )
         quote_payload = _quote_payload(request.quote)
@@ -3487,10 +3875,14 @@ class VirtualPortfolioStore:
         *,
         as_of: datetime | None = None,
         record_export: bool = False,
+        include_ineligible_for_audit: bool = False,
     ) -> dict[str, object]:
         """Return PIT-safe, mature outcomes for offline challenger research."""
 
         moment = _as_utc(as_of or datetime.now(UTC), "learning as_of")
+        if record_export and include_ineligible_for_audit:
+            raise InvalidVirtualRecord("audit rows cannot be recorded as a learning export")
+        row_filter = "1 = 1" if include_ineligible_for_audit else _LEARNING_ELIGIBLE_SQL
         eligible_row = self.connection.execute(
             f"""
             SELECT COUNT(*) AS row_count
@@ -3536,7 +3928,7 @@ class VirtualPortfolioStore:
             JOIN simulated_trade_open_observations ok ON ok.trade_id = o.trade_id
             JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
             JOIN simulated_trade_close_observations ck ON ck.trade_id = c.trade_id
-            WHERE {_LEARNING_ELIGIBLE_SQL} AND c.close_time_ns <= ?
+            WHERE {row_filter} AND c.close_time_ns <= ?
               AND ok.open_known_at_ns <= ? AND ck.close_known_at_ns <= ?
               AND h.allocation_class = 'intraday_capacity'
             ORDER BY c.close_time_ns, o.trade_id
@@ -3680,10 +4072,11 @@ class VirtualPortfolioStore:
             "research_only": True,
             "promotion_eligible": False,
             "allocation_scope": "intraday_capacity",
+            "audit_includes_ineligible": include_ineligible_for_audit,
             "excluded_legacy_or_observer_rows": int(excluded_row["row_count"]),
             "canonical_net_r": canonical_label_summary(
                 dataset,
-                eligible_rows=eligible_rows,
+                eligible_rows=(len(dataset) if include_ineligible_for_audit else eligible_rows),
             ),
             "rows": dataset,
         }
@@ -3858,9 +4251,11 @@ class VirtualPortfolioStore:
         monthly_pnl = self._period_pnl(moment, "month", known_at=moment)
         open_rows = self.connection.execute(
             """
-            SELECT o.*, k.open_known_at_ns, k.known_at_basis
+            SELECT o.*, k.open_known_at_ns, k.known_at_basis,
+                   a.assessment_json AS execution_assessment_json
             FROM simulated_trade_opens o
             JOIN simulated_trade_open_observations k ON k.trade_id = o.trade_id
+            JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
             LEFT JOIN simulated_trade_close_observations ck
               ON ck.trade_id = o.trade_id AND ck.close_known_at_ns <= ?
             LEFT JOIN simulated_trade_closes c
@@ -3902,9 +4297,19 @@ class VirtualPortfolioStore:
                 mark_times.append(mark_time)
                 unrealized = int(mark["executable_unrealized_pnl_jpy"])
                 marked_unrealized_pnl_jpy += unrealized
+                execution_assessment = position.get("execution_assessment")
+                modeled_mark = (
+                    isinstance(execution_assessment, Mapping)
+                    and execution_assessment.get("execution_mode")
+                    == MODELED_SNAPSHOT_EXECUTION_MODE
+                )
                 position.update(
                     {
-                        "valuation_status": "delayed_executable_mark",
+                        "valuation_status": (
+                            "modeled_five_minute_snapshot_mark"
+                            if modeled_mark
+                            else "delayed_executable_mark"
+                        ),
                         "mark_time": mark_time.isoformat(),
                         "mark_observed_at": _from_ns(int(mark["observed_at_ns"])).isoformat(),
                         "mark_bid": float(mark["bid"]),
@@ -3923,10 +4328,12 @@ class VirtualPortfolioStore:
         trade_rows = self.connection.execute(
             """
             SELECT o.*, k.open_known_at_ns, k.known_at_basis,
+                   a.assessment_json AS execution_assessment_json,
                    ck.close_known_at_ns, ck.known_at_basis AS close_known_at_basis,
                    c.*
             FROM simulated_trade_opens o
             JOIN simulated_trade_open_observations k ON k.trade_id = o.trade_id
+            JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
             LEFT JOIN simulated_trade_close_observations ck
               ON ck.trade_id = o.trade_id AND ck.close_known_at_ns <= ?
             LEFT JOIN simulated_trade_closes c
@@ -3998,7 +4405,7 @@ class VirtualPortfolioStore:
                     "allocation_class": assignment["allocation_class"],
                     "capacity_eligible": assignment["capacity_eligible"],
                     "status": (
-                        "waiting_for_historical_bid_ask"
+                        "waiting_for_free_five_minute_snapshot"
                         if assignment["capacity_eligible"] is True
                         else "awaiting_terminal_observation_classification"
                     ),
@@ -4040,6 +4447,21 @@ class VirtualPortfolioStore:
                 (_to_ns(moment), _to_ns(moment)),
             ).fetchone()[0]
         )
+        modeled_execution_count = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM simulated_trade_execution_assessments "
+                "WHERE execution_mode = ?",
+                (MODELED_SNAPSHOT_EXECUTION_MODE,),
+            ).fetchone()[0]
+        )
+        modeled_reconciled_legs = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM simulated_trade_quote_reconciliations "
+                "WHERE observed_at_ns <= ?",
+                (_to_ns(moment),),
+            ).fetchone()[0]
+        )
+        modeled_pending_legs = len(self.modeled_snapshot_reconciliation_candidates())
         daily_series: dict[str, int] = {}
         for row in self.connection.execute(
             """
@@ -4343,8 +4765,19 @@ class VirtualPortfolioStore:
         return {
             "configured": True,
             "read_only": True,
-            "execution_mode": "offline_simulation",
+            "execution_mode": "five_minute_snapshot_simulation",
             "broker_connected": False,
+            "free_snapshot_simulation": {
+                "contract": "free-five-minute-snapshot-simulation-v1",
+                "cadence_seconds": 300,
+                "realtime": False,
+                "fill_basis": "midpoint snapshot plus conservative modeled spread",
+                "modeled_trade_count": modeled_execution_count,
+                "reconciled_bid_ask_legs": modeled_reconciled_legs,
+                "pending_bid_ask_reconciliation_legs": modeled_pending_legs,
+                "learning_eligible": False,
+                "broker_connected": False,
+            },
             "portfolio_id": self._portfolio_config()["portfolio_id"],
             "currency": "JPY",
             "policy": asdict(policy),
@@ -5036,6 +5469,13 @@ class VirtualPortfolioStore:
             equity_jpy=Decimal(current_balance),
         )
         sizing_violations = sizing_assessment["violations"]
+        if sizing_assessment["canonical"] is not True:
+            violation_text = (
+                ",".join(str(value) for value in sizing_violations)
+                if isinstance(sizing_violations, tuple)
+                else "unknown"
+            )
+            raise InvalidVirtualRecord("sizing invariant rejected before open: " + violation_text)
         sizing_violation_warnings: list[str] = (
             []
             if sizing_assessment["canonical"] is True or not isinstance(sizing_violations, tuple)
@@ -5201,6 +5641,183 @@ class VirtualPortfolioStore:
                 return assessment
         return _sizing_invariants_of_open(opened)
 
+    def _execution_assessment_for(self, trade_id: str) -> dict[str, object] | None:
+        row = self.connection.execute(
+            "SELECT assessment_json FROM simulated_trade_execution_assessments "
+            "WHERE trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            assessment = json.loads(str(row["assessment_json"]))
+        except (TypeError, ValueError):
+            return None
+        return dict(assessment) if isinstance(assessment, Mapping) else None
+
+    def modeled_snapshot_reconciliation_candidates(self) -> list[dict[str, object]]:
+        """Return modeled entry/exit legs that still need delayed quote comparison."""
+
+        rows = self.connection.execute(
+            """
+            SELECT o.trade_id, o.symbol, o.direction, o.open_time_ns,
+                   o.entry_bid, o.entry_ask, o.quote_json AS entry_quote_json,
+                   c.close_time_ns, c.exit_bid, c.exit_ask,
+                   c.quote_json AS exit_quote_json
+            FROM simulated_trade_opens o
+            JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
+            LEFT JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
+            WHERE a.execution_mode = ?
+            ORDER BY o.open_time_ns, o.trade_id
+            """,
+            (MODELED_SNAPSHOT_EXECUTION_MODE,),
+        ).fetchall()
+        candidates: list[dict[str, object]] = []
+        for row in rows:
+            legs = [("entry", "open_time_ns", "entry_bid", "entry_ask", "entry_quote_json")]
+            if row["close_time_ns"] is not None:
+                legs.append(("exit", "close_time_ns", "exit_bid", "exit_ask", "exit_quote_json"))
+            for leg, time_key, bid_key, ask_key, quote_key in legs:
+                existing = self.connection.execute(
+                    "SELECT 1 FROM simulated_trade_quote_reconciliations "
+                    "WHERE trade_id = ? AND leg = ?",
+                    (str(row["trade_id"]), leg),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                candidates.append(
+                    {
+                        "trade_id": str(row["trade_id"]),
+                        "symbol": str(row["symbol"]),
+                        "direction": str(row["direction"]),
+                        "leg": leg,
+                        "modeled_event_time": _from_ns(int(row[time_key])).isoformat(),
+                        "modeled_bid": float(row[bid_key]),
+                        "modeled_ask": float(row[ask_key]),
+                        "modeled_quote": json.loads(str(row[quote_key])),
+                    }
+                )
+        return candidates
+
+    def record_modeled_quote_reconciliation(
+        self,
+        *,
+        trade_id: str,
+        leg: str,
+        actual_quote: QuoteSnapshot,
+        observed_at: datetime,
+        evidence: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Append one delayed measured-Bid/Ask comparison for a modeled leg."""
+
+        writer_id = self._require_writer()
+        identifier = _required_text(trade_id, "trade_id")
+        normalized_leg = _required_text(leg, "leg")
+        if normalized_leg not in {"entry", "exit"}:
+            raise InvalidVirtualRecord("reconciliation leg must be entry or exit")
+        row = self.connection.execute(
+            """
+            SELECT o.trade_id, o.symbol, o.direction, o.open_time_ns,
+                   o.entry_bid, o.entry_ask, o.quote_json AS entry_quote_json,
+                   c.close_time_ns, c.exit_bid, c.exit_ask,
+                   c.quote_json AS exit_quote_json
+            FROM simulated_trade_opens o
+            JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
+            LEFT JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
+            WHERE o.trade_id = ? AND a.execution_mode = ?
+            """,
+            (identifier, MODELED_SNAPSHOT_EXECUTION_MODE),
+        ).fetchone()
+        if row is None or (normalized_leg == "exit" and row["close_time_ns"] is None):
+            raise InvalidVirtualRecord("modeled reconciliation candidate not found")
+        prefix = "entry" if normalized_leg == "entry" else "exit"
+        time_key = "open_time_ns" if normalized_leg == "entry" else "close_time_ns"
+        candidate: dict[str, object] = {
+            "trade_id": identifier,
+            "symbol": str(row["symbol"]),
+            "direction": str(row["direction"]),
+            "leg": normalized_leg,
+            "modeled_event_time": _from_ns(int(row[time_key])).isoformat(),
+            "modeled_bid": float(row[f"{prefix}_bid"]),
+            "modeled_ask": float(row[f"{prefix}_ask"]),
+        }
+        observed = _as_utc(observed_at, "reconciliation observed_at")
+        actual_quote.validate_replay(as_of=observed)
+        modeled_time = _parse_aware(candidate["modeled_event_time"], "modeled event time")
+        actual_time = _as_utc(actual_quote.event_time, "actual event time")
+        if actual_time < modeled_time:
+            raise InvalidVirtualRecord("actual reconciliation quote precedes modeled snapshot")
+        symbol = str(candidate["symbol"])
+        pip_size = Decimal("0.01") if symbol.endswith("JPY") else Decimal("0.0001")
+        modeled_bid = _positive_decimal(candidate["modeled_bid"], "modeled bid")
+        modeled_ask = _positive_decimal(candidate["modeled_ask"], "modeled ask")
+        actual_bid = _positive_decimal(actual_quote.bid, "actual bid")
+        actual_ask = _positive_decimal(actual_quote.ask, "actual ask")
+        direction = str(candidate["direction"])
+        modeled_executable = (
+            modeled_ask if (normalized_leg == "entry") == (direction == "long") else modeled_bid
+        )
+        actual_executable = (
+            actual_ask if (normalized_leg == "entry") == (direction == "long") else actual_bid
+        )
+        payload: dict[str, object] = {
+            "trade_id": identifier,
+            "leg": normalized_leg,
+            "modeled_event_time": modeled_time.isoformat(),
+            "actual_event_time": actual_time.isoformat(),
+            "observed_at": observed.isoformat(),
+            "modeled_bid": float(modeled_bid),
+            "modeled_ask": float(modeled_ask),
+            "actual_bid": float(actual_bid),
+            "actual_ask": float(actual_ask),
+            "executable_delta_pips": float(abs(actual_executable - modeled_executable) / pip_size),
+            "spread_delta_pips": float(
+                ((actual_ask - actual_bid) - (modeled_ask - modeled_bid)) / pip_size
+            ),
+            "evidence": dict(evidence),
+        }
+        record_sha = _record_hash(payload)
+        existing = self.connection.execute(
+            "SELECT record_sha256 FROM simulated_trade_quote_reconciliations "
+            "WHERE trade_id = ? AND leg = ?",
+            (identifier, normalized_leg),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["record_sha256"]) != record_sha:
+                raise ImmutableVirtualRecordConflict(
+                    "modeled quote reconciliation already exists with different content"
+                )
+            return {"inserted": False, **payload}
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO simulated_trade_quote_reconciliations(
+                    reconciliation_id, trade_id, leg, modeled_event_time_ns,
+                    actual_event_time_ns, observed_at_ns, modeled_bid, modeled_ask,
+                    actual_bid, actual_ask, executable_delta_pips,
+                    spread_delta_pips, evidence_json, record_sha256, writer_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _stable_id("quote-reconciliation", payload),
+                    identifier,
+                    normalized_leg,
+                    _to_ns(modeled_time),
+                    _to_ns(actual_time),
+                    _to_ns(observed),
+                    float(modeled_bid),
+                    float(modeled_ask),
+                    float(actual_bid),
+                    float(actual_ask),
+                    payload["executable_delta_pips"],
+                    payload["spread_delta_pips"],
+                    _json(payload["evidence"]),
+                    record_sha,
+                    writer_id,
+                ),
+            )
+        return {"inserted": True, **payload}
+
     def _safety_learning_gate_reason(
         self,
         decision: Mapping[str, object],
@@ -5314,6 +5931,8 @@ class VirtualPortfolioStore:
             "model_sha256": str(row["model_sha256"]),
             "policy_sha256": str(row["policy_sha256"]),
         }
+        if "execution_assessment_json" in row.keys():
+            result["execution_assessment"] = json.loads(str(row["execution_assessment_json"]))
         if "open_known_at_ns" in row.keys():
             result["open_known_at"] = _from_ns(int(row["open_known_at_ns"])).isoformat()
             result["open_known_at_basis"] = str(row["known_at_basis"])
@@ -5324,9 +5943,11 @@ class VirtualPortfolioStore:
 
         rows = self.connection.execute("""
             SELECT o.*, k.open_known_at_ns, k.known_at_basis,
+                   a.assessment_json AS execution_assessment_json,
                    d.decision_time_ns, d.decision_json
             FROM simulated_trade_opens o
             JOIN simulated_trade_open_observations k ON k.trade_id = o.trade_id
+            JOIN simulated_trade_execution_assessments a ON a.trade_id = o.trade_id
             JOIN decision_records d ON d.decision_id = o.decision_id
             LEFT JOIN simulated_trade_closes c ON c.trade_id = o.trade_id
             WHERE c.trade_id IS NULL
@@ -5585,14 +6206,16 @@ def open_virtual_portfolio_writer(
             ) from error
         connection = _connect(target)
         try:
+            requested_writer_id = _required_text(writer_id, "writer_id")
+            _assert_writer_authority(connection, requested_writer_id)
             _initialize(
                 connection,
-                writer_id=_required_text(writer_id, "writer_id"),
+                writer_id=requested_writer_id,
             )
             yield VirtualPortfolioStore(
                 path=target,
                 connection=connection,
-                writer_id=_required_text(writer_id, "writer_id"),
+                writer_id=requested_writer_id,
             )
         finally:
             connection.close()

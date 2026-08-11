@@ -21,8 +21,10 @@ from typing import Any
 
 from data_platform.collect.contract import CollectedQuote, QualityState, QuoteContractError
 
+from .decision_price_anchor import ANCHOR_CONTRACT, anchor_from_price_frame
 from .quote_tape_index import QuoteIndexError, load_indexed_quote_payloads
 from .virtual_portfolio import (
+    MODELED_SNAPSHOT_EXECUTION_MODE,
     PositionMarkRequest,
     QuoteSnapshot,
     TradeCloseRequest,
@@ -674,7 +676,10 @@ def _close_request(
             "cost_policy_sha256": cost_policy.sha256,
             "cost_policy": asdict(cost_policy),
         },
-        **costs,
+        slippage_cost_jpy=costs["slippage_cost_jpy"],
+        commission_jpy=costs["commission_jpy"],
+        financing_jpy=costs["financing_jpy"],
+        conversion_cost_jpy=costs["conversion_cost_jpy"],
     )
 
 
@@ -767,7 +772,10 @@ def _session_close_request(
             conversion_available_time=conversion_available_time,
         ),
         replay_evidence=evidence,
-        **costs,
+        slippage_cost_jpy=costs["slippage_cost_jpy"],
+        commission_jpy=costs["commission_jpy"],
+        financing_jpy=costs["financing_jpy"],
+        conversion_cost_jpy=costs["conversion_cost_jpy"],
     )
 
 
@@ -853,6 +861,7 @@ def run_replay_cycle(
     quote_index: str | Path | None = None,
     as_of: datetime,
     cost_policy: VirtualReplayCostPolicy | None = None,
+    admission_rejection_reasons: list[str] | None = None,
 ) -> dict[str, object]:
     """Open queued decisions and settle mature trades in event-time order."""
 
@@ -864,6 +873,7 @@ def run_replay_cycle(
     pre_abstained = 0
     pre_waiting = 0
     pre_conflicts: list[dict[str, str]] = []
+    admission_reasons = list(admission_rejection_reasons or [])
     for intake in initial_pending:
         raw_decision = intake["decision"]
         assert isinstance(raw_decision, Mapping)
@@ -878,6 +888,21 @@ def run_replay_cycle(
         )
         assignment = classify_virtual_horizon(decision.get("timeframe"))
         if assignment["capacity_eligible"] is True:
+            if admission_reasons:
+                try:
+                    result = store.process_decision(
+                        decision,
+                        observed_at=_aware(intake["observed_at"], "observed_at"),
+                        additional_rejection_reasons=admission_reasons,
+                    )
+                    if result["inserted"] and result["disposition"] == "abstained":
+                        pre_abstained += 1
+                except Exception as error:
+                    pre_waiting += 1
+                    pre_conflicts.append(
+                        {"record_id": str(intake["decision_id"]), "error": str(error)}
+                    )
+                continue
             pending.append({**intake, "decision": decision})
             continue
         try:
@@ -895,7 +920,15 @@ def run_replay_cycle(
                     "error": str(error),
                 }
             )
-    open_trades = store.open_trade_details()
+    open_trades = []
+    for trade in store.open_trade_details():
+        assessment = trade.get("execution_assessment")
+        if (
+            isinstance(assessment, Mapping)
+            and assessment.get("execution_mode") == MODELED_SNAPSHOT_EXECUTION_MODE
+        ):
+            continue
+        open_trades.append(trade)
     session_request = store.pending_session_close_request(as_of=moment)
     session_close_cutoff = (
         _aware(session_request["cutoff_time"], "session close cutoff")
@@ -1084,12 +1117,29 @@ def run_replay_cycle(
             else:
                 waiting += 1
             continue
+        price_frame = decision.get("price_frame")
+        if isinstance(price_frame, Mapping):
+            price_anchor = anchor_from_price_frame(
+                price_frame,
+                direction=direction,
+                decision_time=decision_time,
+                tick_event_time=entry.event_time,
+                tick_bid=entry.bid,
+                tick_ask=entry.ask,
+            )
+        else:
+            price_anchor = {
+                "contract": ANCHOR_CONTRACT,
+                "status": "rejected",
+                "reason": "missing_price_frame",
+            }
         payload = {
             "decision": dict(decision),
             "observed_at": observed_at,
             "entry": entry,
             "conversion_rate": conversion_rate,
             "conversion_source": conversion_source,
+            "price_anchor": price_anchor,
         }
         heapq.heappush(events, (entry.event_time, 1, serial, "open", payload))
         serial += 1
@@ -1131,10 +1181,12 @@ def run_replay_cycle(
             entry_value = payload.get("entry")
             rate_value = payload.get("conversion_rate")
             source_value = payload.get("conversion_source")
+            anchor_value = payload.get("price_anchor")
             assert isinstance(decision_value, Mapping)
             assert isinstance(observed_value, datetime)
             assert isinstance(entry_value, ReplayTick)
             assert isinstance(source_value, str)
+            assert isinstance(anchor_value, Mapping)
             result = store.process_decision(
                 decision_value,
                 quote=entry_value.snapshot(),
@@ -1143,6 +1195,7 @@ def run_replay_cycle(
                 quote_conversion_source=source_value,
                 historical_replay=True,
                 replay_as_of=moment,
+                price_anchor=anchor_value,
             )
             if result["inserted"] and result["disposition"] == "opened":
                 opened += 1

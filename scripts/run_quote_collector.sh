@@ -46,7 +46,9 @@ if [ "$permissions" != "600" ]; then
 fi
 
 set +e
-"$PYTHON" "$ROOT/tools/fx_quote_collector.py" --env-file "$ENV_FILE" "$@"
+env -u PYTHONHOME -u PYTHONPATH \
+  "$PYTHON" -I -S -B -X pycache_prefix=/dev/null \
+  "$ROOT/tools/fx_quote_collector.py" --env-file "$ENV_FILE" "$@"
 code=$?
 set -e
 

@@ -18,7 +18,7 @@ from fx_backtester.experiment_pipeline import (
 from fx_backtester.failures import FailureReason, TypedFailure
 from fx_backtester.promotion_policy import parse_promotion_policy
 
-from test_experiment_pipeline import COMMIT, _manifest_dict, _write_prices
+from tests.test_experiment_pipeline import COMMIT, _manifest_dict, _write_prices
 
 POLICY_PAYLOAD: dict[str, Any] = {
     "min_net_expectancy_r": 0.0,

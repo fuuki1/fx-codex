@@ -113,6 +113,7 @@ class DecisionChecklist:
     position_units: float | None = None  # ポジションサイズ(通貨単位/ロット)
     expectancy_source: str = ""
     probability_calibrated: bool = False
+    terminalization: dict[str, object] = field(default_factory=dict)
 
     @property
     def blocked(self) -> bool:
@@ -137,8 +138,69 @@ class DecisionChecklist:
             "position_units": self.position_units,
             "expectancy_source": self.expectancy_source,
             "probability_calibrated": self.probability_calibrated,
+            "terminalization": dict(self.terminalization),
             "steps": [step.to_dict() for step in self.steps],
         }
+
+
+def terminalize_blocked_plan(
+    plan: TradePlan,
+    checklist: DecisionChecklist,
+) -> TradePlan:
+    """Make every checklist block terminal while preserving the counterfactual plan.
+
+    The checklist used to be display-only, which allowed a directional plan to
+    reach the virtual portfolio even when spread, expectancy, cost, or
+    operational freshness was ``block``.  The analytical proposal remains in
+    ``terminalization.counterfactual`` for research, but the as-run decision is
+    always neutral and carries no executable levels.
+    """
+
+    blocked_steps = [step for step in checklist.steps if step.status == "block"]
+    counterfactual = {
+        "direction": plan.direction,
+        "conviction": plan.conviction,
+        "stop": plan.stop,
+        "target1": plan.target1,
+        "target2": plan.target2,
+        "planned_risk_distance": plan.planned_risk_distance,
+        "price_frame": dict(plan.price_frame),
+    }
+    checklist.terminalization = {
+        "contract": "decision-pipeline-terminal-v1",
+        "blocked": bool(blocked_steps),
+        "blocked_by": [step.key for step in blocked_steps],
+        "as_run_direction": "neutral" if blocked_steps else plan.direction,
+        "counterfactual": counterfactual,
+    }
+    if not blocked_steps:
+        plan.checklist = checklist.to_dict()
+        return plan
+
+    known_gates = {
+        str(row.get("gate"))
+        for row in plan.gate_trace
+        if isinstance(row, Mapping) and row.get("gate")
+    }
+    for step in blocked_steps:
+        gate = f"decision_pipeline:{step.key}"
+        if gate not in known_gates:
+            plan.gate_trace.append(
+                {
+                    "gate": gate,
+                    "status": "blocked",
+                    "reason": step.note,
+                    "terminal": True,
+                }
+            )
+    plan.direction = "neutral"
+    plan.conviction = 0
+    plan.stop = None
+    plan.target1 = None
+    plan.target2 = None
+    plan.planned_risk_distance = None
+    plan.checklist = checklist.to_dict()
+    return plan
 
 
 # --- 個別ステップの純粋関数(テストしやすいよう外だし) -----------------------
@@ -684,6 +746,7 @@ def run_pipeline(
         operational_data_ok=operational_data_ok,
         operational_data_reason=operational_data_reason,
     )
+    terminalize_blocked_plan(plan, checklist)
     return plan, checklist
 
 

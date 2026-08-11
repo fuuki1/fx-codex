@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
+import random
 import sqlite3
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -26,7 +27,9 @@ from fx_intel.virtual_portfolio import (
     TradeCloseRequest,
     VirtualPortfolioError,
     VirtualPortfolioPolicy,
+    _OPEN_INSERT_KEYS,
     _classify_label_quality,
+    _record_hash,
     classify_sizing_invariants,
     five_x_virtual_portfolio_policy,
     open_virtual_portfolio_reader,
@@ -120,11 +123,15 @@ def _cycle_args(tmp_path, database):
     decisions.write_text(json.dumps({"events": []}), encoding="utf-8")
     return SimpleNamespace(
         db=database,
-        writer_id="cycle-test",
+        as_run_db=tmp_path / "as_run.sqlite3",
+        counterfactual_db=tmp_path / "counterfactual.sqlite3",
+        writer_id="test",
         decisions=decisions,
         closes=tmp_path / "missing-closes.json",
+        snapshot_prices=tmp_path / "missing-snapshots.jsonl",
         quotes=tmp_path / "missing-quotes.jsonl",
         quote_index=None,
+        heartbeat_config=None,
         close_session=False,
         audit_run_root=tmp_path / "runs",
         no_audit_artifact=True,
@@ -159,6 +166,155 @@ def test_initialize_is_idempotent_and_reader_is_query_only(tmp_path) -> None:
             )
 
 
+def test_initialized_ledger_rejects_a_second_writer_identity(tmp_path) -> None:
+    path, _ = _initialized(tmp_path)
+
+    with pytest.raises(VirtualPortfolioError, match="not authorized"):
+        with open_virtual_portfolio_writer(path, writer_id="second-service"):
+            pass
+
+
+def test_open_transaction_rolls_back_decision_anchor_and_capacity_on_insert_failure(
+    tmp_path,
+) -> None:
+    path, policy = _initialized(tmp_path)
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        store.connection.execute("""
+            CREATE TRIGGER injected_open_failure
+            BEFORE INSERT ON simulated_trade_opens
+            BEGIN
+                SELECT RAISE(ABORT, 'injected open failure');
+            END
+            """)
+        with pytest.raises(sqlite3.IntegrityError, match="injected open failure"):
+            store.process_decision(
+                _decision(policy, decision_id="atomic-open"),
+                quote=_quote(record_id="atomic-open-quote"),
+                observed_at=START,
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+                price_anchor=_anchor_payload(
+                    anchor_event_time=(START - timedelta(seconds=2)).isoformat(),
+                    anchor_lag_seconds=0.0,
+                    target="151.02",
+                    target_rr="2.0",
+                ),
+            )
+        counts = {
+            table: int(store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in (
+                "decision_records",
+                "decision_price_anchors",
+                "simulated_trade_opens",
+            )
+        }
+
+    assert counts == {
+        "decision_records": 0,
+        "decision_price_anchors": 0,
+        "simulated_trade_opens": 0,
+    }
+
+
+def test_terminal_checklist_block_cannot_open_even_with_valid_quote(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    decision = _decision(policy, decision_id="terminal-block")
+    decision["checklist"] = {
+        "steps": [
+            {
+                "order": 5,
+                "key": "spread",
+                "status": "block",
+                "note": "spread exceeds risk distance",
+            }
+        ]
+    }
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        result = store.process_decision(
+            decision,
+            quote=_quote(record_id="terminal-block-quote"),
+            observed_at=START,
+            quote_to_jpy_rate=1,
+            quote_conversion_source="JPY quote currency",
+        )
+
+    assert result["disposition"] == "abstained"
+    assert any("decision_pipeline:spread" in reason for reason in result["rejection_reasons"])
+
+
+def test_zero_width_stop_is_terminal_before_open(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    decision = _decision(policy, decision_id="zero-stop")
+    decision["stop"] = 150.02
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        result = store.process_decision(
+            decision,
+            quote=_quote(record_id="zero-stop-quote"),
+            observed_at=START,
+            quote_to_jpy_rate=1,
+            quote_conversion_source="JPY quote currency",
+        )
+        open_count = int(
+            store.connection.execute("SELECT COUNT(*) FROM simulated_trade_opens").fetchone()[0]
+        )
+
+    assert result["disposition"] == "abstained"
+    assert open_count == 0
+
+
+def test_jpy_conversion_and_sizing_properties_over_rate_grid(tmp_path) -> None:
+    """Property test: conversion changes units, never the bounded JPY risk."""
+
+    for index, conversion_rate in enumerate((80.0, 100.0, 125.0, 150.0, 200.0)):
+        path, policy = _initialized(tmp_path / str(index))
+        decision = _decision(policy, decision_id=f"eur-{index}")
+        decision.update(symbol="EURUSD", stop=1.0950, target1=1.1100)
+        with open_virtual_portfolio_writer(path, writer_id="test") as store:
+            result = store.process_decision(
+                decision,
+                quote=_quote(bid=1.1000, ask=1.1002, record_id=f"eur-quote-{index}"),
+                observed_at=START,
+                quote_to_jpy_rate=conversion_rate,
+                quote_conversion_source="USDJPY canonical tick",
+            )
+            row = store.connection.execute(
+                "SELECT units, planned_risk_jpy, quote_to_jpy_rate FROM simulated_trade_opens"
+            ).fetchone()
+        assert result["disposition"] == "opened"
+        assert 0 < int(row["planned_risk_jpy"]) <= 5_000
+        assert float(row["quote_to_jpy_rate"]) == conversion_rate
+        expected = int(5_000 / ((1.1002 - 1.0950) * conversion_rate))
+        assert int(row["units"]) == expected
+
+
+def test_sizing_invariant_properties_over_valid_microstructure_grid() -> None:
+    """Property test over reproducible random valid spreads, stops, and rewards."""
+
+    generator = random.Random(20260811)
+    for _ in range(250):
+        entry = Decimal("100") + Decimal(str(generator.uniform(0, 100)))
+        spread = Decimal(str(generator.uniform(0.0001, 0.02)))
+        risk = spread * Decimal(str(generator.uniform(2.01, 20)))
+        reward_to_risk = Decimal(str(generator.uniform(0.25, 9.5)))
+        planned_risk = Decimal("5000")
+        units = (planned_risk / risk).quantize(Decimal("1"))
+        notional = abs(units) * entry
+        equity = max(Decimal("1000000"), notional / Decimal("50"))
+        assessment = classify_sizing_invariants(
+            executable=entry,
+            stop=entry - risk,
+            target=entry + risk * reward_to_risk,
+            bid=entry - spread,
+            ask=entry,
+            units=units,
+            conversion_rate=Decimal("1"),
+            planned_risk_jpy=units * risk,
+            equity_jpy=equity,
+        )
+        assert assessment["canonical"] is True
+        assert assessment["denominator_unstable"] is False
+
+
 def test_five_x_policy_is_append_only_point_in_time_and_keeps_per_trade_risk(
     tmp_path,
 ) -> None:
@@ -174,7 +330,7 @@ def test_five_x_policy_is_append_only_point_in_time_and_keeps_per_trade_risk(
     assert five_x_policy.risk_per_trade_bps == base_policy.risk_per_trade_bps
     assert five_x_policy.daily_target_jpy == base_policy.daily_target_jpy
 
-    with open_virtual_portfolio_writer(path, writer_id="five-x-test") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         opened = store.process_decision(
             _decision(base_policy, decision_id="pre-transition-loss"),
             quote=_quote(record_id="pre-transition-entry"),
@@ -262,7 +418,7 @@ def test_writer_migrates_v6_store_to_append_only_policy_history(tmp_path) -> Non
         with open_virtual_portfolio_reader(path):
             pass
 
-    with open_virtual_portfolio_writer(path, writer_id="v6-migration") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         assert int(store.connection.execute("PRAGMA user_version").fetchone()[0]) == (
             SCHEMA_VERSION
         )
@@ -362,7 +518,7 @@ def test_process_decision_rejects_a_caller_supplied_risk_snapshot(tmp_path) -> N
 
 def test_writer_migrates_v3_store_to_current_additive_tables(tmp_path) -> None:
     path, policy = _initialized(tmp_path)
-    with open_virtual_portfolio_writer(path, writer_id="pre-v4") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         result = store.process_decision(
             _decision(policy, decision_id="pre-v4-decision", timeframe="1d"),
             observed_at=START,
@@ -383,7 +539,7 @@ def test_writer_migrates_v3_store_to_current_additive_tables(tmp_path) -> None:
         with open_virtual_portfolio_reader(path):
             pass
 
-    with open_virtual_portfolio_writer(path, writer_id="migration-test") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         assert not store.initialize_portfolio(policy=policy, created_at=START)
         assert store.pending_decisions() == []
         version = int(store.connection.execute("PRAGMA user_version").fetchone()[0])
@@ -440,7 +596,7 @@ def test_writer_migrates_original_v1_store_to_current_additive_tables(tmp_path) 
         with open_virtual_portfolio_reader(path):
             pass
 
-    with open_virtual_portfolio_writer(path, writer_id="v1-migration") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         version = int(store.connection.execute("PRAGMA user_version").fetchone()[0])
         before = store.audit_virtual_portfolio_v2()
         migration = store.migrate_virtual_portfolio_v2_accounting(
@@ -458,7 +614,7 @@ def test_writer_migrates_original_v1_store_to_current_additive_tables(tmp_path) 
 def test_writer_migrates_v4_open_and_close_knowledge_clocks(tmp_path) -> None:
     path, policy = _initialized(tmp_path)
     close_time = START + timedelta(minutes=1)
-    with open_virtual_portfolio_writer(path, writer_id="pre-v6") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         opened = store.process_decision(
             _decision(policy, decision_id="pre-v6-trade"),
             quote=_quote(record_id="pre-v6-open"),
@@ -491,7 +647,7 @@ def test_writer_migrates_v4_open_and_close_knowledge_clocks(tmp_path) -> None:
         connection.execute("PRAGMA user_version=4")
         connection.commit()
 
-    with open_virtual_portfolio_writer(path, writer_id="v4-migration") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         version = int(store.connection.execute("PRAGMA user_version").fetchone()[0])
         open_observation = store.connection.execute(
             "SELECT * FROM simulated_trade_open_observations"
@@ -548,11 +704,11 @@ def test_schema_v6_observation_hashes_and_append_only_triggers_fail_closed(
         with open_virtual_portfolio_reader(tampered_path):
             pass
     with pytest.raises(VirtualPortfolioError, match="record hash mismatch"):
-        with open_virtual_portfolio_writer(tampered_path, writer_id="must-not-repair"):
+        with open_virtual_portfolio_writer(tampered_path, writer_id="test"):
             pass
 
     audit_path, audit_policy = _initialized(tmp_path / "audit-tampered")
-    with open_virtual_portfolio_writer(audit_path, writer_id="audit-test") as store:
+    with open_virtual_portfolio_writer(audit_path, writer_id="test") as store:
         audited_open = store.process_decision(
             _decision(audit_policy, decision_id="audit-observation-tamper"),
             quote=_quote(record_id="audit-observation-tamper"),
@@ -748,7 +904,7 @@ def test_cycle_keeps_request_pending_when_reconciliation_fails(tmp_path, monkeyp
     path, _ = _initialized(tmp_path)
     cycle_time = START + timedelta(minutes=2)
     session_date = cycle_time.astimezone(ZoneInfo("Asia/Tokyo")).date().isoformat()
-    with open_virtual_portfolio_writer(path, writer_id="fault-injection") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         store.record_session_close_request(
             session_date_jst=session_date,
             requested_at=START + timedelta(minutes=1),
@@ -791,7 +947,7 @@ def test_cycle_does_not_hide_completed_session_with_open_position(tmp_path, monk
     requested_at = START + timedelta(minutes=1)
     cycle_time = START + timedelta(minutes=2)
     session_date = cycle_time.astimezone(ZoneInfo("Asia/Tokyo")).date().isoformat()
-    with open_virtual_portfolio_writer(path, writer_id="fault-injection") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         opened = store.process_decision(
             _decision(policy, decision_id="fault-open"),
             quote=_quote(record_id="fault-open-quote"),
@@ -1034,6 +1190,12 @@ def test_delayed_post_completion_open_is_not_visible_before_replay_as_of(tmp_pat
             quote_conversion_source="JPY quote currency",
             historical_replay=True,
             replay_as_of=replay_as_of,
+            price_anchor=_anchor_payload(
+                anchor_event_time=event_time.isoformat(),
+                anchor_lag_seconds=0.0,
+                target="151.02",
+                target_rr="2.0",
+            ),
         )
         impossible_close_time = event_time + timedelta(seconds=30)
         with pytest.raises(
@@ -1549,7 +1711,7 @@ def test_legacy_unassigned_close_is_excluded_from_intraday_learning_and_kpi(
     finally:
         connection.close()
 
-    with open_virtual_portfolio_writer(path, writer_id="migration-test") as store:
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
         learning = store.export_learning_rows(as_of=close_time)
         snapshot = store.snapshot(now=close_time)
 
@@ -1973,14 +2135,10 @@ def _open_and_close(
     return dict(opened)
 
 
-def test_quarantined_trade_is_excluded_from_every_evaluation_surface(tmp_path) -> None:
-    """Adding a denominator-unstable trade must not move any evaluation output.
-
-    This is the core P0-B guarantee: quarantine is exclusion from the canonical
-    population, not merely down-weighting. The added trade reproduces the
-    production +46.4R geometry (stop inside the spread), which under the old
-    behaviour moved the 50-trade mean from -0.357R to +0.579R.
-    """
+def test_denominator_unstable_trade_is_rejected_before_every_evaluation_surface(
+    tmp_path,
+) -> None:
+    """A collapsed stop denominator must never create a simulated open."""
 
     baseline_path, policy = _initialized(tmp_path / "baseline")
     with open_virtual_portfolio_writer(baseline_path, writer_id="test") as store:
@@ -2013,33 +2171,35 @@ def test_quarantined_trade_is_excluded_from_every_evaluation_surface(tmp_path) -
             exit_bid=150.30,
             exit_ask=150.32,
         )
-        # Stop 0.005 inside a 0.02 spread: the production denominator collapse.
-        outlier = _open_and_close(
-            store,
+        decision = _decision(
             policy2,
             decision_id="outlier-1",
-            moment=START + timedelta(minutes=2),
-            stop=150.015,
-            target=150.10,
-            bid=150.00,
-            ask=150.02,
-            exit_bid=150.10,
-            exit_ask=150.12,
+            prediction_time=START + timedelta(minutes=2),
+        )
+        decision["stop"] = 150.015
+        decision["target1"] = 150.10
+        outlier = store.process_decision(
+            decision,
+            quote=_quote(
+                moment=START + timedelta(minutes=2),
+                bid=150.00,
+                ask=150.02,
+                record_id="entry-outlier-1",
+            ),
+            observed_at=START + timedelta(minutes=2),
+            quote_to_jpy_rate=1,
+            quote_conversion_source="JPY quote currency",
         )
         outlier_learning = store.export_learning_rows(as_of=START + timedelta(minutes=5))
         outlier_snapshot = store.snapshot(now=START + timedelta(minutes=5))
 
-    # The outlier really was opened and really was quarantined. The assessment
-    # is persisted on the open record (inside record_sha256), not returned.
+    assert outlier["disposition"] == "abstained"
+    assert outlier["trade_id"] is None
+    assert any(
+        "sizing invariant rejected before open" in row for row in outlier["rejection_reasons"]
+    )
     with sqlite3.connect(with_outlier_path) as raw:
-        raw.row_factory = sqlite3.Row
-        stored = raw.execute(
-            "SELECT components_json FROM simulated_trade_opens WHERE trade_id = ?",
-            (str(outlier["trade_id"]),),
-        ).fetchone()
-    sizing = json.loads(stored["components_json"])["sizing_invariants"]
-    assert sizing["canonical"] is False
-    assert sizing["denominator_unstable"] is True
+        assert int(raw.execute("SELECT COUNT(*) FROM simulated_trade_opens").fetchone()[0]) == 1
 
     # Learning export: identical row count and identical net-R values.
     assert outlier_learning["row_count"] == baseline_learning["row_count"]
@@ -2067,29 +2227,28 @@ def test_quarantined_trade_is_excluded_from_every_evaluation_surface(tmp_path) -
     )
 
 
-def test_quarantined_losses_do_not_arm_the_safety_gate(tmp_path) -> None:
-    """A quarantined loss must not count toward the consecutive-loss veto.
-
-    The gate exists to stop genuine losing streaks. Feeding it trades whose R
-    unit is meaningless would let sizing defects drive risk decisions.
-    """
+def test_rejected_sizing_attempts_do_not_arm_the_safety_gate(tmp_path) -> None:
 
     path, policy = _initialized(tmp_path)
     with open_virtual_portfolio_writer(path, writer_id="test") as store:
         for index in range(3):
-            _open_and_close(
-                store,
+            moment = START + timedelta(days=index)
+            decision = _decision(
                 policy,
                 decision_id=f"quarantined-loss-{index}",
-                moment=START + timedelta(days=index),
-                stop=150.015,
-                target=150.10,
-                bid=150.00,
-                ask=150.02,
-                exit_bid=150.018,
-                exit_ask=150.038,
+                prediction_time=moment,
             )
-        next_moment = START + timedelta(days=4)
+            decision["stop"] = 150.015
+            decision["target1"] = 150.10
+            rejected = store.process_decision(
+                decision,
+                quote=_quote(moment=moment, record_id=f"rejected-{index}"),
+                observed_at=moment,
+                quote_to_jpy_rate=1,
+                quote_conversion_source="JPY quote currency",
+            )
+            assert rejected["disposition"] == "abstained"
+        next_moment = START + timedelta(days=5)
         following = store.process_decision(
             _decision(policy, decision_id="after-quarantined", prediction_time=next_moment),
             quote=_quote(moment=next_moment, record_id="after-quarantined-entry"),
@@ -2101,6 +2260,7 @@ def test_quarantined_losses_do_not_arm_the_safety_gate(tmp_path) -> None:
     assert not any(
         reason.startswith("学習安全ゲート:") for reason in following["rejection_reasons"]
     )
+    assert following["disposition"] == "opened"
 
 
 def test_label_quality_reports_the_largest_unobserved_gap(tmp_path) -> None:
@@ -2200,8 +2360,8 @@ def test_backfilled_verdict_excludes_legacy_trades_from_evaluation(tmp_path) -> 
             policy,
             decision_id="legacy-unstable",
             moment=START,
-            stop=150.015,
-            target=150.10,
+            stop=149.50,
+            target=150.50,
             bid=150.00,
             ask=150.02,
             exit_bid=150.10,
@@ -2211,9 +2371,20 @@ def test_backfilled_verdict_excludes_legacy_trades_from_evaluation(tmp_path) -> 
     # Simulate a pre-P0-C row: drop the sidecar verdict and force the stored
     # column back to eligible, which is exactly the legacy on-disk shape.
     with sqlite3.connect(path) as raw:
+        raw.row_factory = sqlite3.Row
+        raw.execute("DROP TRIGGER simulated_trade_opens_no_update")
         raw.execute("DROP TRIGGER simulated_trade_closes_no_update")
+        raw.execute("DROP TRIGGER simulated_trade_sizing_assessments_no_delete")
         raw.execute("DELETE FROM simulated_trade_sizing_assessments")
+        raw.execute("UPDATE simulated_trade_opens SET stop_price = 150.015, target_price = 150.10")
+        opened = raw.execute("SELECT * FROM simulated_trade_opens").fetchone()
+        open_payload = {key: opened[key] for key in _OPEN_INSERT_KEYS if key != "record_sha256"}
+        raw.execute(
+            "UPDATE simulated_trade_opens SET record_sha256 = ?",
+            (_record_hash(open_payload),),
+        )
         raw.execute("UPDATE simulated_trade_closes SET learning_eligible = 1")
+        raw.execute("PRAGMA user_version=8")
         raw.commit()
 
     with sqlite3.connect(path) as raw:

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fx-codex.operational-sync</string>
+  <!-- Existing JSONL remains authoritative. This job updates only the shadow
+       SQLite projection and is deliberately absent from install_launchd.sh. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__OPERATIONAL_PYTHON__</string>
+    <string>__FX_ROOT__/tools/operational_store_scheduled.py</string>
+    <string>sync</string>
+    <string>--db</string><string>__OPERATIONAL_DB__</string>
+    <string>--decisions</string><string>__FX_ROOT__/logs/briefing_decisions.jsonl</string>
+    <string>--prices</string><string>__FX_ROOT__/logs/briefing_tf_prices.jsonl</string>
+    <string>--evidence-dir</string><string>__OPERATIONAL_EVIDENCE_DIR__</string>
+  </array>
+  <key>WorkingDirectory</key><string>__FX_ROOT__</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>3</integer></dict>
+    <dict><key>Minute</key><integer>8</integer></dict>
+    <dict><key>Minute</key><integer>13</integer></dict>
+    <dict><key>Minute</key><integer>18</integer></dict>
+    <dict><key>Minute</key><integer>23</integer></dict>
+    <dict><key>Minute</key><integer>28</integer></dict>
+    <dict><key>Minute</key><integer>33</integer></dict>
+    <dict><key>Minute</key><integer>38</integer></dict>
+    <dict><key>Minute</key><integer>43</integer></dict>
+    <dict><key>Minute</key><integer>48</integer></dict>
+    <dict><key>Minute</key><integer>53</integer></dict>
+    <dict><key>Minute</key><integer>58</integer></dict>
+  </array>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/operational-sync.out.log</string>
+  <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/operational-sync.err.log</string>
+</dict>
+</plist>

@@ -4019,10 +4019,11 @@ function renderPortfolioTradeDetail(trade) {
 function renderVirtualPortfolio(data) {
   const portfolio = data.virtual_portfolio || {};
   const configured = portfolio.configured === true;
+  const freeSnapshot = portfolio.free_snapshot_simulation || {};
   const banner = $("portfolioReality");
   banner.classList.toggle("is-good", configured);
   banner.classList.toggle("is-waiting", !configured);
-  setText("portfolioMode", "delayed bid/ask replay / broker disconnected");
+  setText("portfolioMode", "無料5分スナップショット仮想取引 / ブローカー未接続");
   setText(
     "portfolioRealityTitle",
     configured ? "100万円の仮想口座を追記専用台帳で監視中" : "仮想口座はまだ初期化されていません",
@@ -4030,7 +4031,9 @@ function renderVirtualPortfolio(data) {
   setText(
     "portfolioRealityBody",
     configured
-      ? "15m/1hだけを既存リスク上限内の仮想取引評価枠にし、4h/1dはポジションを持たない観測専用として記録します。遅延履歴bid/askによる分析で、実時間約定ではありません。"
+      ? `15m/1hを5分価格と保守的な推定スプレッドで暫定約定します。実注文・リアルタイムBid/Askではありません。遅延Bid/Ask照合 ${Number(
+          freeSnapshot.reconciled_bid_ask_legs || 0,
+        )}件 / 待機 ${Number(freeSnapshot.pending_bid_ask_reconciliation_legs || 0)}件。`
       : portfolio.risk_gate?.reason || "tools/virtual_portfolio.py init を実行してください。",
   );
 

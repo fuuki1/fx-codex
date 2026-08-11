@@ -23,25 +23,42 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fx_intel.virtual_portfolio import (  # noqa: E402
+    DEFAULT_WRITER_ID,
     QuoteSnapshot,
     TradeCloseRequest,
     VirtualPortfolioPolicy,
     open_virtual_portfolio_writer,
     portfolio_snapshot,
 )
+from fx_intel.service_heartbeat import (  # noqa: E402
+    evaluate_required_service_heartbeats,
+)
 from fx_intel.market import is_market_open  # noqa: E402
+from fx_intel.free_snapshot_simulation import (  # noqa: E402
+    reconcile_modeled_snapshot_quotes,
+    run_free_snapshot_cycle,
+)
 from fx_intel.virtual_portfolio_replay import run_replay_cycle  # noqa: E402
 from fx_intel.virtual_portfolio_valuation import (  # noqa: E402
     append_synchronized_valuation_from_marks,
     evaluate_shadow_risk_gate_v2,
 )
 
-DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio.sqlite3"
+DEFAULT_AS_RUN_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio.sqlite3"
+DEFAULT_COUNTERFACTUAL_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio_counterfactual.sqlite3"
+DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio_canonical_v2.sqlite3"
 DEFAULT_DECISIONS = REPO_ROOT / "logs" / "briefing_decisions_latest.json"
 DEFAULT_CLOSES = REPO_ROOT / "logs" / "virtual_trade_closes_latest.json"
 DEFAULT_QUOTES = REPO_ROOT / "collect" / "log" / "quotes.jsonl"
+DEFAULT_SNAPSHOT_PRICES = REPO_ROOT / "logs" / "briefing_tf_prices.jsonl"
 DEFAULT_AUDIT_RUN_ROOT = REPO_ROOT / "runs" / "virtual_portfolio"
+DEFAULT_HEARTBEAT_CONFIG = REPO_ROOT / "ops" / "virtual_portfolio_required_heartbeats.json"
 TOKYO = ZoneInfo("Asia/Tokyo")
+
+
+def _scheduled_session_close_due(now: datetime) -> bool:
+    local = now.astimezone(TOKYO)
+    return local.weekday() < 5 and (local.hour, local.minute) >= (17, 30)
 
 
 def _read_json(path: Path) -> Any:
@@ -276,6 +293,77 @@ def _set_five_x_limits(db: Path, writer_id: str) -> dict[str, object]:
         }
 
 
+def _counterfactual_cycle(
+    args: argparse.Namespace,
+    *,
+    events: list[dict[str, object]],
+    batch_id: str,
+    now: datetime,
+) -> dict[str, object]:
+    """Write modeled fills only to the physically separate counterfactual DB."""
+
+    counterfactual_db = getattr(
+        args,
+        "counterfactual_db",
+        args.db.with_name(f"{args.db.stem}_counterfactual.sqlite3"),
+    )
+    with open_virtual_portfolio_writer(counterfactual_db, writer_id=args.writer_id) as store:
+        store.initialize_portfolio(policy=VirtualPortfolioPolicy(), created_at=now)
+        queued = 0
+        conflicts: list[dict[str, str]] = []
+        for event in events:
+            decision = _canonical_decision(event)
+            try:
+                result = store.queue_decision(
+                    decision,
+                    observed_at=now,
+                    source=str(args.decisions.resolve()),
+                    batch_id=batch_id,
+                )
+                queued += int(result["inserted"] is True)
+            except Exception as error:
+                conflicts.append(
+                    {
+                        "record_id": str(decision.get("decision_id") or "unknown"),
+                        "error": str(error),
+                    }
+                )
+        try:
+            simulation = run_free_snapshot_cycle(
+                store,
+                snapshot_log=args.snapshot_prices,
+                as_of=now,
+            )
+        except Exception as error:
+            simulation = {
+                "contract": "free-five-minute-snapshot-simulation-v1",
+                "status": "failed_closed",
+                "opened": 0,
+                "abstained": 0,
+                "closed": 0,
+                "marked": 0,
+                "waiting": len(store.pending_decisions()),
+                "broker_connected": False,
+                "conflicts": [{"record_id": "counterfactual", "error": str(error)}],
+            }
+        reconciliation = reconcile_modeled_snapshot_quotes(
+            store,
+            quote_log=args.quotes,
+            quote_index=args.quote_index,
+            as_of=now,
+        )
+        return {
+            "contract": "virtual-portfolio-counterfactual-ledger-v1",
+            "database": str(counterfactual_db.resolve()),
+            "queued": queued,
+            "simulation": simulation,
+            "delayed_bid_ask_reconciliation": reconciliation,
+            "conflicts": conflicts,
+            "portfolio": store.snapshot(now=now),
+            "broker_connected": False,
+        }
+
+
 def _cycle(args: argparse.Namespace) -> dict[str, object]:
     now = datetime.now(UTC)
     events, batch_id = _latest_events(args.decisions)
@@ -287,6 +375,26 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
     closed = 0
     queued = 0
     conflicts: list[dict[str, str]] = []
+    as_run_db = getattr(
+        args,
+        "as_run_db",
+        args.db.with_name(f"{args.db.stem}_as_run.sqlite3"),
+    )
+    counterfactual_db = getattr(
+        args,
+        "counterfactual_db",
+        args.db.with_name(f"{args.db.stem}_counterfactual.sqlite3"),
+    )
+    if len({args.db.resolve(), as_run_db.resolve(), counterfactual_db.resolve()}) != 3:
+        raise ValueError("As-run, counterfactual, and Canonical v2 databases must be distinct")
+    counterfactual = _counterfactual_cycle(args, events=events, batch_id=batch_id, now=now)
+    heartbeat_config = getattr(args, "heartbeat_config", None)
+    heartbeat_gate = (
+        evaluate_required_service_heartbeats(heartbeat_config, root=REPO_ROOT, now=now)
+        if heartbeat_config is not None
+        else None
+    )
+    admission_reasons = heartbeat_gate.rejection_reasons if heartbeat_gate is not None else []
     with open_virtual_portfolio_writer(args.db, writer_id=args.writer_id) as store:
         store.initialize_portfolio(policy=VirtualPortfolioPolicy(), created_at=now)
         session_date = now.astimezone(TOKYO).date().isoformat()
@@ -302,7 +410,12 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
             },
         )
         existing_pending_close = store.pending_session_close_request(as_of=now)
-        requested_now = bool(args.close_session or (not market_open and store.open_trade_details()))
+        integrated_close_due = _scheduled_session_close_due(now)
+        requested_now = bool(
+            args.close_session
+            or integrated_close_due
+            or (not market_open and store.open_trade_details())
+        )
         if (
             requested_now
             and existing_pending_close is None
@@ -314,8 +427,8 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
                 cutoff_time=now,
                 detail={
                     "source": (
-                        "scheduled_session_close"
-                        if args.close_session
+                        "single_writer_integrated_session_close"
+                        if (args.close_session or integrated_close_due)
                         else "market_closed_safety_close"
                     ),
                     "market_open": market_open,
@@ -361,6 +474,7 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
                 quote_log=args.quotes,
                 quote_index=args.quote_index,
                 as_of=now,
+                admission_rejection_reasons=admission_reasons,
             )
         except Exception as error:
             replay = {
@@ -489,6 +603,15 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
         "closed": closed,
         "session_close_status": session_close_status,
         "session_close_request": session_close_request,
+        "ledgers": {
+            "as_run": {"database": str(as_run_db.resolve()), "read_only": True},
+            "counterfactual": {"database": str(counterfactual_db.resolve())},
+            "canonical_v2": {"database": str(args.db.resolve())},
+        },
+        "required_service_heartbeats": (
+            heartbeat_gate.to_dict() if heartbeat_gate is not None else {"status": "test_bypass"}
+        ),
+        "counterfactual": counterfactual,
         "replay": replay,
         "conflicts": conflicts,
         "portfolio": snapshot,
@@ -547,7 +670,9 @@ def _value(args: argparse.Namespace) -> dict[str, object]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analysis-only, append-only virtual FX portfolio")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
-    parser.add_argument("--writer-id", default="virtual-portfolio-cli")
+    parser.add_argument("--as-run-db", type=Path, default=DEFAULT_AS_RUN_DB)
+    parser.add_argument("--counterfactual-db", type=Path, default=DEFAULT_COUNTERFACTUAL_DB)
+    parser.add_argument("--writer-id", default=DEFAULT_WRITER_ID)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="initialize the fixed JPY 1,000,000 portfolio")
     commands.add_parser(
@@ -557,6 +682,18 @@ def _parser() -> argparse.ArgumentParser:
     cycle = commands.add_parser("cycle", help="record the latest decision batch fail-closed")
     cycle.add_argument("--decisions", type=Path, default=DEFAULT_DECISIONS)
     cycle.add_argument("--closes", type=Path, default=DEFAULT_CLOSES)
+    cycle.add_argument(
+        "--snapshot-prices",
+        type=Path,
+        default=DEFAULT_SNAPSHOT_PRICES,
+        help="append-only five-minute midpoint snapshot JSONL",
+    )
+    cycle.add_argument(
+        "--heartbeat-config",
+        type=Path,
+        default=DEFAULT_HEARTBEAT_CONFIG,
+        help="required service output heartbeat contract",
+    )
     cycle.add_argument(
         "--quotes",
         type=Path,

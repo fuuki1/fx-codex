@@ -1,0 +1,70 @@
+{
+  "contract": "raw-ledger-collector-environment-lock-v1",
+  "environment": {
+    "contract": "raw-ledger-collector-environment-v1",
+    "distributions": [
+      {
+        "file_count": 12,
+        "files_sha256": "3ae7a0fbdc2e7e533cc0d7237f848788118bd5587e9ad2340f7c42e14fb17606",
+        "name": "certifi",
+        "version": "2026.6.17"
+      },
+      {
+        "file_count": 25,
+        "files_sha256": "6725d42d9f24fef1300699e46416fbdbb6decc267afc3d65c0c368a89c89cf5b",
+        "name": "charset-normalizer",
+        "version": "3.4.7"
+      },
+      {
+        "file_count": 19,
+        "files_sha256": "a4eba09417be1dd88c76c79d77acc657f5ef20cf32445ecd6a449e1556890d33",
+        "name": "idna",
+        "version": "3.18"
+      },
+      {
+        "file_count": 28,
+        "files_sha256": "9fd3b09aa8b9c35e97d956d500ed6e1f646e7b76357f7af847186a1938762775",
+        "name": "requests",
+        "version": "2.34.2"
+      },
+      {
+        "file_count": 44,
+        "files_sha256": "3bb5922303fe8e746e28cc6e69fdc59ad1f3a57c1fa3e38b15b0490e9d02a849",
+        "name": "urllib3",
+        "version": "2.7.0"
+      }
+    ],
+    "loaded_modules": [
+      {
+        "distribution": "certifi",
+        "module": "certifi",
+        "origin": "lib/python3.12/site-packages/certifi/__init__.py",
+        "origin_sha256": "f96d51ff2f1609a4a44f5b5d8eec47ff34c1658d581fac5081d3759db05a8ce1"
+      },
+      {
+        "distribution": "charset-normalizer",
+        "module": "charset_normalizer",
+        "origin": "lib/python3.12/site-packages/charset_normalizer/__init__.py",
+        "origin_sha256": "38a47146fd99867aa4d34b6a90dd1cd41b498e6d7ae5f5972f2744e7620ab877"
+      },
+      {
+        "distribution": "idna",
+        "module": "idna",
+        "origin": "lib/python3.12/site-packages/idna/__init__.py",
+        "origin_sha256": "30fa8d0cb65b5ea19a35d5f1005862a853ca1105e3bb68cd42109ecbafb97893"
+      },
+      {
+        "distribution": "requests",
+        "module": "requests",
+        "origin": "lib/python3.12/site-packages/requests/__init__.py",
+        "origin_sha256": "311157e7fa4aa9166c827d5237e6fd694eeb5ca549ee40e2e90f89f21abcd56e"
+      },
+      {
+        "distribution": "urllib3",
+        "module": "urllib3",
+        "origin": "lib/python3.12/site-packages/urllib3/__init__.py",
+        "origin_sha256": "24ca35b60d67215d40789daf10d0bf4f17e5d1ee61e86ce5f43195935ad645ba"
+      }
+    ]
+  }
+}
