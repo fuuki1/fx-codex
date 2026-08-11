@@ -80,7 +80,8 @@ def test_reviewed_collector_environment_lock_matches_installed_files() -> None:
 def test_collector_environment_lock_rejects_tampering(tmp_path: Path) -> None:
     source = REPO_ROOT / COLLECTOR_ENVIRONMENT_LOCK_PATH
     payload = json.loads(source.read_text(encoding="utf-8"))
-    payload["environment"]["distributions"][0]["version"] = "tampered"
+    for environment in payload["environments"]:
+        environment["distributions"][0]["version"] = "tampered"
     lock = tmp_path / "collector-environment.lock.json"
     lock.write_text(json.dumps(payload), encoding="utf-8")
 

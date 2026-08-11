@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 COLLECTOR_ENVIRONMENT_CONTRACT = "raw-ledger-collector-environment-v1"
-COLLECTOR_ENVIRONMENT_LOCK_CONTRACT = "raw-ledger-collector-environment-lock-v1"
+COLLECTOR_ENVIRONMENT_LOCK_CONTRACT = "raw-ledger-collector-environment-lock-v2"
 COLLECTOR_ENVIRONMENT_LOCK_PATH = "ops/raw_ledger_collector_environment.lock.json"
 COLLECTOR_DISTRIBUTIONS = (
     "certifi",
@@ -281,11 +281,17 @@ def verified_collector_environment_identity(
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeIdentityError("cannot read collector environment lock") from error
     environment = collector_environment_snapshot(environment_root)
-    expected: dict[str, Any] = {
-        "contract": COLLECTOR_ENVIRONMENT_LOCK_CONTRACT,
-        "environment": environment,
-    }
-    if lock_payload != expected:
+    locked_environments = (
+        lock_payload.get("environments") if isinstance(lock_payload, dict) else None
+    )
+    if (
+        not isinstance(lock_payload, dict)
+        or lock_payload.get("contract") != COLLECTOR_ENVIRONMENT_LOCK_CONTRACT
+        or not isinstance(locked_environments, list)
+        or not locked_environments
+        or any(not isinstance(item, dict) for item in locked_environments)
+        or environment not in locked_environments
+    ):
         raise RuntimeIdentityError("installed collector environment does not match reviewed lock")
     return (
         hashlib.sha256(_canonical_json(environment)).hexdigest(),
