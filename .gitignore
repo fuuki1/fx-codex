@@ -22,9 +22,8 @@ runs/
 research_pack/
 # 学習・監視の実行時ログ(fx_briefing / fx_tf_snapshot / tools/learning_capture /
 # tools/trade_outcome_monitor が書き、ダッシュボードが読む)。実データは追跡せず、
-# 構成の説明(logs/README.md)だけをGit管理する。
+# runtime logsは全てGit管理しない。構成説明はdocs/RUNTIME_LOGS_MANIFEST.mdで管理する。
 logs/*
-!logs/README.md
 trade_log.csv
 trades.csv
 equity.csv
