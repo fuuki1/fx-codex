@@ -9,4 +9,5 @@ mkdir -p logs
   --no-export-events \
   --no-event-archive \
   --technical-cache-only \
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" \
   </dev/null >> logs/fx_horizon.log 2>&1

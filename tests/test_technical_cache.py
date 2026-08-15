@@ -325,3 +325,6 @@ def test_launchd_topology_has_one_network_producer_and_cache_only_consumers() ->
     assert "--technical-cache-only" in (ROOT / "scripts" / "fx_horizon_once.sh").read_text(
         encoding="utf-8"
     )
+    assert "--stage-timing-log" in (ROOT / "scripts" / "fx_horizon_once.sh").read_text(
+        encoding="utf-8"
+    )
