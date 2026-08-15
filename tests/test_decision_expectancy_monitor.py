@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from fx_intel import decision_log
+
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "decision_expectancy_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
 
@@ -33,6 +35,15 @@ def _decision_event(ts: datetime, index: int) -> dict:
         "symbol": "USDJPY",
         "timeframe": "1h",
         "horizon_hours": 1.0,
+        "prediction_time": ts.isoformat(),
+        "source_cutoff": ts.isoformat(),
+        "max_feature_available_time": ts.isoformat(),
+        "pit_eligible": True,
+        "pit_contract": "decision-journal-pit-v2",
+        "producer": "timeframe_raw",
+        "producer_version": "timeframe-journal-v2",
+        "input_context_id": f"context:sha256:{index:064x}",
+        "source_record_ids": [f"source-{index}"],
         "decision": {
             "symbol": "USDJPY",
             "timeframe": "1h",
@@ -72,6 +83,17 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     )
 
 
+def _write_decisions(path: Path, rows: list[dict]) -> None:
+    decision_log.append_decision_transaction(
+        rows,
+        rows,
+        mode="per_timeframe",
+        full_path=path,
+        compact_path=path.parent / "briefing_tf_journal.jsonl",
+        committed_at=NOW,
+    )
+
+
 def _losing_rows(count: int = 25) -> tuple[list[dict], list[dict]]:
     events: list[dict] = []
     prices: list[dict] = []
@@ -97,8 +119,9 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
     outcome_path = tmp_path / "briefing_decision_outcomes.json"
     feedback_path = tmp_path / "briefing_decision_feedback.json"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
+    timing_path = tmp_path / "decision_pipeline_stage_timings.jsonl"
     events, prices = _losing_rows()
-    _write_jsonl(decision_log_path, events)
+    _write_decisions(decision_log_path, events)
     _write_jsonl(prices_path, prices)
 
     result = monitor.run_decision_expectancy_monitor(
@@ -107,6 +130,7 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
         outcome_json_path=outcome_path,
         feedback_json_path=feedback_path,
         monitor_json_path=monitor_path,
+        stage_timing_log=timing_path,
         now=NOW + timedelta(days=5),
     )
 
@@ -121,9 +145,24 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
     assert payload["summary"]["action_counts"]["quality_guard"] == 1
     assert payload["runner"]["decision_event_count"] == 25
     assert outcome_report["scored_outcomes"] == 25
+    assert outcome_report["pit_required"] is True
+    assert outcome_report["pit_contract"] == "decision-journal-pit-v2"
     assert outcome_report["failure_reason_summary"]
     assert feedback["cells"]["USDJPY|1h|long"]["action"] == "quality_guard"
     assert feedback["cells"]["USDJPY|1h|long"]["block"] is False
+    timing_rows = [json.loads(line) for line in timing_path.read_text().splitlines()]
+    assert [row["stage"] for row in timing_rows] == [
+        "decision_log_reader_open",
+        "price_journal_read",
+        "price_health_build",
+        "decision_log_read_and_outcome_score",
+        "decision_feedback_derive",
+        "monitor_snapshot_build",
+        "outcome_report_save",
+        "decision_feedback_save",
+        "monitor_save",
+    ]
+    assert all(row["status"] == "ok" for row in timing_rows)
 
 
 def test_decision_expectancy_monitor_marks_immature_horizon_pending(
@@ -133,7 +172,7 @@ def test_decision_expectancy_monitor_marks_immature_horizon_pending(
     decision_log_path = tmp_path / "briefing_decisions.jsonl"
     prices_path = tmp_path / "briefing_tf_prices.jsonl"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
-    _write_jsonl(decision_log_path, [_decision_event(NOW, 1)])
+    _write_decisions(decision_log_path, [_decision_event(NOW, 1)])
     _write_jsonl(
         prices_path,
         [
@@ -169,7 +208,7 @@ def test_decision_expectancy_monitor_fails_stale_price_series(monitor, tmp_path)
     decision_log_path = tmp_path / "briefing_decisions.jsonl"
     prices_path = tmp_path / "briefing_tf_prices.jsonl"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
-    _write_jsonl(decision_log_path, [_decision_event(NOW, 1)])
+    _write_decisions(decision_log_path, [_decision_event(NOW, 1)])
     _write_jsonl(prices_path, [_price(NOW, 100.0)])
 
     result = monitor.run_decision_expectancy_monitor(
@@ -193,7 +232,7 @@ def test_decision_expectancy_monitor_cli_quiet_returns_exit_code(monitor, tmp_pa
     decision_log_path = tmp_path / "decisions.jsonl"
     prices_path = tmp_path / "prices.jsonl"
     events, prices = _losing_rows()
-    _write_jsonl(decision_log_path, events)
+    _write_decisions(decision_log_path, events)
     _write_jsonl(prices_path, prices)
 
     exit_code = monitor.main(

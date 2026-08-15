@@ -21,7 +21,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fx_intel import decision_feedback, decision_log, journal, trade_outcome  # noqa: E402
+from fx_intel import (  # noqa: E402
+    decision_feedback,
+    decision_log,
+    journal,
+    stage_timing,
+    trade_outcome,
+)
 
 DEFAULT_DECISION_LOG_PATH = REPO_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_TF_PRICES_PATH = REPO_ROOT / "logs" / "briefing_tf_prices.jsonl"
@@ -40,32 +46,53 @@ def run_decision_expectancy_monitor(
     monitor_json_path: Path = DEFAULT_MONITOR_PATH,
     require_sample_ok: bool = False,
     price_stale_minutes: float | None = DEFAULT_PRICE_STALE_MINUTES,
+    stage_timing_log: Path | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Run the full complete-decision expectancy monitoring pass."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    events = list(decision_log.read_decision_events(decision_log_path))
-    price_rows = list(journal.read_entries(prices_path)) if prices_path is not None else []
-    price_health = _price_file_health(
-        prices_path,
-        price_rows,
-        now=generated_at,
-        stale_minutes=price_stale_minutes,
+    timing = stage_timing.StageTimingRecorder(
+        stage_timing_log,
+        pipeline="decision_expectancy_monitor",
+        metadata={
+            "decision_log_path": decision_log_path,
+            "prices_path": prices_path,
+            "generated_at": generated_at,
+        },
     )
-    outcome_report = decision_log.score_decision_events(
-        events,
-        price_entries=price_rows,
-        now=generated_at,
+    with timing.stage("decision_log_reader_open"):
+        events = decision_log.read_decision_events(decision_log_path)
+    with timing.stage("price_journal_read"):
+        price_rows = list(journal.read_entries(prices_path)) if prices_path is not None else []
+    with timing.stage("price_health_build"):
+        price_health = _price_file_health(
+            prices_path,
+            price_rows,
+            now=generated_at,
+            stale_minutes=price_stale_minutes,
+        )
+    with timing.stage("decision_log_read_and_outcome_score", price_row_count=len(price_rows)):
+        outcome_report = decision_log.score_decision_events(
+            events,
+            price_entries=price_rows,
+            now=generated_at,
+            require_pit=True,
+        )
+    input_event_count = outcome_report.get("input_decision_events")
+    decision_event_count = (
+        int(input_event_count) if isinstance(input_event_count, (int, float)) else 0
     )
-    profile = decision_feedback.derive_decision_feedback(outcome_report, now=generated_at)
-    monitor = decision_feedback.build_monitoring_snapshot(
-        profile,
-        outcome_report,
-        now=generated_at,
-        require_sample_ok=require_sample_ok,
-        price_health=price_health,
-    )
+    with timing.stage("decision_feedback_derive"):
+        profile = decision_feedback.derive_decision_feedback(outcome_report, now=generated_at)
+    with timing.stage("monitor_snapshot_build"):
+        monitor = decision_feedback.build_monitoring_snapshot(
+            profile,
+            outcome_report,
+            now=generated_at,
+            require_sample_ok=require_sample_ok,
+            price_health=price_health,
+        )
     monitor["runner"] = {
         "schema": 1,
         "decision_log_path": str(decision_log_path),
@@ -73,17 +100,20 @@ def run_decision_expectancy_monitor(
         "outcome_json_path": str(outcome_json_path) if outcome_json_path else None,
         "feedback_json_path": str(feedback_json_path) if feedback_json_path else None,
         "monitor_json_path": str(monitor_json_path),
-        "decision_event_count": len(events),
+        "decision_event_count": decision_event_count,
         "price_row_count": len(price_rows),
         "require_sample_ok": require_sample_ok,
         "price_stale_minutes": price_stale_minutes,
     }
 
     if outcome_json_path is not None:
-        decision_log.save_outcome_report(outcome_report, outcome_json_path)
+        with timing.stage("outcome_report_save", path=outcome_json_path):
+            decision_log.save_outcome_report(outcome_report, outcome_json_path)
     if feedback_json_path is not None:
-        decision_feedback.save_decision_feedback(profile, feedback_json_path)
-    _write_json_atomic(monitor_json_path, monitor)
+        with timing.stage("decision_feedback_save", path=feedback_json_path):
+            decision_feedback.save_decision_feedback(profile, feedback_json_path)
+    with timing.stage("monitor_save", path=monitor_json_path):
+        _write_json_atomic(monitor_json_path, monitor)
 
     return {
         "exit_code": int(monitor.get("exit_code", 0) or 0),
@@ -93,6 +123,7 @@ def run_decision_expectancy_monitor(
         "outcome_report_path": outcome_json_path,
         "feedback_json_path": feedback_json_path,
         "monitor_json_path": monitor_json_path,
+        "timing": stage_timing.summarize(timing.records),
     }
 
 
@@ -121,6 +152,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--monitor-json", type=Path, default=DEFAULT_MONITOR_PATH)
     parser.add_argument(
+        "--stage-timing-log",
+        type=Path,
+        default=None,
+        help="工程別UTC時刻・monotonic経過時間を追記するJSONLパス",
+    )
+    parser.add_argument(
         "--health-require-sample",
         action="store_true",
         help="最低サンプル数未満をヘルスチェック失敗扱いにする",
@@ -145,6 +182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         monitor_json_path=args.monitor_json,
         require_sample_ok=args.health_require_sample,
         price_stale_minutes=_optional_float(args.price_stale_minutes),
+        stage_timing_log=args.stage_timing_log,
     )
     if not args.quiet:
         _print_summary(result)

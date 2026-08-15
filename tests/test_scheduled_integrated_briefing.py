@@ -23,5 +23,12 @@ def test_scheduled_briefing_uses_integrated_timeframe_payload() -> None:
     assert "tools/fusion_capture_schedule.py" in script
     assert "--minimum-interval-minutes 55" in script
     assert "--no-discord" in fusion_command
+    assert "--defer-decision-scoring" in per_timeframe_command
+    assert "--defer-decision-scoring" in fusion_command
+    assert "--decision-latest-output" not in per_timeframe_command
+    assert (
+        '--decision-latest-output "$PWD/logs/briefing_fusion_decisions_latest.json"'
+        in fusion_command
+    )
     assert "fx_fusion_capture.log" in script
     assert "--symbols USDJPY EURUSD GBPUSD" in fusion_command

@@ -291,7 +291,7 @@ def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) ->
         rc = _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
     assert rc == fx_briefing.NOTIFICATION_FAILURE_EXIT_CODE
     assert tf_journal.exists()
-    rows = [json.loads(line) for line in tf_journal.read_text().splitlines() if line.strip()]
+    rows = list(fx_briefing.journal.read_entries(tf_journal))
     timeframes = {row["timeframe"] for row in rows}
     assert timeframes == {"15m", "1h", "4h", "1d"}
     context_ids = {row["input_context_id"] for row in rows}
@@ -320,12 +320,12 @@ def test_per_timeframe_journal_failure_stops_later_writers(patched_paths, capsys
     with (
         mock.patch.object(
             fx_briefing.journal,
-            "append_timeframe_plans",
+            "build_timeframe_plan_rows",
             side_effect=OSError("read-only"),
         ),
         mock.patch.object(
             fx_briefing.decision_log,
-            "append_decision_events",
+            "append_decision_transaction",
             side_effect=AssertionError("must not run"),
         ),
     ):
@@ -356,17 +356,11 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     assert fx_briefing.DEFAULT_DECISION_LATEST_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.exists()
-    decision_rows = [
-        json.loads(line)
-        for line in fx_briefing.DEFAULT_DECISION_LOG_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    decision_rows = list(
+        fx_briefing.decision_log.read_decision_events(fx_briefing.DEFAULT_DECISION_LOG_PATH)
+    )
     assert {row["timeframe"] for row in decision_rows} == {"15m", "1h", "4h", "1d"}
-    journal_rows = [
-        json.loads(line)
-        for line in tf_journal.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    journal_rows = list(fx_briefing.journal.read_entries(tf_journal))
     assert {row["decision_id"] for row in journal_rows} == {
         row["decision_id"] for row in decision_rows
     }

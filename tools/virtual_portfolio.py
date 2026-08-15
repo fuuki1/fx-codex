@@ -33,6 +33,7 @@ from fx_intel.virtual_portfolio import (  # noqa: E402
 from fx_intel.service_heartbeat import (  # noqa: E402
     evaluate_required_service_heartbeats,
 )
+from fx_intel import stage_timing  # noqa: E402
 from fx_intel.market import is_market_open  # noqa: E402
 from fx_intel.free_snapshot_simulation import (  # noqa: E402
     reconcile_modeled_snapshot_quotes,
@@ -366,8 +367,26 @@ def _counterfactual_cycle(
 
 def _cycle(args: argparse.Namespace) -> dict[str, object]:
     now = datetime.now(UTC)
-    events, batch_id = _latest_events(args.decisions)
-    close_requests = _close_requests(args.closes)
+    timing = stage_timing.StageTimingRecorder(
+        getattr(args, "stage_timing_log", None),
+        pipeline="virtual_portfolio_cycle",
+        metadata={
+            "writer_id": args.writer_id,
+            "database": str(args.db.resolve()),
+            "cycle_observation_time": now,
+        },
+    )
+    with timing.stage("latest_snapshot_read"):
+        events, batch_id = _latest_events(args.decisions)
+        timing.bind(
+            batch_id=batch_id,
+            decision_run_ids=sorted(
+                {str(event.get("run_id")) for event in events if event.get("run_id")}
+            ),
+            decision_event_count=len(events),
+        )
+    with timing.stage("close_request_read"):
+        close_requests = _close_requests(args.closes)
     market_open = is_market_open(now)
     inserted = 0
     opened = 0
@@ -387,16 +406,20 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
     )
     if len({args.db.resolve(), as_run_db.resolve(), counterfactual_db.resolve()}) != 3:
         raise ValueError("As-run, counterfactual, and Canonical v2 databases must be distinct")
-    counterfactual = _counterfactual_cycle(args, events=events, batch_id=batch_id, now=now)
     heartbeat_config = getattr(args, "heartbeat_config", None)
-    heartbeat_gate = (
-        evaluate_required_service_heartbeats(heartbeat_config, root=REPO_ROOT, now=now)
-        if heartbeat_config is not None
-        else None
-    )
+    with timing.stage("required_heartbeat_evaluation"):
+        heartbeat_gate = (
+            evaluate_required_service_heartbeats(heartbeat_config, root=REPO_ROOT, now=now)
+            if heartbeat_config is not None
+            else None
+        )
     admission_reasons = heartbeat_gate.rejection_reasons if heartbeat_gate is not None else []
-    with open_virtual_portfolio_writer(args.db, writer_id=args.writer_id) as store:
-        store.initialize_portfolio(policy=VirtualPortfolioPolicy(), created_at=now)
+    writer_context = open_virtual_portfolio_writer(args.db, writer_id=args.writer_id)
+    with timing.stage("canonical_writer_acquire"):
+        store = writer_context.__enter__()
+    try:
+        with timing.stage("canonical_portfolio_initialize"):
+            store.initialize_portfolio(policy=VirtualPortfolioPolicy(), created_at=now)
         session_date = now.astimezone(TOKYO).date().isoformat()
         store.record_session_event(
             session_date_jst=session_date,
@@ -449,42 +472,53 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
                 continue
             if close_result["inserted"]:
                 closed += 1
-        for event in events:
-            decision = _canonical_decision(event)
+        with timing.stage("canonical_decision_queue", event_count=len(events)) as queue_stage:
+            conflict_count_before_queue = len(conflicts)
+            for event in events:
+                decision = _canonical_decision(event)
+                try:
+                    queue_result = store.queue_decision(
+                        decision,
+                        observed_at=now,
+                        source=str(args.decisions.resolve()),
+                        batch_id=batch_id,
+                    )
+                except Exception as error:  # preserve the rest of the immutable batch
+                    conflicts.append(
+                        {
+                            "decision_id": str(decision.get("decision_id") or "unknown"),
+                            "error": str(error),
+                        }
+                    )
+                    continue
+                if queue_result["inserted"]:
+                    queued += 1
+            if len(conflicts) > conflict_count_before_queue:
+                queue_stage.mark_handled_error("DecisionQueueConflict")
+        with timing.stage("canonical_replay_cycle") as replay_stage:
             try:
-                queue_result = store.queue_decision(
-                    decision,
-                    observed_at=now,
-                    source=str(args.decisions.resolve()),
-                    batch_id=batch_id,
+                replay = run_replay_cycle(
+                    store,
+                    quote_log=args.quotes,
+                    quote_index=args.quote_index,
+                    as_of=now,
+                    admission_rejection_reasons=admission_reasons,
                 )
-            except Exception as error:  # preserve the rest of the immutable batch
-                conflicts.append(
-                    {
-                        "decision_id": str(decision.get("decision_id") or "unknown"),
-                        "error": str(error),
-                    }
-                )
-                continue
-            if queue_result["inserted"]:
-                queued += 1
-        try:
-            replay = run_replay_cycle(
-                store,
-                quote_log=args.quotes,
-                quote_index=args.quote_index,
-                as_of=now,
-                admission_rejection_reasons=admission_reasons,
-            )
-        except Exception as error:
-            replay = {
-                "status": "failed_closed",
-                "opened": 0,
-                "abstained": 0,
-                "closed": 0,
-                "waiting": len(store.pending_decisions()),
-                "conflicts": [{"record_id": "replay", "error": str(error)}],
-            }
+            except Exception as error:
+                replay_stage.mark_handled_error(error)
+                replay = {
+                    "status": "failed_closed",
+                    "opened": 0,
+                    "abstained": 0,
+                    "closed": 0,
+                    "waiting": len(store.pending_decisions()),
+                    "conflicts": [{"record_id": "replay", "error": str(error)}],
+                }
+            replay_stage_conflicts = replay.get("conflicts")
+            if replay.get("status") in {"failed_closed", "partial_failure"} or (
+                isinstance(replay_stage_conflicts, list) and replay_stage_conflicts
+            ):
+                replay_stage.mark_handled_error("ReplayCycleFailedClosed")
         inserted += int(str(replay.get("opened", 0))) + int(str(replay.get("abstained", 0)))
         opened += int(str(replay.get("opened", 0)))
         abstained += int(str(replay.get("abstained", 0)))
@@ -500,7 +534,8 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
             for row in replay_conflicts
             if isinstance(row, Mapping)
         )
-        snapshot = store.snapshot(now=now)
+        with timing.stage("canonical_portfolio_snapshot"):
+            snapshot = store.snapshot(now=now)
         pending_close = store.pending_session_close_request(as_of=now)
         session_request = store.session_close_request(session_date_jst=session_date)
         lifecycle = snapshot.get("session_close_lifecycle")
@@ -589,6 +624,66 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
                     }
                 )
         session_close_request = pending_close or session_request
+    finally:
+        with timing.stage("canonical_writer_release"):
+            writer_context.__exit__(None, None, None)
+    # The counterfactual ledger is explanatory and physically separate.  It must
+    # never consume the bounded admission window before canonical decisions are
+    # durably queued.  Keep the same cycle observation time for comparability,
+    # but run this optional comparison only after releasing the canonical writer.
+    with timing.stage("counterfactual_cycle") as counterfactual_stage:
+        try:
+            counterfactual = _counterfactual_cycle(
+                args,
+                events=events,
+                batch_id=batch_id,
+                now=now,
+            )
+        except Exception as error:
+            # This ledger is explanatory only.  A corrupt/busy comparison DB or
+            # reconciliation failure must stay visible without turning an
+            # already-committed canonical cycle into a failed command and
+            # suppressing its downstream outcome/report artifacts.
+            counterfactual_stage.mark_handled_error(error)
+            counterfactual = {
+                "contract": "virtual-portfolio-counterfactual-ledger-v1",
+                "status": "failed_closed",
+                "database": str(counterfactual_db.resolve()),
+                "queued": 0,
+                "simulation": {
+                    "contract": "free-five-minute-snapshot-simulation-v1",
+                    "status": "failed_closed",
+                    "opened": 0,
+                    "abstained": 0,
+                    "closed": 0,
+                    "marked": 0,
+                    "waiting": 0,
+                    "broker_connected": False,
+                    "conflicts": [{"record_id": "counterfactual", "error": str(error)}],
+                },
+                "delayed_bid_ask_reconciliation": {
+                    "status": "failed_closed",
+                    "conflicts": [{"record_id": "counterfactual", "error": str(error)}],
+                },
+                "conflicts": [{"record_id": "counterfactual", "error": str(error)}],
+                "portfolio": {"status": "unavailable"},
+                "broker_connected": False,
+            }
+        counterfactual_conflicts = counterfactual.get("conflicts")
+        simulation = counterfactual.get("simulation")
+        reconciliation = counterfactual.get("delayed_bid_ask_reconciliation")
+        if (
+            (isinstance(counterfactual_conflicts, list) and counterfactual_conflicts)
+            or (
+                isinstance(simulation, Mapping)
+                and simulation.get("status") in {"failed_closed", "partial_failure"}
+            )
+            or (
+                isinstance(reconciliation, Mapping)
+                and reconciliation.get("status") == "partial_failure"
+            )
+        ):
+            counterfactual_stage.mark_handled_error("CounterfactualCycleFailedClosed")
     result: dict[str, object] = {
         "ok": not conflicts,
         "mode": "offline_simulation",
@@ -615,6 +710,12 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
         "replay": replay,
         "conflicts": conflicts,
         "portfolio": snapshot,
+        "stage_timing": {
+            **stage_timing.summarize(timing.records),
+            "trace_id": timing.trace_id,
+            "log_path": str(timing.path.resolve()) if timing.path is not None else None,
+            "write_error": timing.write_error,
+        },
     }
     if not args.no_audit_artifact:
         result["audit_artifact"] = str(_write_cycle_audit(args.audit_run_root, result))
@@ -716,6 +817,12 @@ def _parser() -> argparse.ArgumentParser:
         "--no-audit-artifact",
         action="store_true",
         help="skip artifact creation for isolated functional tests only",
+    )
+    cycle.add_argument(
+        "--stage-timing-log",
+        type=Path,
+        default=None,
+        help="工程別UTC時刻・monotonic経過時間を追記するJSONLパス",
     )
     close = commands.add_parser("close", help="append one simulated close from validated JSON")
     close.add_argument("--request-json", type=Path, required=True)

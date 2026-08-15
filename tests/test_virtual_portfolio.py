@@ -6,6 +6,7 @@ import json
 import random
 import sqlite3
 from types import SimpleNamespace
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -135,6 +136,7 @@ def _cycle_args(tmp_path, database):
         close_session=False,
         audit_run_root=tmp_path / "runs",
         no_audit_artifact=True,
+        stage_timing_log=tmp_path / "stage_timings.jsonl",
     )
 
 
@@ -932,12 +934,133 @@ def test_cycle_keeps_request_pending_when_reconciliation_fails(tmp_path, monkeyp
 
     assert result["session_close_status"] == "failed_closed_reconciliation"
     assert result["ok"] is False
+    assert result["stage_timing"]["failed_stages"] == [
+        "canonical_replay_cycle",
+        "counterfactual_cycle",
+    ]
+    assert {
+        "latest_snapshot_read",
+        "required_heartbeat_evaluation",
+        "canonical_writer_acquire",
+        "canonical_decision_queue",
+        "canonical_replay_cycle",
+        "canonical_writer_release",
+    } <= set(result["stage_timing"]["elapsed_ms_by_stage"])
     with open_virtual_portfolio_reader(path) as store:
         assert store.pending_session_close_request(as_of=cycle_time) is not None
         assert (
             store.connection.execute("SELECT COUNT(*) FROM session_close_completions").fetchone()[0]
             == 0
         )
+
+
+def test_cycle_timing_marks_handled_replay_failure(tmp_path, monkeypatch) -> None:
+    from tools import virtual_portfolio as cli
+
+    path, _ = _initialized(tmp_path)
+    monkeypatch.setattr(cli, "run_replay_cycle", mock.Mock(side_effect=RuntimeError("replay")))
+
+    result = cli._cycle(_cycle_args(tmp_path, path))
+
+    assert result["replay"]["status"] == "failed_closed"
+    assert "canonical_replay_cycle" in result["stage_timing"]["failed_stages"]
+
+
+def test_cycle_queues_canonical_decisions_before_counterfactual_work(tmp_path) -> None:
+    from tools import virtual_portfolio as cli
+
+    path, _ = _initialized(tmp_path)
+    args = _cycle_args(tmp_path, path)
+
+    cli._cycle(args)
+
+    timing_rows = [
+        json.loads(line)
+        for line in args.stage_timing_log.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    stages = [str(row["stage"]) for row in timing_rows]
+    assert stages.index("latest_snapshot_read") < stages.index("canonical_decision_queue")
+    assert stages.index("canonical_decision_queue") < stages.index("counterfactual_cycle")
+    assert stages.index("canonical_writer_release") < stages.index("counterfactual_cycle")
+
+
+def test_counterfactual_exception_preserves_canonical_cycle(tmp_path, monkeypatch) -> None:
+    from tools import virtual_portfolio as cli
+
+    path, policy = _initialized(tmp_path)
+    args = _cycle_args(tmp_path, path)
+    decision = _decision(policy, decision_id="counterfactual-failure")
+    args.decisions.write_text(
+        json.dumps(
+            {
+                "generated_at": START.isoformat(),
+                "events": [{"decision": decision}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_counterfactual_cycle",
+        mock.Mock(side_effect=RuntimeError("counterfactual unavailable")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_replay_cycle",
+        mock.Mock(
+            return_value={
+                "status": "ok",
+                "opened": 0,
+                "abstained": 0,
+                "closed": 0,
+                "waiting": 1,
+                "conflicts": [],
+            }
+        ),
+    )
+
+    result = cli._cycle(args)
+
+    assert result["ok"] is True
+    assert result["queued_intakes"] == 1
+    assert result["counterfactual"]["status"] == "failed_closed"
+    assert result["counterfactual"]["conflicts"] == [
+        {"record_id": "counterfactual", "error": "counterfactual unavailable"}
+    ]
+    assert result["stage_timing"]["failed_stages"] == ["counterfactual_cycle"]
+    with open_virtual_portfolio_reader(path) as store:
+        assert (
+            store.connection.execute(
+                "SELECT COUNT(*) FROM decision_intakes WHERE decision_id = ?",
+                ("counterfactual-failure",),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_cycle_timing_marks_replay_partial_failure_return(tmp_path, monkeypatch) -> None:
+    from tools import virtual_portfolio as cli
+
+    path, _ = _initialized(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "run_replay_cycle",
+        mock.Mock(
+            return_value={
+                "status": "partial_failure",
+                "opened": 0,
+                "abstained": 0,
+                "closed": 0,
+                "conflicts": [{"record_id": "x", "error": "bad row"}],
+            }
+        ),
+    )
+
+    result = cli._cycle(_cycle_args(tmp_path, path))
+
+    assert result["replay"]["status"] == "partial_failure"
+    assert "canonical_replay_cycle" in result["stage_timing"]["failed_stages"]
 
 
 def test_cycle_does_not_hide_completed_session_with_open_position(tmp_path, monkeypatch) -> None:

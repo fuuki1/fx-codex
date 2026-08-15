@@ -29,6 +29,15 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fx_intel.market import is_market_open  # noqa: E402
 
+_TRANSACTION_METADATA_TYPES = frozenset(
+    {
+        "decision_batch",
+        "decision_cross_log_commit",
+        "decision_cross_log_receipt",
+        "journal_batch_commit",
+    }
+)
+
 
 def read_journal(path: Path) -> list[dict]:
     rows: list[dict] = []
@@ -69,7 +78,12 @@ def audit_journal(
     """重複・欠損・時刻逆転を集計する。"""
     parsed: list[tuple[datetime, str, str]] = []
     unparsable = 0
+    metadata_types: Counter[str] = Counter()
     for row in rows:
+        event_type = str(row.get("event_type") or "")
+        if event_type in _TRANSACTION_METADATA_TYPES:
+            metadata_types[event_type] += 1
+            continue
         ts = _parse_ts(row.get("ts"))
         if ts is None:
             unparsable += 1
@@ -133,6 +147,9 @@ def audit_journal(
 
     return {
         "total_rows": len(rows),
+        "decision_rows": len(parsed),
+        "transaction_metadata_rows": sum(metadata_types.values()),
+        "transaction_metadata_types": dict(sorted(metadata_types.items())),
         "unparsable_ts": unparsable,
         "series_count": len(series),
         "time_reversals": reversals,

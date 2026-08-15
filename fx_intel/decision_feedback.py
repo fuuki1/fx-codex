@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 import json
+import os
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -269,7 +270,14 @@ def save_decision_feedback(profile: DecisionFeedbackProfile, path: str | Path) -
                 allow_nan=False,
             )
             handle.write("\n")
-        tmp_path.replace(target)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         if tmp_path is not None:
             try:

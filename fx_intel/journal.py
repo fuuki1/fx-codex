@@ -270,16 +270,15 @@ class DirectionalStats:
         return self.hits / self.evaluated
 
 
-def append_plans(
-    path: str | Path,
+def build_plan_rows(
     plans: Sequence[TradePlan],
     now: datetime | None = None,
     *,
     source_cutoff: datetime | None = None,
     max_feature_available_time: datetime | None = None,
     decision_ids: Sequence[str] | None = None,
-) -> None:
-    """今回の判断をJSONLへ追記する(1プラン1行)。
+) -> list[dict[str, object]]:
+    """融合判断をcross-log transactionへ渡せるcompact rowsにする。
 
     時刻順序、decision ID、input context、source record IDが全てある行だけを
     PIT適格行として記録する。旧呼出しは互換のため記録できるが、学習対象外になる。
@@ -287,93 +286,80 @@ def append_plans(
     now, source_utc, feature_utc = _pit_times(now, source_cutoff, max_feature_available_time)
     if decision_ids is not None and len(decision_ids) != len(plans):
         raise PointInTimeError("decision_ids must contain exactly one ID per plan")
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        for index, plan in enumerate(plans):
-            decision_id = _decision_id_at(decision_ids, index)
-            pit_metadata = pit_metadata_for_plan(
-                plan,
-                prediction_time=now,
-                source_cutoff=source_utc,
-                max_feature_available_time=feature_utc,
-                decision_id=decision_id,
-                mode="fusion",
-            )
-            input_context_id = str(pit_metadata["input_context_id"])
-            handle.write(
-                json.dumps(
-                    {
-                        "ts": now.isoformat(),
-                        **pit_metadata,
-                        "symbol": plan.symbol,
-                        "direction": plan.direction,
-                        "analysis_direction": plan.analysis_direction,
-                        "analysis_conviction": plan.analysis_conviction,
-                        "conviction": plan.conviction,
-                        "composite": plan.composite,
-                        "tech_score": plan.tech_score,
-                        "news_score": plan.news_score,
-                        "close": plan.close,
-                        "atr": plan.atr,
-                        "stop": plan.stop,
-                        "target1": plan.target1,
-                        "target2": plan.target2,
-                        "entry_bid": plan.entry_bid,
-                        "entry_ask": plan.entry_ask,
-                        "quote_observed_at": plan.quote_observed_at,
-                        "quote_available_at": plan.quote_available_at,
-                        "quote_source": plan.quote_source,
-                        "quote_source_record_id": plan.quote_source_record_id,
-                        "planned_risk_distance": plan.planned_risk_distance,
-                        "label_version": plan.label_version,
-                        "label_provenance": plan.label_provenance,
-                        "cost_model_id": plan.cost_model_id,
-                        "cost_model_version": plan.cost_model_version,
-                        "cost_status": plan.cost_status,
-                        "slippage_model_id": plan.slippage_model_id,
-                        "commission_model_id": plan.commission_model_id,
-                        "slippage_r": plan.slippage_r,
-                        "commission_r": plan.commission_r,
-                        "financing_r": plan.financing_r,
-                        "cost_quality_flags": list(plan.cost_quality_flags),
-                        "direction_threshold": plan.direction_threshold,
-                        "target_policy": plan.target_policy,
-                        **_pre_guard_plan(plan),
-                        "data_quality": plan.data_quality,
-                        # チャート状態の特徴量(learning.pyの状態別学習に使う)
-                        "features": plan.features,
-                        # 複合スコアの内訳(委員別スコアと正規化重み。監査証跡)
-                        "components": plan.components,
-                        # 執行コスト(R換算)と期待R予測。採点(trade_outcome)が
-                        # realized_net_r を作る入力で、MLの収益ラベルの源になる。
-                        **_plan_execution(plan),
-                        "learning_dimensions": plan.learning_dimensions,
-                        "gate_trace": plan.gate_trace,
-                        "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": input_context_id,
-                        "input_features": plan.input_features,
-                        "input_feature_masks": plan.input_feature_masks,
-                        "input_context_schema_version": plan.input_context.get(
-                            "context_schema_version"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+    rows: list[dict[str, object]] = []
+    for index, plan in enumerate(plans):
+        decision_id = _decision_id_at(decision_ids, index)
+        pit_metadata = pit_metadata_for_plan(
+            plan,
+            prediction_time=now,
+            source_cutoff=source_utc,
+            max_feature_available_time=feature_utc,
+            decision_id=decision_id,
+            mode="fusion",
+        )
+        rows.append(
+            {
+                "ts": now.isoformat(),
+                **pit_metadata,
+                "symbol": plan.symbol,
+                "direction": plan.direction,
+                "analysis_direction": plan.analysis_direction,
+                "analysis_conviction": plan.analysis_conviction,
+                "conviction": plan.conviction,
+                "composite": plan.composite,
+                "tech_score": plan.tech_score,
+                "news_score": plan.news_score,
+                "close": plan.close,
+                "atr": plan.atr,
+                "stop": plan.stop,
+                "target1": plan.target1,
+                "target2": plan.target2,
+                "entry_bid": plan.entry_bid,
+                "entry_ask": plan.entry_ask,
+                "quote_observed_at": plan.quote_observed_at,
+                "quote_available_at": plan.quote_available_at,
+                "quote_source": plan.quote_source,
+                "quote_source_record_id": plan.quote_source_record_id,
+                "planned_risk_distance": plan.planned_risk_distance,
+                "label_version": plan.label_version,
+                "label_provenance": plan.label_provenance,
+                "cost_model_id": plan.cost_model_id,
+                "cost_model_version": plan.cost_model_version,
+                "cost_status": plan.cost_status,
+                "slippage_model_id": plan.slippage_model_id,
+                "commission_model_id": plan.commission_model_id,
+                "slippage_r": plan.slippage_r,
+                "commission_r": plan.commission_r,
+                "financing_r": plan.financing_r,
+                "cost_quality_flags": list(plan.cost_quality_flags),
+                "direction_threshold": plan.direction_threshold,
+                "target_policy": plan.target_policy,
+                **_pre_guard_plan(plan),
+                "data_quality": plan.data_quality,
+                "features": plan.features,
+                "components": plan.components,
+                **_plan_execution(plan),
+                "learning_dimensions": plan.learning_dimensions,
+                "gate_trace": plan.gate_trace,
+                "shadow_predictions": plan.shadow_predictions,
+                "input_context_id": str(pit_metadata["input_context_id"]),
+                "input_features": plan.input_features,
+                "input_feature_masks": plan.input_feature_masks,
+                "input_context_schema_version": plan.input_context.get("context_schema_version"),
+            }
+        )
+    return rows
 
 
-def append_timeframe_plans(
-    path: str | Path,
+def build_timeframe_plan_rows(
     plans: Sequence[TimeframePlan],
     now: datetime | None = None,
     *,
     source_cutoff: datetime | None = None,
     max_feature_available_time: datetime | None = None,
     decision_ids: Sequence[str] | None = None,
-) -> None:
-    """時間足別の判断をJSONLへ追記する(1プラン1行)。
+) -> list[dict[str, object]]:
+    """時間足別判断をcross-log transactionへ渡せるcompact rowsにする。
 
     append_plans(融合1判断)と同じスキーマに timeframe と horizon_hours を
     加える。この2フィールドで learning.py が「どの時間足の・どの主ホライズンの
@@ -386,85 +372,127 @@ def append_timeframe_plans(
     now, source_utc, feature_utc = _pit_times(now, source_cutoff, max_feature_available_time)
     if decision_ids is not None and len(decision_ids) != len(plans):
         raise PointInTimeError("decision_ids must contain exactly one ID per plan")
+    rows: list[dict[str, object]] = []
+    for index, plan in enumerate(plans):
+        decision_id = _decision_id_at(decision_ids, index)
+        pit_metadata = pit_metadata_for_plan(
+            plan,
+            prediction_time=now,
+            source_cutoff=source_utc,
+            max_feature_available_time=feature_utc,
+            decision_id=decision_id,
+            mode="per_timeframe",
+        )
+        rows.append(
+            {
+                "ts": now.isoformat(),
+                **pit_metadata,
+                "symbol": plan.symbol,
+                "timeframe": plan.timeframe,
+                "horizon_hours": plan.horizon_hours,
+                "direction": plan.direction,
+                "analysis_direction": plan.analysis_direction,
+                "analysis_conviction": plan.analysis_conviction,
+                "conviction": plan.conviction,
+                "composite": plan.composite,
+                "tech_score": plan.tf_score,
+                "news_score": plan.news_score,
+                "close": plan.close,
+                "atr": plan.atr,
+                "rsi": plan.rsi,
+                "adx": plan.adx,
+                "stop": plan.stop,
+                "target1": plan.target1,
+                "target2": plan.target2,
+                "entry_bid": plan.entry_bid,
+                "entry_ask": plan.entry_ask,
+                "quote_observed_at": plan.quote_observed_at,
+                "quote_available_at": plan.quote_available_at,
+                "quote_source": plan.quote_source,
+                "quote_source_record_id": plan.quote_source_record_id,
+                "planned_risk_distance": plan.planned_risk_distance,
+                "label_version": plan.label_version,
+                "label_provenance": plan.label_provenance,
+                "cost_model_id": plan.cost_model_id,
+                "cost_model_version": plan.cost_model_version,
+                "cost_status": plan.cost_status,
+                "slippage_model_id": plan.slippage_model_id,
+                "commission_model_id": plan.commission_model_id,
+                "slippage_r": plan.slippage_r,
+                "commission_r": plan.commission_r,
+                "financing_r": plan.financing_r,
+                "cost_quality_flags": list(plan.cost_quality_flags),
+                "direction_threshold": plan.direction_threshold,
+                "target_policy": plan.target_policy,
+                **_pre_guard_plan(plan),
+                "data_quality": plan.data_quality,
+                "features": plan.features,
+                "components": plan.components,
+                **_plan_execution(plan),
+                "learning_dimensions": plan.learning_dimensions,
+                "gate_trace": plan.gate_trace,
+                "shadow_predictions": plan.shadow_predictions,
+                "input_context_id": str(pit_metadata["input_context_id"]),
+                "input_features": plan.input_features,
+                "input_feature_masks": plan.input_feature_masks,
+                "input_context_schema_version": plan.input_context.get("context_schema_version"),
+            }
+        )
+    return rows
+
+
+def _append_rows(path: str | Path, rows: Sequence[Mapping[str, object]]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        for index, plan in enumerate(plans):
-            decision_id = _decision_id_at(decision_ids, index)
-            pit_metadata = pit_metadata_for_plan(
-                plan,
-                prediction_time=now,
-                source_cutoff=source_utc,
-                max_feature_available_time=feature_utc,
-                decision_id=decision_id,
-                mode="per_timeframe",
-            )
-            input_context_id = str(pit_metadata["input_context_id"])
-            handle.write(
-                json.dumps(
-                    {
-                        "ts": now.isoformat(),
-                        **pit_metadata,
-                        "symbol": plan.symbol,
-                        # 時間足別化の中核。旧スキーマの行にはこの2つが無く、
-                        # 読み込み側は timeframe 欠落=融合判断(horizon 24h)として扱う
-                        "timeframe": plan.timeframe,
-                        "horizon_hours": plan.horizon_hours,
-                        "direction": plan.direction,
-                        "analysis_direction": plan.analysis_direction,
-                        "analysis_conviction": plan.analysis_conviction,
-                        "conviction": plan.conviction,
-                        "composite": plan.composite,
-                        # 融合版の tech_score に相当(時間足単体の方向スコア)。
-                        # learning._signal_hit_rate が読むキー名に合わせる
-                        "tech_score": plan.tf_score,
-                        "news_score": plan.news_score,
-                        "close": plan.close,
-                        "atr": plan.atr,
-                        "rsi": plan.rsi,
-                        "adx": plan.adx,
-                        "stop": plan.stop,
-                        "target1": plan.target1,
-                        "target2": plan.target2,
-                        "entry_bid": plan.entry_bid,
-                        "entry_ask": plan.entry_ask,
-                        "quote_observed_at": plan.quote_observed_at,
-                        "quote_available_at": plan.quote_available_at,
-                        "quote_source": plan.quote_source,
-                        "quote_source_record_id": plan.quote_source_record_id,
-                        "planned_risk_distance": plan.planned_risk_distance,
-                        "label_version": plan.label_version,
-                        "label_provenance": plan.label_provenance,
-                        "cost_model_id": plan.cost_model_id,
-                        "cost_model_version": plan.cost_model_version,
-                        "cost_status": plan.cost_status,
-                        "slippage_model_id": plan.slippage_model_id,
-                        "commission_model_id": plan.commission_model_id,
-                        "slippage_r": plan.slippage_r,
-                        "commission_r": plan.commission_r,
-                        "financing_r": plan.financing_r,
-                        "cost_quality_flags": list(plan.cost_quality_flags),
-                        "direction_threshold": plan.direction_threshold,
-                        "target_policy": plan.target_policy,
-                        **_pre_guard_plan(plan),
-                        "data_quality": plan.data_quality,
-                        "features": plan.features,
-                        "components": plan.components,
-                        **_plan_execution(plan),
-                        "learning_dimensions": plan.learning_dimensions,
-                        "gate_trace": plan.gate_trace,
-                        "shadow_predictions": plan.shadow_predictions,
-                        "input_context_id": input_context_id,
-                        "input_features": plan.input_features,
-                        "input_feature_masks": plan.input_feature_masks,
-                        "input_context_schema_version": plan.input_context.get(
-                            "context_schema_version"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def append_plans(
+    path: str | Path,
+    plans: Sequence[TradePlan],
+    now: datetime | None = None,
+    *,
+    source_cutoff: datetime | None = None,
+    max_feature_available_time: datetime | None = None,
+    decision_ids: Sequence[str] | None = None,
+) -> None:
+    """今回の融合判断を後方互換の1プラン1行形式で追記する。"""
+
+    _append_rows(
+        path,
+        build_plan_rows(
+            plans,
+            now,
+            source_cutoff=source_cutoff,
+            max_feature_available_time=max_feature_available_time,
+            decision_ids=decision_ids,
+        ),
+    )
+
+
+def append_timeframe_plans(
+    path: str | Path,
+    plans: Sequence[TimeframePlan],
+    now: datetime | None = None,
+    *,
+    source_cutoff: datetime | None = None,
+    max_feature_available_time: datetime | None = None,
+    decision_ids: Sequence[str] | None = None,
+) -> None:
+    """今回の時間足別判断を後方互換の1プラン1行形式で追記する。"""
+
+    _append_rows(
+        path,
+        build_timeframe_plan_rows(
+            plans,
+            now,
+            source_cutoff=source_cutoff,
+            max_feature_available_time=max_feature_available_time,
+            decision_ids=decision_ids,
+        ),
+    )
 
 
 def _plan_execution(plan: object) -> dict[str, object]:

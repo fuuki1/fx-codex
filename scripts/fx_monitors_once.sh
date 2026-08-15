@@ -35,5 +35,7 @@ run_monitor() {
 
 overall=0
 run_monitor trade-outcome logs/trade_outcome_monitor.json tools/trade_outcome_monitor.py || overall=$?
-run_monitor decision-expectancy logs/decision_expectancy_monitor.json tools/decision_expectancy_monitor.py || overall=$?
+run_monitor decision-expectancy logs/decision_expectancy_monitor.json \
+  tools/decision_expectancy_monitor.py \
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?
 exit "$overall"

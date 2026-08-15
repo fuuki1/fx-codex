@@ -163,6 +163,7 @@ PLIST_TEMPLATES = [
     "com.fx-codex.health.plist.tmpl",
     "com.fx-codex.horizon.plist.tmpl",
     "com.fx-codex.monitors.plist.tmpl",
+    "com.fx-codex.virtual-portfolio.plist.tmpl",
 ]
 
 
@@ -184,6 +185,24 @@ def test_plist_template_renders_to_valid_xml(template, tmp_path):
     assert any("run_exclusive.py" in arg for arg in args)
     # 秘密情報をplistへ埋めていない
     assert "WEBHOOK" not in rendered and "API_KEY" not in rendered
+
+
+def test_virtual_portfolio_interval_preserves_admission_margin():
+    raw = (_ROOT / "ops" / "launchd" / "com.fx-codex.virtual-portfolio.plist.tmpl").read_text(
+        encoding="utf-8"
+    )
+    rendered = raw.replace("__FX_ROOT__", "/Users/example/srv/fx-codex").replace(
+        "__PYTHON__", "/Users/example/srv/fx-codex/.venv/bin/python"
+    )
+    dictionary = ET.fromstring(rendered).find("dict")
+    assert dictionary is not None
+    children = list(dictionary)
+    interval_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "StartInterval"
+    )
+    assert int(children[interval_index + 1].text or "0") == 180
 
 
 def test_briefing_plist_runs_on_five_minute_boundaries():
@@ -446,6 +465,10 @@ def test_briefing_wrapper_runs_due_fusion_without_discord_or_price_write(tmp_pat
     assert "--no-discord" in fusion
     assert "--no-price-write" in fusion
     assert "--require-freshness" in fusion
+    assert (
+        "--decision-latest-output " + str(root / "logs" / "briefing_fusion_decisions_latest.json")
+        in fusion
+    )
     assert "USDJPY EURUSD GBPUSD" in fusion
 
 
@@ -537,6 +560,14 @@ def test_status_script_treats_corrupt_freshness_report_as_critical(tmp_path):
 
     assert result.returncode == 2
     assert "CRITICAL: freshness reportを読めない" in result.stdout
+
+
+def test_status_script_uses_only_canonical_virtual_portfolio() -> None:
+    script = (_ROOT / "scripts" / "status_fx_services.sh").read_text(encoding="utf-8")
+
+    assert "fx_virtual_portfolio_canonical_v2.sqlite3" in script
+    assert '"$ROOT/logs/fx_virtual_portfolio.sqlite3"' not in script
+    assert "broker_connected" in script
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
@@ -743,6 +774,32 @@ def test_gap_audit_clean_journal(gap_audit):
     assert report["duplicate_rows"] == 0
     assert report["gaps"] == []
     assert report["time_reversals"] == 0
+
+
+def test_gap_audit_excludes_transaction_metadata_from_unparsable_rows(gap_audit):
+    base = datetime(2026, 7, 6, 10, 10, tzinfo=UTC)
+    rows = _journal_rows(base, hours=2)
+    rows.extend(
+        [
+            {"event_type": "journal_batch_commit", "journal_batch_id": "batch-1"},
+            {
+                "event_type": "decision_cross_log_receipt",
+                "decision_transaction_id": "transaction-1",
+            },
+            {"event_type": "unknown_without_timestamp"},
+        ]
+    )
+
+    report = gap_audit.audit_journal(rows)
+
+    assert report["total_rows"] == 5
+    assert report["decision_rows"] == 2
+    assert report["transaction_metadata_rows"] == 2
+    assert report["transaction_metadata_types"] == {
+        "decision_cross_log_receipt": 1,
+        "journal_batch_commit": 1,
+    }
+    assert report["unparsable_ts"] == 1
 
 
 def test_gap_audit_detects_duplicates(gap_audit):

@@ -76,6 +76,7 @@ from fx_intel import (
     briefing,
     calendar,
     committee,
+    decision_commit,
     decision_feedback,
     decision_log,
     decision_pipeline,
@@ -100,6 +101,7 @@ from fx_intel import (
     price_history,
     promotion,
     signal_board,
+    stage_timing,
     sentiment,
     technicals,
     technical_cache,
@@ -138,6 +140,9 @@ DEFAULT_TRADE_IMPROVEMENT_REGISTRY = PROJECT_ROOT / "logs" / "trade_improvement_
 DEFAULT_TRADE_MONITOR_PATH = PROJECT_ROOT / "logs" / "trade_outcome_monitor.json"
 DEFAULT_DECISION_LOG_PATH = PROJECT_ROOT / "logs" / "briefing_decisions.jsonl"
 DEFAULT_DECISION_LATEST_PATH = PROJECT_ROOT / "logs" / "briefing_decisions_latest.json"
+DEFAULT_FUSION_DECISION_LATEST_PATH = (
+    PROJECT_ROOT / "logs" / "briefing_fusion_decisions_latest.json"
+)
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
 JOURNAL_WRITE_FAILURE_EXIT_CODE = 4
@@ -150,6 +155,10 @@ DEFAULT_INPUT_POLICY_PATH = PROJECT_ROOT / "ops" / "input_policy.json"
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
 # ガードが早期returnするため、データが足りないうちは実質ノーコスト)
 ML_RETRAIN_DAYS = 7.0
+
+
+class DecisionDeliveryError(RuntimeError):
+    """The cross-log transaction or canonical latest publication failed."""
 
 
 def _attach_cot_pit_dataset(
@@ -815,6 +824,117 @@ def attach_decision_pit_metadata(
         )
 
 
+def _persist_decision_batch_with_timing(
+    decision_events: list[dict[str, object]],
+    *,
+    compact_rows: Sequence[Mapping[str, object]],
+    compact_path: Path,
+    mode: str,
+    prediction_time: datetime,
+    timing: stage_timing.StageTimingRecorder,
+    latest_snapshot_path: Path,
+    price_entries: Sequence[Mapping[str, object]] | None = None,
+    score_history: bool = True,
+) -> dict[str, object] | None:
+    """Publish one decision batch before running expensive historical scoring.
+
+    The canonical virtual portfolio consumes ``latest_snapshot_path`` and has a
+    bounded admission window from ``prediction_time``.  Historical outcome
+    scoring reads the complete multi-gigabyte audit log, so it must not sit in
+    front of the append/latest durable-delivery boundary.
+    """
+
+    try:
+        with timing.stage(
+            "decision_transaction_append",
+            event_count=len(decision_events),
+            compact_path=compact_path,
+            mode=mode,
+        ):
+            decision_log.append_decision_transaction(
+                decision_events,
+                compact_rows,
+                mode=mode,
+                full_path=DEFAULT_DECISION_LOG_PATH,
+                compact_path=compact_path,
+                committed_at=prediction_time,
+            )
+        with timing.stage(
+            "latest_snapshot_save",
+            event_count=len(decision_events),
+            path=latest_snapshot_path,
+        ):
+            decision_log.save_latest_snapshot(
+                latest_snapshot_path,
+                decision_events,
+                now=prediction_time,
+            )
+    except (OSError, ValueError, decision_commit.DecisionCommitError) as error:
+        raise DecisionDeliveryError(str(error)) from error
+
+    if not score_history:
+        with timing.stage(
+            "historical_scoring_deferred",
+            scorer="tools/decision_expectancy_monitor.py",
+        ):
+            pass
+        return None
+
+    try:
+        source_bytes = DEFAULT_DECISION_LOG_PATH.stat().st_size
+    except OSError:
+        source_bytes = 0
+    with timing.stage("decision_log_read", source_bytes=source_bytes):
+        committed_decision_events = list(
+            decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
+        )
+    committed_ids = {
+        str(event.get("decision_id") or "")
+        for event in committed_decision_events
+        if event.get("decision_id")
+    }
+    scoring_events = [
+        *committed_decision_events,
+        *[
+            event
+            for event in decision_events
+            if str(event.get("decision_id") or "") not in committed_ids
+        ],
+    ]
+    with timing.stage(
+        "decision_outcome_score",
+        committed_event_count=len(committed_decision_events),
+        scoring_event_count=len(scoring_events),
+        price_entry_count=len(price_entries or ()),
+    ):
+        if price_entries is None:
+            decision_outcome_report = decision_log.score_decision_events(
+                scoring_events,
+                now=prediction_time,
+                require_pit=True,
+            )
+        else:
+            decision_outcome_report = decision_log.score_decision_events(
+                scoring_events,
+                price_entries=price_entries,
+                now=prediction_time,
+                require_pit=True,
+            )
+    with timing.stage("decision_outcome_report_save"):
+        decision_log.save_outcome_report(
+            decision_outcome_report,
+            DEFAULT_DECISION_OUTCOMES_PATH,
+        )
+    with timing.stage("decision_feedback_save"):
+        decision_feedback.save_decision_feedback(
+            decision_feedback.derive_decision_feedback(
+                decision_outcome_report, now=prediction_time
+            ),
+            DEFAULT_DECISION_FEEDBACK_PATH,
+        )
+    return decision_outcome_report
+
+
 def _run_horizon_track(
     *,
     args,
@@ -920,6 +1040,7 @@ def _run_per_timeframe(
     learning_dimensions,
     price_rows,
     input_contexts,
+    timing,
 ) -> int:
     """時間足別モードの本体(main から分岐)。
 
@@ -927,7 +1048,8 @@ def _run_per_timeframe(
     自己採点・学習して次回の確信度に反映する。融合1判断モードとは
     ジャーナル・学習ファイルを分ける(スキーマも採点ホライズンも異なるため)。
     """
-    journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
+    with timing.stage("timeframe_journal_read"):
+        journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
     pit_journal_entries = [
         entry for entry in journal_entries if journal.is_pit_eligible_entry(entry)
     ]
@@ -936,15 +1058,18 @@ def _run_per_timeframe(
     # fx_tf_snapshot.py で継続できる価格専用系列と、今回の現在価格を
     # 結合する。direction を持たない価格行は採点対象を増やさず将来価格系列だけを
     # 密にするので、15m/1h/4h/1d の全時間足が採点可能になる。
-    current_snapshot = price_history.snapshot_entries(
-        {
-            symbol: {tf: tech_map[symbol].price_snapshot(tf) for tf in timeframe.DEFAULT_TIMEFRAMES}
-            for symbol in symbols
-        },
-        # The main analysis timestamp is captured before network I/O. Price
-        # availability must instead reflect acquisition completion.
-        now=datetime.now(UTC),
-    )
+    with timing.stage("current_price_snapshot_build"):
+        current_snapshot = price_history.snapshot_entries(
+            {
+                symbol: {
+                    tf: tech_map[symbol].price_snapshot(tf) for tf in timeframe.DEFAULT_TIMEFRAMES
+                }
+                for symbol in symbols
+            },
+            # The main analysis timestamp is captured before network I/O. Price
+            # availability must instead reflect acquisition completion.
+            now=datetime.now(UTC),
+        )
     # 判断時点のTradingView現在値は方向採点には使うが、完了済み約定経路ではない。
     # trade_outcome側がTP/SL・MFE/MAE経路から除外できるよう用途を明記する。
     for row in current_snapshot:
@@ -983,14 +1108,6 @@ def _run_per_timeframe(
         learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
         if not args.no_trade_expectancy_guard:
             decision_feedback_lookup = decision_feedback_profile.expectancy_lookup
-        if not args.dry_run:
-            try:
-                decision_feedback.save_decision_feedback(
-                    decision_feedback_profile,
-                    DEFAULT_DECISION_FEEDBACK_PATH,
-                )
-            except OSError as error:
-                fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
 
     tp_sl_lookup = None
     tp_sl_learn = None
@@ -1042,27 +1159,28 @@ def _run_per_timeframe(
 
     # 各ペア・各時間足の独立判断
     plans_by_symbol: dict[str, list[timeframe.TimeframePlan]] = {}
-    for symbol in symbols:
-        base, quote = calendar.symbol_currencies(symbol)
-        windows = calendar.risk_windows(events, {base, quote})
-        plans_by_symbol[symbol] = timeframe.build_timeframe_plans(
-            symbol,
-            tech_map[symbol],
-            analysis.currencies,
-            windows,
-            items,
-            now=now,
-            atr_multiple=atr_multiple,
-            calendar_ok=calendar_ok,
-            operational_data_ok=operational_data_ok,
-            operational_data_reason=operational_data_reason,
-            profile_lookup=profile_lookup,
-            expectancy_lookup=expectancy_lookup,
-            target_r_adjuster=target_r_adjuster,
-            direction_threshold=active_direction_threshold,
-            learning_dimensions=learning_dimensions,
-            input_context=input_contexts.get(symbol),
-        )
+    with timing.stage("timeframe_plan_build", symbol_count=len(symbols)):
+        for symbol in symbols:
+            base, quote = calendar.symbol_currencies(symbol)
+            windows = calendar.risk_windows(events, {base, quote})
+            plans_by_symbol[symbol] = timeframe.build_timeframe_plans(
+                symbol,
+                tech_map[symbol],
+                analysis.currencies,
+                windows,
+                items,
+                now=now,
+                atr_multiple=atr_multiple,
+                calendar_ok=calendar_ok,
+                operational_data_ok=operational_data_ok,
+                operational_data_reason=operational_data_reason,
+                profile_lookup=profile_lookup,
+                expectancy_lookup=expectancy_lookup,
+                target_r_adjuster=target_r_adjuster,
+                direction_threshold=active_direction_threshold,
+                learning_dimensions=learning_dimensions,
+                input_context=input_contexts.get(symbol),
+            )
 
     # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意。
     # 将来価格は採点と同じ結合系列(判断+価格スナップショット)から取る
@@ -1078,68 +1196,66 @@ def _run_per_timeframe(
         all_plans = [plan for plans in plans_by_symbol.values() for plan in plans]
         max_feature_available_time = datetime.now(UTC)
         prediction_time = datetime.now(UTC)
-        decision_events = decision_log.build_timeframe_decision_events(
-            plans_by_symbol,
-            now=prediction_time,
-            analysis=analysis,
-            tech_map=tech_map,
-            news_items=items,
-            events_48h=events_48h,
-            fetch_warnings=fetch_warnings,
-            calendar_ok=calendar_ok,
-            macro_snapshot=macro_snapshot,
-            timeframe_learning=tf_learn if not args.no_learning else None,
-            tp_sl_learning=tp_sl_learn,
-            maximization_profile=max_profile,
-            decision_feedback_profile=decision_feedback_profile,
-            expectancy_summaries=_expectancy_summaries,
-        )
-        try:
-            attach_decision_pit_metadata(
-                decision_events,
-                all_plans,
-                prediction_time=prediction_time,
-                source_cutoff=now,
-                max_feature_available_time=max_feature_available_time,
-                mode="per_timeframe",
-            )
-            journal.append_timeframe_plans(
-                DEFAULT_TF_JOURNAL_PATH,
-                all_plans,
+        with timing.stage("decision_event_build", event_mode="per_timeframe"):
+            decision_events = decision_log.build_timeframe_decision_events(
+                plans_by_symbol,
                 now=prediction_time,
-                source_cutoff=now,
-                max_feature_available_time=max_feature_available_time,
-                decision_ids=[str(event["decision_id"]) for event in decision_events],
+                analysis=analysis,
+                tech_map=tech_map,
+                news_items=items,
+                events_48h=events_48h,
+                fetch_warnings=fetch_warnings,
+                calendar_ok=calendar_ok,
+                macro_snapshot=macro_snapshot,
+                timeframe_learning=tf_learn if not args.no_learning else None,
+                tp_sl_learning=tp_sl_learn,
+                maximization_profile=max_profile,
+                decision_feedback_profile=decision_feedback_profile,
+                expectancy_summaries=_expectancy_summaries,
             )
+            timing.bind(
+                decision_run_ids=sorted(
+                    {str(event.get("run_id")) for event in decision_events if event.get("run_id")}
+                ),
+                prediction_time=prediction_time,
+                decision_event_count=len(decision_events),
+            )
+        try:
+            with timing.stage("decision_pit_metadata_attach"):
+                attach_decision_pit_metadata(
+                    decision_events,
+                    all_plans,
+                    prediction_time=prediction_time,
+                    source_cutoff=now,
+                    max_feature_available_time=max_feature_available_time,
+                    mode="per_timeframe",
+                )
+            with timing.stage("timeframe_journal_build", event_count=len(all_plans)):
+                compact_rows = journal.build_timeframe_plan_rows(
+                    all_plans,
+                    now=prediction_time,
+                    source_cutoff=now,
+                    max_feature_available_time=max_feature_available_time,
+                    decision_ids=[str(event["decision_id"]) for event in decision_events],
+                )
         except (OSError, journal.PointInTimeError) as error:
             print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
             return JOURNAL_WRITE_FAILURE_EXIT_CODE
         try:
-            prior_decision_events = list(
-                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-            )
-            decision_outcome_report = decision_log.score_decision_events(
-                [*prior_decision_events, *decision_events],
-                price_entries=[*price_rows, *current_snapshot],
-                now=prediction_time,
-                require_pit=True,
-            )
-            decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
-            decision_log.save_latest_snapshot(
-                DEFAULT_DECISION_LATEST_PATH,
+            _persist_decision_batch_with_timing(
                 decision_events,
-                now=prediction_time,
+                compact_rows=compact_rows,
+                compact_path=DEFAULT_TF_JOURNAL_PATH,
+                mode="per_timeframe",
+                prediction_time=prediction_time,
+                timing=timing,
+                latest_snapshot_path=args.decision_latest_output,
+                price_entries=[*price_rows, *current_snapshot],
+                score_history=not args.defer_decision_scoring,
             )
-            decision_log.save_outcome_report(
-                decision_outcome_report,
-                DEFAULT_DECISION_OUTCOMES_PATH,
-            )
-            decision_feedback.save_decision_feedback(
-                decision_feedback.derive_decision_feedback(
-                    decision_outcome_report, now=prediction_time
-                ),
-                DEFAULT_DECISION_FEEDBACK_PATH,
-            )
+        except DecisionDeliveryError as error:
+            print(f"判断トランザクション書き込み失敗: {error}", file=sys.stderr)
+            return JOURNAL_WRITE_FAILURE_EXIT_CODE
         except OSError as error:
             fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
@@ -1193,7 +1309,8 @@ def _run_per_timeframe(
         return NOTIFICATION_FAILURE_EXIT_CODE
 
     try:
-        post_to_discord(webhook_url, payload)
+        with timing.stage("discord_delivery"):
+            post_to_discord(webhook_url, payload)
     except discord_delivery.DiscordDeliveryError as error:
         print(str(error), file=sys.stderr)
         return NOTIFICATION_FAILURE_EXIT_CODE
@@ -1449,11 +1566,51 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Discordには送信せず、判断ジャーナル・学習ファイルなどのローカル保存だけ行う",
     )
+    parser.add_argument(
+        "--stage-timing-log",
+        type=Path,
+        default=None,
+        help="工程別UTC時刻・monotonic経過時間を追記するJSONLパス",
+    )
+    parser.add_argument(
+        "--decision-latest-output",
+        type=Path,
+        default=None,
+        help="この判断モードのlatest snapshot保存先",
+    )
+    parser.add_argument(
+        "--defer-decision-scoring",
+        action="store_true",
+        help=(
+            "判断transaction/latestの永続化後に全履歴採点を行わず、"
+            "tools/decision_expectancy_monitor.pyへ委譲する"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.promote_live is not None:
         parser.error("--promote-live is disabled; this build is research/shadow only")
     if args.signal_board:
         args.per_timeframe = True
+    if args.decision_latest_output is None:
+        args.decision_latest_output = (
+            DEFAULT_DECISION_LATEST_PATH
+            if args.per_timeframe
+            else DEFAULT_FUSION_DECISION_LATEST_PATH
+        )
+    elif (
+        not args.per_timeframe
+        and args.decision_latest_output.resolve() == DEFAULT_DECISION_LATEST_PATH.resolve()
+    ):
+        parser.error("fusion cannot overwrite the canonical per-timeframe latest snapshot")
+    timing = stage_timing.StageTimingRecorder(
+        args.stage_timing_log,
+        pipeline="fx_briefing",
+        metadata={
+            "mode": "per_timeframe" if args.per_timeframe else "fusion",
+            "dry_run": args.dry_run,
+            "symbols": [str(symbol) for symbol in args.symbols],
+        },
+    )
 
     lifecycle_actions = [
         bool(args.approve_trade_candidate),
@@ -1591,7 +1748,8 @@ def main(argv: list[str] | None = None) -> int:
     active_direction_threshold = direction_threshold.effective_threshold(threshold_policy, now=now)
 
     # 1. 経済指標カレンダー(レート制限対策にローカルキャッシュ併用)
-    events, calendar_warnings = calendar.fetch_calendar(cache_path=DEFAULT_CALENDAR_CACHE)
+    with timing.stage("calendar_fetch"):
+        events, calendar_warnings = calendar.fetch_calendar(cache_path=DEFAULT_CALENDAR_CACHE)
     fetch_warnings.extend(calendar_warnings)
     # イベントが1件も取れていない=警戒窓判定が機能しない状態。判断側で安全側に倒す
     calendar_ok = bool(events)
@@ -1610,29 +1768,36 @@ def main(argv: list[str] | None = None) -> int:
             fetch_warnings.append(f"イベント履歴アーカイブ追記失敗: {error}")
 
     # 2. ニュース収集
-    items, news_warnings = news.fetch_news_for_symbols(data_symbols, hours_back=args.hours_back)
+    with timing.stage("news_fetch", symbol_count=len(data_symbols)):
+        items, news_warnings = news.fetch_news_for_symbols(data_symbols, hours_back=args.hours_back)
     fetch_warnings.extend(news_warnings)
 
     # 3. マクロデータ。FRED系は現行snapshot、COTは明示された監査済みPIT artifact
     # だけをprediction timeでas-of読込みする。legacy current snapshotは使わない。
     macro_snapshot = None
     if not args.no_macro:
-        macro_snapshot = macro.fetch_macro_snapshot(
-            DEFAULT_MACRO_CACHE,
-            now=now,
-            include_cot=False,
-        )
-        _attach_cot_pit_dataset(
-            macro_snapshot,
-            args.cot_pit_dataset,
-            prediction_time=now,
-        )
+        with timing.stage("macro_fetch"):
+            macro_snapshot = macro.fetch_macro_snapshot(
+                DEFAULT_MACRO_CACHE,
+                now=now,
+                include_cot=False,
+            )
+            _attach_cot_pit_dataset(
+                macro_snapshot,
+                args.cot_pit_dataset,
+                prediction_time=now,
+            )
         fetch_warnings.extend(macro_snapshot.warnings)
 
     # 4. センチメント分析(Claude API → 自前分析エンジン。レジームはマクロ実データ優先)
-    analysis = sentiment.analyze_market(
-        items, ordered_currencies, use_llm=not args.no_llm, macro=macro_snapshot, now=now
-    )
+    with timing.stage("sentiment_analysis", news_item_count=len(items)):
+        analysis = sentiment.analyze_market(
+            items,
+            ordered_currencies,
+            use_llm=not args.no_llm,
+            macro=macro_snapshot,
+            now=now,
+        )
     learning_dimensions = market_session.build_learning_dimensions(
         now,
         regime=analysis.regime,
@@ -1641,33 +1806,40 @@ def main(argv: list[str] | None = None) -> int:
     ).to_dict()
 
     # 5. テクニカル取得
-    if args.technical_cache_only:
-        tech_map, tech_warnings = technical_cache.load_pair_technicals(
-            data_symbols,
-            fast_window=fast_window,
-            slow_window=slow_window,
-            cache_path=args.technical_cache,
-            now=now,
-        )
-    else:
-        tech_map, tech_warnings = technicals.fetch_pair_technicals(
-            data_symbols, fast_window=fast_window, slow_window=slow_window
-        )
+    with timing.stage(
+        "technical_load",
+        source="cache" if args.technical_cache_only else "network",
+        symbol_count=len(data_symbols),
+    ):
+        if args.technical_cache_only:
+            tech_map, tech_warnings = technical_cache.load_pair_technicals(
+                data_symbols,
+                fast_window=fast_window,
+                slow_window=slow_window,
+                cache_path=args.technical_cache,
+                now=now,
+            )
+        else:
+            tech_map, tech_warnings = technicals.fetch_pair_technicals(
+                data_symbols, fast_window=fast_window, slow_window=slow_window
+            )
     fetch_warnings.extend(tech_warnings)
 
     # C input context: completed M5 history is used only as an as-of spread
     # baseline.  Each symbol gets one context shared by fusion and every
     # timeframe; the context is record/shadow-only at this stage.
-    input_price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
-    input_contexts = build_decision_input_contexts(
-        data_symbols,
-        tech_map,
-        macro_snapshot=macro_snapshot,
-        learning_dimensions=learning_dimensions,
-        price_rows=input_price_rows,
-        now=now,
-        fetch_warnings=fetch_warnings,
-    )
+    with timing.stage("price_history_read"):
+        input_price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
+    with timing.stage("decision_input_context_build"):
+        input_contexts = build_decision_input_contexts(
+            data_symbols,
+            tech_map,
+            macro_snapshot=macro_snapshot,
+            learning_dimensions=learning_dimensions,
+            price_rows=input_price_rows,
+            now=now,
+            fetch_warnings=fetch_warnings,
+        )
 
     if args.horizon_only:
         return _run_horizon_track(
@@ -1708,6 +1880,7 @@ def main(argv: list[str] | None = None) -> int:
             learning_dimensions=learning_dimensions,
             price_rows=input_price_rows,
             input_contexts=input_contexts,
+            timing=timing,
         )
 
     # 6. 学習ループ: ジャーナル履歴を相互採点し、重み・確信度の調整を導出
@@ -1752,14 +1925,6 @@ def main(argv: list[str] | None = None) -> int:
         learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
         if not args.no_trade_expectancy_guard:
             decision_feedback_adjuster = decision_feedback_profile.fusion_adjuster()
-        if not args.dry_run:
-            try:
-                decision_feedback.save_decision_feedback(
-                    decision_feedback_profile,
-                    DEFAULT_DECISION_FEEDBACK_PATH,
-                )
-            except OSError as error:
-                fetch_warnings.append(f"失敗理由フィードバック保存失敗: {error}")
 
     if not args.no_trade_expectancy:
         trade_outcomes = trade_outcome.evaluate_trade_outcomes(pit_journal_entries)
@@ -1975,69 +2140,71 @@ def main(argv: list[str] | None = None) -> int:
         )
         journal_note = journal.format_stats_ja(stats)
         if not args.dry_run:
-            decision_events = decision_log.build_fusion_decision_events(
-                plans,
-                now=prediction_time,
-                analysis=analysis,
-                tech_map=tech_map,
-                news_items=items,
-                events_48h=events_48h,
-                fetch_warnings=fetch_warnings,
-                calendar_ok=calendar_ok,
-                macro_snapshot=macro_snapshot,
-                learning_profile=profile if not args.no_learning else None,
-                trade_expectancy_summary=(
-                    trade_expectancy_summary if not args.no_trade_expectancy else None
-                ),
-                decision_feedback_profile=decision_feedback_profile,
-                ml_artifact=ml_artifact if not args.no_ml else None,
-                promotion_state=promotion_state,
-            )
-            try:
-                attach_decision_pit_metadata(
-                    decision_events,
-                    list(plans),
-                    prediction_time=prediction_time,
-                    source_cutoff=now,
-                    max_feature_available_time=feature_available_time,
-                    mode="fusion",
-                )
-                journal.append_plans(
-                    DEFAULT_JOURNAL_PATH,
+            with timing.stage("decision_event_build", event_mode="fusion"):
+                decision_events = decision_log.build_fusion_decision_events(
                     plans,
                     now=prediction_time,
-                    source_cutoff=now,
-                    max_feature_available_time=feature_available_time,
-                    decision_ids=[str(event["decision_id"]) for event in decision_events],
+                    analysis=analysis,
+                    tech_map=tech_map,
+                    news_items=items,
+                    events_48h=events_48h,
+                    fetch_warnings=fetch_warnings,
+                    calendar_ok=calendar_ok,
+                    macro_snapshot=macro_snapshot,
+                    learning_profile=profile if not args.no_learning else None,
+                    trade_expectancy_summary=(
+                        trade_expectancy_summary if not args.no_trade_expectancy else None
+                    ),
+                    decision_feedback_profile=decision_feedback_profile,
+                    ml_artifact=ml_artifact if not args.no_ml else None,
+                    promotion_state=promotion_state,
                 )
+                timing.bind(
+                    decision_run_ids=sorted(
+                        {
+                            str(event.get("run_id"))
+                            for event in decision_events
+                            if event.get("run_id")
+                        }
+                    ),
+                    prediction_time=prediction_time,
+                    decision_event_count=len(decision_events),
+                )
+            try:
+                with timing.stage("decision_pit_metadata_attach"):
+                    attach_decision_pit_metadata(
+                        decision_events,
+                        list(plans),
+                        prediction_time=prediction_time,
+                        source_cutoff=now,
+                        max_feature_available_time=feature_available_time,
+                        mode="fusion",
+                    )
+                with timing.stage("fusion_journal_build", event_count=len(plans)):
+                    compact_rows = journal.build_plan_rows(
+                        plans,
+                        now=prediction_time,
+                        source_cutoff=now,
+                        max_feature_available_time=feature_available_time,
+                        decision_ids=[str(event["decision_id"]) for event in decision_events],
+                    )
             except (OSError, journal.PointInTimeError) as error:
                 print(f"判断ジャーナル書き込み失敗: {error}", file=sys.stderr)
                 return JOURNAL_WRITE_FAILURE_EXIT_CODE
             try:
-                prior_decision_events = list(
-                    decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-                )
-                decision_outcome_report = decision_log.score_decision_events(
-                    [*prior_decision_events, *decision_events],
-                    now=prediction_time,
-                    require_pit=True,
-                )
-                decision_log.append_decision_events(DEFAULT_DECISION_LOG_PATH, decision_events)
-                decision_log.save_latest_snapshot(
-                    DEFAULT_DECISION_LATEST_PATH,
+                _persist_decision_batch_with_timing(
                     decision_events,
-                    now=prediction_time,
+                    compact_rows=compact_rows,
+                    compact_path=DEFAULT_JOURNAL_PATH,
+                    mode="fusion",
+                    prediction_time=prediction_time,
+                    timing=timing,
+                    latest_snapshot_path=args.decision_latest_output,
+                    score_history=not args.defer_decision_scoring,
                 )
-                decision_log.save_outcome_report(
-                    decision_outcome_report,
-                    DEFAULT_DECISION_OUTCOMES_PATH,
-                )
-                decision_feedback.save_decision_feedback(
-                    decision_feedback.derive_decision_feedback(
-                        decision_outcome_report, now=prediction_time
-                    ),
-                    DEFAULT_DECISION_FEEDBACK_PATH,
-                )
+            except DecisionDeliveryError as error:
+                print(f"判断トランザクション書き込み失敗: {error}", file=sys.stderr)
+                return JOURNAL_WRITE_FAILURE_EXIT_CODE
             except OSError as error:
                 fetch_warnings.append(f"完全判断ログ書き込み失敗: {error}")
 
@@ -2080,7 +2247,8 @@ def main(argv: list[str] | None = None) -> int:
         return NOTIFICATION_FAILURE_EXIT_CODE
 
     try:
-        post_to_discord(webhook_url, payload)
+        with timing.stage("discord_delivery"):
+            post_to_discord(webhook_url, payload)
     except discord_delivery.DiscordDeliveryError as error:
         print(str(error), file=sys.stderr)
         return NOTIFICATION_FAILURE_EXIT_CODE

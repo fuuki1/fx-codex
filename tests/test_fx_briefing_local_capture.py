@@ -88,12 +88,18 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     decision_latest_path = tmp_path / "briefing_decisions_latest.json"
     decision_outcomes_path = tmp_path / "briefing_decision_outcomes.json"
     decision_feedback_path = tmp_path / "briefing_decision_feedback.json"
+    stage_timing_path = tmp_path / "stage_timings.jsonl"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
         mock.patch.object(fx_briefing, "DEFAULT_LEARNING_PATH", learning_path),
         mock.patch.object(fx_briefing, "DEFAULT_PROMOTION_STATE", promotion_path),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LOG_PATH", decision_log_path),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LATEST_PATH", decision_latest_path),
+        mock.patch.object(
+            fx_briefing,
+            "DEFAULT_FUSION_DECISION_LATEST_PATH",
+            decision_latest_path,
+        ),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_OUTCOMES_PATH", decision_outcomes_path),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_FEEDBACK_PATH", decision_feedback_path),
         mock.patch("fx_intel.technicals.fetch_pair_technicals", side_effect=_tech_for),
@@ -111,6 +117,8 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
                 "--no-trade-expectancy",
                 "--no-export-events",
                 "--no-event-archive",
+                "--stage-timing-log",
+                str(stage_timing_path),
                 "--symbols",
                 "USDJPY",
             ]
@@ -123,10 +131,8 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert decision_latest_path.exists()
     assert decision_outcomes_path.exists()
     assert decision_feedback_path.exists()
-    rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
-    decision_rows = [
-        json.loads(line) for line in decision_log_path.read_text().splitlines() if line.strip()
-    ]
+    rows = list(fx_briefing.journal.read_entries(journal_path))
+    decision_rows = list(fx_briefing.decision_log.read_decision_events(decision_log_path))
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
     outcome_report = json.loads(decision_outcomes_path.read_text(encoding="utf-8"))
     feedback = json.loads(decision_feedback_path.read_text(encoding="utf-8"))
@@ -147,7 +153,221 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert outcome_report["pit_eligible_decision_events"] == 1
     assert "cells" in feedback
     assert "evaluated" in profile
+    timing_rows = [
+        json.loads(line)
+        for line in stage_timing_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    timing_stages = {str(row["stage"]) for row in timing_rows}
+    assert {
+        "calendar_fetch",
+        "technical_load",
+        "decision_event_build",
+        "decision_log_read",
+        "decision_outcome_score",
+        "decision_transaction_append",
+        "latest_snapshot_save",
+    } <= timing_stages
+    ordered_stages = [str(row["stage"]) for row in timing_rows]
+    assert ordered_stages.index("decision_transaction_append") < ordered_stages.index(
+        "latest_snapshot_save"
+    )
+    assert ordered_stages.index("latest_snapshot_save") < ordered_stages.index("decision_log_read")
+    assert ordered_stages.index("decision_log_read") < ordered_stages.index(
+        "decision_outcome_score"
+    )
+    assert all(row["status"] == "ok" for row in timing_rows)
     assert "Discord送信なし" in capsys.readouterr().out
+
+
+def test_fusion_cannot_overwrite_canonical_timeframe_latest(capsys) -> None:
+    with pytest.raises(SystemExit) as error:
+        fx_briefing.main(
+            [
+                "--decision-latest-output",
+                str(fx_briefing.DEFAULT_DECISION_LATEST_PATH),
+                "--dry-run",
+            ]
+        )
+
+    assert error.value.code == 2
+    assert "fusion cannot overwrite" in capsys.readouterr().err
+
+
+def test_decision_batch_is_published_before_historical_scoring(tmp_path) -> None:
+    calls: list[str] = []
+    recorder = fx_briefing.stage_timing.StageTimingRecorder(
+        None,
+        pipeline="test",
+    )
+    decision_log_path = tmp_path / "briefing_decisions.jsonl"
+    latest_path = tmp_path / "briefing_decisions_latest.json"
+
+    def fail_read(_path):
+        calls.append("read")
+        raise OSError("historical log unavailable")
+
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_LOG_PATH", decision_log_path),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "append_decision_transaction",
+            side_effect=lambda *_args, **_kwargs: calls.append("append"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "save_latest_snapshot",
+            side_effect=lambda *_args, **_kwargs: calls.append("latest"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "read_decision_events",
+            side_effect=fail_read,
+        ),
+        pytest.raises(OSError, match="historical log unavailable"),
+    ):
+        fx_briefing._persist_decision_batch_with_timing(
+            [{"decision_id": "decision-1"}],
+            compact_rows=[{"decision_id": "decision-1"}],
+            compact_path=tmp_path / "briefing_journal.jsonl",
+            mode="fusion",
+            prediction_time=datetime.now(UTC),
+            timing=recorder,
+            latest_snapshot_path=latest_path,
+        )
+
+    assert calls == ["append", "latest", "read"]
+    assert [str(row["stage"]) for row in recorder.records] == [
+        "decision_transaction_append",
+        "latest_snapshot_save",
+        "decision_log_read",
+    ]
+    assert recorder.records[-1]["status"] == "error"
+
+
+def test_decision_batch_can_defer_historical_scoring_after_publication(tmp_path) -> None:
+    calls: list[str] = []
+    recorder = fx_briefing.stage_timing.StageTimingRecorder(None, pipeline="test")
+
+    with (
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "append_decision_transaction",
+            side_effect=lambda *_args, **_kwargs: calls.append("append"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "save_latest_snapshot",
+            side_effect=lambda *_args, **_kwargs: calls.append("latest"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "read_decision_events",
+            side_effect=AssertionError("deferred scorer must own the historical read"),
+        ),
+        mock.patch.object(
+            fx_briefing.decision_log,
+            "score_decision_events",
+            side_effect=AssertionError("deferred scorer must own scoring"),
+        ),
+    ):
+        result = fx_briefing._persist_decision_batch_with_timing(
+            [{"decision_id": "decision-1"}],
+            compact_rows=[{"decision_id": "decision-1"}],
+            compact_path=tmp_path / "briefing_journal.jsonl",
+            mode="per_timeframe",
+            prediction_time=datetime.now(UTC),
+            timing=recorder,
+            latest_snapshot_path=tmp_path / "briefing_decisions_latest.json",
+            score_history=False,
+        )
+
+    assert result is None
+    assert calls == ["append", "latest"]
+    assert [str(row["stage"]) for row in recorder.records] == [
+        "decision_transaction_append",
+        "latest_snapshot_save",
+        "historical_scoring_deferred",
+    ]
+
+
+def _pit_transaction_row(
+    decision_id: str,
+    prediction_time: datetime,
+) -> dict[str, object]:
+    return {
+        "ts": prediction_time.isoformat(),
+        "prediction_time": prediction_time.isoformat(),
+        "source_cutoff": prediction_time.isoformat(),
+        "max_feature_available_time": prediction_time.isoformat(),
+        "pit_eligible": True,
+        "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+        "decision_id": decision_id,
+        "mode": "per_timeframe",
+        "producer": fx_briefing.journal.TIMEFRAME_PRODUCER,
+        "producer_version": fx_briefing.journal.TIMEFRAME_PRODUCER_VERSION,
+        "input_context_id": f"context:{decision_id}",
+        "source_record_ids": [f"source:{decision_id}"],
+        "symbol": "USDJPY",
+        "timeframe": "1h",
+        "horizon_hours": 1.0,
+    }
+
+
+def test_next_run_scores_prior_committed_batch_once(tmp_path) -> None:
+    decision_log_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = tmp_path / "briefing_tf_journal.jsonl"
+    latest_path = tmp_path / "briefing_decisions_latest.json"
+    first_time = datetime(2026, 8, 15, 0, 0, tzinfo=UTC)
+    score_calls: list[list[str]] = []
+
+    def event(decision_id: str, prediction_time: datetime) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "event_type": fx_briefing.decision_log.EVENT_TYPE,
+            "source": "fx_briefing",
+            "decision": {"direction": "standby", "close": 150.0},
+            **_pit_transaction_row(decision_id, prediction_time),
+        }
+
+    def score(events, **_kwargs):
+        score_calls.append([str(row["decision_id"]) for row in events])
+        return {
+            "pit_contract": fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT,
+            "pit_required": True,
+            "outcomes": [],
+        }
+
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_DECISION_LOG_PATH", decision_log_path),
+        mock.patch.object(fx_briefing.decision_log, "score_decision_events", side_effect=score),
+        mock.patch.object(fx_briefing.decision_log, "save_outcome_report"),
+        mock.patch.object(
+            fx_briefing.decision_feedback, "derive_decision_feedback", return_value={}
+        ),
+        mock.patch.object(fx_briefing.decision_feedback, "save_decision_feedback"),
+    ):
+        for offset, decision_id in enumerate(("run-1", "run-2")):
+            prediction_time = first_time + timedelta(minutes=offset)
+            fx_briefing._persist_decision_batch_with_timing(
+                [event(decision_id, prediction_time)],
+                compact_rows=[_pit_transaction_row(decision_id, prediction_time)],
+                compact_path=compact_path,
+                mode="per_timeframe",
+                prediction_time=prediction_time,
+                timing=fx_briefing.stage_timing.StageTimingRecorder(None, pipeline="test"),
+                latest_snapshot_path=latest_path,
+            )
+
+    assert score_calls == [["run-1"], ["run-1", "run-2"]]
+    assert [
+        str(row["decision_id"])
+        for row in fx_briefing.decision_log.read_decision_events(decision_log_path)
+    ] == ["run-1", "run-2"]
+    assert [str(row["decision_id"]) for row in fx_briefing.journal.read_entries(compact_path)] == [
+        "run-1",
+        "run-2",
+    ]
 
 
 def test_fusion_journal_failure_stops_full_decision_writer(tmp_path, capsys) -> None:
@@ -160,12 +380,12 @@ def test_fusion_journal_failure_stops_full_decision_writer(tmp_path, capsys) -> 
         mock.patch("fx_intel.sentiment.analyze_market", return_value=_analysis()),
         mock.patch.object(
             fx_briefing.journal,
-            "append_plans",
+            "build_plan_rows",
             side_effect=OSError("read-only"),
         ),
         mock.patch.object(
             fx_briefing.decision_log,
-            "append_decision_events",
+            "append_decision_transaction",
             side_effect=AssertionError("must not run"),
         ),
     ):
@@ -350,7 +570,7 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert registry["candidates"][candidate_id]["stage"] == "auto_paused"
     # 今回追記されたプラン行(履歴20行の後)には停止済みポリシーを適用しない
-    rows = [json.loads(line) for line in journal_path.read_text().splitlines() if line.strip()]
+    rows = list(fx_briefing.journal.read_entries(journal_path))
     new_rows = rows[20:]
     assert new_rows, "今回のプランがジャーナルへ追記されていること"
     assert all(row["direction"] == "neutral" for row in new_rows)

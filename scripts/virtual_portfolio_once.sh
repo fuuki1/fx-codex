@@ -32,6 +32,8 @@ arguments=(
   "$PWD/runs/virtual_portfolio"
   --heartbeat-config
   "$PWD/ops/virtual_portfolio_required_heartbeats.json"
+  --stage-timing-log
+  "$PWD/logs/decision_pipeline_stage_timings.jsonl"
 )
 if [ "${1:-}" = "--close-session" ]; then
   arguments+=(--close-session)

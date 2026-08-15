@@ -9,10 +9,19 @@ import json
 from pathlib import Path
 import sys
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 DUE_EXIT_CODE = 0
 INVALID_EXIT_CODE = 2
 NOT_DUE_EXIT_CODE = 3
 DEFAULT_MINIMUM_INTERVAL_MINUTES = 55
+_TRANSACTION_EVENT_TYPES = {
+    "journal_batch_commit",
+    "decision_cross_log_receipt",
+    "decision_cross_log_commit",
+}
 
 
 class FusionCaptureScheduleError(ValueError):
@@ -32,7 +41,12 @@ def _aware_timestamp(value: object) -> datetime:
 
 
 def latest_journal_timestamp(journal: Path) -> datetime | None:
-    """最終非空行のaware UTC時刻を返す。未作成・空ファイルはNone。"""
+    """最後に確定した判断のaware UTC時刻を返す。未作成・空ならNone。
+
+    compact journal は判断行だけの旧形式に加え、cross-log transaction の
+    batch marker / receipt が末尾に付く。transaction 参加行を見つけた場合は
+    正準readerを通し、full log 側までcommit済みの判断だけを時刻判定に使う。
+    """
     if not journal.exists():
         return None
     try:
@@ -51,7 +65,24 @@ def latest_journal_timestamp(journal: Path) -> datetime | None:
         raise FusionCaptureScheduleError("journal最終行が不正なJSONです") from error
     if not isinstance(row, dict):
         raise FusionCaptureScheduleError("journal最終行がobjectではありません")
-    return _aware_timestamp(row.get("ts"))
+    transaction_row = (
+        bool(row.get("journal_batch_id")) or row.get("event_type") in _TRANSACTION_EVENT_TYPES
+    )
+    if not transaction_row:
+        return _aware_timestamp(row.get("ts"))
+
+    # 旧形式だけを使う最小運用fixtureでもCLIを起動できるよう、transaction reader
+    # は実際にtransaction行を見つけた時だけ読み込む。
+    from fx_intel import journal as decision_journal
+
+    latest: object | None = None
+    try:
+        for entry in decision_journal.read_entries(journal):
+            if entry.get("mode") in (None, "", "fusion"):
+                latest = entry.get("ts")
+    except (OSError, UnicodeError) as error:
+        raise FusionCaptureScheduleError(f"journalを読めません: {error}") from error
+    return _aware_timestamp(latest) if latest is not None else None
 
 
 def capture_is_due(
