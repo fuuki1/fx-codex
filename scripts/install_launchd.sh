@@ -117,6 +117,16 @@ unmanaged_direct_writers() {
   done
 }
 
+wait_for_unloaded() {
+  local label="$1"
+  local attempts=0
+  while launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 50 ] || return 1
+    sleep 0.1
+  done
+}
+
 echo "fx-codex root : $ROOT"
 echo "python        : $PYTHON"
 echo "agents dir    : $AGENTS_DIR"
@@ -166,7 +176,7 @@ for label in $LEGACY_LABELS; do
       echo "ERROR: legacy bootout失敗: $label" >&2
       exit 2
     fi
-    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    if ! wait_for_unloaded "$label"; then
       echo "ERROR: legacy serviceがbootout後も残存: $label" >&2
       exit 2
     fi
@@ -205,7 +215,7 @@ for label in $LABELS; do
       echo "ERROR: 既存serviceのbootout失敗: $label" >&2
       exit 2
     fi
-    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    if ! wait_for_unloaded "$label"; then
       rm -f "$candidate"
       echo "ERROR: bootout後もserviceが残存: $label" >&2
       exit 2
