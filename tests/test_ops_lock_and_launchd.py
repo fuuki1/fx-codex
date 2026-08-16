@@ -258,6 +258,17 @@ def test_install_script_dry_run_makes_no_changes(tmp_path):
         "com.fx-codex.health",
         "com.fx-codex.horizon",
         "com.fx-codex.monitors",
+        "com.fx-codex.monitor-diagnostics",
+        "com.fx-codex.dukascopy-history",
+        "com.fx-codex.quote-index",
+        "com.fx-codex.virtual-portfolio",
+        "com.fx-codex.virtual-portfolio-postprocess",
+        "com.fx-codex.virtual-portfolio-report",
+        "com.fx-codex.virtual-portfolio-counterfactual",
+        "com.fx-codex.virtual-portfolio-learning",
+        "com.fx-codex.virtual-portfolio-read",
+        "com.fx-codex.dashboard-state",
+        "com.fx-codex.operational-read",
     ):
         assert label in result.stdout
     # 展開済みパスが含まれ、プレースホルダは残らない
@@ -274,6 +285,11 @@ def test_shell_scripts_parse(tmp_path):
         "fx_briefing_once.sh",
         "fx_horizon_once.sh",
         "fx_monitors_once.sh",
+        "fx_monitor_diagnostics_once.sh",
+        "virtual_portfolio_once.sh",
+        "virtual_portfolio_postprocess_once.sh",
+        "virtual_portfolio_report_once.sh",
+        "virtual_portfolio_counterfactual_once.sh",
     ):
         result = subprocess.run(
             [_ZSH, "-n", str(_ROOT / "scripts" / script)],
@@ -285,10 +301,62 @@ def test_shell_scripts_parse(tmp_path):
 
 
 def test_scheduled_trade_outcome_monitor_cannot_mutate_policy_registry():
-    script = (_ROOT / "scripts" / "fx_monitors_once.sh").read_text(encoding="utf-8")
+    script = (_ROOT / "scripts" / "fx_monitor_diagnostics_once.sh").read_text(encoding="utf-8")
 
     assert "tools/trade_outcome_monitor.py" in script
     assert "--no-registry-update" in script
+
+
+def test_canonical_learning_publisher_isolated_from_diagnostic_scans():
+    publisher = (_ROOT / "scripts" / "fx_monitors_once.sh").read_text(encoding="utf-8")
+
+    assert "timeframe_learning_monitor.py" in publisher
+    assert "trade_outcome_monitor.py" not in publisher
+    assert "decision_expectancy_monitor.py" not in publisher
+
+
+def test_scheduled_virtual_intake_isolated_from_optional_postprocessing():
+    intake = (_ROOT / "scripts" / "virtual_portfolio_once.sh").read_text(encoding="utf-8")
+    postprocess = (_ROOT / "scripts" / "virtual_portfolio_postprocess_once.sh").read_text(
+        encoding="utf-8"
+    )
+    counterfactual = (_ROOT / "scripts" / "virtual_portfolio_counterfactual_once.sh").read_text(
+        encoding="utf-8"
+    )
+    report = (_ROOT / "scripts" / "virtual_portfolio_report_once.sh").read_text(encoding="utf-8")
+
+    assert "--skip-counterfactual" in intake
+    assert "virtual_portfolio_canonical_outcomes.py" not in intake
+    assert "virtual_portfolio_daily_report.py" not in intake
+    assert "virtual_portfolio_canonical_outcomes.py" in postprocess
+    assert "virtual_portfolio_daily_report.py" not in postprocess
+    assert "counterfactual-cycle" not in postprocess
+    assert "counterfactual-cycle" in counterfactual
+    assert "--writer-id com.fx-codex.virtual-portfolio-v2" in counterfactual
+    assert "virtual_portfolio_canonical_outcomes.py" not in counterfactual
+    assert "virtual_portfolio_daily_report.py" not in counterfactual
+    assert "virtual_portfolio_daily_report.py" in report
+    assert "virtual_portfolio_canonical_outcomes.py" not in report
+    assert "counterfactual-cycle" not in report
+
+    lock_names = {
+        "intake": "fx-virtual-portfolio",
+        "outcomes": "fx-virtual-portfolio-postprocess",
+        "report": "fx-virtual-portfolio-report",
+        "counterfactual": "fx-virtual-portfolio-counterfactual",
+    }
+    for role, lock_name in lock_names.items():
+        template = (
+            _ROOT / "ops" / "launchd" / f"com.fx-codex.virtual-portfolio-{role}.plist.tmpl"
+            if role != "intake"
+            else _ROOT / "ops" / "launchd" / "com.fx-codex.virtual-portfolio.plist.tmpl"
+        )
+        if role == "outcomes":
+            template = (
+                _ROOT / "ops" / "launchd" / "com.fx-codex.virtual-portfolio-postprocess.plist.tmpl"
+            )
+        body = template.read_text(encoding="utf-8")
+        assert f"<string>{lock_name}</string>" in body
 
 
 def test_scheduled_briefing_cannot_apply_fusion_tp_sl_policy():

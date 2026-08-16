@@ -238,6 +238,10 @@ def _write_empty_learning_caches(generated_at: datetime) -> None:
                         "read_offset_bytes": 0,
                         "mtime_ns": 0,
                         "sha256": "0" * 64,
+                        "source_sha256": "0" * 64,
+                        "physical_rows": 0,
+                        "parsed_object_rows": 0,
+                        "blank_rows": 0,
                         "raw_rows": 0,
                         "eligible_rows": 0,
                         "max_prediction_time": None,
@@ -249,6 +253,10 @@ def _write_empty_learning_caches(generated_at: datetime) -> None:
                         "read_offset_bytes": 0,
                         "mtime_ns": 0,
                         "sha256": "0" * 64,
+                        "source_sha256": "0" * 64,
+                        "physical_rows": 0,
+                        "parsed_object_rows": 0,
+                        "blank_rows": 0,
                         "raw_rows": 0,
                         "eligible_rows": 0,
                         "max_available_time": None,
@@ -441,6 +449,107 @@ def test_mixed_learning_cache_generation_blocks_directional_decisions(
     assert "timeframe_learning_generation_mismatch" in json.dumps(latest, ensure_ascii=False)
 
 
+def test_learning_bundle_lock_timeout_publishes_neutral_batch(patched_paths, capsys) -> None:
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    with mock.patch.object(
+        fx_briefing.state_io,
+        "advisory_file_lock",
+        side_effect=TimeoutError("publisher is stalled"),
+    ):
+        rc = _run(
+            [
+                "--per-timeframe",
+                "--no-discord",
+                "--no-macro",
+                "--cached-timeframe-learning",
+                "--no-auxiliary-horizon-reports",
+                "--no-approved-tp-sl-policy",
+                "--defer-decision-scoring",
+                "--symbols",
+                "USDJPY",
+            ],
+            capsys,
+            calendar_result=([calendar_event], []),
+        )
+
+    assert rc == 0
+    latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
+    assert all(event["decision"]["direction"] == "neutral" for event in latest["events"])
+    assert "timeframe_learning_bundle_lock_timeout" in json.dumps(latest, ensure_ascii=False)
+
+
+def test_no_trade_expectancy_still_requires_valid_learning_bundle(patched_paths, capsys) -> None:
+    _write_empty_learning_caches(datetime.now(UTC))
+    fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH.unlink()
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--no-discord",
+            "--no-macro",
+            "--cached-timeframe-learning",
+            "--no-trade-expectancy",
+            "--no-auxiliary-horizon-reports",
+            "--defer-decision-scoring",
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
+    assert all(event["decision"]["direction"] == "neutral" for event in latest["events"])
+    assert "timeframe_learning_bundle_invalid" in json.dumps(latest, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    ("option", "reserved_name"),
+    (
+        ("--stage-timing-log", "direction"),
+        ("--stage-timing-log", "lock"),
+        ("--decision-latest-output", "manifest"),
+    ),
+)
+def test_briefing_writable_outputs_cannot_alias_learning_bundle(
+    patched_paths, option, reserved_name
+) -> None:
+    reserved = {
+        "direction": fx_briefing.DEFAULT_TF_LEARNING_PATH,
+        "manifest": fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH,
+        "lock": fx_briefing._timeframe_learning_bundle_lock_path(
+            fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH
+        ),
+    }
+
+    with pytest.raises(SystemExit) as error:
+        fx_briefing.main(["--per-timeframe", option, str(reserved[reserved_name]), "--dry-run"])
+
+    assert error.value.code == 2
+
+
+def test_briefing_rejects_symlink_and_case_alias_to_learning_bundle(
+    patched_paths, tmp_path
+) -> None:
+    symlink_alias = tmp_path / "manifest-alias.json"
+    symlink_alias.symlink_to(fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH)
+    case_alias = fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH.with_name(
+        fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH.name.upper()
+    )
+
+    for target in (symlink_alias, case_alias):
+        with pytest.raises(SystemExit) as error:
+            fx_briefing.main(["--per-timeframe", "--stage-timing-log", str(target), "--dry-run"])
+        assert error.value.code == 2
+
+
 def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
     rc = _run(
         ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
@@ -594,7 +703,7 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
 
     assert rc == 0
     assert tf_journal.exists()
-    assert tf_learning.exists()
+    assert not tf_learning.exists()
     assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_LATEST_PATH.exists()
     assert fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
@@ -637,7 +746,7 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
 
 
 def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
-    """既存の時間足別ジャーナルがあれば学習が働き、学習ファイルが書かれる。"""
+    """既存の時間足別ジャーナルはその実行中の判断へ学習を反映する。"""
     tf_journal, tf_learning = patched_paths
     # 事前に 1h の負け履歴を仕込む(全 miss で減衰が発動する量)
     start = datetime(2026, 6, 22, 8, 0, tzinfo=UTC)
@@ -669,10 +778,11 @@ def test_per_timeframe_learning_feeds_back(patched_paths, capsys) -> None:
 
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):
         _run(["--per-timeframe", "--no-macro", "--symbols", "USDJPY"], capsys)
-    # 学習プロファイルが保存される
-    assert tf_learning.exists()
-    payload = json.loads(tf_learning.read_text(encoding="utf-8"))
-    assert "USDJPY|1h" in payload["profiles"]
+    latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
+    one_hour = next(event for event in latest["events"] if event["timeframe"] == "1h")
+    assert any("学習調整" in warning for warning in one_hour["decision"]["warnings"])
+    # Canonical cache publication belongs only to timeframe_learning_monitor.py.
+    assert not tf_learning.exists()
 
 
 def test_per_timeframe_expectancy_guard_uses_timeframe_cell(patched_paths, capsys) -> None:

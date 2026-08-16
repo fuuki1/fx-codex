@@ -4,11 +4,12 @@ from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
 from pathlib import Path
+import threading
 from unittest import mock
 
 import pytest
 
-from fx_intel import decision_feedback, maximization, tf_learning, tp_sl_learning
+from fx_intel import decision_feedback, maximization, state_io, tf_learning, tp_sl_learning
 from fx_intel.learning import LearnedProfile
 
 
@@ -232,9 +233,15 @@ def test_timeframe_learning_monitor_publishes_all_caches(tmp_path) -> None:
     assert {row["stage"] for row in timing_rows} == {
         "timeframe_learning_journal_read",
         "timeframe_learning_price_read",
+        "timeframe_learning_pit_filter",
         "timeframe_direction_learning_refresh",
         "timeframe_tp_sl_learning_refresh",
         "timeframe_maximization_learning_refresh",
+        "timeframe_learning_manifest_prepare",
+        "timeframe_learning_bundle_lock_wait",
+        "timeframe_learning_previous_generation_check",
+        "timeframe_learning_bundle_publish",
+        "timeframe_learning_manifest_publish",
     }
     import fx_briefing
 
@@ -287,6 +294,487 @@ def test_timeframe_learning_monitor_publishes_all_caches(tmp_path) -> None:
         )
 
 
+def test_timeframe_learning_monitor_derives_full_generation_before_publish(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_order", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    journal_path.write_text("", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(tmp_path / "tf.json"),
+            "--tp-sl-learning",
+            str(tmp_path / "tp.json"),
+            "--maximization",
+            str(tmp_path / "max.json"),
+            "--monitor-json",
+            str(tmp_path / "monitor.json"),
+        ]
+    )
+    events: list[str] = []
+
+    def track(name: str, wrapped):
+        def call(*call_args, **call_kwargs):
+            events.append(name)
+            return wrapped(*call_args, **call_kwargs)
+
+        return call
+
+    with (
+        mock.patch.object(
+            module.tf_learning,
+            "derive_timeframe_learning",
+            side_effect=track("derive_direction", module.tf_learning.derive_timeframe_learning),
+        ),
+        mock.patch.object(
+            module.tp_sl_learning,
+            "derive_timeframe_tp_sl_learning",
+            side_effect=track(
+                "derive_tp_sl", module.tp_sl_learning.derive_timeframe_tp_sl_learning
+            ),
+        ),
+        mock.patch.object(
+            module.maximization,
+            "derive_timeframe_maximization",
+            side_effect=track(
+                "derive_maximization", module.maximization.derive_timeframe_maximization
+            ),
+        ),
+        mock.patch.object(
+            module.tf_learning,
+            "save_timeframe_learning",
+            side_effect=track("save_direction", module.tf_learning.save_timeframe_learning),
+        ),
+        mock.patch.object(
+            module.tp_sl_learning,
+            "save_timeframe_tp_sl_learning",
+            side_effect=track("save_tp_sl", module.tp_sl_learning.save_timeframe_tp_sl_learning),
+        ),
+        mock.patch.object(
+            module.maximization,
+            "save_timeframe_maximization",
+            side_effect=track("save_maximization", module.maximization.save_timeframe_maximization),
+        ),
+    ):
+        module.run(args)
+
+    assert events == [
+        "derive_direction",
+        "derive_tp_sl",
+        "derive_maximization",
+        "save_direction",
+        "save_tp_sl",
+        "save_maximization",
+    ]
+
+
+def test_timeframe_learning_monitor_rejects_split_canonical_output_set(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_outputs", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    args = module.build_parser().parse_args(
+        [
+            "--monitor-json",
+            str(tmp_path / "alternate-monitor.json"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="outputs and monitor must be used together"):
+        module.run(args)
+
+
+def test_canonical_learning_bundle_rejects_noncanonical_inputs(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_inputs", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(tmp_path / "alternate-journal.jsonl"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires canonical journal and price inputs"):
+        module.run(args)
+
+
+def test_canonical_learning_bundle_accepts_resolved_input_alias(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_input_alias", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    alias = tmp_path / "journal-alias.jsonl"
+    alias.symlink_to(module.DEFAULT_JOURNAL)
+    args = module.build_parser().parse_args(["--journal", str(alias)])
+
+    validated = module._validate_output_bundle(args)
+
+    assert validated[0] == module.DEFAULT_JOURNAL.resolve()
+
+
+def test_timeframe_learning_monitor_rejects_lock_output_collision(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_collision", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monitor_path = tmp_path / "monitor.json"
+    args = module.build_parser().parse_args(
+        [
+            "--tf-learning",
+            str(module._bundle_lock_path(monitor_path)),
+            "--tp-sl-learning",
+            str(tmp_path / "tp.json"),
+            "--maximization",
+            str(tmp_path / "max.json"),
+            "--monitor-json",
+            str(monitor_path),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="lock must not alias data or output"):
+        module.run(args)
+
+
+def test_timeframe_learning_monitor_rejects_case_variant_lock_collision(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_case", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monitor_path = tmp_path / "monitor.json"
+    args = module.build_parser().parse_args(
+        [
+            "--tf-learning",
+            str(tmp_path / "MONITOR.JSON.LOCK"),
+            "--tp-sl-learning",
+            str(tmp_path / "tp.json"),
+            "--maximization",
+            str(tmp_path / "max.json"),
+            "--monitor-json",
+            str(monitor_path),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="lock must not alias data or output"):
+        module.run(args)
+
+
+@pytest.mark.parametrize("timing_target", ("tf", "monitor", "lock"))
+def test_timeframe_learning_monitor_rejects_timing_output_alias(tmp_path, timing_target) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location(
+        f"timeframe_learning_monitor_timing_{timing_target}", script
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monitor_path = tmp_path / "monitor.json"
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": monitor_path,
+        "lock": module._bundle_lock_path(monitor_path),
+    }
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+            "--stage-timing-log",
+            str(outputs[timing_target]),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="stage timing log must not alias"):
+        module.run(args)
+
+
+def test_timeframe_learning_monitor_normalizes_output_symlink_aliases(
+    tmp_path, monkeypatch
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_alias", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    canonical_dir = tmp_path / "canonical"
+    alias_dir = tmp_path / "aliases"
+    canonical_dir.mkdir()
+    alias_dir.mkdir()
+    canonical = {
+        "tf": canonical_dir / "tf.json",
+        "tp": canonical_dir / "tp.json",
+        "max": canonical_dir / "max.json",
+        "monitor": canonical_dir / "monitor.json",
+    }
+    aliases = {key: alias_dir / f"alias-{key}.json" for key in canonical}
+    for key, alias in aliases.items():
+        alias.symlink_to(canonical[key])
+    monkeypatch.setattr(module, "DEFAULT_TF_LEARNING", canonical["tf"])
+    monkeypatch.setattr(module, "DEFAULT_TP_SL_LEARNING", canonical["tp"])
+    monkeypatch.setattr(module, "DEFAULT_MAXIMIZATION", canonical["max"])
+    monkeypatch.setattr(module, "DEFAULT_MONITOR", canonical["monitor"])
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    journal_path.write_text("", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(module, "DEFAULT_JOURNAL", journal_path)
+    monkeypatch.setattr(module, "DEFAULT_PRICES", price_path)
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(aliases["tf"]),
+            "--tp-sl-learning",
+            str(aliases["tp"]),
+            "--maximization",
+            str(aliases["max"]),
+            "--monitor-json",
+            str(aliases["monitor"]),
+        ]
+    )
+
+    module.run(args)
+
+    assert all(alias.is_symlink() for alias in aliases.values())
+    assert all(path.exists() for path in canonical.values())
+    assert module._bundle_lock_path(canonical["monitor"]).exists()
+    assert not aliases["monitor"].with_suffix(".json.lock").exists()
+    import fx_briefing
+
+    assert fx_briefing._timeframe_learning_bundle_lock_path(
+        aliases["monitor"]
+    ) == module._bundle_lock_path(canonical["monitor"])
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", journal_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", price_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_PATH", aliases["tf"]),
+        mock.patch.object(fx_briefing, "DEFAULT_TP_SL_LEARNING_PATH", aliases["tp"]),
+        mock.patch.object(fx_briefing, "DEFAULT_MAXIMIZATION_PATH", aliases["max"]),
+    ):
+        loaded = fx_briefing._load_cached_timeframe_learning_bundle(
+            aliases["monitor"],
+            max_age_seconds=1800,
+        )
+    assert loaded[3:] == (True, True)
+
+
+def test_advisory_file_lock_has_bounded_reader_wait(tmp_path) -> None:
+    lock_path = tmp_path / "bundle.lock"
+    writer_locked = threading.Event()
+    release_writer = threading.Event()
+
+    def hold_writer() -> None:
+        with state_io.advisory_file_lock(lock_path, exclusive=True):
+            writer_locked.set()
+            assert release_writer.wait(timeout=5)
+
+    writer = threading.Thread(target=hold_writer)
+    writer.start()
+    assert writer_locked.wait(timeout=5)
+    try:
+        with pytest.raises(TimeoutError, match="timed out waiting for state lock"):
+            with state_io.advisory_file_lock(lock_path, exclusive=False, timeout_seconds=0.02):
+                pass
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+
+    assert not writer.is_alive()
+
+
+def test_timeframe_learning_bundle_reader_waits_for_complete_publication(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_lock", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    tf_path = tmp_path / "tf.json"
+    tp_path = tmp_path / "tp.json"
+    max_path = tmp_path / "max.json"
+    monitor_path = tmp_path / "monitor.json"
+    journal_path.write_text("", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(tf_path),
+            "--tp-sl-learning",
+            str(tp_path),
+            "--maximization",
+            str(max_path),
+            "--monitor-json",
+            str(monitor_path),
+        ]
+    )
+    module.run(args)
+
+    writer_paused = threading.Event()
+    allow_writer = threading.Event()
+    reader_done = threading.Event()
+    reader_clock_called = threading.Event()
+    errors: list[BaseException] = []
+    result: list[tuple[object, ...]] = []
+    original_tp_save = module.tp_sl_learning.save_timeframe_tp_sl_learning
+
+    def paused_tp_save(*call_args, **call_kwargs):
+        writer_paused.set()
+        if not allow_writer.wait(timeout=5):
+            raise TimeoutError("test did not release cache publisher")
+        return original_tp_save(*call_args, **call_kwargs)
+
+    def publish() -> None:
+        try:
+            module.run(args)
+        except BaseException as error:
+            errors.append(error)
+
+    import fx_briefing
+
+    def read_bundle() -> None:
+        def reader_clock() -> datetime:
+            reader_clock_called.set()
+            return datetime.now(UTC)
+
+        try:
+            result.append(
+                fx_briefing._load_cached_timeframe_learning_bundle(
+                    monitor_path,
+                    max_age_seconds=1800,
+                    clock=reader_clock,
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            reader_done.set()
+
+    with (
+        mock.patch.object(
+            module.tp_sl_learning,
+            "save_timeframe_tp_sl_learning",
+            side_effect=paused_tp_save,
+        ),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", journal_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", price_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_PATH", tf_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TP_SL_LEARNING_PATH", tp_path),
+        mock.patch.object(fx_briefing, "DEFAULT_MAXIMIZATION_PATH", max_path),
+    ):
+        writer = threading.Thread(target=publish)
+        writer.start()
+        assert writer_paused.wait(timeout=5)
+        reader = threading.Thread(target=read_bundle)
+        reader.start()
+        assert not reader_done.wait(timeout=0.1)
+        assert not reader_clock_called.is_set()
+        allow_writer.set()
+        writer.join(timeout=5)
+        reader.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reader.is_alive()
+    assert reader_clock_called.is_set()
+    assert errors == []
+    assert len(result) == 1
+    assert result[0][3:] == (True, True)
+
+
+def test_partial_bundle_publication_fails_closed_after_writer_error(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_failure", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    tf_path = tmp_path / "tf.json"
+    tp_path = tmp_path / "tp.json"
+    max_path = tmp_path / "max.json"
+    monitor_path = tmp_path / "monitor.json"
+    journal_path.write_text("", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(tf_path),
+            "--tp-sl-learning",
+            str(tp_path),
+            "--maximization",
+            str(max_path),
+            "--monitor-json",
+            str(monitor_path),
+        ]
+    )
+    module.run(args)
+
+    with (
+        mock.patch.object(
+            module.tp_sl_learning,
+            "save_timeframe_tp_sl_learning",
+            side_effect=OSError("injected TP cache failure"),
+        ),
+        pytest.raises(OSError, match="injected TP cache failure"),
+    ):
+        module.run(args)
+
+    import fx_briefing
+
+    with (
+        mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", journal_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", price_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_PATH", tf_path),
+        mock.patch.object(fx_briefing, "DEFAULT_TP_SL_LEARNING_PATH", tp_path),
+        mock.patch.object(fx_briefing, "DEFAULT_MAXIMIZATION_PATH", max_path),
+    ):
+        loaded = fx_briefing._load_cached_timeframe_learning_bundle(
+            monitor_path,
+            max_age_seconds=1800,
+        )
+
+    assert loaded[3:] == (False, False)
+
+
 def test_timeframe_learning_monitor_excludes_non_pit_decisions(tmp_path) -> None:
     script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
     spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_pit", script)
@@ -319,6 +807,19 @@ def test_timeframe_learning_monitor_excludes_non_pit_decisions(tmp_path) -> None
     ]
     price_rows = [{"id": "price"}]
     captured: list[list[dict[str, str]]] = []
+    populations = iter((decision_rows, price_rows))
+
+    def read_entries(_path, *, audit, **_kwargs):
+        rows = next(populations)
+        audit.update(
+            {
+                "physical_rows": len(rows),
+                "parsed_object_rows": len(rows),
+                "blank_rows": 0,
+                "source_sha256": "0" * 64,
+            }
+        )
+        return iter(rows)
 
     def derive(entries, *, now):
         captured.append(list(entries))
@@ -328,7 +829,7 @@ def test_timeframe_learning_monitor_excludes_non_pit_decisions(tmp_path) -> None
         mock.patch.object(
             module.journal,
             "read_entries",
-            side_effect=[iter(decision_rows), iter(price_rows)],
+            side_effect=read_entries,
         ),
         mock.patch.object(
             module.journal,
@@ -454,7 +955,7 @@ def test_timeframe_learning_monitor_rejects_source_change_during_read(tmp_path) 
         ]
     )
 
-    def changing_read(_path):
+    def changing_read(_path, **_kwargs):
         journal_path.write_text("{}\n", encoding="utf-8")
         return iter(())
 
@@ -465,6 +966,96 @@ def test_timeframe_learning_monitor_rejects_source_change_during_read(tmp_path) 
         module.run(args)
 
     assert not (tmp_path / "monitor.json").exists()
+
+
+@pytest.mark.parametrize("corrupt_source", ("journal", "prices"))
+def test_timeframe_learning_monitor_preserves_bundle_on_malformed_source(
+    tmp_path, corrupt_source
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location(
+        f"timeframe_learning_monitor_malformed_{corrupt_source}", script
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": tmp_path / "monitor.json",
+    }
+    journal_path.write_text("", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+        ]
+    )
+    module.run(args)
+    before = {key: path.read_bytes() for key, path in outputs.items()}
+    target = journal_path if corrupt_source == "journal" else price_path
+    target.write_text("{malformed-json}\n", encoding="utf-8")
+
+    with pytest.raises(module.journal.JournalIntegrityError, match="malformed JSONL row"):
+        module.run(args)
+
+    assert {key: path.read_bytes() for key, path in outputs.items()} == before
+
+
+def test_timeframe_learning_monitor_rejects_valid_but_truncated_source(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_truncate", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": tmp_path / "monitor.json",
+    }
+    journal_path.write_text("{}\n", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+        ]
+    )
+    module.run(args)
+    before = {key: path.read_bytes() for key, path in outputs.items()}
+    journal_path.write_text("", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="source regressed"):
+        module.run(args)
+
+    assert {key: path.read_bytes() for key, path in outputs.items()} == before
 
 
 def test_learning_cache_freshness_rejects_future_and_stale() -> None:

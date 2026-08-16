@@ -124,3 +124,58 @@ def test_maximization_monitor_cli_quiet_returns_exit_code(monitor, tmp_path) -> 
     )
 
     assert exit_code == 1
+
+
+def test_maximization_monitor_default_is_not_canonical_bundle_member(monitor) -> None:
+    args = monitor.build_parser().parse_args([])
+
+    assert args.profile_json == monitor.DEFAULT_PROFILE_PATH
+    assert args.profile_json != monitor.CANONICAL_PROFILE_PATH
+
+
+def test_maximization_monitor_rejects_canonical_bundle_member(monitor, tmp_path) -> None:
+    with pytest.raises(ValueError, match="owned by timeframe_learning_monitor"):
+        monitor.run_maximization_monitor(
+            journal_path=tmp_path / "unused-journal.jsonl",
+            prices_path=tmp_path / "unused-prices.jsonl",
+            profile_json_path=monitor.CANONICAL_PROFILE_PATH,
+            monitor_json_path=tmp_path / "unused-monitor.json",
+            now=NOW,
+        )
+
+
+def test_maximization_monitor_reserves_every_canonical_bundle_path(monitor, tmp_path) -> None:
+    for index, reserved in enumerate(monitor._canonical_bundle_paths()):
+        with pytest.raises(ValueError, match="owned by timeframe_learning_monitor"):
+            monitor.run_maximization_monitor(
+                journal_path=tmp_path / "unused-journal.jsonl",
+                prices_path=tmp_path / "unused-prices.jsonl",
+                profile_json_path=tmp_path / f"diagnostic-{index}.json",
+                monitor_json_path=reserved,
+                now=NOW,
+            )
+
+
+def test_maximization_monitor_rejects_symlink_and_case_aliases(monitor, tmp_path) -> None:
+    alias = tmp_path / "manifest-alias.json"
+    alias.symlink_to(monitor.CANONICAL_MANIFEST_PATH)
+    with pytest.raises(ValueError, match="owned by timeframe_learning_monitor"):
+        monitor.run_maximization_monitor(
+            journal_path=tmp_path / "unused-journal.jsonl",
+            prices_path=tmp_path / "unused-prices.jsonl",
+            profile_json_path=tmp_path / "diagnostic-profile.json",
+            monitor_json_path=alias,
+            now=NOW,
+        )
+
+    case_alias = monitor.CANONICAL_MANIFEST_PATH.with_name(
+        monitor.CANONICAL_MANIFEST_PATH.name.upper()
+    )
+    with pytest.raises(ValueError, match="owned by timeframe_learning_monitor"):
+        monitor.run_maximization_monitor(
+            journal_path=tmp_path / "unused-journal.jsonl",
+            prices_path=tmp_path / "unused-prices.jsonl",
+            profile_json_path=case_alias,
+            monitor_json_path=tmp_path / "diagnostic-monitor.json",
+            now=NOW,
+        )

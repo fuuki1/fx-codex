@@ -34,6 +34,7 @@ arguments=(
   "$PWD/ops/virtual_portfolio_required_heartbeats.json"
   --stage-timing-log
   "$PWD/logs/decision_pipeline_stage_timings.jsonl"
+  --skip-counterfactual
 )
 if [ "${1:-}" = "--close-session" ]; then
   arguments+=(--close-session)
@@ -43,26 +44,3 @@ elif [ "$#" -gt 0 ]; then
 fi
 
 "$PYTHON" "${arguments[@]}" </dev/null
-
-# Fail closed unless every mature intraday virtual fill is present in the
-# append-only canonical net-R store. The connector is idempotent, so a later
-# cycle safely retries any interruption between the SQLite close and JSONL append.
-"$PYTHON" tools/virtual_portfolio_canonical_outcomes.py \
-  --db "$PWD/logs/fx_virtual_portfolio_canonical_v2.sqlite3" \
-  --store "$PWD/logs/canonical_v2_outcomes.jsonl" \
-  --label-evidence-store "$PWD/logs/canonical_v2_label_evidence.jsonl" \
-  --quote-log "$PWD/collect/log/quotes.jsonl" \
-  --raw-store "$PWD/collect/raw" \
-  </dev/null
-
-# A persisted close request may settle in a later 5-minute cycle after delayed
-# bid/ask arrives.  The report command is create-only and delivery-receipted, so
-# every cycle can safely retry without duplicating a completed daily report.
-"$PYTHON" tools/virtual_portfolio_daily_report.py \
-  --db "$PWD/logs/fx_virtual_portfolio_canonical_v2.sqlite3" \
-  --run-root "$PWD/runs/virtual_portfolio_daily" \
-  --root "$PWD" \
-  --outbox "$PWD/logs/virtual_portfolio_daily_discord_outbox.json" \
-  --send-discord \
-  --if-ready \
-  </dev/null

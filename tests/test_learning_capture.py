@@ -31,6 +31,10 @@ def test_build_steps_use_no_discord_for_briefing_runs() -> None:
     assert "--per-timeframe" in commands["timeframe-briefing-capture"]
     assert "--no-llm" in commands["fusion-briefing-capture"]
     assert "--symbols" in commands["timeframe-price-snapshot"]
+    assert commands["timeframe-learning-bundle"][-2:] == [
+        "tools/timeframe_learning_monitor.py",
+        "--quiet",
+    ]
     monitor = next(step for step in steps if step.name == "trade-outcome-monitor")
     assert monitor.allowed_exit_codes == (0, 1)
     assert "--no-registry-update" in monitor.command

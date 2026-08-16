@@ -69,6 +69,7 @@ import hashlib
 import json
 import os
 import sys
+import unicodedata
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
@@ -103,6 +104,7 @@ from fx_intel import (
     promotion,
     signal_board,
     stage_timing,
+    state_io,
     sentiment,
     technicals,
     technical_cache,
@@ -127,6 +129,7 @@ DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
 DEFAULT_TP_SL_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tp_sl_learning.json"
 DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
 DEFAULT_TF_LEARNING_MONITOR_PATH = PROJECT_ROOT / "logs" / "timeframe_learning_monitor.json"
+TIMEFRAME_LEARNING_BUNDLE_LOCK_TIMEOUT_SECONDS = 5.0
 # 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
 # 判断ジャーナルだけでは短い足の採点窓に十分な価格点が得られないため、
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
@@ -835,9 +838,9 @@ def timeframe_learning_bundle_is_valid(
         return False
     artifacts = manifest.get("cache_artifacts")
     expected = {
-        "timeframe_direction": DEFAULT_TF_LEARNING_PATH,
-        "timeframe_tp_sl": DEFAULT_TP_SL_LEARNING_PATH,
-        "timeframe_maximization": DEFAULT_MAXIMIZATION_PATH,
+        "timeframe_direction": DEFAULT_TF_LEARNING_PATH.resolve(),
+        "timeframe_tp_sl": DEFAULT_TP_SL_LEARNING_PATH.resolve(),
+        "timeframe_maximization": DEFAULT_MAXIMIZATION_PATH.resolve(),
     }
     if not isinstance(artifacts, Mapping) or set(artifacts) != set(expected):
         return False
@@ -876,6 +879,10 @@ def timeframe_learning_bundle_is_valid(
             "read_offset_bytes",
             "mtime_ns",
             "sha256",
+            "source_sha256",
+            "physical_rows",
+            "parsed_object_rows",
+            "blank_rows",
             "raw_rows",
             "eligible_rows",
             timestamp_key,
@@ -889,6 +896,9 @@ def timeframe_learning_bundle_is_valid(
             "inode",
             "read_offset_bytes",
             "mtime_ns",
+            "physical_rows",
+            "parsed_object_rows",
+            "blank_rows",
             "raw_rows",
             "eligible_rows",
         ):
@@ -897,8 +907,15 @@ def timeframe_learning_bundle_is_valid(
                 return False
         if int(evidence["eligible_rows"]) > int(evidence["raw_rows"]):
             return False
+        if int(evidence["raw_rows"]) > int(evidence["parsed_object_rows"]):
+            return False
+        if int(evidence["parsed_object_rows"]) > int(evidence["physical_rows"]):
+            return False
         digest = evidence.get("sha256")
         if not isinstance(digest, str) or len(digest) != 64:
+            return False
+        source_digest = evidence.get("source_sha256")
+        if not isinstance(source_digest, str) or len(source_digest) != 64:
             return False
         watermark = evidence.get(timestamp_key)
         if watermark is not None and not learning_cache_is_fresh(
@@ -908,6 +925,74 @@ def timeframe_learning_bundle_is_valid(
         ):
             return False
     return True
+
+
+def _timeframe_learning_bundle_lock_path(manifest_path: Path) -> Path:
+    resolved = manifest_path.resolve()
+    return resolved.with_suffix(f"{resolved.suffix}.lock")
+
+
+def _timeframe_learning_reserved_paths() -> tuple[Path, Path, Path, Path, Path]:
+    manifest = DEFAULT_TF_LEARNING_MONITOR_PATH.resolve()
+    return (
+        DEFAULT_TF_LEARNING_PATH.resolve(),
+        DEFAULT_TP_SL_LEARNING_PATH.resolve(),
+        DEFAULT_MAXIMIZATION_PATH.resolve(),
+        manifest,
+        _timeframe_learning_bundle_lock_path(manifest),
+    )
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    left_key = unicodedata.normalize("NFC", str(left)).casefold()
+    right_key = unicodedata.normalize("NFC", str(right)).casefold()
+    if left_key == right_key:
+        return True
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def _validated_non_bundle_output(path: Path, *, option: str) -> Path:
+    resolved = path.resolve()
+    if any(_paths_alias(resolved, reserved) for reserved in _timeframe_learning_reserved_paths()):
+        raise ValueError(f"{option} must not overwrite the timeframe learning bundle")
+    return resolved
+
+
+def _load_cached_timeframe_learning_bundle(
+    manifest_path: Path,
+    *,
+    max_age_seconds: float,
+    clock: Callable[[], datetime] | None = None,
+) -> tuple[
+    tf_learning.TimeframeLearning,
+    tp_sl_learning.TimeframeTpSlLearning,
+    maximization.TimeframeMaximization,
+    bool,
+    bool,
+]:
+    """Load and verify one complete cache generation under a shared lock."""
+
+    with state_io.advisory_file_lock(
+        _timeframe_learning_bundle_lock_path(manifest_path),
+        exclusive=False,
+        timeout_seconds=TIMEFRAME_LEARNING_BUNDLE_LOCK_TIMEOUT_SECONDS,
+    ):
+        validation_now = clock() if clock is not None else datetime.now(UTC)
+        direction = tf_learning.load_timeframe_learning(DEFAULT_TF_LEARNING_PATH)
+        tp_sl = tp_sl_learning.load_timeframe_tp_sl_learning(DEFAULT_TP_SL_LEARNING_PATH)
+        maximum = maximization.load_timeframe_maximization(DEFAULT_MAXIMIZATION_PATH)
+        generations = {direction.generated_at, tp_sl.generated_at, maximum.generated_at}
+        generation_match = len(generations) == 1 and "" not in generations
+        bundle_valid = generation_match and timeframe_learning_bundle_is_valid(
+            manifest_path,
+            generated_at=direction.generated_at,
+            now=validation_now,
+            max_age_seconds=max_age_seconds,
+        )
+    return direction, tp_sl, maximum, generation_match, bundle_valid
 
 
 def attach_decision_pit_metadata(
@@ -1213,29 +1298,64 @@ def _run_per_timeframe(
     # carrying the complete PIT identity/provenance contract may affect learning.
     scoring_entries = pit_journal_entries + price_rows + current_snapshot
 
+    cached_tf_learn: tf_learning.TimeframeLearning | None = None
+    cached_tp_sl: tp_sl_learning.TimeframeTpSlLearning | None = None
+    cached_max_profile: maximization.TimeframeMaximization | None = None
+    cached_generation_match = False
+    cached_bundle_valid = False
+    cached_bundle_load_failure = ""
+    if args.cached_timeframe_learning and not args.no_learning:
+        with timing.stage("timeframe_learning_bundle_load") as bundle_load_outcome:
+            try:
+                (
+                    cached_tf_learn,
+                    cached_tp_sl,
+                    cached_max_profile,
+                    cached_generation_match,
+                    cached_bundle_valid,
+                ) = _load_cached_timeframe_learning_bundle(
+                    DEFAULT_TF_LEARNING_MONITOR_PATH,
+                    max_age_seconds=args.learning_cache_max_age_seconds,
+                )
+            except TimeoutError as error:
+                bundle_load_outcome.mark_handled_error(error)
+                cached_bundle_load_failure = "timeframe_learning_bundle_lock_timeout"
+            except (OSError, UnicodeError) as error:
+                bundle_load_outcome.mark_handled_error(error)
+                cached_bundle_load_failure = "timeframe_learning_bundle_io_error"
+
+        # A busy or unavailable optional learning bundle must fail closed at the
+        # decision level, not abort the whole briefing before its neutral batch
+        # and latest snapshot are durably published.
+        if cached_bundle_load_failure:
+            cached_tf_learn = tf_learning.TimeframeLearning()
+            cached_tp_sl = tp_sl_learning.TimeframeTpSlLearning()
+            cached_max_profile = maximization.TimeframeMaximization()
+
     # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
     tf_learn = tf_learning.TimeframeLearning()
     learning_note = ""
-    stale_learning_caches: list[str] = []
+    stale_learning_caches: list[str] = (
+        [cached_bundle_load_failure] if cached_bundle_load_failure else []
+    )
     with timing.stage("timeframe_direction_learning"):
         if not args.no_learning:
-            tf_learn = (
-                tf_learning.load_timeframe_learning(DEFAULT_TF_LEARNING_PATH)
-                if args.cached_timeframe_learning
-                else tf_learning.derive_timeframe_learning(scoring_entries, now=now)
-            )
-            if args.cached_timeframe_learning and not learning_cache_is_fresh(
-                tf_learn.generated_at,
-                now=datetime.now(UTC),
-                max_age_seconds=args.learning_cache_max_age_seconds,
+            if args.cached_timeframe_learning:
+                assert cached_tf_learn is not None
+                tf_learn = cached_tf_learn
+            else:
+                tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+            if (
+                args.cached_timeframe_learning
+                and not cached_bundle_load_failure
+                and not learning_cache_is_fresh(
+                    tf_learn.generated_at,
+                    now=datetime.now(UTC),
+                    max_age_seconds=args.learning_cache_max_age_seconds,
+                )
             ):
                 stale_learning_caches.append("timeframe_direction")
             learning_note = tf_learn.summary_ja()
-            if not args.dry_run and not args.cached_timeframe_learning:
-                try:
-                    tf_learning.save_timeframe_learning(tf_learn, DEFAULT_TF_LEARNING_PATH)
-                except OSError as error:
-                    fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
 
     profile_lookup = tf_learn.profile_lookup if not args.no_learning else None
     decision_feedback_profile = decision_feedback.DecisionFeedbackProfile()
@@ -1264,26 +1384,25 @@ def _run_per_timeframe(
     tp_sl_learn = None
     with timing.stage("timeframe_tp_sl_learning"):
         if not args.no_learning and not args.no_trade_expectancy:
-            tp_sl_learn = (
-                tp_sl_learning.load_timeframe_tp_sl_learning(DEFAULT_TP_SL_LEARNING_PATH)
-                if args.cached_timeframe_learning
-                else tp_sl_learning.derive_timeframe_tp_sl_learning(scoring_entries, now=now)
-            )
-            if args.cached_timeframe_learning and not learning_cache_is_fresh(
-                tp_sl_learn.generated_at,
-                now=datetime.now(UTC),
-                max_age_seconds=args.learning_cache_max_age_seconds,
+            if args.cached_timeframe_learning:
+                assert cached_tp_sl is not None
+                tp_sl_learn = cached_tp_sl
+            else:
+                tp_sl_learn = tp_sl_learning.derive_timeframe_tp_sl_learning(
+                    scoring_entries, now=now
+                )
+            if (
+                args.cached_timeframe_learning
+                and not cached_bundle_load_failure
+                and not learning_cache_is_fresh(
+                    tp_sl_learn.generated_at,
+                    now=datetime.now(UTC),
+                    max_age_seconds=args.learning_cache_max_age_seconds,
+                )
             ):
                 stale_learning_caches.append("timeframe_tp_sl")
             learning_note = append_note(learning_note, tp_sl_learn.summary_ja())
             tp_sl_lookup = tp_sl_learn.expectancy_lookup
-            if not args.dry_run and not args.cached_timeframe_learning:
-                try:
-                    tp_sl_learning.save_timeframe_tp_sl_learning(
-                        tp_sl_learn, DEFAULT_TP_SL_LEARNING_PATH
-                    )
-                except OSError as error:
-                    fetch_warnings.append(f"TP/SL学習プロファイル保存失敗: {error}")
 
     target_r_adjuster = None
     if not args.no_trade_expectancy and not args.no_approved_tp_sl_policy:
@@ -1304,39 +1423,28 @@ def _run_per_timeframe(
     max_profile = None
     with timing.stage("timeframe_maximization_learning"):
         if not args.no_learning and not args.no_trade_expectancy:
-            max_profile = (
-                maximization.load_timeframe_maximization(DEFAULT_MAXIMIZATION_PATH)
-                if args.cached_timeframe_learning
-                else maximization.derive_timeframe_maximization(scoring_entries, now=now)
-            )
-            if args.cached_timeframe_learning and not learning_cache_is_fresh(
-                max_profile.generated_at,
-                now=datetime.now(UTC),
-                max_age_seconds=args.learning_cache_max_age_seconds,
+            if args.cached_timeframe_learning:
+                assert cached_max_profile is not None
+                max_profile = cached_max_profile
+            else:
+                max_profile = maximization.derive_timeframe_maximization(scoring_entries, now=now)
+            if (
+                args.cached_timeframe_learning
+                and not cached_bundle_load_failure
+                and not learning_cache_is_fresh(
+                    max_profile.generated_at,
+                    now=datetime.now(UTC),
+                    max_age_seconds=args.learning_cache_max_age_seconds,
+                )
             ):
                 stale_learning_caches.append("timeframe_maximization")
             learning_note = append_note(learning_note, max_profile.summary_ja())
             if not args.no_trade_expectancy_guard:
                 maximization_lookup = max_profile.expectancy_lookup
-            if not args.dry_run and not args.cached_timeframe_learning:
-                try:
-                    maximization.save_timeframe_maximization(max_profile, DEFAULT_MAXIMIZATION_PATH)
-                except OSError as error:
-                    fetch_warnings.append(f"最大化プロファイル保存失敗: {error}")
-    if args.cached_timeframe_learning and not args.no_learning and not args.no_trade_expectancy:
-        learning_generations = {
-            tf_learn.generated_at,
-            tp_sl_learn.generated_at if tp_sl_learn is not None else "",
-            max_profile.generated_at if max_profile is not None else "",
-        }
-        if len(learning_generations) != 1 or "" in learning_generations:
+    if args.cached_timeframe_learning and not args.no_learning and not cached_bundle_load_failure:
+        if not cached_generation_match:
             stale_learning_caches.append("timeframe_learning_generation_mismatch")
-        elif not timeframe_learning_bundle_is_valid(
-            DEFAULT_TF_LEARNING_MONITOR_PATH,
-            generated_at=tf_learn.generated_at,
-            now=datetime.now(UTC),
-            max_age_seconds=args.learning_cache_max_age_seconds,
-        ):
+        elif not cached_bundle_valid:
             stale_learning_caches.append("timeframe_learning_bundle_invalid")
     if maximization_lookup is not None:
         expectancy_lookup = maximization_lookup
@@ -1827,6 +1935,18 @@ def main(argv: list[str] | None = None) -> int:
         and args.decision_latest_output.resolve() == DEFAULT_DECISION_LATEST_PATH.resolve()
     ):
         parser.error("fusion cannot overwrite the canonical per-timeframe latest snapshot")
+    try:
+        args.decision_latest_output = _validated_non_bundle_output(
+            args.decision_latest_output,
+            option="--decision-latest-output",
+        )
+        if args.stage_timing_log is not None:
+            args.stage_timing_log = _validated_non_bundle_output(
+                args.stage_timing_log,
+                option="--stage-timing-log",
+            )
+    except ValueError as error:
+        parser.error(str(error))
     timing = stage_timing.StageTimingRecorder(
         args.stage_timing_log,
         pipeline="fx_briefing",

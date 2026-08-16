@@ -631,6 +631,72 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
     # never consume the bounded admission window before canonical decisions are
     # durably queued.  Keep the same cycle observation time for comparability,
     # but run this optional comparison only after releasing the canonical writer.
+    if getattr(args, "skip_counterfactual", False):
+        counterfactual = {
+            "contract": "virtual-portfolio-counterfactual-ledger-v1",
+            "status": "scheduled_separately",
+            "database": str(counterfactual_db.resolve()),
+            "broker_connected": False,
+        }
+    else:
+        counterfactual = _run_optional_counterfactual(
+            args,
+            timing=timing,
+            events=events,
+            batch_id=batch_id,
+            now=now,
+        )
+    result: dict[str, object] = {
+        "ok": not conflicts,
+        "mode": "offline_simulation",
+        "broker_connected": False,
+        "market_open": market_open,
+        "source_events": len(events),
+        "queued_intakes": queued,
+        "close_requests": len(close_requests),
+        "inserted_decisions": inserted,
+        "opened": opened,
+        "abstained": abstained,
+        "closed": closed,
+        "session_close_status": session_close_status,
+        "session_close_request": session_close_request,
+        "ledgers": {
+            "as_run": {"database": str(as_run_db.resolve()), "read_only": True},
+            "counterfactual": {"database": str(counterfactual_db.resolve())},
+            "canonical_v2": {"database": str(args.db.resolve())},
+        },
+        "required_service_heartbeats": (
+            heartbeat_gate.to_dict() if heartbeat_gate is not None else {"status": "test_bypass"}
+        ),
+        "counterfactual": counterfactual,
+        "replay": replay,
+        "conflicts": conflicts,
+        "portfolio": snapshot,
+        "stage_timing": {
+            **stage_timing.summarize(timing.records),
+            "trace_id": timing.trace_id,
+            "log_path": str(timing.path.resolve()) if timing.path is not None else None,
+            "write_error": timing.write_error,
+        },
+    }
+    if not args.no_audit_artifact:
+        result["audit_artifact"] = str(_write_cycle_audit(args.audit_run_root, result))
+    return result
+
+
+def _run_optional_counterfactual(
+    args: argparse.Namespace,
+    *,
+    timing: stage_timing.StageTimingRecorder,
+    events: list[dict[str, object]],
+    batch_id: str,
+    now: datetime,
+) -> dict[str, object]:
+    counterfactual_db = getattr(
+        args,
+        "counterfactual_db",
+        args.db.with_name(f"{args.db.stem}_counterfactual.sqlite3"),
+    )
     with timing.stage("counterfactual_cycle") as counterfactual_stage:
         try:
             counterfactual = _counterfactual_cycle(
@@ -684,41 +750,36 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
             )
         ):
             counterfactual_stage.mark_handled_error("CounterfactualCycleFailedClosed")
-    result: dict[str, object] = {
-        "ok": not conflicts,
-        "mode": "offline_simulation",
-        "broker_connected": False,
-        "market_open": market_open,
-        "source_events": len(events),
-        "queued_intakes": queued,
-        "close_requests": len(close_requests),
-        "inserted_decisions": inserted,
-        "opened": opened,
-        "abstained": abstained,
-        "closed": closed,
-        "session_close_status": session_close_status,
-        "session_close_request": session_close_request,
-        "ledgers": {
-            "as_run": {"database": str(as_run_db.resolve()), "read_only": True},
-            "counterfactual": {"database": str(counterfactual_db.resolve())},
-            "canonical_v2": {"database": str(args.db.resolve())},
+    return counterfactual
+
+
+def _counterfactual_only(args: argparse.Namespace) -> dict[str, object]:
+    now = datetime.now(UTC)
+    timing = stage_timing.StageTimingRecorder(
+        getattr(args, "stage_timing_log", None),
+        pipeline="virtual_portfolio_counterfactual_cycle",
+        metadata={
+            "writer_id": args.writer_id,
+            "database": str(args.counterfactual_db.resolve()),
+            "cycle_observation_time": now,
         },
-        "required_service_heartbeats": (
-            heartbeat_gate.to_dict() if heartbeat_gate is not None else {"status": "test_bypass"}
-        ),
-        "counterfactual": counterfactual,
-        "replay": replay,
-        "conflicts": conflicts,
-        "portfolio": snapshot,
-        "stage_timing": {
-            **stage_timing.summarize(timing.records),
-            "trace_id": timing.trace_id,
-            "log_path": str(timing.path.resolve()) if timing.path is not None else None,
-            "write_error": timing.write_error,
-        },
+    )
+    with timing.stage("latest_snapshot_read"):
+        events, batch_id = _latest_events(args.decisions)
+        timing.bind(batch_id=batch_id, decision_event_count=len(events))
+    result = _run_optional_counterfactual(
+        args,
+        timing=timing,
+        events=events,
+        batch_id=batch_id,
+        now=now,
+    )
+    result["stage_timing"] = {
+        **stage_timing.summarize(timing.records),
+        "trace_id": timing.trace_id,
+        "log_path": str(timing.path.resolve()) if timing.path is not None else None,
+        "write_error": timing.write_error,
     }
-    if not args.no_audit_artifact:
-        result["audit_artifact"] = str(_write_cycle_audit(args.audit_run_root, result))
     return result
 
 
@@ -824,6 +885,20 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="工程別UTC時刻・monotonic経過時間を追記するJSONLパス",
     )
+    cycle.add_argument(
+        "--skip-counterfactual",
+        action="store_true",
+        help="run only the deadline-sensitive canonical intake/replay stages",
+    )
+    counterfactual = commands.add_parser(
+        "counterfactual-cycle",
+        help="run the optional explanatory ledger without touching canonical v2",
+    )
+    counterfactual.add_argument("--decisions", type=Path, default=DEFAULT_DECISIONS)
+    counterfactual.add_argument("--snapshot-prices", type=Path, default=DEFAULT_SNAPSHOT_PRICES)
+    counterfactual.add_argument("--quotes", type=Path, default=DEFAULT_QUOTES)
+    counterfactual.add_argument("--quote-index", type=Path)
+    counterfactual.add_argument("--stage-timing-log", type=Path, default=None)
     close = commands.add_parser("close", help="append one simulated close from validated JSON")
     close.add_argument("--request-json", type=Path, required=True)
     commands.add_parser("summary", help="print the canonical read-only snapshot")
@@ -855,6 +930,8 @@ def main() -> int:
             result = _set_five_x_limits(args.db, args.writer_id)
         elif args.command == "cycle":
             result = _cycle(args)
+        elif args.command == "counterfactual-cycle":
+            result = _counterfactual_only(args)
         elif args.command == "close":
             result = _close(args)
         elif args.command == "export-learning":

@@ -1,6 +1,6 @@
 #!/bin/zsh
-# 学習ダッシュボード用の期待値監視JSONを定期更新する。
-# exit=1 は「監視結果が警告/失敗」を表しJSON自体は生成済みなので許容する。
+# 判断が読む3学習cache+manifestだけを一世代として定期公開する。
+# 重い診断は別serviceへ隔離し、次のcache公開を遅らせない。
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -33,16 +33,6 @@ run_monitor() {
   return 0
 }
 
-overall=0
 run_monitor timeframe-learning logs/timeframe_learning_monitor.json \
   tools/timeframe_learning_monitor.py \
-  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?
-# 旧fusion journalの再採点はhistorical/diagnostic専用。canonicalな判断方針を
-# 書き換えないよう、改善registryは読み取りのみとする。
-run_monitor trade-outcome logs/trade_outcome_monitor.json \
-  tools/trade_outcome_monitor.py \
-  --no-registry-update || overall=$?
-run_monitor decision-expectancy logs/decision_expectancy_monitor.json \
-  tools/decision_expectancy_monitor.py \
-  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?
-exit "$overall"
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl"

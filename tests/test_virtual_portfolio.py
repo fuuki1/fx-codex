@@ -1039,6 +1039,23 @@ def test_counterfactual_exception_preserves_canonical_cycle(tmp_path, monkeypatc
         )
 
 
+def test_scheduled_cycle_skips_optional_counterfactual_work(tmp_path, monkeypatch) -> None:
+    from tools import virtual_portfolio as cli
+
+    path, _ = _initialized(tmp_path)
+    args = _cycle_args(tmp_path, path)
+    args.skip_counterfactual = True
+    counterfactual = mock.Mock(side_effect=AssertionError("must be isolated"))
+    monkeypatch.setattr(cli, "_counterfactual_cycle", counterfactual)
+
+    result = cli._cycle(args)
+
+    assert result["ok"] is True
+    assert result["counterfactual"]["status"] == "scheduled_separately"
+    assert "counterfactual_cycle" not in result["stage_timing"]["elapsed_ms_by_stage"]
+    counterfactual.assert_not_called()
+
+
 def test_cycle_timing_marks_replay_partial_failure_return(tmp_path, monkeypatch) -> None:
     from tools import virtual_portfolio as cli
 

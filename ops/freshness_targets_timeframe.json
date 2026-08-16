@@ -26,7 +26,7 @@
     {
       "name": "timeframe_learning_monitor",
       "path": "logs/timeframe_learning_monitor.json",
-      "kind": "json",
+      "kind": "timeframe_learning_bundle",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
@@ -66,7 +66,7 @@
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
-      "manual_action_ja": "decision_expectancy_monitor.json とcache contractを確認"
+      "manual_action_ja": "decision_expectancy_monitor.json とcache contractを確認し、com.fx-codex.monitor-diagnostics を restart"
     }
   ]
 }

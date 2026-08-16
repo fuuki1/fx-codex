@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Operational runner for the expectancy-maximization layer.
 
-This command is intended for cron/CI/dashboard refresh jobs. It reads the
-per-timeframe decision journal plus dense price snapshots, derives the
-maximization profile, writes logs/briefing_maximization.json, and writes an
-operations monitor JSON with findings and improvement candidates.
+This command is a diagnostic research runner. It reads the per-timeframe
+decision journal plus dense price snapshots and writes a separate diagnostic
+profile. The canonical ``briefing_maximization.json`` is one member of the
+generation-consistent cache bundle owned exclusively by
+``timeframe_learning_monitor.py``.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pathlib import Path
 import sys
 import tempfile
 from typing import Any
+import unicodedata
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -26,7 +28,11 @@ from fx_intel import journal, maximization, trade_outcome  # noqa: E402
 
 DEFAULT_TF_JOURNAL_PATH = REPO_ROOT / "logs" / "briefing_tf_journal.jsonl"
 DEFAULT_TF_PRICES_PATH = REPO_ROOT / "logs" / "briefing_tf_prices.jsonl"
-DEFAULT_PROFILE_PATH = REPO_ROOT / "logs" / "briefing_maximization.json"
+CANONICAL_TF_LEARNING_PATH = REPO_ROOT / "logs" / "briefing_tf_learning.json"
+CANONICAL_TP_SL_LEARNING_PATH = REPO_ROOT / "logs" / "briefing_tp_sl_learning.json"
+CANONICAL_PROFILE_PATH = REPO_ROOT / "logs" / "briefing_maximization.json"
+CANONICAL_MANIFEST_PATH = REPO_ROOT / "logs" / "timeframe_learning_monitor.json"
+DEFAULT_PROFILE_PATH = REPO_ROOT / "logs" / "briefing_maximization_diagnostic.json"
 DEFAULT_MONITOR_PATH = REPO_ROOT / "logs" / "maximization_monitor.json"
 
 
@@ -40,6 +46,12 @@ def run_maximization_monitor(
     timeframes: Sequence[str] = maximization.MVP_TIMEFRAMES,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    profile_json_path, monitor_json_path = _validate_diagnostic_outputs(
+        journal_path=journal_path,
+        prices_path=prices_path,
+        profile_json_path=profile_json_path,
+        monitor_json_path=monitor_json_path,
+    )
     generated_at = _utc(now or datetime.now(UTC))
     entries = list(journal.read_entries(journal_path))
     price_rows = list(journal.read_entries(prices_path))
@@ -155,6 +167,55 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
             except OSError:
                 pass
         raise
+
+
+def _validate_diagnostic_outputs(
+    *,
+    journal_path: Path,
+    prices_path: Path,
+    profile_json_path: Path,
+    monitor_json_path: Path,
+) -> tuple[Path, Path]:
+    outputs = (profile_json_path.resolve(), monitor_json_path.resolve())
+    if _paths_alias(*outputs):
+        raise ValueError("diagnostic profile and monitor outputs must be distinct")
+    reserved = tuple(path.resolve() for path in _canonical_bundle_paths())
+    if any(
+        _paths_alias(output, canonical_path) for output in outputs for canonical_path in reserved
+    ):
+        raise ValueError(
+            "canonical timeframe learning bundle is owned by "
+            "timeframe_learning_monitor.py; choose diagnostic output paths"
+        )
+    sources = (journal_path.resolve(), prices_path.resolve())
+    if any(_paths_alias(output, source) for output in outputs for source in sources):
+        raise ValueError("diagnostic outputs must not alias input journals")
+    return outputs
+
+
+def _canonical_bundle_paths() -> tuple[Path, Path, Path, Path, Path]:
+    manifest = CANONICAL_MANIFEST_PATH.resolve()
+    lock_path = manifest.with_suffix(f"{manifest.suffix}.lock")
+    return (
+        CANONICAL_TF_LEARNING_PATH,
+        CANONICAL_TP_SL_LEARNING_PATH,
+        CANONICAL_PROFILE_PATH,
+        manifest,
+        lock_path,
+    )
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    if _normalized_path_key(left) == _normalized_path_key(right):
+        return True
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def _normalized_path_key(path: Path) -> str:
+    return unicodedata.normalize("NFC", str(path)).casefold()
 
 
 def _utc(value: datetime) -> datetime:

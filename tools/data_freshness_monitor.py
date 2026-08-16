@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,8 @@ import socket
 import sys
 import tempfile
 from collections.abc import Callable, Mapping
+
+from fx_intel.state_io import advisory_file_lock
 
 DEFAULT_CONFIG_PATH = "ops/freshness_targets.json"
 DEFAULT_STATE_PATH = "logs/freshness_state.json"
@@ -226,7 +229,114 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
             if not isinstance(parsed, dict):
                 result.status = STATUS_CRITICAL
                 result.reason = "json_non_object"
+    elif target.kind == "timeframe_learning_bundle":
+        _apply_timeframe_learning_bundle_integrity(result, file_path, root)
     return result
+
+
+def _apply_timeframe_learning_bundle_integrity(
+    result: TargetResult,
+    manifest_path: Path,
+    root: Path,
+) -> None:
+    """Validate the complete cache generation, not only manifest freshness."""
+
+    resolved_manifest = manifest_path.resolve()
+    lock_path = resolved_manifest.with_suffix(f"{resolved_manifest.suffix}.lock")
+    try:
+        with advisory_file_lock(lock_path, exclusive=False, timeout_seconds=5.0):
+            _validate_timeframe_learning_bundle(result, resolved_manifest, root)
+    except TimeoutError:
+        result.status = STATUS_CRITICAL
+        result.reason = "learning_bundle_lock_timeout"
+    except OSError:
+        result.status = STATUS_CRITICAL
+        result.reason = "learning_bundle_lock_error"
+
+
+def _validate_timeframe_learning_bundle(
+    result: TargetResult,
+    manifest_path: Path,
+    root: Path,
+) -> None:
+    """Read manifest and all cache bodies while holding the reader lock."""
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        result.status = STATUS_CRITICAL
+        result.reason = "learning_bundle_manifest_corrupt"
+        return
+    if not isinstance(manifest, dict):
+        result.status = STATUS_CRITICAL
+        result.reason = "learning_bundle_manifest_non_object"
+        return
+    generated_at = manifest.get("generated_at")
+    if (
+        manifest.get("monitor_contract") != "fx-codex-timeframe-learning-monitor-v1"
+        or manifest.get("status") != "ok"
+        or not isinstance(generated_at, str)
+        or not generated_at
+    ):
+        result.status = STATUS_CRITICAL
+        result.reason = "learning_bundle_manifest_invalid"
+        return
+
+    expected = {
+        "timeframe_direction": (
+            (root / "logs" / "briefing_tf_learning.json").resolve(),
+            "fx-codex-timeframe-learning-v1",
+        ),
+        "timeframe_tp_sl": (
+            (root / "logs" / "briefing_tp_sl_learning.json").resolve(),
+            "fx-codex-timeframe-tp-sl-learning-v1",
+        ),
+        "timeframe_maximization": (
+            (root / "logs" / "briefing_maximization.json").resolve(),
+            "fx-codex-timeframe-maximization-v1",
+        ),
+    }
+    artifacts = manifest.get("cache_artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != set(expected):
+        result.status = STATUS_CRITICAL
+        result.reason = "learning_bundle_artifacts_invalid"
+        return
+
+    for key, (cache_path, contract) in expected.items():
+        evidence = artifacts.get(key)
+        if not isinstance(evidence, dict):
+            result.status = STATUS_CRITICAL
+            result.reason = "learning_bundle_artifacts_invalid"
+            return
+        try:
+            body = cache_path.read_bytes()
+        except OSError:
+            result.status = STATUS_CRITICAL
+            result.reason = "learning_bundle_artifact_missing"
+            return
+        if (
+            evidence.get("path") != cache_path.name
+            or type(evidence.get("size")) is not int
+            or evidence.get("size") != len(body)
+            or evidence.get("sha256") != hashlib.sha256(body).hexdigest()
+        ):
+            result.status = STATUS_CRITICAL
+            result.reason = "learning_bundle_artifact_mismatch"
+            return
+        try:
+            cache = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            result.status = STATUS_CRITICAL
+            result.reason = "learning_bundle_cache_corrupt"
+            return
+        if not isinstance(cache, dict) or cache.get("cache_contract") != contract:
+            result.status = STATUS_CRITICAL
+            result.reason = "learning_bundle_cache_invalid"
+            return
+        if cache.get("generated_at") != generated_at:
+            result.status = STATUS_CRITICAL
+            result.reason = "learning_bundle_generation_mismatch"
+            return
 
 
 def _read_recent_nonempty_lines(path: Path, chunk: int = 65536) -> list[str]:

@@ -4,8 +4,25 @@
 set -u
 
 AGENTS_DIR="$HOME/Library/LaunchAgents"
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
-LEGACY_LABELS=(com.fx-codex.briefing.hourly)
+LABELS=(
+  com.fx-codex.snapshot
+  com.fx-codex.briefing
+  com.fx-codex.health
+  com.fx-codex.horizon
+  com.fx-codex.monitors
+  com.fx-codex.monitor-diagnostics
+  com.fx-codex.dukascopy-history
+  com.fx-codex.quote-index
+  com.fx-codex.virtual-portfolio
+  com.fx-codex.virtual-portfolio-postprocess
+  com.fx-codex.virtual-portfolio-report
+  com.fx-codex.virtual-portfolio-counterfactual
+  com.fx-codex.virtual-portfolio-learning
+  com.fx-codex.virtual-portfolio-read
+  com.fx-codex.dashboard-state
+  com.fx-codex.operational-read
+)
+LEGACY_LABELS=(com.fx-codex.briefing.hourly com.fx-codex.virtual-portfolio-close)
 overall_status=0
 
 for label in $LABELS; do

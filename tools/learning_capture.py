@@ -2,8 +2,9 @@
 """Capture local learning logs without posting to Discord.
 
 This runner is a safe one-shot alternative to fx_briefing_loop.sh while
-bootstrapping the dashboard. It writes journals, learning profiles, timeframe
-price snapshots, and monitoring JSON, but all briefing runs use --no-discord.
+bootstrapping the dashboard. It writes journals, timeframe price snapshots,
+the canonical generation-consistent learning bundle, and monitoring JSON, but
+all briefing runs use --no-discord.
 """
 
 from __future__ import annotations
@@ -53,6 +54,12 @@ def build_steps(args: argparse.Namespace) -> list[CaptureStep]:
             CaptureStep(
                 "timeframe-briefing-capture",
                 [python, "fx_briefing.py", "--per-timeframe", *common_briefing_args],
+            )
+        )
+        steps.append(
+            CaptureStep(
+                "timeframe-learning-bundle",
+                [python, "tools/timeframe_learning_monitor.py", "--quiet"],
             )
         )
     if not args.skip_trade_monitor:

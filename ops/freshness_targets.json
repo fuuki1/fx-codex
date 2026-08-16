@@ -33,11 +33,11 @@
     {
       "name": "timeframe_learning_monitor",
       "path": "logs/timeframe_learning_monitor.json",
-      "kind": "json",
+      "kind": "timeframe_learning_bundle",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 5400,
-      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
+      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log を確認し、com.fx-codex.monitor-diagnostics を restart"
     },
     {
       "name": "trade_outcome_monitor",
@@ -46,7 +46,7 @@
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 5400,
-      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
+      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log を確認し、com.fx-codex.monitor-diagnostics を restart"
     },
     {
       "name": "decision_expectancy_monitor",
@@ -91,7 +91,7 @@
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
-      "manual_action_ja": "logs/launchd/monitors.err.log と decision_expectancy_monitor.json を確認し、com.fx-codex.monitors を restart"
+      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log と decision_expectancy_monitor.json を確認し、com.fx-codex.monitor-diagnostics を restart"
     }
   ]
 }

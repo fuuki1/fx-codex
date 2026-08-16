@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -182,6 +183,149 @@ def test_corrupt_json_is_critical_even_if_fresh(monitor, tmp_path):
 
     assert report["overall"] == "critical"
     assert report["targets"][0]["reason"] == "json_corrupt"
+
+
+def _write_learning_bundle(root: Path, *, generation: str) -> Path:
+    logs = root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    specs = {
+        "timeframe_direction": (
+            "briefing_tf_learning.json",
+            "fx-codex-timeframe-learning-v1",
+        ),
+        "timeframe_tp_sl": (
+            "briefing_tp_sl_learning.json",
+            "fx-codex-timeframe-tp-sl-learning-v1",
+        ),
+        "timeframe_maximization": (
+            "briefing_maximization.json",
+            "fx-codex-timeframe-maximization-v1",
+        ),
+    }
+    artifacts = {}
+    for key, (name, contract) in specs.items():
+        path = logs / name
+        path.write_text(
+            json.dumps({"cache_contract": contract, "generated_at": generation}),
+            encoding="utf-8",
+        )
+        body = path.read_bytes()
+        artifacts[key] = {
+            "path": name,
+            "size": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+    manifest_path = logs / "timeframe_learning_monitor.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "monitor_contract": "fx-codex-timeframe-learning-monitor-v1",
+                "status": "ok",
+                "generated_at": generation,
+                "cache_artifacts": artifacts,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _learning_bundle_target(monitor):
+    return monitor.TargetConfig(
+        name="timeframe_learning_monitor",
+        path="logs/timeframe_learning_monitor.json",
+        kind="timeframe_learning_bundle",
+        expected_interval_seconds=900,
+        warn_after_seconds=1800,
+        critical_after_seconds=2700,
+    )
+
+
+def test_learning_bundle_integrity_is_ok(monitor, tmp_path):
+    _write_learning_bundle(tmp_path, generation=NOW.isoformat())
+
+    result = monitor.check_target(_learning_bundle_target(monitor), tmp_path, NOW)
+
+    assert result.status == "ok"
+    assert result.reason == ""
+
+
+def test_learning_bundle_parseable_cache_tamper_is_critical(monitor, tmp_path):
+    _write_learning_bundle(tmp_path, generation=NOW.isoformat())
+    (tmp_path / "logs" / "briefing_tf_learning.json").write_text(
+        json.dumps(
+            {
+                "cache_contract": "fx-codex-timeframe-learning-v1",
+                "generated_at": (NOW + timedelta(minutes=1)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = monitor.check_target(_learning_bundle_target(monitor), tmp_path, NOW)
+
+    assert result.status == "critical"
+    assert result.reason == "learning_bundle_artifact_mismatch"
+
+
+def test_learning_bundle_generation_mismatch_is_critical(monitor, tmp_path):
+    manifest_path = _write_learning_bundle(tmp_path, generation=NOW.isoformat())
+    cache_path = tmp_path / "logs" / "briefing_tf_learning.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "cache_contract": "fx-codex-timeframe-learning-v1",
+                "generated_at": (NOW + timedelta(minutes=1)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    body = cache_path.read_bytes()
+    manifest["cache_artifacts"]["timeframe_direction"] = {
+        "path": cache_path.name,
+        "size": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = monitor.check_target(_learning_bundle_target(monitor), tmp_path, NOW)
+
+    assert result.status == "critical"
+    assert result.reason == "learning_bundle_generation_mismatch"
+
+
+def test_learning_bundle_lock_timeout_is_critical(monitor, tmp_path, monkeypatch):
+    _write_learning_bundle(tmp_path, generation=NOW.isoformat())
+
+    class _TimeoutLock:
+        def __enter__(self):
+            raise TimeoutError("publisher stalled")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(monitor, "advisory_file_lock", lambda *_args, **_kwargs: _TimeoutLock())
+
+    result = monitor.check_target(_learning_bundle_target(monitor), tmp_path, NOW)
+
+    assert result.status == "critical"
+    assert result.reason == "learning_bundle_lock_timeout"
+
+
+def test_learning_bundle_health_uses_same_resolved_artifact_name_as_reader(monitor, tmp_path):
+    manifest_path = _write_learning_bundle(tmp_path, generation=NOW.isoformat())
+    logical = tmp_path / "logs" / "briefing_tf_learning.json"
+    target = tmp_path / "logs" / "direction-generation.json"
+    logical.replace(target)
+    logical.symlink_to(target)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cache_artifacts"]["timeframe_direction"]["path"] = target.name
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = monitor.check_target(_learning_bundle_target(monitor), tmp_path, NOW)
+
+    assert result.status == "ok"
 
 
 def test_latest_capture_slot_requires_complete_symbol_timeframe_coverage(monitor, tmp_path):

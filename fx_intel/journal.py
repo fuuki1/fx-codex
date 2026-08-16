@@ -60,6 +60,10 @@ class PointInTimeError(ValueError):
     """Raised when a journal row cannot prove feature availability before prediction."""
 
 
+class JournalIntegrityError(RuntimeError):
+    """Raised when a canonical JSONL source is not byte-complete and parseable."""
+
+
 def _aware_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise PointInTimeError(f"{field_name} must be timezone-aware")
@@ -616,7 +620,12 @@ def _append_journal_batch(
     }
 
 
-def read_entries(path: str | Path):
+def read_entries(
+    path: str | Path,
+    *,
+    strict: bool = False,
+    audit: dict[str, object] | None = None,
+):
     """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。
 
     ⚠️ `journal_batch_id` を持つ行は **cross-log commit が付くまで返さない**
@@ -624,9 +633,21 @@ def read_entries(path: str | Path):
     確定記録が無い」状態であり、採点・学習へ流すと PIT 整合が壊れるため。
     batch を使わない従来の行はこれまでどおり無条件に返す。
     """
+    if audit is not None:
+        audit.clear()
+        audit.update(
+            {
+                "physical_rows": 0,
+                "parsed_object_rows": 0,
+                "blank_rows": 0,
+                "source_sha256": "",
+            }
+        )
     try:
-        handle = Path(path).open(encoding="utf-8")
+        handle = Path(path).open("rb")
     except OSError:
+        if strict:
+            raise
         return
 
     from . import decision_commit
@@ -669,17 +690,35 @@ def read_entries(path: str | Path):
             return []
         return list(pending)
 
+    source_digest = hashlib.sha256()
     with handle:
-        for line in handle:
-            line = line.strip()
+        for line_number, raw_line in enumerate(handle, start=1):
+            source_digest.update(raw_line)
+            if strict and not raw_line.endswith(b"\n"):
+                raise JournalIntegrityError(f"incomplete JSONL row at {Path(path)}:{line_number}")
+            line = raw_line.strip()
             if not line:
+                if audit is not None:
+                    _increment_audit_count(audit, "blank_rows")
                 continue
+            if audit is not None:
+                _increment_audit_count(audit, "physical_rows")
             try:
                 entry = json.loads(line)
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                if strict:
+                    raise JournalIntegrityError(
+                        f"malformed JSONL row at {Path(path)}:{line_number}"
+                    ) from error
                 continue
             if not isinstance(entry, dict):
+                if strict:
+                    raise JournalIntegrityError(
+                        f"non-object JSONL row at {Path(path)}:{line_number}"
+                    )
                 continue
+            if audit is not None:
+                _increment_audit_count(audit, "parsed_object_rows")
             event_type = entry.get("event_type")
             if event_type == JOURNAL_BATCH_COMMIT:
                 yield from _release(entry)
@@ -700,6 +739,15 @@ def read_entries(path: str | Path):
                 pending.append(entry)
                 continue
             yield entry
+    if audit is not None:
+        audit["source_sha256"] = source_digest.hexdigest()
+
+
+def _increment_audit_count(audit: dict[str, object], key: str) -> None:
+    value = audit.get(key)
+    if type(value) is not int:  # noqa: E721
+        raise JournalIntegrityError(f"invalid journal audit counter: {key}")
+    audit[key] = value + 1
     # marker が来ないまま終端に達したバッチは未確定なので捨てる
 
 

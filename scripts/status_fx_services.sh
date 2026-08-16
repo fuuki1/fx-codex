@@ -9,15 +9,19 @@ LABELS=(
   com.fx-codex.health
   com.fx-codex.horizon
   com.fx-codex.monitors
+  com.fx-codex.monitor-diagnostics
+  com.fx-codex.dukascopy-history
+  com.fx-codex.quote-index
   com.fx-codex.virtual-portfolio
-  com.fx-codex.virtual-portfolio-close
+  com.fx-codex.virtual-portfolio-postprocess
+  com.fx-codex.virtual-portfolio-report
+  com.fx-codex.virtual-portfolio-counterfactual
   com.fx-codex.virtual-portfolio-learning
   com.fx-codex.virtual-portfolio-read
   com.fx-codex.dashboard-state
-  com.fx-codex.quote-index
   com.fx-codex.operational-read
 )
-LEGACY_LABELS=(com.fx-codex.briefing.hourly)
+LEGACY_LABELS=(com.fx-codex.briefing.hourly com.fx-codex.virtual-portfolio-close)
 overall_status=0
 PYTHON="$ROOT/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then

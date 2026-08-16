@@ -88,7 +88,15 @@ launchd のワンショットジョブだけを常駐させます。
 | ジョブ | 周期 | 正規の責務 |
 |---|---:|---|
 | `com.fx-codex.snapshot` | 5分 | `logs/briefing_tf_prices.jsonl` の唯一の定期writer |
-| `com.fx-codex.briefing` | 5分境界 | 時間足別の判断ジャーナル・学習プロファイル・統合通知 |
+| `com.fx-codex.briefing` | 5分境界 | 時間足別の判断ジャーナル・統合通知（学習cacheはread-only） |
+| `com.fx-codex.monitors` | 15分 | direction/TP・SL/maximizationの世代整合cache bundleを単独更新 |
+| `com.fx-codex.monitor-diagnostics` | 15分 | outcome/expectancyの重い診断（cache writerとは別lock） |
+| `com.fx-codex.dukascopy-history` | 5分 | 認証・注文経路を持たない遅延Bid/Ask履歴を収集 |
+| `com.fx-codex.quote-index` | 1分 | 追記quote tapeのread-only byte offset索引を更新 |
+| `com.fx-codex.virtual-portfolio` | 3分 | canonical仮想口座の期限付き受付・再生だけを実行 |
+| `com.fx-codex.virtual-portfolio-postprocess` | 5分 | canonical損益export（受付と別lock） |
+| `com.fx-codex.virtual-portfolio-report` | 5分 | 冪等な日次Discord出力（受付・損益exportと別lock） |
+| `com.fx-codex.virtual-portfolio-counterfactual` | 5分 | 任意の反実仮想台帳（受付・canonical成果出力と別lock） |
 | `com.fx-codex.health` | 5分 | 鮮度監視と運用通知（収集ジョブから独立） |
 
 `--signal-board` と `fx_briefing_loop.sh` は**開発・一時確認専用**です。Mac miniの
@@ -111,7 +119,7 @@ institutional governance方針が表現できる上限は **research → validat
 ```bash
 .venv/bin/python fx_briefing.py --signal-board --dry-run --symbols GBPUSD EURUSD USDJPY
                                                    # 5分ボードを送信せず内容確認
-.venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ・学習ファイルだけ更新
+.venv/bin/python fx_briefing.py --no-discord     # 送信せず判断ログ更新（時間足cacheは更新しない）
 .venv/bin/python fx_briefing.py                  # Discordへ送信
 .venv/bin/python fx_briefing.py --no-llm         # Claude APIを使わない
 .venv/bin/python fx_briefing.py --horizon-only --dry-run  # 設計Aの9本を表示確認
@@ -151,7 +159,8 @@ calendar/macro等のsource cacheは取得処理により更新され、イベン
   確信度キャリブレーション・ペア別減衰・状態×方向学習・反省レポート・Brier)を、
   `(通貨ペア × 時間足)` のセル単位で適用します。「この通貨のこの時間足でのこの状態の
   ロングは過去に外しやすい」といった粒度で確信度を自動調整します。結果は
-  `logs/briefing_tf_learning.json` に保存されます。
+  正規の`com.fx-codex.monitors`が他の2cacheと同一世代で
+  `logs/briefing_tf_learning.json` に保存します。
 - 融合1判断モードとはジャーナル・学習ファイルを分離しているため、両モードを
   混在させても互いに干渉しません。
 

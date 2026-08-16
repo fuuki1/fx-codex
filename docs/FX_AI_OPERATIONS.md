@@ -16,15 +16,22 @@ tail -n 20 logs/fx_integrated_briefing.log
 tail -n 5 logs/briefing_tf_journal.jsonl
 ```
 
-正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・canonical時間足別判断/通知）、`com.fx-codex.virtual-portfolio`（3分・仮想口座受付）、`com.fx-codex.health`（5分）です。旧融合判断はmanual observation-onlyで定期実行せず、canonical仮想口座・鮮度SLO・方針更新に使いません。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
+正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・canonical時間足別判断/通知）、`com.fx-codex.virtual-portfolio`（3分・仮想口座受付）、`com.fx-codex.virtual-portfolio-postprocess`（5分・canonical損益export）、`com.fx-codex.virtual-portfolio-report`（5分・日次通知）、`com.fx-codex.virtual-portfolio-counterfactual`（5分・任意比較）、`com.fx-codex.health`（5分）です。受付・損益export・通知・反実仮想を別process/別lockにし、任意の後段停止で300秒の受付期限や将来のcanonical成果出力を失わないようにします。旧融合判断はmanual observation-onlyで定期実行せず、canonical仮想口座・鮮度SLO・方針更新に使いません。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
 
 定時時間足判断は旧fusion由来の承認済みTP/SL registryを適用せず、定時monitorもregistryを
-更新しません。decision outcome/feedbackの正規writerは`com.fx-codex.monitors`だけです。
+更新しません。decision outcome/feedbackの正規writerは`com.fx-codex.monitor-diagnostics`だけです。
 manual fusionは別latestへ観測記録するだけで、canonical outcome/feedback/policyを更新しません。
-同serviceは時間足別のdirection/TP・SL/maximization cacheも15分ごとに更新します。定時briefingは
+`com.fx-codex.monitors`は時間足別のdirection/TP・SL/maximization cacheだけを15分ごとに更新し、重いdiagnostic scanを同じ排他区間で実行しません。定時briefingは
 全履歴を読み直さず、この3cacheの契約・30分鮮度・同一生成時刻とdecision feedbackの30分鮮度を
 検証します。不一致時は再計算へfallbackせずneutralに停止するため、まず
 `logs/timeframe_learning_monitor.json`と`logs/launchd/monitors.err.log`を確認してください。
+3cacheとmanifestは同一bundle lock下で公開・読込し、`com.fx-codex.monitors`だけがcanonical cacheを書きます。
+readerは5秒でlock待ちを打ち切り、cache利用不可としてその回の判断をneutralで記録します。
+writerが複数fileのreplace途中で異常終了した場合も世代/hash検証でfail-closeし、次のmonitor成功まで
+旧cacheへ自動復帰はしません。これは誤った世代を使わないためのavailability上の制約です。
+`tools/maximization_monitor.py`は別名のdiagnostic artifactだけを出力します。
+health monitorもmanifestのmtimeだけでなく、3cacheのsize/hash/contract/generated_atを照合し、
+parse可能でも世代が混在したbundleをCRITICALとして通知します。
 monitorは生成時刻より未来のdecision/price、hash不一致、時刻順序・provenance不足を学習から除外し、
 入力digest・最大availability・3cache hashをmanifestへ残します。briefing側もmanifestと実ファイルの
 size/hashを照合します。判断時の価格読込は末尾128MiB上限で、履歴成長に対して無界ではありません。

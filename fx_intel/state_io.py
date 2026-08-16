@@ -6,10 +6,48 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
+
+
+@contextmanager
+def advisory_file_lock(
+    path: str | Path,
+    *,
+    exclusive: bool,
+    timeout_seconds: float | None = None,
+) -> Iterator[None]:
+    """Hold a POSIX advisory lock for one multi-file state transaction."""
+
+    if timeout_seconds is not None and timeout_seconds < 0:
+        raise ValueError("timeout_seconds must be non-negative")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a+b") as handle:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if timeout_seconds is None:
+            fcntl.flock(handle.fileno(), operation)
+        else:
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), operation | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"timed out waiting for state lock: {target}")
+                    time.sleep(min(0.01, remaining))
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def atomic_write_json(path: str | Path, payload: object) -> None:

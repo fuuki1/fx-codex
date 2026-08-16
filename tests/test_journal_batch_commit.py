@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from fx_intel import journal
 
 
@@ -63,3 +65,43 @@ def test_read_entries_rejects_commit_with_missing_or_reordered_rows(tmp_path) ->
     )
 
     assert list(journal.read_entries(path)) == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    (
+        (b'{"ok": true}\n{broken}\n', "malformed JSONL row"),
+        (b'{"ok": true}\n[]\n', "non-object JSONL row"),
+        (b'{"ok": true}', "incomplete JSONL row"),
+        (b'{"ok": true}\n\xff\n', "malformed JSONL row"),
+    ),
+)
+def test_strict_read_entries_rejects_incomplete_or_malformed_source(
+    tmp_path, payload, message
+) -> None:
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(payload)
+
+    with pytest.raises(journal.JournalIntegrityError, match=message):
+        list(journal.read_entries(path, strict=True))
+
+
+def test_read_entries_default_remains_tolerant_and_strict_audits_bytes(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(b'{"id": 1}\n{broken}\n')
+
+    assert list(journal.read_entries(path)) == [{"id": 1}]
+    with pytest.raises(journal.JournalIntegrityError):
+        list(journal.read_entries(path, strict=True, audit={}))
+
+    valid = tmp_path / "valid.jsonl"
+    valid.write_bytes(b'{"id": 1}\n\n{"id": 2}\n')
+    audit: dict[str, object] = {}
+    assert list(journal.read_entries(valid, strict=True, audit=audit)) == [
+        {"id": 1},
+        {"id": 2},
+    ]
+    assert audit["physical_rows"] == 2
+    assert audit["parsed_object_rows"] == 2
+    assert audit["blank_rows"] == 1
+    assert len(str(audit["source_sha256"])) == 64

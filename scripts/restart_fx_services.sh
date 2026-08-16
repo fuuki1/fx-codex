@@ -1,9 +1,57 @@
 #!/bin/zsh
 # fx-codex収集サービスを再起動する(kickstart -k = 実行中なら殺してから再実行)。
 set -u
-LABELS=(com.fx-codex.snapshot com.fx-codex.briefing com.fx-codex.health com.fx-codex.horizon com.fx-codex.monitors)
-LEGACY_LABELS=(com.fx-codex.briefing.hourly)
+LABELS=(
+  com.fx-codex.snapshot
+  com.fx-codex.briefing
+  com.fx-codex.health
+  com.fx-codex.horizon
+  com.fx-codex.monitors
+  com.fx-codex.monitor-diagnostics
+  com.fx-codex.dukascopy-history
+  com.fx-codex.quote-index
+  com.fx-codex.virtual-portfolio
+  com.fx-codex.virtual-portfolio-postprocess
+  com.fx-codex.virtual-portfolio-report
+  com.fx-codex.virtual-portfolio-counterfactual
+  com.fx-codex.virtual-portfolio-learning
+  com.fx-codex.virtual-portfolio-read
+  com.fx-codex.dashboard-state
+  com.fx-codex.operational-read
+)
+LEGACY_LABELS=(com.fx-codex.briefing.hourly com.fx-codex.virtual-portfolio-close)
 overall_status=0
+
+has_managed_ancestor() {
+  local child_pid="$1"
+  local hops=0
+  local parent_pid
+  local parent_command
+  while [ "$hops" -lt 4 ]; do
+    parent_pid="$(ps -o ppid= -p "$child_pid" 2>/dev/null | tr -d ' ')"
+    [ -n "$parent_pid" ] || return 1
+    [ "$parent_pid" -gt 1 ] 2>/dev/null || return 1
+    parent_command="$(ps -o command= -p "$parent_pid" 2>/dev/null || true)"
+    case "$parent_command" in
+      *"/tools/run_exclusive.py"*) return 0 ;;
+    esac
+    child_pid="$parent_pid"
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
+unmanaged_direct_writers() {
+  local pid
+  local command
+  for pid in $(pgrep -f "[p]ython.*(fx_briefing.py|fx_tf_snapshot.py|virtual_portfolio.py)" 2>/dev/null || true); do
+    if has_managed_ancestor "$pid"; then
+      continue
+    fi
+    command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+    [ -z "$command" ] || echo "$pid $command"
+  done
+}
 
 # 部分restartを避けるため、全labelと競合writerを変更前に検証する。
 for label in $LABELS; do
@@ -23,8 +71,8 @@ for label in $LEGACY_LABELS; do
 done
 
 loops=$(pgrep -fl "fx_briefing_loop.sh|fx_tf_snapshot_loop.sh" || true)
-direct_writers=$(pgrep -fl "[p]ython.*(fx_briefing.py|fx_tf_snapshot.py)" || true)
-cron_writers=$(crontab -l 2>/dev/null | grep -E "fx_briefing.py|fx_tf_snapshot.py|fx_.*_loop.sh" || true)
+direct_writers=$(unmanaged_direct_writers)
+cron_writers=$(crontab -l 2>/dev/null | grep -E "fx_briefing.py|fx_tf_snapshot.py|virtual_portfolio.py|fx_.*_loop.sh" || true)
 if [ -n "$loops$direct_writers$cron_writers" ]; then
   echo "競合writer候補を検知したためrestartは未実行です。親PID/cwdを確認してください。" >&2
   [ -z "$loops" ] || echo "$loops" >&2
