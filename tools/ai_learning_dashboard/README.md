@@ -30,6 +30,9 @@ python3 tools/trade_outcome_monitor.py
 python3 tools/decision_expectancy_monitor.py
 ```
 
+上記monitorは改善候補registryを更新しません。候補追加・auto-pauseを保存する
+`--update-registry`は、正規serviceを停止してsingle-writerを確認した人手review時だけ使います。
+
 学習ログをDiscord送信なしで作り始める場合:
 
 ```bash

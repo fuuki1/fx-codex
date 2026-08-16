@@ -26,7 +26,7 @@
 
 | ファイル | 内容 | 書き手 |
 | --- | --- | --- |
-| `trade_improvement_candidates.json` | 改善候補レジストリ(paper_ready/approved/auto_paused と監査イベント) | `tools/trade_outcome_monitor.py` / `fx_briefing.py` |
+| `trade_improvement_candidates.json` | 改善候補レジストリ(paper_ready/approved/auto_paused と監査イベント) | 人手review CLIのみ（`trade_outcome_monitor.py --update-registry` または明示approval操作）。定時monitor/fusionはread-only |
 | `trade_outcome_monitor.json` | ダッシュボード用の期待値監視スナップショット(ヘルス・候補件数) | `tools/trade_outcome_monitor.py` |
 | `trade_outcome_report.json` | MFE/MAE/TP/SL採点の詳細監査レポート | `tools/trade_outcome_monitor.py` |
 | `trade_variant_report.json` | TP1/TP2のR倍率候補のpaper再採点レポート | `tools/trade_outcome_monitor.py` |

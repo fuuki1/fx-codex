@@ -169,13 +169,16 @@ launchdとraw loopの併走は禁止です。開発機で一時的にどちら�
 
 `tools/trade_outcome_monitor.py` は cron/CI/dashboard 向けの運用コマンドです。判断
 ジャーナルを MFE/MAE/TP/SL で採点し、期待値・サンプル数・経路品質をチェックしたうえで、
-改善候補レジストリ、TP/SL候補paper再採点、承認済みTP/SLの自動停止、ダッシュボード用
-監視JSONを1回で更新します。候補の`paper`/approval表記はoffline研究内の比較状態であり、
+TP/SL候補paper再採点とダッシュボード用監視JSONを1回で更新します。改善候補registryは
+既定でread-onlyです。人手reviewで明示的に`--update-registry`を付けた場合だけ候補追加・
+承認済みTP/SLの自動停止を保存します。候補の`paper`/approval表記はoffline研究内の比較状態であり、
 institutional model stageやbroker paper実行を意味せず、live反映も行いません。
 
 ```bash
 python3 tools/trade_outcome_monitor.py
 python3 tools/trade_outcome_monitor.py --journal logs/briefing_journal.jsonl --health-require-sample
+# registry更新は正規service停止・single-writer確認後の人手reviewだけ
+python3 tools/trade_outcome_monitor.py --update-registry
 python3 fx_briefing.py --approve-trade-candidate <candidate_id> --trade-approval-actor <name>
 ```
 

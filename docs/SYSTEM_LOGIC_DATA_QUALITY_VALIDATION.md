@@ -445,9 +445,12 @@ python3 tools/journal_gap_audit.py logs/briefing_journal.jsonl
 python3 tools/journal_gap_audit.py logs/briefing_tf_journal.jsonl
 
 # 期待値と失敗理由
-python3 tools/trade_outcome_monitor.py
+python3 tools/trade_outcome_monitor.py  # registryはread-only
 python3 tools/decision_expectancy_monitor.py
 python3 tools/maximization_monitor.py
+
+# 候補registry更新は正規service停止・single-writer確認後の人手reviewだけ
+python3 tools/trade_outcome_monitor.py --update-registry
 
 # Discord送信なしで1回収集
 python3 tools/learning_capture.py --keep-going
