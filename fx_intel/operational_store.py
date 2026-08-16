@@ -11,7 +11,7 @@ different launchd jobs cannot silently become concurrent writers.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 import sqlite3
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 APPLICATION_ID = 0x46584344  # "FXCD"
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 1_000
@@ -309,6 +309,9 @@ ON price_points(event_time_ns DESC, source_record_id DESC);
 
 CREATE INDEX IF NOT EXISTS price_points_symbol_page_idx
 ON price_points(symbol, timeframe, event_time_ns DESC, source_record_id DESC);
+
+CREATE INDEX IF NOT EXISTS price_points_symbol_available_idx
+ON price_points(symbol, available_time_ns DESC, source_record_id DESC);
 
 CREATE TABLE IF NOT EXISTS outcomes (
     prediction_id TEXT NOT NULL,
@@ -1076,6 +1079,52 @@ class OperationalStore:
         ).fetchall()
         return [_decoded_row(row) for row in rows]
 
+    def price_payloads_between(
+        self,
+        *,
+        symbols: Sequence[str],
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, object]]:
+        """Return original PIT price payloads for a bounded availability window."""
+
+        normalized_symbols = sorted({_required(symbol, "symbol") for symbol in symbols})
+        if not normalized_symbols:
+            return []
+        start_ns = _utc_ns(start, "start")
+        end_ns = _utc_ns(end, "end")
+        if end_ns <= start_ns:
+            raise ValueError("end must follow start")
+        placeholders = ",".join("?" for _ in normalized_symbols)
+        rows = self.connection.execute(
+            f"""
+            SELECT payload_json
+            FROM price_points
+            WHERE symbol IN ({placeholders})
+              AND available_time_ns >= ?
+              AND available_time_ns < ?
+            ORDER BY available_time_ns, source_record_id
+            """,
+            (*normalized_symbols, start_ns, end_ns),
+        ).fetchall()
+        payloads: list[dict[str, object]] = []
+        for row in rows:
+            decoded = json.loads(str(row["payload_json"]))
+            if not isinstance(decoded, dict):
+                raise OperationalStoreError("price payload is not a JSON object")
+            payloads.append(decoded)
+        return payloads
+
+    def ingest_rejection_count(self, source_name: str) -> int:
+        """Return durable rejected-line count for one projected source."""
+
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM ingest_rejections WHERE source_name = ?",
+                (_required(source_name, "source_name"),),
+            ).fetchone()[0]
+        )
+
     def source_cursor(self, source_name: str) -> SourceCursor | None:
         """Return the durable byte cursor for one append-only raw source."""
 
@@ -1636,7 +1685,7 @@ def _initialize(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
             INSERT INTO store_metadata(key, value, updated_at_ns)
-            VALUES ('schema_contract', 'fx-operational-store-v4', ?)
+            VALUES ('schema_contract', 'fx-operational-store-v5', ?)
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at_ns = excluded.updated_at_ns
@@ -1680,6 +1729,7 @@ def _verify_schema(connection: sqlite3.Connection) -> None:
         "audit_events_page_idx",
         "price_points_page_idx",
         "price_points_symbol_page_idx",
+        "price_points_symbol_available_idx",
     }
     present_indexes = {
         str(row[0])

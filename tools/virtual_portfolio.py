@@ -473,27 +473,24 @@ def _cycle(args: argparse.Namespace) -> dict[str, object]:
             if close_result["inserted"]:
                 closed += 1
         with timing.stage("canonical_decision_queue", event_count=len(events)) as queue_stage:
-            conflict_count_before_queue = len(conflicts)
-            for event in events:
-                decision = _canonical_decision(event)
-                try:
-                    queue_result = store.queue_decision(
-                        decision,
-                        observed_at=now,
-                        source=str(args.decisions.resolve()),
-                        batch_id=batch_id,
-                    )
-                except Exception as error:  # preserve the rest of the immutable batch
-                    conflicts.append(
-                        {
-                            "decision_id": str(decision.get("decision_id") or "unknown"),
-                            "error": str(error),
-                        }
-                    )
-                    continue
-                if queue_result["inserted"]:
-                    queued += 1
-            if len(conflicts) > conflict_count_before_queue:
+            queue_result = store.queue_decisions(
+                [_canonical_decision(event) for event in events],
+                observed_at=now,
+                source=str(args.decisions.resolve()),
+                batch_id=batch_id,
+            )
+            queued += int(str(queue_result["inserted"]))
+            queue_conflicts = queue_result["conflicts"]
+            if isinstance(queue_conflicts, list):
+                conflicts.extend(
+                    {
+                        "decision_id": str(row.get("decision_id") or "unknown"),
+                        "error": str(row.get("error") or "unknown queue error"),
+                    }
+                    for row in queue_conflicts
+                    if isinstance(row, Mapping)
+                )
+            if queue_conflicts:
                 queue_stage.mark_handled_error("DecisionQueueConflict")
         with timing.stage("canonical_replay_cycle") as replay_stage:
             try:

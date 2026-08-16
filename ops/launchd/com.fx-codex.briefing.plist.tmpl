@@ -2,7 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>EnvironmentVariables</key><dict><key>PYTHONPATH</key><string>__FX_ROOT__</string></dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key><string>__FX_ROOT__</string>
+    <key>FX_LIQUIDITY_OPERATIONAL_DB</key><string>__FX_LIQUIDITY_OPERATIONAL_DB__</string>
+    <key>FX_REQUIRE_OPERATIONAL_LIQUIDITY</key><string>__FX_REQUIRE_OPERATIONAL_LIQUIDITY__</string>
+  </dict>
   <key>Label</key><string>com.fx-codex.briefing</string>
   <!-- 00/05/10/.../55分にFX統合ブリーフィングを1回実行する。
        run_exclusive.pyで前回処理との重複を拒否し、Discord通知を1通へ集約する。
@@ -33,7 +38,9 @@
     <dict><key>Minute</key><integer>50</integer></dict>
     <dict><key>Minute</key><integer>55</integer></dict>
   </array>
-  <key>ProcessType</key><string>Background</string>
+  <!-- This is the bounded decision hot path.  Standard QoS avoids the disk-I/O
+       throttling applied to long-running research/monitor jobs. -->
+  <key>ProcessType</key><string>Standard</string>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/briefing.out.log</string>
   <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/briefing.err.log</string>

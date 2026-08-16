@@ -100,7 +100,7 @@ def test_initializes_strict_wal_store_with_full_sync(tmp_path: Path) -> None:
             "SELECT sql FROM sqlite_schema WHERE name = 'predictions'"
         ).fetchone()[0]
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert audit.journal_mode == "wal"
     assert audit.synchronous == 2  # SQLITE_SYNC_FULL
     assert audit.integrity_check == "ok"
@@ -111,7 +111,7 @@ def test_initializes_strict_wal_store_with_full_sync(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA application_id").fetchone()[0] == store.APPLICATION_ID
 
 
-def test_writer_migrates_schema_v1_candidate_to_v4(tmp_path: Path) -> None:
+def test_writer_migrates_schema_v1_candidate_to_v5(tmp_path: Path) -> None:
     path = tmp_path / "operational.sqlite3"
     with store.open_operational_writer(path, writer_id="test-writer"):
         pass
@@ -122,11 +122,11 @@ def test_writer_migrates_schema_v1_candidate_to_v4(tmp_path: Path) -> None:
     with store.open_operational_writer(path, writer_id="migration-writer") as opened:
         audit = opened.audit()
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert audit.audit_events == 0
 
 
-def test_writer_migrates_schema_v2_candidate_to_v4(tmp_path: Path) -> None:
+def test_writer_migrates_schema_v2_candidate_to_v5(tmp_path: Path) -> None:
     path = tmp_path / "operational.sqlite3"
     with store.open_operational_writer(path, writer_id="test-writer"):
         pass
@@ -149,13 +149,13 @@ def test_writer_migrates_schema_v2_candidate_to_v4(tmp_path: Path) -> None:
     with store.open_operational_writer(path, writer_id="migration-writer") as opened:
         audit = opened.audit()
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert audit.source_cursors == 0
     assert audit.source_chunks == 0
     assert audit.ingest_rejections == 0
 
 
-def test_writer_migrates_schema_v3_candidate_to_v4_page_indexes(
+def test_writer_migrates_schema_v3_candidate_to_v5_page_indexes(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "operational.sqlite3"
@@ -177,12 +177,30 @@ def test_writer_migrates_schema_v3_candidate_to_v4_page_indexes(
                 """).fetchall()}
         audit = opened.audit()
 
-    assert audit.schema_version == 4
+    assert audit.schema_version == 5
     assert {
         "audit_events_page_idx",
         "price_points_page_idx",
         "price_points_symbol_page_idx",
     } <= indexes
+
+
+def test_writer_migrates_schema_v4_candidate_to_v5_available_index(tmp_path: Path) -> None:
+    path = tmp_path / "operational.sqlite3"
+    with store.open_operational_writer(path, writer_id="test-writer"):
+        pass
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX price_points_symbol_available_idx")
+        connection.execute("PRAGMA user_version=4")
+
+    with store.open_operational_writer(path, writer_id="migration-writer") as opened:
+        index = opened.connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'price_points_symbol_available_idx'"
+        ).fetchone()
+        audit = opened.audit()
+
+    assert index is not None
+    assert audit.schema_version == 5
 
 
 def test_source_cursor_cannot_advance_without_matching_chunk(tmp_path: Path) -> None:

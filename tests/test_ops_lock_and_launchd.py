@@ -204,6 +204,20 @@ def test_virtual_portfolio_interval_preserves_admission_margin():
     )
     assert int(children[interval_index + 1].text or "0") == 180
 
+    watch_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "WatchPaths"
+    )
+    watch_paths = [node.text for node in children[watch_index + 1].findall("string")]
+    assert watch_paths == ["/Users/example/srv/fx-codex/logs/briefing_decisions_latest.json"]
+    process_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "ProcessType"
+    )
+    assert children[process_index + 1].text == "Standard"
+
 
 def test_briefing_plist_runs_on_five_minute_boundaries():
     raw = (_ROOT / "ops" / "launchd" / "com.fx-codex.briefing.plist.tmpl").read_text(
@@ -235,9 +249,50 @@ def test_briefing_plist_runs_on_five_minute_boundaries():
     assert minutes == list(range(0, 60, 5))
     keys = [node.text for node in root.iter("key")]
     assert "RunAtLoad" not in keys
+    process_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "ProcessType"
+    )
+    assert children[process_index + 1].text == "Standard"
 
 
 _ZSH = shutil.which("zsh")  # CI(ubuntu)にはzshが無いためスキップ。macOS実機で検証する
+
+
+def test_briefing_plist_persists_operational_liquidity_mode():
+    raw = (_ROOT / "ops" / "launchd" / "com.fx-codex.briefing.plist.tmpl").read_text(
+        encoding="utf-8"
+    )
+    rendered = (
+        raw.replace("__FX_ROOT__", "/Users/example/srv/fx-codex")
+        .replace("__PYTHON__", "/Users/example/srv/fx-codex/.venv/bin/python")
+        .replace("__FX_LIQUIDITY_OPERATIONAL_DB__", "/Users/example/state/operational.sqlite3")
+        .replace("__FX_REQUIRE_OPERATIONAL_LIQUIDITY__", "0")
+    )
+    root = ET.fromstring(rendered)
+    values = [node.text for node in root.iter("string")]
+    assert "/Users/example/state/operational.sqlite3" in values
+    keys = [node.text for node in root.iter("key")]
+    assert "FX_LIQUIDITY_OPERATIONAL_DB" in keys
+    assert "FX_REQUIRE_OPERATIONAL_LIQUIDITY" in keys
+
+
+@pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
+def test_install_script_rejects_required_operational_mode_without_database():
+    environment = os.environ.copy()
+    environment.pop("FX_LIQUIDITY_OPERATIONAL_DB", None)
+    environment["FX_REQUIRE_OPERATIONAL_LIQUIDITY"] = "1"
+    result = subprocess.run(
+        [_ZSH, str(_ROOT / "scripts" / "install_launchd.sh"), "--dry-run"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=_ROOT,
+        env=environment,
+    )
+    assert result.returncode != 0
+    assert "FX_LIQUIDITY_OPERATIONAL_DB" in result.stderr
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
@@ -327,10 +382,13 @@ def test_managed_launchd_python_imports_are_pinned_to_release_root():
             if node.tag == "key" and node.text == "EnvironmentVariables"
         )
         environment = list(fields[environment_index + 1])
-        assert [(node.tag, node.text) for node in environment] == [
+        environment_fields = [(node.tag, node.text) for node in environment]
+        assert environment_fields[:2] == [
             ("key", "PYTHONPATH"),
             ("string", "__FX_ROOT__"),
         ]
+        if name != "briefing":
+            assert len(environment_fields) == 2
 
 
 def test_manual_tool_wrappers_prepend_release_root_to_pythonpath():

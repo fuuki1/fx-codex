@@ -100,6 +100,7 @@ from fx_intel import (
     ml,
     news,
     oanda_prices,
+    operational_liquidity,
     price_history,
     promotion,
     signal_board,
@@ -1702,6 +1703,23 @@ def main(argv: list[str] | None = None) -> int:
         help="cached timeframe learningの最大許容経過秒数",
     )
     parser.add_argument(
+        "--liquidity-operational-db",
+        type=Path,
+        default=None,
+        help=(
+            "raw価格履歴と完全一致する増分SQLite投影から流動性baselineを読む。"
+            "未指定時は従来のbounded JSONL suffixを使う"
+        ),
+    )
+    parser.add_argument(
+        "--require-operational-liquidity",
+        action="store_true",
+        help=(
+            "増分SQLiteのcursor/identity/parityが不成立ならJSONL全読みにfallbackせず、"
+            "新規リスクをfail-closedする"
+        ),
+    )
+    parser.add_argument(
         "--no-trade-expectancy",
         action="store_true",
         help="TP/SL込み期待値監査・改善候補レジストリ・期待値ガードを使わない",
@@ -1915,6 +1933,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.promote_live is not None:
         parser.error("--promote-live is disabled; this build is research/shadow only")
+    if args.require_operational_liquidity and args.liquidity_operational_db is None:
+        parser.error("--require-operational-liquidity requires --liquidity-operational-db")
+    if args.liquidity_operational_db is not None and not args.defer_decision_scoring:
+        parser.error(
+            "--liquidity-operational-db requires --defer-decision-scoring; "
+            "the bounded liquidity window must not replace full historical scoring input"
+        )
     if args.signal_board:
         args.per_timeframe = True
     if args.update_trade_improvement_registry and not (
@@ -2173,8 +2198,51 @@ def main(argv: list[str] | None = None) -> int:
     # C input context: completed M5 history is used only as an as-of spread
     # baseline.  Each symbol gets one context shared by fusion and every
     # timeframe; the context is record/shadow-only at this stage.
-    with timing.stage("price_history_read"):
-        if args.cached_timeframe_learning:
+    with timing.stage("price_history_read") as price_history_stage:
+        input_price_rows: list[dict[str, object]]
+        liquidity_history_source = "jsonl"
+        if args.cached_timeframe_learning and args.liquidity_operational_db is not None:
+            try:
+                policy = liquidity.load_policy(DEFAULT_INPUT_POLICY_PATH)
+                operational_rows = operational_liquidity.load_recent_liquidity_rows(
+                    args.liquidity_operational_db,
+                    DEFAULT_TF_PRICES_PATH,
+                    symbols=tuple(data_symbols),
+                    as_of=now,
+                    lookback_market_days=policy.lookback_market_days,
+                )
+                input_price_rows = list(operational_rows.rows)
+                liquidity_history_source = "operational_sqlite"
+                timing.bind(
+                    liquidity_history_window_days=operational_rows.window_days,
+                    liquidity_history_projected_rows=operational_rows.projected_rows,
+                    liquidity_history_source_bytes=operational_rows.source_bytes,
+                )
+            except (
+                operational_liquidity.OperationalLiquidityError,
+                OSError,
+                ValueError,
+            ) as error:
+                price_history_stage.mark_handled_error(error)
+                fetch_warnings.append(f"増分流動性履歴を検証できません: {error}")
+                if args.require_operational_liquidity:
+                    input_price_rows = []
+                    liquidity_history_source = "operational_sqlite_failed_closed"
+                    freshness_gate = freshness.FreshnessGate(
+                        False,
+                        "invalid",
+                        f"operational liquidity unavailable: {error}",
+                    )
+                else:
+                    input_price_rows = [
+                        row
+                        for row in price_history.read_recent_snapshot_entries(
+                            DEFAULT_TF_PRICES_PATH
+                        )
+                        if price_history.is_pit_eligible_snapshot_entry(row, as_of=now)
+                    ]
+                    liquidity_history_source = "jsonl_fallback"
+        elif args.cached_timeframe_learning:
             input_price_rows = [
                 row
                 for row in price_history.read_recent_snapshot_entries(DEFAULT_TF_PRICES_PATH)
@@ -2182,6 +2250,7 @@ def main(argv: list[str] | None = None) -> int:
             ]
         else:
             input_price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
+        timing.bind(liquidity_history_source=liquidity_history_source)
     with timing.stage("decision_input_context_build"):
         input_contexts = build_decision_input_contexts(
             data_symbols,

@@ -4,7 +4,8 @@
 <dict>
   <key>EnvironmentVariables</key><dict><key>PYTHONPATH</key><string>__FX_ROOT__</string></dict>
   <key>Label</key><string>com.fx-codex.virtual-portfolio</string>
-  <!-- 3分ごとのワンショット。300秒の判断受付期限にwrapper実行時間の余白を残す。 -->
+  <!-- latestのatomic replaceを契機に即時受付する。3分周期はイベント通知が
+       coalesce/欠落した場合のdurable fallbackであり、source of truthではない。 -->
   <key>ProgramArguments</key>
   <array>
     <string>__PYTHON__</string>
@@ -17,8 +18,12 @@
   </array>
   <key>WorkingDirectory</key><string>__FX_ROOT__</string>
   <key>StartInterval</key><integer>180</integer>
+  <key>WatchPaths</key>
+  <array>
+    <string>__FX_ROOT__/logs/briefing_decisions_latest.json</string>
+  </array>
   <key>RunAtLoad</key><true/>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>__FX_ROOT__/logs/launchd/virtual-portfolio.out.log</string>
   <key>StandardErrorPath</key><string>__FX_ROOT__/logs/launchd/virtual-portfolio.err.log</string>

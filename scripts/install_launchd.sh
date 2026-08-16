@@ -49,10 +49,41 @@ LABELS=(
 LEGACY_LABELS=(com.fx-codex.briefing.hourly com.fx-codex.virtual-portfolio-close)
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+LIQUIDITY_OPERATIONAL_DB="${FX_LIQUIDITY_OPERATIONAL_DB:-}"
+REQUIRE_OPERATIONAL_LIQUIDITY="${FX_REQUIRE_OPERATIONAL_LIQUIDITY:-0}"
+
+if [ -n "$LIQUIDITY_OPERATIONAL_DB" ]; then
+  case "$LIQUIDITY_OPERATIONAL_DB" in
+    /*) ;;
+    *)
+      echo "ERROR: FX_LIQUIDITY_OPERATIONAL_DBは絶対パスで指定してください" >&2
+      exit 1
+      ;;
+  esac
+  case "$LIQUIDITY_OPERATIONAL_DB" in
+    *[\&\<\>\|\\]*)
+      echo "ERROR: FX_LIQUIDITY_OPERATIONAL_DBにrender上安全でない文字があります" >&2
+      exit 1
+      ;;
+  esac
+fi
+if [ "$REQUIRE_OPERATIONAL_LIQUIDITY" != 0 ] && [ "$REQUIRE_OPERATIONAL_LIQUIDITY" != 1 ]; then
+  echo "ERROR: FX_REQUIRE_OPERATIONAL_LIQUIDITYは0または1で指定してください" >&2
+  exit 1
+fi
+if [ "$REQUIRE_OPERATIONAL_LIQUIDITY" = 1 ] && [ -z "$LIQUIDITY_OPERATIONAL_DB" ]; then
+  echo "ERROR: 必須モードにはFX_LIQUIDITY_OPERATIONAL_DBが必要です" >&2
+  exit 1
+fi
 
 render() {
-  # __FX_ROOT__/__PYTHON__を実パスへ展開してplistを生成する
-  sed -e "s|__FX_ROOT__|$ROOT|g" -e "s|__PYTHON__|$PYTHON|g" "$1"
+  # runtime pathと承認済みoperational liquidity modeをplistへ固定する。
+  sed \
+    -e "s|__FX_ROOT__|$ROOT|g" \
+    -e "s|__PYTHON__|$PYTHON|g" \
+    -e "s|__FX_LIQUIDITY_OPERATIONAL_DB__|$LIQUIDITY_OPERATIONAL_DB|g" \
+    -e "s|__FX_REQUIRE_OPERATIONAL_LIQUIDITY__|$REQUIRE_OPERATIONAL_LIQUIDITY|g" \
+    "$1"
 }
 
 has_managed_ancestor() {

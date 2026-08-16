@@ -176,6 +176,46 @@ def test_initialized_ledger_rejects_a_second_writer_identity(tmp_path) -> None:
             pass
 
 
+def test_queue_decisions_uses_one_commit_and_preserves_valid_rows(tmp_path) -> None:
+    path, policy = _initialized(tmp_path)
+    first = _decision(policy, decision_id="batch-1")
+    second = _decision(policy, decision_id="batch-2")
+    changed_first = {**first, "conviction": 99}
+
+    with open_virtual_portfolio_writer(path, writer_id="test") as store:
+        store.queue_decision(
+            first,
+            observed_at=START + timedelta(seconds=1),
+            source="test",
+            batch_id="prior",
+        )
+        statements: list[str] = []
+        store.connection.set_trace_callback(statements.append)
+        result = store.queue_decisions(
+            [changed_first, second],
+            observed_at=START + timedelta(seconds=2),
+            source="test",
+            batch_id="batch",
+        )
+        store.connection.set_trace_callback(None)
+
+    assert result["inserted"] == 1
+    assert result["conflicts"] == [
+        {
+            "decision_id": "batch-1",
+            "error_type": "ImmutableVirtualRecordConflict",
+            "error": "decision intake already exists with different content: batch-1",
+        }
+    ]
+    assert sum(statement == "BEGIN IMMEDIATE" for statement in statements) == 1
+    assert sum(statement == "COMMIT" for statement in statements) == 1
+    with open_virtual_portfolio_reader(path) as store:
+        assert [row["decision_id"] for row in store.pending_decisions()] == [
+            "batch-1",
+            "batch-2",
+        ]
+
+
 def test_open_transaction_rolls_back_decision_anchor_and_capacity_on_insert_failure(
     tmp_path,
 ) -> None:

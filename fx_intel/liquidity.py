@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time, UTC
+from datetime import date, datetime, timedelta, time, UTC
 import hashlib
 import json
 from pathlib import Path
@@ -279,22 +279,10 @@ def _baseline_spreads(
 ) -> tuple[list[float], str]:
     deduped: dict[str, tuple[float, str, datetime]] = {}
     for row in rows:
-        if str(row.get("symbol", "")).upper().replace("/", "") != symbol.upper().replace("/", ""):
+        candidate = _baseline_row(symbol, row, decision_time=decision_time)
+        if candidate is None:
             continue
-        available = _parse_time(row.get("available_time") or row.get("ts"))
-        if available is None or available >= _utc(decision_time):
-            continue
-        spread = _number(row.get("spread"))
-        if spread is None or spread <= 0:
-            bid = _number(row.get("bid") or row.get("bid_close"))
-            ask = _number(row.get("ask") or row.get("ask_close"))
-            spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
-        if spread is None or spread <= 0:
-            continue
-        record = _base_record_id(row, available)
-        bucket, _active = classify_market_session(available)
-        if bucket == "closed":
-            continue
+        record, spread, bucket, available = candidate
         deduped[record] = (spread, bucket, available)
     observed_dates = sorted({available.date() for _spread, _bucket, available in deduped.values()})
     allowed_dates = set(observed_dates[-policy.lookback_market_days :])
@@ -306,6 +294,42 @@ def _baseline_spreads(
     return all_symbol, (
         "symbol" if len(all_symbol) >= policy.min_baseline_samples else "insufficient"
     )
+
+
+def baseline_market_date(
+    symbol: str,
+    row: Mapping[str, object],
+    *,
+    decision_time: datetime,
+) -> date | None:
+    """Return the UTC market date when *row* can enter a spread baseline."""
+
+    candidate = _baseline_row(symbol, row, decision_time=decision_time)
+    return candidate[3].date() if candidate is not None else None
+
+
+def _baseline_row(
+    symbol: str,
+    row: Mapping[str, object],
+    *,
+    decision_time: datetime,
+) -> tuple[str, float, str, datetime] | None:
+    if str(row.get("symbol", "")).upper().replace("/", "") != symbol.upper().replace("/", ""):
+        return None
+    available = _parse_time(row.get("available_time") or row.get("ts"))
+    if available is None or available >= _utc(decision_time):
+        return None
+    spread = _number(row.get("spread"))
+    if spread is None or spread <= 0:
+        bid = _number(row.get("bid") or row.get("bid_close"))
+        ask = _number(row.get("ask") or row.get("ask_close"))
+        spread = ask - bid if bid is not None and ask is not None and ask >= bid else None
+    if spread is None or spread <= 0:
+        return None
+    bucket, _active = classify_market_session(available)
+    if bucket == "closed":
+        return None
+    return _base_record_id(row, available), spread, bucket, available
 
 
 def _base_record_id(row: Mapping[str, object], available: datetime) -> str:

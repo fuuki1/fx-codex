@@ -20,7 +20,7 @@ launchdのワンショットサービスとして運用するための手順書�
 |---|---|---|---|
 | `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | 時間足別採点用の価格系列を供給する唯一の定期writer |
 | `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 5分ごとのcanonical時間足別判断・通知。monitor生成の学習cacheだけを読み、履歴全件採点と融合判断は受付経路外 |
-| `com.fx-codex.virtual-portfolio` | 3分毎(StartInterval 180) | `scripts/virtual_portfolio_once.sh` | 300秒の受付期限内にcanonical仮想判断を取り込み、比較simulationは受付後に実行 |
+| `com.fx-codex.virtual-portfolio` | latest変更時 + 3分fallback | `scripts/virtual_portfolio_once.sh` | `WatchPaths`でcanonical latestを即時受付し、通知coalesce/欠落時だけStartInterval 180で回収。比較simulationは受付後に実行 |
 | `com.fx-codex.health` | 5分毎 | `tools/data_freshness_monitor.py` | データ鮮度監視。WARNING/CRITICAL/RECOVERYをDiscordへ |
 | `com.fx-codex.horizon` | 5分毎(StartInterval 300) | `scripts/fx_horizon_once.sh` | 3ペア×9本のshadow予測、満期採点、セル学習。Discord/既存判断への影響なし |
 
@@ -56,8 +56,11 @@ pathから外し、必要時の手動researchだけで生成する。
 要求する。cache異常時にcritical path内で全履歴再計算へfallbackしてはならない。
 monitorはPIT契約済みdecisionと、event/available/ingested時刻・provenance・content hashを検証して
 生成時刻以前に利用可能だったpriceだけを採用する。manifestへ入力digest、最大availability、各cacheの
-size/hashを記録し、briefingはbundle hash不一致もneutralへ倒す。判断時のliquidity baselineは価格
-JSONLの末尾128MiB以内だけを読むため、scheduled critical pathに無界な全件materializeを戻さない。
+size/hashを記録し、briefingはbundle hash不一致もneutralへ倒す。判断時のliquidity baselineは、
+parity/bootstrap済みoperational SQLiteを指定した場合、raw価格JSONLのpath/inode/size/mtime、完全EOF
+cursor、reject 0を検証して必要な20市場日だけをindex readする。証拠不一致時は通常modeなら従来の
+bounded JSONL suffixへ戻り、`--require-operational-liquidity`なら空履歴+新規リスク拒否へ倒す。
+scheduled critical pathに履歴サイズ比例の全件materializeを戻してはならない。
 手動研究で融合を実行する場合も、PIT適格な融合行だけを使い、件数・クラス数・時系列分割を
 通過してモデル本体ができた時点でartifactを保存し、検証スコア不合格なら`usable=false`のまま
 判断参加を禁止する。
@@ -87,6 +90,10 @@ zero-write確認は正規runtimeと分離したcopyで行う。
   (再起動→自動ログイン→エージェント自動起動)。
 - ワンショット型のため「異常終了からの復旧」は次周期の再実行で担保される
   (常駐プロセスの再起動ループより単純で、部分実行の中間状態が残らない)。
+- briefingとvirtual portfolio intakeは`ProcessType=Standard`、長時間の学習・monitor・reportは
+  `Background`とする。仮想口座の同一latest再実行はdecision_idで冪等であり、WatchPathsと
+  180秒fallbackが同時発火しても二重計上しない。8判断のintakeはsavepoint付き単一transactionで
+  commitし、1行の競合を可視化しながら他の正当行を保持する。
 - 秘密情報(Discord webhook)はplistに書かず、実行時に `.env` から読む。
   鮮度監視は `DISCORD_OPS_WEBHOOK_URL`(運用専用)があれば優先し、
   無ければ既存の `DISCORD_WEBHOOK_URL` を使う。

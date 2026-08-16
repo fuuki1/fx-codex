@@ -9,7 +9,7 @@ executable quote, costs, and governing artifact hashes are all explicit.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -2588,6 +2588,74 @@ class VirtualPortfolioStore:
     ) -> dict[str, object]:
         """Append a decision before any later price-path outcome is inspected."""
 
+        with self.connection:
+            return self._queue_decision(
+                decision,
+                observed_at=observed_at,
+                source=source,
+                batch_id=batch_id,
+            )
+
+    def queue_decisions(
+        self,
+        decisions: Sequence[Mapping[str, object]],
+        *,
+        observed_at: datetime,
+        source: str,
+        batch_id: str,
+    ) -> dict[str, object]:
+        """Durably queue one decision batch with a single FULL-sync commit.
+
+        Each row is isolated by a savepoint so one malformed or conflicting
+        decision remains visible without discarding other valid rows.  The
+        outer transaction is the durability boundary: an abrupt process exit
+        cannot expose only a prefix of the successfully accepted rows.
+        """
+
+        self._require_writer()
+        results: list[dict[str, object]] = []
+        conflicts: list[dict[str, str]] = []
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            for index, decision in enumerate(decisions):
+                savepoint = f"decision_intake_{index}"
+                self.connection.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    result = self._queue_decision(
+                        decision,
+                        observed_at=observed_at,
+                        source=source,
+                        batch_id=batch_id,
+                    )
+                except Exception as error:
+                    self.connection.execute(f"ROLLBACK TO {savepoint}")
+                    self.connection.execute(f"RELEASE {savepoint}")
+                    conflicts.append(
+                        {
+                            "decision_id": str(decision.get("decision_id") or "unknown"),
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        }
+                    )
+                else:
+                    self.connection.execute(f"RELEASE {savepoint}")
+                    results.append(result)
+        return {
+            "results": results,
+            "conflicts": conflicts,
+            "inserted": sum(result.get("inserted") is True for result in results),
+        }
+
+    def _queue_decision(
+        self,
+        decision: Mapping[str, object],
+        *,
+        observed_at: datetime,
+        source: str,
+        batch_id: str,
+    ) -> dict[str, object]:
+        """Insert one intake inside the caller-owned transaction."""
+
         writer_id = self._require_writer()
         decision_id = _required_text(decision.get("decision_id"), "decision_id")
         observed = _as_utc(observed_at, "observed_at")
@@ -2629,25 +2697,24 @@ class VirtualPortfolioStore:
             "batch_id": _required_text(batch_id, "decision batch_id"),
             "decision": dict(decision),
         }
-        with self.connection:
-            self.connection.execute(
-                """
-                INSERT INTO decision_intakes(
-                    decision_id, decision_time_ns, observed_at_ns, source, batch_id,
-                    decision_json, record_sha256, writer_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    decision_id,
-                    _to_ns(decision_time),
-                    _to_ns(observed),
-                    str(payload["source"]),
-                    str(payload["batch_id"]),
-                    canonical,
-                    _record_hash(payload),
-                    writer_id,
-                ),
-            )
+        self.connection.execute(
+            """
+            INSERT INTO decision_intakes(
+                decision_id, decision_time_ns, observed_at_ns, source, batch_id,
+                decision_json, record_sha256, writer_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                _to_ns(decision_time),
+                _to_ns(observed),
+                str(payload["source"]),
+                str(payload["batch_id"]),
+                canonical,
+                _record_hash(payload),
+                writer_id,
+            ),
+        )
         return {"inserted": True, "decision_id": decision_id, "status": "pending"}
 
     def pending_decisions(self) -> list[dict[str, object]]:
