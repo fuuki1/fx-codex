@@ -50,6 +50,9 @@ canonical outcome exportは`scripts/virtual_portfolio_postprocess_once.sh`、日
 `scripts/virtual_portfolio_counterfactual_once.sh`へ分離し、4者はlockを共有しない。すべてoffline
 simulationでありbroker接続はない。
 
+launchd templateは`EnvironmentVariables.PYTHONPATH=__FX_ROOT__`を持ち、manual wrapperも実行時の
+repository rootを先頭へ追加する。共有venvのeditable install先はruntime codeの正本にしない。
+
 ## 読み手
 
 - `tools/ai_learning_dashboard/server.py` — 全ファイルを読み取り専用で可視化

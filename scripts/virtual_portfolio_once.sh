@@ -4,6 +4,7 @@
 set -eu
 
 cd "$(dirname "$0")/.." || exit 1
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON="$PWD/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then

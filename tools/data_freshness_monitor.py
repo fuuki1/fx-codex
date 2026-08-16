@@ -33,7 +33,14 @@ import sys
 import tempfile
 from collections.abc import Callable, Mapping
 
-from fx_intel.state_io import advisory_file_lock
+REPO_ROOT = Path(__file__).resolve().parents[1]
+try:
+    sys.path.remove(str(REPO_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(REPO_ROOT))
+
+from fx_intel.state_io import advisory_file_lock  # noqa: E402
 
 DEFAULT_CONFIG_PATH = "ops/freshness_targets.json"
 DEFAULT_STATE_PATH = "logs/freshness_state.json"

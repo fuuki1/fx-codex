@@ -5,6 +5,7 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 mkdir -p logs
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON="$PWD/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then

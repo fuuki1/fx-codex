@@ -300,6 +300,56 @@ def test_shell_scripts_parse(tmp_path):
         assert result.returncode == 0, f"{script}: {result.stderr}"
 
 
+def test_managed_launchd_python_imports_are_pinned_to_release_root():
+    managed = (
+        "snapshot",
+        "briefing",
+        "health",
+        "horizon",
+        "monitors",
+        "monitor-diagnostics",
+        "dukascopy-history",
+        "quote-index",
+        "virtual-portfolio",
+        "virtual-portfolio-postprocess",
+        "virtual-portfolio-report",
+        "virtual-portfolio-counterfactual",
+        "virtual-portfolio-learning",
+        "virtual-portfolio-read",
+        "dashboard-state",
+        "operational-read",
+    )
+    for name in managed:
+        root = ET.parse(_ROOT / "ops" / "launchd" / f"com.fx-codex.{name}.plist.tmpl")
+        dictionary = root.find("dict")
+        assert dictionary is not None
+        fields = list(dictionary)
+        environment_index = next(
+            index
+            for index, node in enumerate(fields)
+            if node.tag == "key" and node.text == "EnvironmentVariables"
+        )
+        environment = list(fields[environment_index + 1])
+        assert [(node.tag, node.text) for node in environment] == [
+            ("key", "PYTHONPATH"),
+            ("string", "__FX_ROOT__"),
+        ]
+
+
+def test_manual_tool_wrappers_prepend_release_root_to_pythonpath():
+    for name in (
+        "fx_monitors_once.sh",
+        "fx_monitor_diagnostics_once.sh",
+        "virtual_portfolio_once.sh",
+        "virtual_portfolio_postprocess_once.sh",
+        "virtual_portfolio_report_once.sh",
+        "virtual_portfolio_counterfactual_once.sh",
+        "virtual_portfolio_learning_once.sh",
+    ):
+        body = (_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert 'export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"' in body
+
+
 def test_scheduled_trade_outcome_monitor_cannot_mutate_policy_registry():
     script = (_ROOT / "scripts" / "fx_monitor_diagnostics_once.sh").read_text(encoding="utf-8")
 

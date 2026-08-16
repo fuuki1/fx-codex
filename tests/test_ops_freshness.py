@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -526,6 +527,28 @@ def test_repo_default_config_is_valid(monitor):
         assert target.warn_after_seconds > target.expected_interval_seconds
         if target.critical_after_seconds is not None:
             assert target.critical_after_seconds > target.warn_after_seconds
+
+
+def test_health_entrypoint_prefers_its_immutable_release_root(tmp_path):
+    fake = tmp_path / "stale-editable-root" / "fx_intel"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "state_io.py").write_text(
+        "# advisory_file_lock intentionally absent\n", encoding="utf-8"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(fake.parent)
+
+    result = subprocess.run(
+        [sys.executable, str(_MODULE_PATH), "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_report_is_written_before_notification_io(monitor, tmp_path):

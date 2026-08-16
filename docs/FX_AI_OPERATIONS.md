@@ -26,6 +26,8 @@ manual fusionは別latestへ観測記録するだけで、canonical outcome/feed
 検証します。不一致時は再計算へfallbackせずneutralに停止するため、まず
 `logs/timeframe_learning_monitor.json`と`logs/launchd/monitors.err.log`を確認してください。
 3cacheとmanifestは同一bundle lock下で公開・読込し、`com.fx-codex.monitors`だけがcanonical cacheを書きます。
+全managed plistは`PYTHONPATH`をimmutable release rootへ固定する。共有venvが別checkoutをeditable
+installしていても、`tools/...`が旧rootの`fx_intel`をimportしてreleaseを混在させてはならない。
 readerは5秒でlock待ちを打ち切り、cache利用不可としてその回の判断をneutralで記録します。
 writerが複数fileのreplace途中で異常終了した場合も世代/hash検証でfail-closeし、次のmonitor成功まで
 旧cacheへ自動復帰はしません。これは誤った世代を使わないためのavailability上の制約です。
