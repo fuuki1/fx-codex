@@ -1136,7 +1136,7 @@ def _run_per_timeframe(
                     fetch_warnings.append(f"TP/SL学習プロファイル保存失敗: {error}")
 
     target_r_adjuster = None
-    if not args.no_trade_expectancy:
+    if not args.no_trade_expectancy and not args.no_approved_tp_sl_policy:
         target_r_adjuster = make_approved_tp_sl_adjuster(
             trade_outcome.load_improvement_registry(args.trade_improvement_registry)
         )
@@ -1406,6 +1406,11 @@ def main(argv: list[str] | None = None) -> int:
         help="期待値監査は表示・記録するが、今回の判断への減衰/見送り反映は行わない",
     )
     parser.add_argument(
+        "--no-approved-tp-sl-policy",
+        action="store_true",
+        help="改善候補registryの承認済みTP/SLを今回の判断へ適用しない",
+    )
+    parser.add_argument(
         "--no-macro",
         action="store_true",
         help="マクロデータ(COT・金利・VIX・ドル指数)の取得と委員を使わない",
@@ -1606,6 +1611,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--promote-live is disabled; this build is research/shadow only")
     if args.signal_board:
         args.per_timeframe = True
+    if args.update_trade_improvement_registry and not (
+        args.score_trade_outcomes or args.retest_trade_variants
+    ):
+        parser.error(
+            "--update-trade-improvement-registry is allowed only with "
+            "--score-trade-outcomes or --retest-trade-variants"
+        )
     if args.decision_latest_output is None:
         args.decision_latest_output = (
             DEFAULT_DECISION_LATEST_PATH
@@ -1698,12 +1710,12 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(UTC)
     trade_improvement_registry = (
         load_pit_improvement_registry(args.trade_improvement_registry)
-        if not args.no_trade_expectancy
+        if not args.no_trade_expectancy and not args.no_approved_tp_sl_policy
         else {}
     )
     target_r_adjuster = (
         make_approved_tp_sl_adjuster(trade_improvement_registry)
-        if not args.no_trade_expectancy
+        if not args.no_trade_expectancy and not args.no_approved_tp_sl_policy
         else None
     )
 
@@ -1950,40 +1962,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if trade_expectancy_note != "トレード期待値監視: 対象なし":
             learning_note = append_note(learning_note, trade_expectancy_note)
-        overall_stats = trade_expectancy_summary.get("overall")
-        evaluated_outcomes = (
-            int(overall_stats.get("evaluated", 0)) if isinstance(overall_stats, dict) else 0
-        )
-        if not args.dry_run and evaluated_outcomes > 0:
-            try:
-                candidates = trade_outcome.improvement_candidates(trade_expectancy_summary)
-                registry = trade_outcome.update_improvement_registry(
-                    trade_improvement_registry,
-                    candidates,
-                    now=now,
-                    managed_action_types=trade_outcome.EXPECTANCY_CANDIDATE_ACTION_TYPES,
-                    data_contract=journal.FUSION_PIT_DATA_CONTRACT,
-                    prospective_outcomes=trade_outcomes,
-                )
-                registry, paused_policies = (
-                    trade_outcome.auto_pause_underperforming_approved_policies(
-                        registry,
-                        trade_expectancy_summary,
-                        now=now,
-                    )
-                )
-                # 自動停止をこの実行のプランへ即時反映する。実行冒頭の
-                # レジストリから作った注入器のままだと、いま停止した
-                # ポリシーのTP/SLが今回のプランに最後まで適用されてしまう
-                target_r_adjuster = make_approved_tp_sl_adjuster(registry)
-                for paused in paused_policies:
-                    fetch_warnings.append(
-                        "承認済みTP/SLを自動停止: "
-                        f"{paused['candidate_id']} — {paused['reason_ja']}"
-                    )
-                trade_outcome.save_improvement_registry(registry, args.trade_improvement_registry)
-            except OSError as error:
-                fetch_warnings.append(f"期待値改善候補レジストリ保存失敗: {error}")
         if not args.no_trade_expectancy_guard:
             # legacy close/OHLC反実仮想は経路診断の更新に限る。canonical bid/ask net
             # labelへjoinされるまではblock/boost/approvalの根拠にしない。
@@ -2216,7 +2194,9 @@ def main(argv: list[str] | None = None) -> int:
                     prediction_time=prediction_time,
                     timing=timing,
                     latest_snapshot_path=args.decision_latest_output,
-                    score_history=not args.defer_decision_scoring,
+                    # Fusion is manual observation-only.  The canonical monitor
+                    # is the sole outcome/feedback writer.
+                    score_history=False,
                 )
             except DecisionDeliveryError as error:
                 print(f"判断トランザクション書き込み失敗: {error}", file=sys.stderr)

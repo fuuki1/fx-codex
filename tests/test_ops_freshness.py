@@ -347,6 +347,9 @@ def test_repo_default_config_is_valid(monitor):
     names = {target.name for target in targets}
     assert {"tf_price_snapshot", "tf_journal", "horizon_journal"} <= names
     assert "fusion_journal" not in names
+    assert "promotion_state" not in names
+    tf_journal = next(target for target in targets if target.name == "tf_journal")
+    assert tf_journal.expected_interval_seconds == 300
     for target in targets:
         assert target.warn_after_seconds > target.expected_interval_seconds
         if target.critical_after_seconds is not None:

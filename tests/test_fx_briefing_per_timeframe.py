@@ -563,6 +563,35 @@ def test_per_timeframe_applies_approved_tp_sl_registry(patched_paths, tmp_path, 
     assert "T2 156.812" in out
 
 
+def test_per_timeframe_can_fail_closed_against_approved_tp_sl_registry(
+    patched_paths, tmp_path, capsys
+) -> None:
+    registry_path = tmp_path / "trade_registry.json"
+    _approved_tp_registry(registry_path)
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--dry-run",
+            "--no-learning",
+            "--no-macro",
+            "--no-approved-tp-sl-policy",
+            "--trade-improvement-registry",
+            str(registry_path),
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    assert "承認済みTP/SL" not in capsys.readouterr().out
+
+
 def test_no_learning_flag_skips_profile(patched_paths, capsys) -> None:
     tf_journal, tf_learning = patched_paths
     with mock.patch.object(fx_briefing, "load_webhook_url", return_value=None):

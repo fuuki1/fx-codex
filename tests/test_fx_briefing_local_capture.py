@@ -15,7 +15,6 @@ from fx_intel.evaluation_labels import (
     NET_LABEL_PROVENANCE,
     NET_LABEL_VERSION,
 )
-from fx_intel.market import is_market_open
 from fx_intel.sentiment import CurrencySentiment, MarketAnalysis
 from fx_intel.technicals import PairTechnicals, build_interval_view
 from tests.support.prospective_registry import mark_candidate_ready_for_review
@@ -80,7 +79,7 @@ def test_load_pit_decision_outcome_report_rejects_legacy_or_unrequired(tmp_path)
     assert fx_briefing.load_pit_decision_outcome_report(path) == {}
 
 
-def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None:
+def test_no_discord_writes_fusion_journal_without_canonical_outcomes(tmp_path, capsys) -> None:
     journal_path = tmp_path / "briefing_journal.jsonl"
     learning_path = tmp_path / "briefing_learning.json"
     promotion_path = tmp_path / "promotion_state.json"
@@ -129,13 +128,11 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert learning_path.exists()
     assert decision_log_path.exists()
     assert decision_latest_path.exists()
-    assert decision_outcomes_path.exists()
-    assert decision_feedback_path.exists()
+    assert not decision_outcomes_path.exists()
+    assert not decision_feedback_path.exists()
     rows = list(fx_briefing.journal.read_entries(journal_path))
     decision_rows = list(fx_briefing.decision_log.read_decision_events(decision_log_path))
     profile = json.loads(learning_path.read_text(encoding="utf-8"))
-    outcome_report = json.loads(decision_outcomes_path.read_text(encoding="utf-8"))
-    feedback = json.loads(decision_feedback_path.read_text(encoding="utf-8"))
     assert rows and rows[0]["symbol"] == "USDJPY"
     assert rows[0]["pit_eligible"] is True
     assert (
@@ -148,10 +145,6 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
     assert rows[0]["source_record_ids"]
     assert rows[0]["pit_contract"] == fx_briefing.journal.DECISION_JOURNAL_PIT_CONTRACT
     assert decision_rows and decision_rows[0]["learning_context"]["promotion"]["stages"]
-    assert outcome_report["scoring_method"] == "tp_sl_mfe_mae_first_touch"
-    assert outcome_report["pit_required"] is True
-    assert outcome_report["pit_eligible_decision_events"] == 1
-    assert "cells" in feedback
     assert "evaluated" in profile
     timing_rows = [
         json.loads(line)
@@ -163,18 +156,16 @@ def test_no_discord_writes_fusion_journal_and_learning(tmp_path, capsys) -> None
         "calendar_fetch",
         "technical_load",
         "decision_event_build",
-        "decision_log_read",
-        "decision_outcome_score",
         "decision_transaction_append",
         "latest_snapshot_save",
+        "historical_scoring_deferred",
     } <= timing_stages
     ordered_stages = [str(row["stage"]) for row in timing_rows]
     assert ordered_stages.index("decision_transaction_append") < ordered_stages.index(
         "latest_snapshot_save"
     )
-    assert ordered_stages.index("latest_snapshot_save") < ordered_stages.index("decision_log_read")
-    assert ordered_stages.index("decision_log_read") < ordered_stages.index(
-        "decision_outcome_score"
+    assert ordered_stages.index("latest_snapshot_save") < ordered_stages.index(
+        "historical_scoring_deferred"
     )
     assert all(row["status"] == "ok" for row in timing_rows)
     assert "Discord送信なし" in capsys.readouterr().out
@@ -513,18 +504,12 @@ def _losing_policy_journal(path, candidate_id: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def test_auto_paused_policy_not_applied_to_same_run_plans(
+def test_manual_fusion_does_not_mutate_policy_registry_or_outcomes(
     tmp_path,
     capsys,
     isolated_fx_briefing_runtime,
 ) -> None:
-    """実行中に自動停止した承認済みTP/SLは、その実行のプランにも適用しない。
-
-    修正前は実行冒頭のレジストリで注入器を作っていたため、悪化を検知して
-    auto_paused に落としたポリシーがその回のプランへ最後まで適用されていた。
-    """
-    if not is_market_open(datetime.now(UTC)):
-        pytest.skip("FX市場休場中はSL/TP付きプランが生成されないため検証不能")
+    """Manual fusion is observation-only and cannot write canonical policy/feedback."""
 
     candidate_id = "pol-overall-tp"
     journal_path = tmp_path / "briefing_journal.jsonl"
@@ -533,6 +518,7 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
     registry_path = tmp_path / "trade_improvement_candidates.json"
     _approved_overall_policy_registry(registry_path, candidate_id)
     _losing_policy_journal(journal_path, candidate_id)
+    registry_before = registry_path.read_bytes()
 
     with (
         mock.patch.object(fx_briefing, "DEFAULT_JOURNAL_PATH", journal_path),
@@ -554,6 +540,7 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
                 "--no-trade-expectancy-guard",
                 "--no-export-events",
                 "--no-event-archive",
+                "--no-journal",
                 "--trade-improvement-registry",
                 str(registry_path),
                 "--symbols",
@@ -565,24 +552,6 @@ def test_auto_paused_policy_not_applied_to_same_run_plans(
     assert fx_briefing.DEFAULT_DECISION_LOG_PATH == (
         isolated_fx_briefing_runtime / "logs" / "briefing_decisions.jsonl"
     )
-    assert fx_briefing.DEFAULT_DECISION_LOG_PATH.exists()
-    # 負け履歴の悪化検知で、承認済みポリシーはこの実行内で自動停止される
-    registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert registry["candidates"][candidate_id]["stage"] == "auto_paused"
-    # 今回追記されたプラン行(履歴20行の後)には停止済みポリシーを適用しない
-    rows = list(fx_briefing.journal.read_entries(journal_path))
-    new_rows = rows[20:]
-    assert new_rows, "今回のプランがジャーナルへ追記されていること"
-    assert all(row["direction"] == "neutral" for row in new_rows)
-    assert any(
-        str(trace.get("gate", "")).startswith("decision_pipeline:")
-        and trace.get("terminal") is True
-        for row in new_rows
-        for trace in row.get("gate_trace", [])
-        if isinstance(trace, dict)
-    )
-    for row in new_rows:
-        assert row["target_policy"] == {}, (
-            "自動停止したTP/SLポリシーが同一実行のプランに適用されている: "
-            f"{row['target_policy']}"
-        )
+    assert registry_path.read_bytes() == registry_before
+    assert not fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.exists()
+    assert not fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.exists()

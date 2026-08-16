@@ -16,9 +16,9 @@
       "name": "tf_journal",
       "path": "logs/briefing_tf_journal.jsonl",
       "kind": "jsonl",
-      "expected_interval_seconds": 3600,
-      "warn_after_seconds": 7200,
-      "critical_after_seconds": 21600,
+      "expected_interval_seconds": 300,
+      "warn_after_seconds": 900,
+      "critical_after_seconds": 2700,
       "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を restart"
     },
     {
@@ -52,19 +52,10 @@
       "name": "learning_profile",
       "path": "logs/briefing_tf_learning.json",
       "kind": "json",
-      "expected_interval_seconds": 3600,
-      "warn_after_seconds": 10800,
+      "expected_interval_seconds": 300,
+      "warn_after_seconds": 900,
       "critical_after_seconds": null,
       "manual_action_ja": "ブリーフィング自体が動いているのに学習が更新されない場合はfx_briefing.pyの--no-learning指定やプロファイル破損を確認"
-    },
-    {
-      "name": "promotion_state",
-      "path": "logs/promotion_state.json",
-      "kind": "json",
-      "expected_interval_seconds": 3600,
-      "warn_after_seconds": 10800,
-      "critical_after_seconds": null,
-      "manual_action_ja": "ブリーフィングログでpromotion採点のエラーを確認"
     }
   ]
 }

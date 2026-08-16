@@ -29,9 +29,11 @@ launchdのワンショットサービスとして運用するための手順書�
 | 状態ファイル | 正規writer | 禁止する競合 |
 |---|---|---|
 | `logs/briefing_tf_prices.jsonl` | `com.fx-codex.snapshot`のみ | signal boardの価格書込み、raw snapshot loop、別checkoutのcron |
-| `logs/briefing_journal.jsonl` | `com.fx-codex.briefing`のみ | manual briefing、signal board、旧cron/旧plist |
+| `logs/briefing_journal.jsonl` | 定期writerなし（manual fusion研究のみ） | 正規service稼働中のmanual fusion、旧cron/旧plist |
 | `logs/briefing_tf_journal.jsonl` | `com.fx-codex.briefing`のみ | manual per-timeframe、signal board、旧cron/旧plist |
-| 学習・昇格・decision系の状態 | `com.fx-codex.briefing`のみ | 同じ状態を更新する任意の別プロセス |
+| decision transaction / latest | `com.fx-codex.briefing`のみ | manual per-timeframe、旧writer |
+| decision outcome / feedback | `com.fx-codex.monitors`のみ | briefing、manual fusion、manual monitor |
+| `trade_improvement_candidates.json` | 明示した人手review CLIのみ | 定時briefing、定時monitor、manual fusion |
 
 全サービスは`tools/run_exclusive.py`の排他ロック（`flock`）経由で起動する。ただしロックは
 同一checkout・同一ロック名の呼出しにしか効かない。rawな手動コマンド、別名ロック、別checkout、
@@ -44,6 +46,8 @@ launchdのワンショットサービスとして運用するための手順書�
 5分ごとに実行する。判断transactionとlatest snapshotを先に永続化し、履歴全件のoutcome採点は
 `com.fx-codex.monitors`へ分離する。旧融合判断・GBDT候補収集は定期実行しないmanual
 observation-only研究経路であり、canonical virtual portfolioの入力、鮮度SLO、方針更新に使用しない。
+定時時間足判断は`--no-approved-tp-sl-policy`を必須とし、旧fusion由来registryがTP/SLや仮想純損益へ
+入る経路を閉じる。定時monitorも`--no-registry-update`で診断レポートだけを更新する。
 手動研究で融合を実行する場合も、PIT適格な融合行だけを使い、件数・クラス数・時系列分割を
 通過してモデル本体ができた時点でartifactを保存し、検証スコア不合格なら`usable=false`のまま
 判断参加を禁止する。
@@ -55,6 +59,9 @@ GBDT artifactはschema 5と`training_contract=decision-journal-pit-v2`を必須�
 旧registryのTP/SL候補は現行判断へ適用しない。
 手動の融合研究には`--no-discord --no-price-write --require-freshness`を必須とし、Discordの重複通知と
 snapshot以外からの価格追記を防ぐ。定期wrapperからは呼び出さず、正規writer稼働中に実行しない。
+fusion本体はpolicy registryとdecision outcome/feedbackを更新しない。registryの変更は
+`--score-trade-outcomes`または`--retest-trade-variants`と`--update-trade-improvement-registry`を
+明示した人手review CLIに限り、実行前に正規serviceを停止して単一writerを確認する。
 判定不能・未来時刻・末尾破損はfail-closedで次工程を開始しない。主要ジャーナル保存後の
 Discord通知失敗だけは専用終了コード5で識別し、launchdへ失敗を報告する。
 主要ジャーナルの書込み失敗は終了コード4で即時停止し、後続の完全判断ログへ部分更新を広げない。

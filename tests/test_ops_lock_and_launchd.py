@@ -291,6 +291,12 @@ def test_scheduled_trade_outcome_monitor_cannot_mutate_policy_registry():
     assert "--no-registry-update" in script
 
 
+def test_scheduled_briefing_cannot_apply_fusion_tp_sl_policy():
+    script = (_ROOT / "scripts" / "fx_briefing_once.sh").read_text(encoding="utf-8")
+
+    assert "--no-approved-tp-sl-policy" in script
+
+
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
 def test_restart_script_fails_if_any_service_is_not_loaded(tmp_path):
     fake_launchctl = tmp_path / "launchctl"

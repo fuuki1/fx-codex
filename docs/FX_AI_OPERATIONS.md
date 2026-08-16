@@ -18,6 +18,10 @@ tail -n 5 logs/briefing_tf_journal.jsonl
 
 正規構成はlaunchdの `com.fx-codex.snapshot`（5分・唯一の価格writer）、`com.fx-codex.briefing`（5分境界・canonical時間足別判断/通知）、`com.fx-codex.virtual-portfolio`（3分・仮想口座受付）、`com.fx-codex.health`（5分）です。旧融合判断はmanual observation-onlyで定期実行せず、canonical仮想口座・鮮度SLO・方針更新に使いません。`fx_briefing_loop.sh` / `fx_tf_snapshot_loop.sh`、直接実行、cron writerが見つかった場合は競合です。自動killせず、プロセス一覧・cron・plist・ログを保存してから人間が停止対象を確認します。
 
+定時時間足判断は旧fusion由来の承認済みTP/SL registryを適用せず、定時monitorもregistryを
+更新しません。decision outcome/feedbackの正規writerは`com.fx-codex.monitors`だけです。
+manual fusionは別latestへ観測記録するだけで、canonical outcome/feedback/policyを更新しません。
+
 時間足別Discord通知とcanonical仮想口座候補はUSDJPY/EURUSDです。旧融合/GBDT artifactは
 手動研究と監査用に保持しますが、定期更新・canonical入力・自動方針変更には使いません。
 
