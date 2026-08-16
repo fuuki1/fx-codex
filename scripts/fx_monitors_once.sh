@@ -34,7 +34,11 @@ run_monitor() {
 }
 
 overall=0
-run_monitor trade-outcome logs/trade_outcome_monitor.json tools/trade_outcome_monitor.py || overall=$?
+# 旧fusion journalの再採点はhistorical/diagnostic専用。canonicalな判断方針を
+# 書き換えないよう、改善registryは読み取りのみとする。
+run_monitor trade-outcome logs/trade_outcome_monitor.json \
+  tools/trade_outcome_monitor.py \
+  --no-registry-update || overall=$?
 run_monitor decision-expectancy logs/decision_expectancy_monitor.json \
   tools/decision_expectancy_monitor.py \
   --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment_ja": "データ鮮度監視の対象と閾値。expected_interval_secondsは書込み側の実際の周期(snapshot=5分ループ/journal=毎時:10のブリーフィング)から導出。warn/criticalの根拠: snapshotは3周期欠け=15分でWARNING、45分(9周期)でCRITICAL。journalは1周期スキップ許容で2時間WARNING、6時間(週末クローズ中も書込みは継続するため休場例外なし)でCRITICAL。learning/promotionはブリーフィング成功の副産物なのでwarnのみ(criticalはジャーナル側が担当)。",
+  "comment_ja": "データ鮮度監視の対象と閾値。canonicalな価格・時間足判断・horizonと各monitorだけを監視する。fusion journalは定期writerを廃止したmanual observation-only artifactなので鮮度対象に含めない。",
   "cooldown_seconds": 21600,
   "targets": [
     {
@@ -47,15 +47,6 @@
       "warn_after_seconds": 1800,
       "critical_after_seconds": 5400,
       "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
-    },
-    {
-      "name": "fusion_journal",
-      "path": "logs/briefing_journal.jsonl",
-      "kind": "jsonl",
-      "expected_interval_seconds": 3600,
-      "warn_after_seconds": 7200,
-      "critical_after_seconds": 21600,
-      "manual_action_ja": "logs/launchd/briefing.err.log を確認し、com.fx-codex.briefing を restart"
     },
     {
       "name": "learning_profile",

@@ -345,7 +345,8 @@ def test_repo_default_config_is_valid(monitor):
     targets, cooldown = monitor.load_config(config_path)
     assert cooldown > 0
     names = {target.name for target in targets}
-    assert {"tf_price_snapshot", "tf_journal", "fusion_journal"} <= names
+    assert {"tf_price_snapshot", "tf_journal", "horizon_journal"} <= names
+    assert "fusion_journal" not in names
     for target in targets:
         assert target.warn_after_seconds > target.expected_interval_seconds
         if target.critical_after_seconds is not None:

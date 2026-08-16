@@ -284,6 +284,13 @@ def test_shell_scripts_parse(tmp_path):
         assert result.returncode == 0, f"{script}: {result.stderr}"
 
 
+def test_scheduled_trade_outcome_monitor_cannot_mutate_policy_registry():
+    script = (_ROOT / "scripts" / "fx_monitors_once.sh").read_text(encoding="utf-8")
+
+    assert "tools/trade_outcome_monitor.py" in script
+    assert "--no-registry-update" in script
+
+
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")
 def test_restart_script_fails_if_any_service_is_not_loaded(tmp_path):
     fake_launchctl = tmp_path / "launchctl"

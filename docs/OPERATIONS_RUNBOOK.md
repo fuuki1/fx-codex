@@ -19,7 +19,8 @@ launchdのワンショットサービスとして運用するための手順書�
 | Label | 周期 | 実体 | 役割 |
 |---|---|---|---|
 | `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | 時間足別採点用の価格系列を供給する唯一の定期writer |
-| `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 5分ごとの時間足別統合通知と、最大1時間ごとの融合判断・学習更新 |
+| `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 5分ごとのcanonical時間足別判断・通知。履歴全件採点と融合判断は受付経路外 |
+| `com.fx-codex.virtual-portfolio` | 3分毎(StartInterval 180) | `scripts/virtual_portfolio_once.sh` | 300秒の受付期限内にcanonical仮想判断を取り込み、比較simulationは受付後に実行 |
 | `com.fx-codex.health` | 5分毎 | `tools/data_freshness_monitor.py` | データ鮮度監視。WARNING/CRITICAL/RECOVERYをDiscordへ |
 | `com.fx-codex.horizon` | 5分毎(StartInterval 300) | `scripts/fx_horizon_once.sh` | 3ペア×9本のshadow予測、満期採点、セル学習。Discord/既存判断への影響なし |
 
@@ -39,25 +40,26 @@ launchdのワンショットサービスとして運用するための手順書�
 単一writer保証はない。正規writerの所有権は当面の運用統制であり、トランザクションDBまたは
 共通ファイルロックへ移行するまで**未解決の残存リスク**とする。
 
-`fx_briefing_once.sh`は同じ`fx-briefing`ロック内で、時間足別統合を5分ごとに実行した後、
-`logs/briefing_journal.jsonl`の最終aware UTC時刻を読み取り、55分以上経過した場合だけ融合判断を実行する。
-時間足別Discord通知はUSDJPY/EURUSD、Discordなしの融合判断はsnapshotが完全性を監視している
-USDJPY/EURUSD/GBPUSDを対象にする。GBDTはモデル無し・stale時に融合実行内で自動再学習し、
-PIT適格な融合行だけを使う。件数・クラス数・時系列分割を通過してモデル本体ができた時点で
-artifactを保存し、検証スコア不合格なら`usable=false`のまま判断参加を禁止する。
+`fx_briefing_once.sh`は同じ`fx-briefing`ロック内で、USDJPY/EURUSDのcanonical時間足別判断だけを
+5分ごとに実行する。判断transactionとlatest snapshotを先に永続化し、履歴全件のoutcome採点は
+`com.fx-codex.monitors`へ分離する。旧融合判断・GBDT候補収集は定期実行しないmanual
+observation-only研究経路であり、canonical virtual portfolioの入力、鮮度SLO、方針更新に使用しない。
+手動研究で融合を実行する場合も、PIT適格な融合行だけを使い、件数・クラス数・時系列分割を
+通過してモデル本体ができた時点でartifactを保存し、検証スコア不合格なら`usable=false`のまま
+判断参加を禁止する。
 融合・時間足別の両行には`source_cutoff <= max_feature_available_time <= prediction_time`に加え、
 `pit_contract`、`decision_id`、`input_context_id`、`source_record_ids`、明示producer/versionを記録する。
 完全な契約を持たない旧形式行は可視化には残すが、方向・収益学習、閾値停止、昇格から除外する。
 GBDT artifactはschema 5と`training_contract=decision-journal-pit-v2`を必須とし、旧artifactは
 未学習扱いで自動再学習する。期待値monitor/改善registryも同じdata contractを必須とし、
 旧registryのTP/SL候補は現行判断へ適用しない。
-融合判断には`--no-discord --no-price-write --require-freshness`を必須とし、Discordの重複通知と
-snapshot以外からの価格追記を防ぐ。判定不能・未来時刻・末尾破損はfail-closedで次工程を開始しない。
-時間足別処理が失敗した場合も融合writerを開始しない。ただし、主要ジャーナル保存後の
-Discord通知失敗だけは専用終了コード5で識別し、launchdへ失敗を報告しつつ融合取得を継続する。
+手動の融合研究には`--no-discord --no-price-write --require-freshness`を必須とし、Discordの重複通知と
+snapshot以外からの価格追記を防ぐ。定期wrapperからは呼び出さず、正規writer稼働中に実行しない。
+判定不能・未来時刻・末尾破損はfail-closedで次工程を開始しない。主要ジャーナル保存後の
+Discord通知失敗だけは専用終了コード5で識別し、launchdへ失敗を報告する。
 主要ジャーナルの書込み失敗は終了コード4で即時停止し、後続の完全判断ログへ部分更新を広げない。
-時間足別の出力は`logs/fx_integrated_briefing.log`、融合判断とschedule判定は
-`logs/fx_fusion_capture.log`で確認する。
+時間足別の出力は`logs/fx_integrated_briefing.log`で確認する。`logs/fx_fusion_capture.log`は
+過去または明示的な手動研究の証跡であり、更新停止を障害と判定しない。
 
 `--signal-board`と`fx_briefing_loop.sh`は開発・一時確認専用である。Mac miniの正規サービス、
 cron、旧plistのいずれかが動いている間は起動しない。`--no-price-write`でも判断ジャーナルは
@@ -432,9 +434,9 @@ SHA/行数を`AUDIT_ROOT`へ追記し、移行担当者と独立確認者を記�
 | `briefing_horizon_forecasts.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 5m恒久shadowを含む全9本のcapture継続を監視 |
 | `briefing_tf_journal.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 現行`--per-timeframe`定期経路の判断鮮度を直接監視 |
 
-融合判断は自身の実行前に`--require-freshness`を通すため、同じhard gateへ
-`briefing_journal.jsonl`を追加すると自己依存になる。独立した非循環monitorを導入するまでは、
-融合判断の鮮度は学習ダッシュボードと`logs/fx_fusion_capture.log`で確認する。
+`briefing_journal.jsonl`は旧融合研究artifactであり、定期writerと鮮度SLOの対象外とする。
+学習ダッシュボード上の融合時刻と`logs/fx_fusion_capture.log`はhistorical evidenceとしてのみ扱い、
+停止を理由に手動writerを起動しない。
 
 週末クローズ中もwriter自体は動き続ける設計(判断はstandbyでも書込みは継続)のため、
 休場例外は設けていない。週末に誤検知が出る場合はこの前提が壊れた証拠なので、
