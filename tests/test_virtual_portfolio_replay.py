@@ -12,6 +12,7 @@ import pytest
 from data_platform.collect.contract import CollectedQuote
 from data_platform.collect.dukascopy import HourContext, parse_hour_payload
 from data_platform.raw.immutable_store import ImmutableRawStore
+from fx_intel import decision_log
 from fx_intel.canonical_label_evidence import canonical_label_evidence_from_virtual_row
 from fx_intel.canonical_label_evidence_store import (
     append_canonical_label_evidence,
@@ -27,7 +28,12 @@ from fx_intel.operational_contracts import (
     DECISION_JOURNAL_PIT_CONTRACT,
     FUSION_PRODUCER,
     FUSION_PRODUCER_VERSION,
+    TIMEFRAME_PRODUCER,
+    TIMEFRAME_PRODUCER_VERSION,
 )
+from fx_intel.sentiment import MarketAnalysis
+from fx_intel.technicals import PairTechnicals, build_interval_view
+from fx_intel.timeframe import build_timeframe_plan
 from fx_intel.virtual_portfolio import (
     VirtualPortfolioPolicy,
     five_x_virtual_portfolio_policy,
@@ -78,6 +84,65 @@ def _decision(*, symbol: str = "USDJPY", timeframe: str = "1h") -> dict[str, obj
         "features": {"rsi": 55.0, "regime": "trend"},
         "components": {"technical": 0.7},
         "warnings": [],
+    }
+
+
+def _generated_timeframe_decision() -> dict[str, object]:
+    tech = PairTechnicals(symbol="USDJPY")
+    tech.views["1h"] = build_interval_view(
+        "1h",
+        {"RECOMMENDATION": "STRONG_BUY", "BUY": 20, "SELL": 0, "NEUTRAL": 6},
+        {
+            "close": 150.0,
+            "RSI": 55.0,
+            "ADX": 28.0,
+            "ATR": 0.2,
+            "SMA20": 150.2,
+            "SMA100": 149.8,
+        },
+        20,
+        100,
+    )
+    plan = build_timeframe_plan(
+        "USDJPY",
+        "1h",
+        tech,
+        {},
+        [],
+        [],
+        now=START,
+    )
+    assert plan.direction == "long"
+    event = decision_log.build_timeframe_decision_events(
+        {"USDJPY": [plan]},
+        now=START,
+        analysis=MarketAnalysis(
+            currencies={},
+            regime="neutral",
+            summary="fixture",
+            engine="fixture",
+        ),
+        tech_map={"USDJPY": tech},
+    )[0]
+    nested = event["decision"]
+    assert isinstance(nested, dict)
+    context_hash = hashlib.sha256(b"generated-timeframe-context").hexdigest()
+    return {
+        **nested,
+        "decision_id": event["decision_id"],
+        "ts": START.isoformat(),
+        "prediction_time": START.isoformat(),
+        "source_cutoff": (START - timedelta(seconds=2)).isoformat(),
+        "max_feature_available_time": (START - timedelta(seconds=1)).isoformat(),
+        "input_context_id": f"context:sha256:{context_hash}",
+        "source_record_ids": ["generated-timeframe-source"],
+        "pit_eligible": True,
+        "pit_contract": DECISION_JOURNAL_PIT_CONTRACT,
+        "producer": TIMEFRAME_PRODUCER,
+        "producer_version": TIMEFRAME_PRODUCER_VERSION,
+        "mode": "per_timeframe",
+        "symbol": "USDJPY",
+        "timeframe": "1h",
     }
 
 
@@ -325,6 +390,41 @@ def test_queue_to_executable_entry_to_target_close_to_learning(tmp_path) -> None
     assert risk_snapshot["as_of"] == START.isoformat()
     assert risk_snapshot["knowledge_as_of"] == START.isoformat()
     assert len(risk_snapshot["snapshot_sha256"]) == 64
+
+
+def test_generated_timeframe_event_anchors_and_replays_without_missing_price_frame(
+    tmp_path,
+) -> None:
+    db = tmp_path / "portfolio.sqlite3"
+    quotes = tmp_path / "quotes.jsonl"
+    as_of = START + timedelta(hours=2)
+    _write_tape(quotes, received_at=as_of)
+
+    decision = _generated_timeframe_decision()
+    assert decision["price_frame"]["reference_atr"] == 0.2
+    assert decision["price_frame"]["stop_atr_multiple"] == 2.5
+    assert decision["price_frame"]["target_rr"] == 1.0
+
+    with open_virtual_portfolio_writer(db, writer_id="test") as store:
+        store.initialize_portfolio(policy=VirtualPortfolioPolicy(), created_at=START)
+        store.queue_decision(
+            decision,
+            observed_at=START,
+            source="generated-timeframe-fixture",
+            batch_id="generated-timeframe-batch",
+        )
+        result = run_replay_cycle(store, quote_log=quotes, as_of=as_of)
+        record = store.connection.execute(
+            "SELECT disposition, rejection_reasons_json FROM decision_records WHERE decision_id = ?",
+            (decision["decision_id"],),
+        ).fetchone()
+
+    assert result["opened"] == 1
+    assert result["closed"] == 1
+    assert result["conflicts"] == []
+    assert record is not None
+    assert record["disposition"] == "opened"
+    assert "missing_atr_or_multiple" not in str(record["rejection_reasons_json"])
 
 
 def test_raw_preimages_independently_verify_exit_and_excursions(tmp_path) -> None:

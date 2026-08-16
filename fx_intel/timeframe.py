@@ -51,6 +51,7 @@ from .briefing import (
     STANDBY_CONVICTION_CAP,
     TECH_WEIGHT,
     _clip,
+    build_price_frame,
     _event_warnings,
     freeze_pre_guard_execution,
     freeze_target_plan,
@@ -196,6 +197,7 @@ class TimeframePlan:
     reason: str = ""  # 判断根拠の一文(Discord表示・監査用)
     warnings: list[str] = field(default_factory=list)
     target_policy: dict[str, object] = field(default_factory=dict)
+    price_frame: dict[str, object] = field(default_factory=dict)
     pre_guard_direction: str = "neutral"
     pre_guard_conviction: int = 0
     pre_guard_stop: float | None = None
@@ -683,6 +685,14 @@ def build_timeframe_plan(
         reason=tf_reason,
         warnings=warnings,
         target_policy=target_policy,
+        price_frame=build_price_frame(
+            reference_close=close,
+            reference_observed_at=quote_observed_at,
+            atr=atr,
+            atr_multiple=atr_multiple,
+            target_policy=final_targets.target_policy,
+            planned_risk_distance=final_targets.planned_risk_distance,
+        ),
         pre_guard_direction=pre_guard_direction,
         pre_guard_conviction=pre_guard_conviction,
         pre_guard_stop=pre_guard_targets.stop,

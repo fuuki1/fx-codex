@@ -609,6 +609,20 @@ def test_per_timeframe_no_discord_writes_journal_without_posting(patched_paths, 
     }
     latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
     assert latest["event_count"] == 4
+    directional = [
+        event for event in latest["events"] if event["decision"]["direction"] in {"long", "short"}
+    ]
+    assert directional
+    assert all(
+        event["decision"]["price_frame"]["contract"] == "decision-price-frame-v1"
+        for event in directional
+    )
+    assert all(
+        event["decision"]["price_frame"]["reference_atr"] is not None
+        and event["decision"]["price_frame"]["stop_atr_multiple"] == 2.5
+        and event["decision"]["price_frame"]["target_rr"] == 1.0
+        for event in directional
+    )
     outcome_report = json.loads(
         fx_briefing.DEFAULT_DECISION_OUTCOMES_PATH.read_text(encoding="utf-8")
     )

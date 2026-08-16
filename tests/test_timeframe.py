@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, UTC
 import pytest
 
 from fx_intel.calendar import EconomicEvent, risk_windows
+from fx_intel.decision_price_anchor import anchor_from_price_frame
 from fx_intel.evaluation_labels import (
     DEFAULT_COST_MODEL_ID,
     DEFAULT_COST_STATUS,
@@ -131,6 +132,36 @@ def test_scanner_quote_remains_diagnostic_only() -> None:
     assert plan.label_version == NET_LABEL_VERSION
     assert plan.label_provenance == NET_LABEL_PROVENANCE
     assert plan.planned_risk_distance == pytest.approx(0.15 * 2.5)
+
+
+def test_timeframe_plan_freezes_replayable_price_frame() -> None:
+    plan = build_timeframe_plan("USDJPY", "1h", _all_up_tech(), {}, [], [], now=OPEN_NOW)
+
+    assert plan.direction == "long"
+    assert plan.price_frame == {
+        "contract": "decision-price-frame-v1",
+        "reference_source": "tradingview_oanda_scanner",
+        "reference_close": 156.25,
+        "reference_observed_at": None,
+        "reference_risk_distance": pytest.approx(0.15 * 2.5),
+        "canonical_source": "dukascopy",
+        "anchor_status": "pending",
+        "stop_atr_multiple": 2.5,
+        "target_rr": 1.0,
+        "reference_atr": 0.15,
+    }
+
+    anchored = anchor_from_price_frame(
+        plan.price_frame,
+        direction=plan.direction,
+        decision_time=OPEN_NOW,
+        tick_event_time=OPEN_NOW + timedelta(seconds=1),
+        tick_bid=156.24,
+        tick_ask=156.26,
+    )
+    assert anchored["status"] == "anchored"
+    assert anchored["entry"] == "156.26"
+    assert anchored["risk_distance"] == "0.375"
 
 
 def test_measured_decision_quote_carries_executable_cost_metadata() -> None:
@@ -323,6 +354,7 @@ def test_expectancy_guard_can_block_timeframe_plan() -> None:
     assert plan.direction == "neutral"
     assert plan.conviction == 0
     assert plan.stop is None
+    assert plan.price_frame["target_rr"] is None
     assert plan.pre_guard_direction == "long"
     assert plan.pre_guard_conviction > 0
     assert plan.pre_guard_stop is not None
@@ -355,6 +387,8 @@ def test_timeframe_plan_uses_approved_target_r_adjuster() -> None:
     assert plan.target1 == pytest.approx(156.25 + risk_distance * 0.75)
     assert plan.target2 == pytest.approx(156.25 + risk_distance * 1.5)
     assert plan.target_policy["target1_r"] == 0.75
+    assert plan.price_frame["target_rr"] == 0.75
+    assert plan.price_frame["reference_risk_distance"] == pytest.approx(risk_distance)
     assert any("承認済みTP/SL" in warning for warning in plan.warnings)
 
 
