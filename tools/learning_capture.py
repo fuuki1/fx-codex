@@ -59,7 +59,12 @@ def build_steps(args: argparse.Namespace) -> list[CaptureStep]:
         steps.append(
             CaptureStep(
                 "trade-outcome-monitor",
-                [python, "tools/trade_outcome_monitor.py", "--quiet"],
+                [
+                    python,
+                    "tools/trade_outcome_monitor.py",
+                    "--no-registry-update",
+                    "--quiet",
+                ],
                 # 初期状態では成熟したTP/SL採点対象がなく exit=1 になり得るが、
                 # 監視JSONは書き出されるため学習ログ収集自体の失敗とは扱わない。
                 (0, 1),

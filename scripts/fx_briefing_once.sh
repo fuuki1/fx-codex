@@ -20,6 +20,7 @@ fi
   --no-price-write \
   --technical-cache-only \
   --require-freshness \
+  --no-auxiliary-horizon-reports \
   --no-approved-tp-sl-policy \
   --defer-decision-scoring \
   --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" \

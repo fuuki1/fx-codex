@@ -33,6 +33,7 @@ def test_build_steps_use_no_discord_for_briefing_runs() -> None:
     assert "--symbols" in commands["timeframe-price-snapshot"]
     monitor = next(step for step in steps if step.name == "trade-outcome-monitor")
     assert monitor.allowed_exit_codes == (0, 1)
+    assert "--no-registry-update" in monitor.command
     decision_monitor = next(step for step in steps if step.name == "decision-expectancy-monitor")
     assert decision_monitor.allowed_exit_codes == (0, 1)
 

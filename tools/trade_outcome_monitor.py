@@ -38,7 +38,7 @@ def run_trade_outcome_monitor(
     monitor_json_path: Path = DEFAULT_MONITOR_PATH,
     outcome_json_path: Path | None = DEFAULT_OUTCOME_REPORT_PATH,
     variant_json_path: Path | None = DEFAULT_VARIANT_REPORT_PATH,
-    update_registry: bool = True,
+    update_registry: bool = False,
     retest_variants: bool = True,
     require_sample_ok: bool = False,
     target1_r_candidates: Sequence[float] | None = None,
@@ -181,11 +181,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_VARIANT_REPORT_PATH,
         help="TP/SL候補paper再採点JSONの保存先。none で無効化",
     )
-    parser.add_argument(
-        "--no-registry-update",
+    registry_group = parser.add_mutually_exclusive_group()
+    registry_group.add_argument(
+        "--update-registry",
+        dest="update_registry",
         action="store_true",
-        help="改善候補レジストリを更新せず監視JSONだけ生成する",
+        help="改善候補レジストリを明示的に更新する",
     )
+    registry_group.add_argument(
+        "--no-registry-update",
+        dest="update_registry",
+        action="store_false",
+        help="改善候補レジストリを更新しない（既定・互換用）",
+    )
+    parser.set_defaults(update_registry=False)
     parser.add_argument(
         "--no-variant-retest",
         action="store_true",
@@ -223,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         monitor_json_path=args.monitor_json,
         outcome_json_path=_optional_path(args.outcome_json),
         variant_json_path=_optional_path(args.variant_json),
-        update_registry=not args.no_registry_update,
+        update_registry=args.update_registry,
         retest_variants=not args.no_variant_retest,
         require_sample_ok=args.health_require_sample,
         target1_r_candidates=args.tp1_r_candidates,

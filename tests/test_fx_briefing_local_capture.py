@@ -185,6 +185,14 @@ def test_fusion_cannot_overwrite_canonical_timeframe_latest(capsys) -> None:
     assert "fusion cannot overwrite" in capsys.readouterr().err
 
 
+def test_registry_update_requires_explicit_scoring_command(capsys) -> None:
+    with pytest.raises(SystemExit) as error:
+        fx_briefing.main(["--update-trade-improvement-registry", "--dry-run"])
+
+    assert error.value.code == 2
+    assert "allowed only with" in capsys.readouterr().err
+
+
 def test_decision_batch_is_published_before_historical_scoring(tmp_path) -> None:
     calls: list[str] = []
     recorder = fx_briefing.stage_timing.StageTimingRecorder(

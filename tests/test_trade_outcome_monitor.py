@@ -107,6 +107,7 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
         variant_json_path=variant_path,
         target1_r_candidates=[0.75, 1.0],
         target2_r_candidates=[1.5, 2.0],
+        update_registry=True,
         now=NOW + timedelta(days=2),
     )
     monitor.run_trade_outcome_monitor(
@@ -117,6 +118,7 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
         variant_json_path=variant_path,
         target1_r_candidates=[0.75, 1.0],
         target2_r_candidates=[1.5, 2.0],
+        update_registry=True,
         now=NOW + timedelta(days=2, hours=1),
     )
     third = monitor.run_trade_outcome_monitor(
@@ -127,6 +129,7 @@ def test_monitor_runner_updates_registry_reports_and_ready_stage(monitor, tmp_pa
         variant_json_path=variant_path,
         target1_r_candidates=[0.75, 1.0],
         target2_r_candidates=[1.5, 2.0],
+        update_registry=True,
         now=NOW + timedelta(days=2, hours=2),
     )
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -258,6 +261,7 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
         monitor_json_path=tmp_path / "monitor.json",
         outcome_json_path=None,
         variant_json_path=None,
+        update_registry=True,
         retest_variants=False,
         now=NOW + timedelta(hours=3),
     )
@@ -266,3 +270,26 @@ def test_monitor_runner_auto_pauses_underperforming_approved_policy(monitor, tmp
     assert saved["candidates"][candidate.candidate_id]["stage"] == "auto_paused"
     assert run["monitor"]["runner"]["auto_paused_policy_count"] == 1
     assert any(alert["type"] == "auto_paused" for alert in run["monitor"]["alerts"])
+
+
+def test_monitor_registry_is_read_only_by_default(monitor, tmp_path) -> None:
+    journal_path = tmp_path / "journal.jsonl"
+    registry_path = tmp_path / "registry.json"
+    _write_jsonl(journal_path, _variant_rows(count=1))
+    registry_path.write_text('{"sentinel":"unchanged"}', encoding="utf-8")
+    before = registry_path.read_bytes()
+
+    result = monitor.run_trade_outcome_monitor(
+        journal_path=journal_path,
+        registry_path=registry_path,
+        monitor_json_path=tmp_path / "monitor.json",
+        outcome_json_path=None,
+        variant_json_path=None,
+        retest_variants=False,
+        now=NOW + timedelta(days=2),
+    )
+
+    assert registry_path.read_bytes() == before
+    assert result["monitor"]["runner"]["registry_updated"] is False
+    assert monitor.build_parser().parse_args([]).update_registry is False
+    assert monitor.build_parser().parse_args(["--update-registry"]).update_registry is True

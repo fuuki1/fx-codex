@@ -1200,7 +1200,7 @@ def _run_per_timeframe(
     # 将来価格は採点と同じ結合系列(判断+価格スナップショット)から取る
     aux_reports_by_symbol: dict[str, dict[str, str]] = {}
     with timing.stage("timeframe_auxiliary_horizon_reports"):
-        if not args.no_learning and pit_journal_entries:
+        if not args.no_auxiliary_horizon_reports and not args.no_learning and pit_journal_entries:
             for tf in timeframe.DEFAULT_TIMEFRAMES:
                 line = tf_learning.auxiliary_horizon_report_ja(scoring_entries, tf)
                 if line:
@@ -1389,6 +1389,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-horizon-forecasts",
         action="store_true",
         help="設計Aのshadow journal追記を停止するロールバックフラグ",
+    )
+    parser.add_argument(
+        "--no-auxiliary-horizon-reports",
+        action="store_true",
+        help="判断に不使用の補助ホライズン表示用再採点を省略する",
     )
     parser.add_argument(
         "--no-learning",

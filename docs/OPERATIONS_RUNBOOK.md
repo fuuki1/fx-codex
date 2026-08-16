@@ -48,6 +48,8 @@ launchdのワンショットサービスとして運用するための手順書�
 observation-only研究経路であり、canonical virtual portfolioの入力、鮮度SLO、方針更新に使用しない。
 定時時間足判断は`--no-approved-tp-sl-policy`を必須とし、旧fusion由来registryがTP/SLや仮想純損益へ
 入る経路を閉じる。定時monitorも`--no-registry-update`で診断レポートだけを更新する。
+判断に使わない補助ホライズン表示の全履歴再採点は`--no-auxiliary-horizon-reports`で定時critical
+pathから外し、必要時の手動researchだけで生成する。
 手動研究で融合を実行する場合も、PIT適格な融合行だけを使い、件数・クラス数・時系列分割を
 通過してモデル本体ができた時点でartifactを保存し、検証スコア不合格なら`usable=false`のまま
 判断参加を禁止する。

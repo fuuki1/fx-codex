@@ -295,6 +295,7 @@ def test_scheduled_briefing_cannot_apply_fusion_tp_sl_policy():
     script = (_ROOT / "scripts" / "fx_briefing_once.sh").read_text(encoding="utf-8")
 
     assert "--no-approved-tp-sl-policy" in script
+    assert "--no-auxiliary-horizon-reports" in script
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")

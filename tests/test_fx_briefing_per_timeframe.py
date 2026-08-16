@@ -239,6 +239,27 @@ def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
     } <= stages
 
 
+def test_per_timeframe_can_skip_observation_only_auxiliary_reports(patched_paths, capsys) -> None:
+    with mock.patch.object(
+        fx_briefing.tf_learning,
+        "auxiliary_horizon_report_ja",
+        side_effect=AssertionError("auxiliary report must stay off the scheduled path"),
+    ):
+        rc = _run(
+            [
+                "--per-timeframe",
+                "--dry-run",
+                "--no-macro",
+                "--no-auxiliary-horizon-reports",
+                "--symbols",
+                "USDJPY",
+            ],
+            capsys,
+        )
+
+    assert rc == 0
+
+
 def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
     rc = _run(
         ["--signal-board", "--dry-run", "--no-macro", "--symbols", "USDJPY"],
@@ -590,6 +611,42 @@ def test_per_timeframe_can_fail_closed_against_approved_tp_sl_registry(
 
     assert rc == 0
     assert "承認済みTP/SL" not in capsys.readouterr().out
+
+
+def test_guarded_registry_is_absent_from_persisted_canonical_latest(
+    patched_paths, tmp_path, capsys
+) -> None:
+    registry_path = tmp_path / "trade_registry.json"
+    _approved_tp_registry(registry_path)
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--no-discord",
+            "--no-learning",
+            "--no-macro",
+            "--no-approved-tp-sl-policy",
+            "--defer-decision-scoring",
+            "--trade-improvement-registry",
+            str(registry_path),
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
+    directional = [
+        event for event in latest["events"] if event["decision"]["direction"] in {"long", "short"}
+    ]
+    assert directional
+    assert all(event["decision"]["target_policy"] == {} for event in directional)
+    assert all(event["decision"]["target1"] is not None for event in directional)
 
 
 def test_no_learning_flag_skips_profile(patched_paths, capsys) -> None:
