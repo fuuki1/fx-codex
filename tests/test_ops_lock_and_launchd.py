@@ -265,10 +265,8 @@ def test_install_script_dry_run_makes_no_changes(tmp_path):
         "com.fx-codex.virtual-portfolio-postprocess",
         "com.fx-codex.virtual-portfolio-report",
         "com.fx-codex.virtual-portfolio-counterfactual",
-        "com.fx-codex.virtual-portfolio-learning",
         "com.fx-codex.virtual-portfolio-read",
         "com.fx-codex.dashboard-state",
-        "com.fx-codex.operational-read",
     ):
         assert label in result.stdout
     # 展開済みパスが含まれ、プレースホルダは残らない
@@ -317,7 +315,6 @@ def test_managed_launchd_python_imports_are_pinned_to_release_root():
         "virtual-portfolio-learning",
         "virtual-portfolio-read",
         "dashboard-state",
-        "operational-read",
     )
     for name in managed:
         root = ET.parse(_ROOT / "ops" / "launchd" / f"com.fx-codex.{name}.plist.tmpl")

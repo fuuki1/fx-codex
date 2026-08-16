@@ -14,10 +14,8 @@ LABELS=(
   com.fx-codex.virtual-portfolio-postprocess
   com.fx-codex.virtual-portfolio-report
   com.fx-codex.virtual-portfolio-counterfactual
-  com.fx-codex.virtual-portfolio-learning
   com.fx-codex.virtual-portfolio-read
   com.fx-codex.dashboard-state
-  com.fx-codex.operational-read
 )
 LEGACY_LABELS=(com.fx-codex.briefing.hourly com.fx-codex.virtual-portfolio-close)
 overall_status=0

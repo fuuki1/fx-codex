@@ -14,7 +14,7 @@
 #   com.fx-codex.dukascopy-history / quote-index  仮想約定用の遅延Bid/Askと索引
 #   com.fx-codex.virtual-portfolio  3分毎のcanonical仮想口座受付
 #   com.fx-codex.virtual-portfolio-postprocess / report / counterfactual  分離した後段処理
-#   com.fx-codex.virtual-portfolio-learning / read  週次検証・query-only API
+#   com.fx-codex.virtual-portfolio-read  query-only API
 #
 # 設計メモ:
 # - LaunchAgent(ユーザーセッション)を使う。LaunchDaemonにしないのは、.envや
@@ -43,10 +43,8 @@ LABELS=(
   com.fx-codex.virtual-portfolio-postprocess
   com.fx-codex.virtual-portfolio-report
   com.fx-codex.virtual-portfolio-counterfactual
-  com.fx-codex.virtual-portfolio-learning
   com.fx-codex.virtual-portfolio-read
   com.fx-codex.dashboard-state
-  com.fx-codex.operational-read
 )
 LEGACY_LABELS=(com.fx-codex.briefing.hourly com.fx-codex.virtual-portfolio-close)
 DRY_RUN=0
