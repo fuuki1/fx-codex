@@ -207,13 +207,36 @@ def test_promote_live_flag_is_rejected_before_any_network_call(capsys) -> None:
 
 
 def test_per_timeframe_dry_run_builds_payload(patched_paths, capsys) -> None:
-    rc = _run(["--per-timeframe", "--dry-run", "--no-macro", "--symbols", "USDJPY"], capsys)
+    timing_path = fx_briefing.DEFAULT_TF_JOURNAL_PATH.parent / "stage_timings.jsonl"
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--dry-run",
+            "--no-macro",
+            "--stage-timing-log",
+            str(timing_path),
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+    )
     assert rc == 0
     out = capsys.readouterr().out
     assert "時間足別" in out
     # embed JSON に4時間足のフィールドが出る
     assert "15分足" in out and "日足" in out
     assert "主ホライズン15分後" in out
+    stages = {
+        json.loads(line)["stage"] for line in timing_path.read_text(encoding="utf-8").splitlines()
+    }
+    assert {
+        "timeframe_direction_learning",
+        "decision_feedback_load_and_derive",
+        "timeframe_tp_sl_learning",
+        "timeframe_trade_expectancy_lookup",
+        "timeframe_maximization_learning",
+        "timeframe_auxiliary_horizon_reports",
+    } <= stages
 
 
 def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:
@@ -256,12 +279,21 @@ def test_horizon_only_defaults_to_three_pairs_and_writes_27_shadow_rows(tmp_path
     horizon_journal = tmp_path / "briefing_horizon_forecasts.jsonl"
     horizon_learning = tmp_path / "briefing_horizon_learning.json"
     tf_prices = tmp_path / "briefing_tf_prices.jsonl"
+    timing_path = tmp_path / "stage_timings.jsonl"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_HORIZON_JOURNAL_PATH", horizon_journal),
         mock.patch.object(fx_briefing, "DEFAULT_HORIZON_LEARNING_PATH", horizon_learning),
         mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", tf_prices),
     ):
-        rc = _run(["--horizon-only", "--no-macro"], capsys)
+        rc = _run(
+            [
+                "--horizon-only",
+                "--no-macro",
+                "--stage-timing-log",
+                str(timing_path),
+            ],
+            capsys,
+        )
 
     assert rc == 0
     rows = [json.loads(line) for line in horizon_journal.read_text().splitlines()]
@@ -282,6 +314,15 @@ def test_horizon_only_defaults_to_three_pairs_and_writes_27_shadow_rows(tmp_path
     assert all(row["track_stage"] == "shadow" for row in rows)
     assert sum(row["shadow_only"] for row in rows) == 3
     assert horizon_learning.exists()
+    stages = {
+        json.loads(line)["stage"] for line in timing_path.read_text(encoding="utf-8").splitlines()
+    }
+    assert {
+        "horizon_journal_read",
+        "horizon_history_score_and_learning",
+        "horizon_forecast_build",
+        "horizon_forecast_append",
+    } <= stages
 
 
 def test_per_timeframe_writes_journal_when_not_dry_run(patched_paths, capsys) -> None:

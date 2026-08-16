@@ -948,47 +948,55 @@ def _run_horizon_track(
     now,
     price_rows,
     input_contexts,
+    timing,
 ) -> int:
     """Generate, score, and persist the isolated five-minute shadow track."""
-    entries = list(horizon_journal.read_horizon_entries(DEFAULT_HORIZON_JOURNAL_PATH))
+    with timing.stage("horizon_journal_read"):
+        entries = list(horizon_journal.read_horizon_entries(DEFAULT_HORIZON_JOURNAL_PATH))
     learning_state = None
     if not args.no_learning:
-        score_result = horizon_learning.score_horizon_history(entries, price_rows, now=now)
-        learning_state = horizon_learning.derive_horizon_learning(score_result, now=now)
-        if not args.dry_run:
-            try:
-                horizon_learning.save_horizon_learning(
-                    learning_state, DEFAULT_HORIZON_LEARNING_PATH
-                )
-            except OSError as error:
-                fetch_warnings.append(f"ホライズン学習状態の保存失敗: {error}")
+        with timing.stage(
+            "horizon_history_score_and_learning",
+            forecast_history_count=len(entries),
+            price_entry_count=len(price_rows),
+        ):
+            score_result = horizon_learning.score_horizon_history(entries, price_rows, now=now)
+            learning_state = horizon_learning.derive_horizon_learning(score_result, now=now)
+            if not args.dry_run:
+                try:
+                    horizon_learning.save_horizon_learning(
+                        learning_state, DEFAULT_HORIZON_LEARNING_PATH
+                    )
+                except OSError as error:
+                    fetch_warnings.append(f"ホライズン学習状態の保存失敗: {error}")
 
     profile_lookup = horizon_learning.make_profile_lookup(learning_state)
     band_provider = horizon_learning.make_band_provider(learning_state)
     calibration_provider = horizon_learning.make_calibration_provider(learning_state)
     feature_time = datetime.now(UTC)
-    forecasts: list[horizon_forecast.HorizonForecast] = []
-    for symbol in symbols:
-        tech = tech_map.get(symbol)
-        if tech is None:
-            fetch_warnings.append(f"ホライズン予測のテクニカル欠損: {symbol}")
-            continue
-        base, quote = calendar.symbol_currencies(symbol)
-        forecasts.extend(
-            horizon_forecast.build_horizon_forecasts(
-                symbol,
-                tech,
-                analysis.currencies,
-                calendar.risk_windows(events, {base, quote}),
-                items,
-                input_contexts.get(symbol),
-                now=feature_time,
-                calendar_ok=calendar_ok,
-                profile_lookup=profile_lookup if not args.no_learning else None,
-                band_provider=band_provider if not args.no_learning else None,
-                calibration_provider=calibration_provider if not args.no_learning else None,
+    with timing.stage("horizon_forecast_build", symbol_count=len(symbols)):
+        forecasts: list[horizon_forecast.HorizonForecast] = []
+        for symbol in symbols:
+            tech = tech_map.get(symbol)
+            if tech is None:
+                fetch_warnings.append(f"ホライズン予測のテクニカル欠損: {symbol}")
+                continue
+            base, quote = calendar.symbol_currencies(symbol)
+            forecasts.extend(
+                horizon_forecast.build_horizon_forecasts(
+                    symbol,
+                    tech,
+                    analysis.currencies,
+                    calendar.risk_windows(events, {base, quote}),
+                    items,
+                    input_contexts.get(symbol),
+                    now=feature_time,
+                    calendar_ok=calendar_ok,
+                    profile_lookup=profile_lookup if not args.no_learning else None,
+                    band_provider=band_provider if not args.no_learning else None,
+                    calibration_provider=(calibration_provider if not args.no_learning else None),
+                )
             )
-        )
 
     if args.dry_run:
         summary = {
@@ -1001,13 +1009,14 @@ def _run_horizon_track(
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
     try:
-        written = horizon_journal.append_horizon_forecasts(
-            DEFAULT_HORIZON_JOURNAL_PATH,
-            forecasts,
-            prediction_time=datetime.now(UTC),
-            source_cutoff=now,
-            max_feature_available_time=feature_time,
-        )
+        with timing.stage("horizon_forecast_append", forecast_count=len(forecasts)):
+            written = horizon_journal.append_horizon_forecasts(
+                DEFAULT_HORIZON_JOURNAL_PATH,
+                forecasts,
+                prediction_time=datetime.now(UTC),
+                source_cutoff=now,
+                max_feature_available_time=feature_time,
+            )
     except (OSError, horizon_journal.HorizonPointInTimeError) as error:
         print(f"ホライズン予測(shadow)の記録失敗: {error}", file=sys.stderr)
         return 1
@@ -1088,40 +1097,43 @@ def _run_per_timeframe(
     # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
     tf_learn = tf_learning.TimeframeLearning()
     learning_note = ""
-    if not args.no_learning:
-        tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
-        learning_note = tf_learn.summary_ja()
-        if not args.dry_run:
-            try:
-                tf_learning.save_timeframe_learning(tf_learn, DEFAULT_TF_LEARNING_PATH)
-            except OSError as error:
-                fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
+    with timing.stage("timeframe_direction_learning"):
+        if not args.no_learning:
+            tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+            learning_note = tf_learn.summary_ja()
+            if not args.dry_run:
+                try:
+                    tf_learning.save_timeframe_learning(tf_learn, DEFAULT_TF_LEARNING_PATH)
+                except OSError as error:
+                    fetch_warnings.append(f"時間足別学習プロファイル保存失敗: {error}")
 
     profile_lookup = tf_learn.profile_lookup if not args.no_learning else None
     decision_feedback_profile = decision_feedback.DecisionFeedbackProfile()
     decision_feedback_lookup = None
-    if not args.no_learning and not args.no_trade_expectancy:
-        decision_feedback_profile = decision_feedback.derive_decision_feedback(
-            load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
-            now=now,
-        )
-        learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
-        if not args.no_trade_expectancy_guard:
-            decision_feedback_lookup = decision_feedback_profile.expectancy_lookup
+    with timing.stage("decision_feedback_load_and_derive"):
+        if not args.no_learning and not args.no_trade_expectancy:
+            decision_feedback_profile = decision_feedback.derive_decision_feedback(
+                load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
+                now=now,
+            )
+            learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
+            if not args.no_trade_expectancy_guard:
+                decision_feedback_lookup = decision_feedback_profile.expectancy_lookup
 
     tp_sl_lookup = None
     tp_sl_learn = None
-    if not args.no_learning and not args.no_trade_expectancy:
-        tp_sl_learn = tp_sl_learning.derive_timeframe_tp_sl_learning(scoring_entries, now=now)
-        learning_note = append_note(learning_note, tp_sl_learn.summary_ja())
-        tp_sl_lookup = tp_sl_learn.expectancy_lookup
-        if not args.dry_run:
-            try:
-                tp_sl_learning.save_timeframe_tp_sl_learning(
-                    tp_sl_learn, DEFAULT_TP_SL_LEARNING_PATH
-                )
-            except OSError as error:
-                fetch_warnings.append(f"TP/SL学習プロファイル保存失敗: {error}")
+    with timing.stage("timeframe_tp_sl_learning"):
+        if not args.no_learning and not args.no_trade_expectancy:
+            tp_sl_learn = tp_sl_learning.derive_timeframe_tp_sl_learning(scoring_entries, now=now)
+            learning_note = append_note(learning_note, tp_sl_learn.summary_ja())
+            tp_sl_lookup = tp_sl_learn.expectancy_lookup
+            if not args.dry_run:
+                try:
+                    tp_sl_learning.save_timeframe_tp_sl_learning(
+                        tp_sl_learn, DEFAULT_TP_SL_LEARNING_PATH
+                    )
+                except OSError as error:
+                    fetch_warnings.append(f"TP/SL学習プロファイル保存失敗: {error}")
 
     target_r_adjuster = None
     if not args.no_trade_expectancy:
@@ -1130,25 +1142,27 @@ def _run_per_timeframe(
         )
     expectancy_lookup = None
     _expectancy_summaries: dict[str, dict] = {}
-    if not args.no_trade_expectancy:
-        expectancy_lookup, expectancy_note, _expectancy_summaries = (
-            make_timeframe_trade_expectancy_lookup(scoring_entries)
-        )
-        learning_note = append_note(learning_note, expectancy_note)
-        if args.no_trade_expectancy_guard:
-            expectancy_lookup = None
+    with timing.stage("timeframe_trade_expectancy_lookup"):
+        if not args.no_trade_expectancy:
+            expectancy_lookup, expectancy_note, _expectancy_summaries = (
+                make_timeframe_trade_expectancy_lookup(scoring_entries)
+            )
+            learning_note = append_note(learning_note, expectancy_note)
+            if args.no_trade_expectancy_guard:
+                expectancy_lookup = None
     maximization_lookup = None
     max_profile = None
-    if not args.no_learning and not args.no_trade_expectancy:
-        max_profile = maximization.derive_timeframe_maximization(scoring_entries, now=now)
-        learning_note = append_note(learning_note, max_profile.summary_ja())
-        if not args.no_trade_expectancy_guard:
-            maximization_lookup = max_profile.expectancy_lookup
-        if not args.dry_run:
-            try:
-                maximization.save_timeframe_maximization(max_profile, DEFAULT_MAXIMIZATION_PATH)
-            except OSError as error:
-                fetch_warnings.append(f"最大化プロファイル保存失敗: {error}")
+    with timing.stage("timeframe_maximization_learning"):
+        if not args.no_learning and not args.no_trade_expectancy:
+            max_profile = maximization.derive_timeframe_maximization(scoring_entries, now=now)
+            learning_note = append_note(learning_note, max_profile.summary_ja())
+            if not args.no_trade_expectancy_guard:
+                maximization_lookup = max_profile.expectancy_lookup
+            if not args.dry_run:
+                try:
+                    maximization.save_timeframe_maximization(max_profile, DEFAULT_MAXIMIZATION_PATH)
+                except OSError as error:
+                    fetch_warnings.append(f"最大化プロファイル保存失敗: {error}")
     if maximization_lookup is not None:
         expectancy_lookup = maximization_lookup
     expectancy_lookup = compose_timeframe_expectancy_lookups(
@@ -1185,11 +1199,12 @@ def _run_per_timeframe(
     # 補助ホライズン(観測専用)の的中率レポートを時間足別に用意。
     # 将来価格は採点と同じ結合系列(判断+価格スナップショット)から取る
     aux_reports_by_symbol: dict[str, dict[str, str]] = {}
-    if not args.no_learning and pit_journal_entries:
-        for tf in timeframe.DEFAULT_TIMEFRAMES:
-            line = tf_learning.auxiliary_horizon_report_ja(scoring_entries, tf)
-            if line:
-                aux_reports_by_symbol.setdefault("_shared", {})[tf] = line
+    with timing.stage("timeframe_auxiliary_horizon_reports"):
+        if not args.no_learning and pit_journal_entries:
+            for tf in timeframe.DEFAULT_TIMEFRAMES:
+                line = tf_learning.auxiliary_horizon_report_ja(scoring_entries, tf)
+                if line:
+                    aux_reports_by_symbol.setdefault("_shared", {})[tf] = line
 
     # ジャーナル: 今回の時間足別判断を専用ジャーナルへ追記
     if not args.no_journal and not args.dry_run:
@@ -1854,6 +1869,7 @@ def main(argv: list[str] | None = None) -> int:
             now=now,
             price_rows=input_price_rows,
             input_contexts=input_contexts,
+            timing=timing,
         )
 
     # 時間足別モード: ここで専用パスへ分岐して早期return(融合1判断の
