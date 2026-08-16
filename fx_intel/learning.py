@@ -63,6 +63,7 @@ from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
+from typing import Any
 from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from .briefing import CONFLICT_THRESHOLD, NEWS_WEIGHT, TECH_WEIGHT
@@ -1312,6 +1313,11 @@ def load_profile(path: str | Path) -> LearnedProfile:
         return LearnedProfile()
     if not isinstance(payload, dict):
         return LearnedProfile()
+    return profile_from_mapping(payload)
+
+
+def profile_from_mapping(payload: Mapping[str, Any]) -> LearnedProfile:
+    """Rehydrate a saved profile payload without filesystem I/O."""
     try:
         tech_weight = float(payload.get("tech_weight", TECH_WEIGHT))
         news_weight = float(payload.get("news_weight", NEWS_WEIGHT))

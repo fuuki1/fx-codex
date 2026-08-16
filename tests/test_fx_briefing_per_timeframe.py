@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, UTC
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -160,6 +162,7 @@ def patched_paths(tmp_path):
     decision_latest = tmp_path / "briefing_decisions_latest.json"
     decision_outcomes = tmp_path / "briefing_decision_outcomes.json"
     decision_feedback = tmp_path / "briefing_decision_feedback.json"
+    learning_monitor = tmp_path / "timeframe_learning_monitor.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", tf_journal),
         mock.patch.object(fx_briefing, "DEFAULT_TF_PRICES_PATH", tf_prices),
@@ -170,6 +173,7 @@ def patched_paths(tmp_path):
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LATEST_PATH", decision_latest),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_OUTCOMES_PATH", decision_outcomes),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_FEEDBACK_PATH", decision_feedback),
+        mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_MONITOR_PATH", learning_monitor),
     ):
         yield tf_journal, tf_learning
 
@@ -194,6 +198,74 @@ def _run(argv, capsys, calendar_result=None):
     ):
         rc = fx_briefing.main(argv)
     return rc
+
+
+def _write_empty_learning_caches(generated_at: datetime) -> None:
+    stamp = generated_at.isoformat()
+    fx_briefing.tf_learning.save_timeframe_learning(
+        fx_briefing.tf_learning.TimeframeLearning(generated_at=stamp),
+        fx_briefing.DEFAULT_TF_LEARNING_PATH,
+    )
+    fx_briefing.tp_sl_learning.save_timeframe_tp_sl_learning(
+        fx_briefing.tp_sl_learning.TimeframeTpSlLearning(generated_at=stamp),
+        fx_briefing.DEFAULT_TP_SL_LEARNING_PATH,
+    )
+    fx_briefing.maximization.save_timeframe_maximization(
+        fx_briefing.maximization.TimeframeMaximization(generated_at=stamp),
+        fx_briefing.DEFAULT_MAXIMIZATION_PATH,
+    )
+    fx_briefing.decision_feedback.save_decision_feedback(
+        fx_briefing.decision_feedback.DecisionFeedbackProfile(generated_at=stamp),
+        fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH,
+    )
+    artifacts = {
+        "timeframe_direction": fx_briefing.DEFAULT_TF_LEARNING_PATH,
+        "timeframe_tp_sl": fx_briefing.DEFAULT_TP_SL_LEARNING_PATH,
+        "timeframe_maximization": fx_briefing.DEFAULT_MAXIMIZATION_PATH,
+    }
+    fx_briefing.DEFAULT_TF_LEARNING_MONITOR_PATH.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "monitor_contract": "fx-codex-timeframe-learning-monitor-v1",
+                "generated_at": stamp,
+                "status": "ok",
+                "input_watermarks": {
+                    "decisions": {
+                        "source_path": str(fx_briefing.DEFAULT_TF_JOURNAL_PATH.resolve()),
+                        "device": 0,
+                        "inode": 0,
+                        "read_offset_bytes": 0,
+                        "mtime_ns": 0,
+                        "sha256": "0" * 64,
+                        "raw_rows": 0,
+                        "eligible_rows": 0,
+                        "max_prediction_time": None,
+                    },
+                    "prices": {
+                        "source_path": str(fx_briefing.DEFAULT_TF_PRICES_PATH.resolve()),
+                        "device": 0,
+                        "inode": 0,
+                        "read_offset_bytes": 0,
+                        "mtime_ns": 0,
+                        "sha256": "0" * 64,
+                        "raw_rows": 0,
+                        "eligible_rows": 0,
+                        "max_available_time": None,
+                    },
+                },
+                "cache_artifacts": {
+                    key: {
+                        "path": path.name,
+                        "size": len(path.read_bytes()),
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    }
+                    for key, path in artifacts.items()
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_promote_live_flag_is_rejected_before_any_network_call(capsys) -> None:
@@ -258,6 +330,115 @@ def test_per_timeframe_can_skip_observation_only_auxiliary_reports(patched_paths
         )
 
     assert rc == 0
+
+
+def test_cached_timeframe_learning_skips_full_journal_and_publishes(
+    patched_paths, tmp_path, capsys
+) -> None:
+    _write_empty_learning_caches(datetime.now(UTC))
+    timing_path = tmp_path / "timing.jsonl"
+    original_read = fx_briefing.journal.read_entries
+
+    def guarded_read(path):
+        if Path(path) in {
+            fx_briefing.DEFAULT_TF_JOURNAL_PATH,
+            fx_briefing.DEFAULT_TF_PRICES_PATH,
+        }:
+            raise AssertionError("scheduled cached path must not materialize full history")
+        return original_read(path)
+
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+    with mock.patch.object(fx_briefing.journal, "read_entries", side_effect=guarded_read):
+        rc = _run(
+            [
+                "--per-timeframe",
+                "--no-discord",
+                "--no-macro",
+                "--cached-timeframe-learning",
+                "--no-auxiliary-horizon-reports",
+                "--no-approved-tp-sl-policy",
+                "--defer-decision-scoring",
+                "--stage-timing-log",
+                str(timing_path),
+                "--symbols",
+                "USDJPY",
+            ],
+            capsys,
+            calendar_result=([calendar_event], []),
+        )
+
+    assert rc == 0
+    assert fx_briefing.DEFAULT_DECISION_LATEST_PATH.exists()
+    timing_rows = [json.loads(line) for line in timing_path.read_text().splitlines()]
+    journal_stage = next(row for row in timing_rows if row["stage"] == "timeframe_journal_read")
+    assert journal_stage["detail"]["source"] == "cache"
+
+
+def test_stale_cached_learning_blocks_directional_decisions(patched_paths, capsys) -> None:
+    _write_empty_learning_caches(datetime.now(UTC) - timedelta(hours=2))
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--no-discord",
+            "--no-macro",
+            "--cached-timeframe-learning",
+            "--no-auxiliary-horizon-reports",
+            "--no-approved-tp-sl-policy",
+            "--defer-decision-scoring",
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
+    assert all(event["decision"]["direction"] == "neutral" for event in latest["events"])
+    assert "cached learning unavailable/stale" in json.dumps(latest, ensure_ascii=False)
+
+
+def test_mixed_learning_cache_generation_blocks_directional_decisions(
+    patched_paths, capsys
+) -> None:
+    generated_at = datetime.now(UTC) - timedelta(seconds=2)
+    _write_empty_learning_caches(generated_at)
+    fx_briefing.tp_sl_learning.save_timeframe_tp_sl_learning(
+        fx_briefing.tp_sl_learning.TimeframeTpSlLearning(
+            generated_at=(generated_at + timedelta(seconds=1)).isoformat()
+        ),
+        fx_briefing.DEFAULT_TP_SL_LEARNING_PATH,
+    )
+    calendar_event = EconomicEvent(
+        "calendar ok marker", "EUR", datetime(2026, 7, 8, tzinfo=UTC), "low"
+    )
+
+    rc = _run(
+        [
+            "--per-timeframe",
+            "--no-discord",
+            "--no-macro",
+            "--cached-timeframe-learning",
+            "--no-auxiliary-horizon-reports",
+            "--no-approved-tp-sl-policy",
+            "--defer-decision-scoring",
+            "--symbols",
+            "USDJPY",
+        ],
+        capsys,
+        calendar_result=([calendar_event], []),
+    )
+
+    assert rc == 0
+    latest = json.loads(fx_briefing.DEFAULT_DECISION_LATEST_PATH.read_text(encoding="utf-8"))
+    assert all(event["decision"]["direction"] == "neutral" for event in latest["events"])
+    assert "timeframe_learning_generation_mismatch" in json.dumps(latest, ensure_ascii=False)
 
 
 def test_signal_board_flag_enables_single_board_payload(patched_paths, capsys) -> None:

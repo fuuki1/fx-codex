@@ -31,6 +31,15 @@
       "manual_action_ja": "logs/launchd/horizon.err.log を確認し、com.fx-codex.horizon を restart"
     },
     {
+      "name": "timeframe_learning_monitor",
+      "path": "logs/timeframe_learning_monitor.json",
+      "kind": "json",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 5400,
+      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
+    },
+    {
       "name": "trade_outcome_monitor",
       "path": "logs/trade_outcome_monitor.json",
       "kind": "json",
@@ -52,10 +61,37 @@
       "name": "learning_profile",
       "path": "logs/briefing_tf_learning.json",
       "kind": "json",
-      "expected_interval_seconds": 300,
-      "warn_after_seconds": 900,
-      "critical_after_seconds": null,
-      "manual_action_ja": "ブリーフィング自体が動いているのに学習が更新されない場合はfx_briefing.pyの--no-learning指定やプロファイル破損を確認"
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/monitors.err.log と timeframe_learning_monitor.json を確認し、com.fx-codex.monitors を restart"
+    },
+    {
+      "name": "tp_sl_learning_profile",
+      "path": "logs/briefing_tp_sl_learning.json",
+      "kind": "json",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/monitors.err.log と timeframe_learning_monitor.json を確認し、com.fx-codex.monitors を restart"
+    },
+    {
+      "name": "maximization_profile",
+      "path": "logs/briefing_maximization.json",
+      "kind": "json",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/monitors.err.log と timeframe_learning_monitor.json を確認し、com.fx-codex.monitors を restart"
+    },
+    {
+      "name": "decision_feedback_profile",
+      "path": "logs/briefing_decision_feedback.json",
+      "kind": "json",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/monitors.err.log と decision_expectancy_monitor.json を確認し、com.fx-codex.monitors を restart"
     }
   ]
 }

@@ -10,7 +10,7 @@ granularity.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, UTC
 import json
 import math
@@ -20,6 +20,7 @@ from typing import Any
 from .effective_samples import select_effective_samples
 from .evaluation_labels import canonical_net_label_contract_flags
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
+from .state_io import atomic_write_json
 from .tp_sl_learning import MVP_SYMBOLS, MVP_TIMEFRAMES
 from .trade_outcome import (
     TradeOutcome,
@@ -45,6 +46,7 @@ STATUS_OK = "ok"
 STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
 CALIBRATION_BINS = ((0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01))
+TIMEFRAME_MAXIMIZATION_CACHE_CONTRACT = "fx-codex-timeframe-maximization-v1"
 
 
 @dataclass(frozen=True)
@@ -353,10 +355,139 @@ def maximization_score(
 def save_timeframe_maximization(profile: TimeframeMaximization, path: str | Path) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(json_safe(profile.to_dict()), ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
+    payload = profile.to_dict()
+    payload["cache_contract"] = TIMEFRAME_MAXIMIZATION_CACHE_CONTRACT
+    atomic_write_json(target, json_safe(payload))
+
+
+def load_timeframe_maximization(path: str | Path) -> TimeframeMaximization:
+    """Load a saved maximization cache; malformed cells are ignored."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return TimeframeMaximization()
+    if not isinstance(payload, Mapping):
+        return TimeframeMaximization()
+    if payload.get("cache_contract") != TIMEFRAME_MAXIMIZATION_CACHE_CONTRACT:
+        return TimeframeMaximization()
+    cells: dict[tuple[str, str, str], MaximizationCell] = {}
+    raw_cells = payload.get("cells")
+    raw_per_timeframe = payload.get("per_timeframe")
+    raw_notes = payload.get("notes_ja")
+    if (
+        not isinstance(raw_cells, Mapping)
+        or not isinstance(raw_per_timeframe, Mapping)
+        or not isinstance(raw_notes, list)
+    ):
+        return TimeframeMaximization()
+    for raw_key, raw_cell in raw_cells.items():
+        parts = str(raw_key).split("|", 2)
+        cell = _maximization_cell_from_mapping(raw_cell)
+        if len(parts) != 3 or not all(parts) or cell is None:
+            return TimeframeMaximization()
+        cell_key = (parts[0].upper(), parts[1], parts[2])
+        if cell_key in cells or (cell.symbol.upper(), cell.timeframe, cell.direction) != cell_key:
+            return TimeframeMaximization()
+        cells[cell_key] = cell
+    per_timeframe: dict[str, MaximizationCell] = {}
+    for raw_key, raw_cell in raw_per_timeframe.items():
+        timeframe_key = str(raw_key)
+        cell = _maximization_cell_from_mapping(raw_cell)
+        if (
+            not timeframe_key
+            or cell is None
+            or timeframe_key in per_timeframe
+            or cell.timeframe != timeframe_key
+        ):
+            return TimeframeMaximization()
+        per_timeframe[timeframe_key] = cell
+    return TimeframeMaximization(
+        generated_at=str(payload.get("generated_at") or ""),
+        cells=cells,
+        per_timeframe=per_timeframe,
+        notes_ja=[str(note) for note in raw_notes],
     )
+
+
+def _maximization_cell_from_mapping(payload: object) -> MaximizationCell | None:
+    if not isinstance(payload, Mapping):
+        return None
+    allowed = {item.name for item in fields(MaximizationCell)}
+    if set(payload) != allowed:
+        return None
+    try:
+        cell = MaximizationCell(**dict(payload))
+    except (TypeError, ValueError):
+        return None
+    return cell if _valid_maximization_cell(cell) and cell.to_dict() == dict(payload) else None
+
+
+def _valid_maximization_cell(cell: MaximizationCell) -> bool:
+    if not all(isinstance(value, str) and value for value in (cell.symbol, cell.timeframe)):
+        return False
+    if cell.direction not in {"long", "short", "all"}:
+        return False
+    if cell.action not in {"collect_samples", "hold", "quality_guard", "avoid", "dampen", "boost"}:
+        return False
+    if type(cell.block) is not bool or type(cell.sample_ok) is not bool:  # noqa: E721
+        return False
+    integer_fields = ("evaluated", "tradable", "wins", "losses", "min_samples")
+    if any(type(getattr(cell, name)) is not int for name in integer_fields):  # noqa: E721
+        return False
+    if any(getattr(cell, name) < 0 for name in integer_fields) or cell.min_samples < 1:
+        return False
+    if cell.wins + cell.losses > cell.tradable or cell.tradable > cell.evaluated:
+        return False
+    numeric_fields = {
+        item.name
+        for item in fields(MaximizationCell)
+        if item.name
+        not in {
+            *integer_fields,
+            "symbol",
+            "timeframe",
+            "direction",
+            "action",
+            "block",
+            "sample_ok",
+            "reason_ja",
+        }
+    }
+    if not isinstance(cell.reason_ja, str):
+        return False
+    for name in numeric_fields:
+        value = getattr(cell, name)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return False
+    bounded_rates = (
+        "win_rate",
+        "sl_rate",
+        "avg_path_quality",
+        "brier",
+        "brier_base",
+        "calibration_error",
+        "stability_score",
+        "sample_confidence",
+    )
+    if any(
+        (value := getattr(cell, name)) is not None and not 0 <= float(value) <= 1
+        for name in bounded_rates
+    ):
+        return False
+    factor = float(cell.factor)
+    policy_ok = {
+        "collect_samples": not cell.block and factor == 1.0,
+        "hold": not cell.block and factor == 1.0,
+        "quality_guard": not cell.block and factor == 1.0,
+        "avoid": cell.block and factor == BLOCK_FACTOR,
+        "dampen": not cell.block and factor == DAMPEN_FACTOR,
+        "boost": not cell.block and 1.0 <= factor <= BOOST_FACTOR_MAX,
+    }
+    return policy_ok[cell.action]
 
 
 def maximization_findings(

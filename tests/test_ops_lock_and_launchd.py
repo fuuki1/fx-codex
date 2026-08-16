@@ -296,6 +296,7 @@ def test_scheduled_briefing_cannot_apply_fusion_tp_sl_policy():
 
     assert "--no-approved-tp-sl-policy" in script
     assert "--no-auxiliary-horizon-reports" in script
+    assert "--cached-timeframe-learning" in script
 
 
 @pytest.mark.skipif(_ZSH is None, reason="zshが必要(macOS運用環境向けスクリプト)")

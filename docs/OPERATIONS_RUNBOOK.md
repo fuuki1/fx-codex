@@ -19,7 +19,7 @@ launchdのワンショットサービスとして運用するための手順書�
 | Label | 周期 | 実体 | 役割 |
 |---|---|---|---|
 | `com.fx-codex.snapshot` | 5分毎(StartInterval 300) | `fx_tf_snapshot.py` | 時間足別採点用の価格系列を供給する唯一の定期writer |
-| `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 5分ごとのcanonical時間足別判断・通知。履歴全件採点と融合判断は受付経路外 |
+| `com.fx-codex.briefing` | 5分境界(StartCalendarInterval) | `scripts/fx_briefing_once.sh` | 5分ごとのcanonical時間足別判断・通知。monitor生成の学習cacheだけを読み、履歴全件採点と融合判断は受付経路外 |
 | `com.fx-codex.virtual-portfolio` | 3分毎(StartInterval 180) | `scripts/virtual_portfolio_once.sh` | 300秒の受付期限内にcanonical仮想判断を取り込み、比較simulationは受付後に実行 |
 | `com.fx-codex.health` | 5分毎 | `tools/data_freshness_monitor.py` | データ鮮度監視。WARNING/CRITICAL/RECOVERYをDiscordへ |
 | `com.fx-codex.horizon` | 5分毎(StartInterval 300) | `scripts/fx_horizon_once.sh` | 3ペア×9本のshadow予測、満期採点、セル学習。Discord/既存判断への影響なし |
@@ -50,6 +50,14 @@ observation-only研究経路であり、canonical virtual portfolioの入力、�
 入る経路を閉じる。定時monitorも`--no-registry-update`で診断レポートだけを更新する。
 判断に使わない補助ホライズン表示の全履歴再採点は`--no-auxiliary-horizon-reports`で定時critical
 pathから外し、必要時の手動researchだけで生成する。
+時間足direction、TP/SL、maximizationの全履歴学習はmonitorが同一生成時刻のatomic cacheとして
+更新する。briefingはcache contract、30分以内の鮮度、3cacheの生成時刻一致をすべて要求し、
+欠落・旧形式・期限切れ・部分更新なら方向判断をneutralへ倒す。decision feedback cacheも30分以内を
+要求する。cache異常時にcritical path内で全履歴再計算へfallbackしてはならない。
+monitorはPIT契約済みdecisionと、event/available/ingested時刻・provenance・content hashを検証して
+生成時刻以前に利用可能だったpriceだけを採用する。manifestへ入力digest、最大availability、各cacheの
+size/hashを記録し、briefingはbundle hash不一致もneutralへ倒す。判断時のliquidity baselineは価格
+JSONLの末尾128MiB以内だけを読むため、scheduled critical pathに無界な全件materializeを戻さない。
 手動研究で融合を実行する場合も、PIT適格な融合行だけを使い、件数・クラス数・時系列分割を
 通過してモデル本体ができた時点でartifactを保存し、検証スコア不合格なら`usable=false`のまま
 判断参加を禁止する。
@@ -442,6 +450,8 @@ SHA/行数を`AUDIT_ROOT`へ追記し、移行担当者と独立確認者を記�
 | `briefing_tf_prices.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 15m採点窓(9〜21分)を守るには45分停止が実害ライン |
 | `briefing_horizon_forecasts.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 5m恒久shadowを含む全9本のcapture継続を監視 |
 | `briefing_tf_journal.jsonl` | 5分 | 15分(3周期) | 45分(9周期) | 現行`--per-timeframe`定期経路の判断鮮度を直接監視 |
+| `timeframe_learning_monitor.json`と3学習cache | 15分 | 30分(2周期) | 45分(3周期) | 定時判断が直接読むcache bundleの停止・部分更新を監視 |
+| `briefing_decision_feedback.json` | 15分 | 30分(2周期) | 45分(3周期) | 失敗分類feedbackの期限切れをneutral化前に通知 |
 
 `briefing_journal.jsonl`は旧融合研究artifactであり、定期writerと鮮度SLOの対象外とする。
 学習ダッシュボード上の融合時刻と`logs/fx_fusion_capture.log`はhistorical evidenceとしてのみ扱い、

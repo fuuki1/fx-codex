@@ -20,6 +20,7 @@ fi
   --no-price-write \
   --technical-cache-only \
   --require-freshness \
+  --cached-timeframe-learning \
   --no-auxiliary-horizon-reports \
   --no-approved-tp-sl-policy \
   --defer-decision-scoring \

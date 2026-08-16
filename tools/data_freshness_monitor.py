@@ -216,6 +216,16 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
                 result.reason = "jsonl_corrupt_tail"
         if target.required_symbols and target.required_timeframes:
             _apply_capture_coverage(result, recent_lines, target)
+    elif target.kind == "json":
+        try:
+            parsed = json.loads(file_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            result.status = STATUS_CRITICAL
+            result.reason = "json_corrupt"
+        else:
+            if not isinstance(parsed, dict):
+                result.status = STATUS_CRITICAL
+                result.reason = "json_non_object"
     return result
 
 

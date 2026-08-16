@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, UTC
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -71,6 +72,7 @@ TRADABLE_ZERO_REASON_DEFS = {
         "quality_flagsとfailure_reasonsを確認する",
     ),
 }
+DECISION_FEEDBACK_CACHE_CONTRACT = "fx-codex-decision-feedback-v1"
 
 FeedbackAdjuster = Callable[[str, str, int], tuple[float, str, bool]]
 
@@ -248,6 +250,169 @@ def load_decision_outcome_report(path: str | Path) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def load_decision_feedback(path: str | Path) -> DecisionFeedbackProfile:
+    """Load the monitor-published feedback cache; malformed cells are ignored."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DecisionFeedbackProfile()
+    if not isinstance(payload, Mapping):
+        return DecisionFeedbackProfile()
+    if payload.get("cache_contract") != DECISION_FEEDBACK_CACHE_CONTRACT:
+        return DecisionFeedbackProfile()
+    cells: dict[tuple[str, str, str], DecisionFeedbackCell] = {}
+    raw_cells = payload.get("cells")
+    raw_notes = payload.get("notes_ja")
+    if not isinstance(raw_cells, Mapping) or not isinstance(raw_notes, list):
+        return DecisionFeedbackProfile()
+    for raw_key, raw_cell in raw_cells.items():
+        parts = str(raw_key).split("|", 2)
+        cell = _feedback_cell_from_mapping(raw_cell)
+        if len(parts) != 3 or not all(parts) or cell is None:
+            return DecisionFeedbackProfile()
+        key = (parts[0].upper(), parts[1], parts[2])
+        if key in cells or (cell.symbol.upper(), cell.timeframe, cell.direction) != key:
+            return DecisionFeedbackProfile()
+        cells[key] = cell
+    return DecisionFeedbackProfile(
+        generated_at=str(payload.get("generated_at") or ""),
+        cells=cells,
+        notes_ja=[str(note) for note in raw_notes],
+    )
+
+
+def _feedback_cell_from_mapping(payload: object) -> DecisionFeedbackCell | None:
+    if not isinstance(payload, Mapping):
+        return None
+    allowed = {item.name for item in fields(DecisionFeedbackCell)} - {"failure_reasons"}
+    expected = allowed | {"failure_reasons"}
+    if set(payload) != expected:
+        return None
+    try:
+        reasons = [
+            FailureReasonStats(
+                **{
+                    key: value
+                    for key, value in reason.items()
+                    if key in {item.name for item in fields(FailureReasonStats)}
+                }
+            )
+            for reason in payload.get("failure_reasons", [])
+            if isinstance(reason, Mapping)
+        ]
+        cell = DecisionFeedbackCell(
+            **{key: value for key, value in payload.items() if key in allowed},
+            failure_reasons=reasons,
+        )
+    except (TypeError, ValueError):
+        return None
+    return cell if _valid_feedback_cell(cell) and cell.to_dict() == dict(payload) else None
+
+
+def _valid_feedback_cell(cell: DecisionFeedbackCell) -> bool:
+    if not all(isinstance(value, str) and value for value in (cell.symbol, cell.timeframe)):
+        return False
+    if cell.direction not in {"long", "short"}:
+        return False
+    if cell.action not in {"collect_samples", "hold", "quality_guard", "avoid", "dampen"}:
+        return False
+    if type(cell.block) is not bool or type(cell.sample_ok) is not bool:  # noqa: E721
+        return False
+    integer_fields = (
+        "evaluated",
+        "tradable",
+        "wins",
+        "losses",
+        "unscored",
+        "low_quality",
+        "gross_samples",
+        "net_label_samples",
+        "effective_samples",
+        "cluster_count",
+        "market_days",
+    )
+    if any(type(getattr(cell, name)) is not int for name in integer_fields):  # noqa: E721
+        return False
+    if any(getattr(cell, name) < 0 for name in integer_fields):
+        return False
+    if cell.wins + cell.losses > cell.tradable or cell.tradable > cell.evaluated:
+        return False
+    numeric_names = (
+        "net_label_coverage",
+        "overlap_ratio",
+        "hit_rate",
+        "gross_expectancy_r",
+        "net_expectancy_r",
+        "expectancy_r",
+        "avg_mfe_r",
+        "avg_mae_r",
+        "sl_rate",
+        "tp_rate",
+        "high_severity_rate",
+        "factor",
+    )
+    for name in numeric_names:
+        value = getattr(cell, name)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return False
+    bounded_rates = (
+        "net_label_coverage",
+        "overlap_ratio",
+        "hit_rate",
+        "sl_rate",
+        "tp_rate",
+        "high_severity_rate",
+    )
+    if any(
+        (value := getattr(cell, name)) is not None and not 0 <= float(value) <= 1
+        for name in bounded_rates
+    ):
+        return False
+    if not isinstance(cell.reason_ja, str) or any(
+        not _valid_failure_reason(reason) for reason in cell.failure_reasons
+    ):
+        return False
+    factor = float(cell.factor)
+    policy_ok = {
+        "collect_samples": not cell.block and factor == 1.0,
+        "hold": not cell.block and factor == 1.0,
+        "quality_guard": not cell.block and factor == 1.0,
+        "avoid": cell.block and factor == BLOCK_FACTOR,
+        "dampen": not cell.block and factor in {DAMPEN_FACTOR, WATCH_FACTOR},
+    }
+    return policy_ok[cell.action]
+
+
+def _valid_failure_reason(reason: FailureReasonStats) -> bool:
+    if not all(isinstance(value, str) for value in (reason.key, reason.label_ja, reason.advice_ja)):
+        return False
+    if (
+        not reason.key or type(reason.count) is not int or type(reason.primary_count) is not int
+    ):  # noqa: E721
+        return False
+    if reason.count < 0 or reason.primary_count < 0 or reason.primary_count > reason.count:
+        return False
+    if (
+        isinstance(reason.rate, bool)
+        or not isinstance(reason.rate, (int, float))
+        or not math.isfinite(float(reason.rate))
+        or not 0 <= float(reason.rate) <= 1
+    ):
+        return False
+    for value in (reason.avg_realized_r, reason.avg_mfe_r, reason.avg_mae_r):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return False
+    return True
+
+
 def save_decision_feedback(profile: DecisionFeedbackProfile, path: str | Path) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -263,7 +428,12 @@ def save_decision_feedback(profile: DecisionFeedbackProfile, path: str | Path) -
         ) as handle:
             tmp_path = Path(handle.name)
             json.dump(
-                json_safe(profile.to_dict()),
+                json_safe(
+                    {
+                        **profile.to_dict(),
+                        "cache_contract": DECISION_FEEDBACK_CACHE_CONTRACT,
+                    }
+                ),
                 handle,
                 ensure_ascii=False,
                 indent=2,

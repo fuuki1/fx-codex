@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
@@ -387,6 +388,26 @@ def test_snapshot_entries_reject_naive_timestamp() -> None:
             {"USDJPY": {"1h": 157.0}},
             now=datetime(2026, 6, 22, 8, 0),
         )
+
+
+def test_pit_snapshot_entry_rejects_future_and_hash_mismatch() -> None:
+    row = ph.snapshot_entries({"USDJPY": {"1h": 157.0}}, now=T0)[0]
+    assert ph.is_pit_eligible_snapshot_entry(row, as_of=T0)
+    assert not ph.is_pit_eligible_snapshot_entry(row, as_of=T0 - timedelta(seconds=1))
+
+    changed = {**row, "close": 999.0}
+    assert not ph.is_pit_eligible_snapshot_entry(changed, as_of=T0)
+
+
+def test_read_recent_snapshot_entries_is_byte_bounded(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    rows = ph.snapshot_entries({"USDJPY": {"15m": 150.0, "1h": 151.0, "4h": 152.0}}, now=T0)
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    loaded = ph.read_recent_snapshot_entries(path, max_bytes=1200)
+
+    assert 0 < len(loaded) < len(rows)
+    assert loaded[-1]["timeframe"] == "4h"
 
 
 # ------------------------------------------------- 5分密系列で15mが解決できる

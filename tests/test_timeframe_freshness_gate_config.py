@@ -11,11 +11,19 @@ CONFIG = ROOT / "ops" / "freshness_targets_timeframe.json"
 PLIST = ROOT / "ops" / "launchd" / "com.fx-codex.health.plist.tmpl"
 
 
-def test_timeframe_freshness_config_contains_only_active_gating_targets() -> None:
+def test_timeframe_freshness_config_contains_active_gating_targets() -> None:
     payload = json.loads(CONFIG.read_text(encoding="utf-8"))
     names = {row["name"] for row in payload["targets"]}
 
-    assert names == {"tf_price_snapshot", "tf_journal"}
+    assert names == {
+        "tf_price_snapshot",
+        "tf_journal",
+        "timeframe_learning_monitor",
+        "learning_profile",
+        "tp_sl_learning_profile",
+        "maximization_profile",
+        "decision_feedback_profile",
+    }
     assert "fusion_journal" not in names
     assert "promotion_state" not in names
     prices = next(row for row in payload["targets"] if row["name"] == "tf_price_snapshot")

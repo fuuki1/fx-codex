@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -43,6 +44,7 @@ from .market import WEEKEND_CLOSURE, WeekendOpenHours
 FuturePriceProvider = Callable[[str, str, datetime, float], float | None]
 SNAPSHOT_SCHEMA_VERSION = 2
 SNAPSHOT_CADENCE_SECONDS = 300
+RECENT_SNAPSHOT_MAX_BYTES = 128 * 1024 * 1024
 
 
 class PriceHistoryWriteError(RuntimeError):
@@ -245,6 +247,89 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     return appended
+
+
+def is_pit_eligible_snapshot_entry(entry: Mapping[str, object], *, as_of: datetime) -> bool:
+    """Return whether a price row is authentic and was available by ``as_of``."""
+
+    if as_of.tzinfo is None or entry.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        return False
+    if not all(
+        isinstance(entry.get(key), str) and bool(str(entry.get(key)).strip())
+        for key in (
+            "symbol",
+            "timeframe",
+            "source",
+            "source_record_id",
+            "run_id",
+            "writer_id",
+            "capture_slot",
+        )
+    ):
+        return False
+    close = entry.get("close")
+    if (
+        isinstance(close, bool)
+        or not isinstance(close, (int, float))
+        or not math.isfinite(float(close))
+        or float(close) <= 0
+    ):
+        return False
+
+    timestamps: list[datetime] = []
+    for key in ("ts", "event_time", "available_time", "ingested_time"):
+        raw = entry.get(key)
+        if not isinstance(raw, str) or not raw:
+            return False
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return False
+        timestamps.append(parsed.astimezone(UTC))
+    recorded, event_time, available_time, ingested_time = timestamps
+    if recorded != event_time or not (
+        event_time <= available_time <= ingested_time <= as_of.astimezone(UTC)
+    ):
+        return False
+
+    claimed_hash = entry.get("content_hash")
+    if not isinstance(claimed_hash, str) or len(claimed_hash) != 64:
+        return False
+    try:
+        return claimed_hash == _content_hash(entry)
+    except (TypeError, ValueError):
+        return False
+
+
+def read_recent_snapshot_entries(
+    path: str | Path, *, max_bytes: int = RECENT_SNAPSHOT_MAX_BYTES
+) -> list[dict[str, object]]:
+    """Read a bounded JSONL suffix for decision-time liquidity baselines."""
+
+    if max_bytes <= 0:
+        return []
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - max_bytes)
+            handle.seek(start)
+            if start:
+                handle.readline()  # discard the first partial record
+            payload = handle.read()
+    except OSError:
+        return []
+    rows: list[dict[str, object]] = []
+    for raw_line in payload.splitlines():
+        try:
+            row = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
 
 
 def _snapshot_row(

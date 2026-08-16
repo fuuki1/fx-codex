@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, UTC
 import json
 from pathlib import Path
+from typing import Any
 
 from .timeframe import PRIMARY_HORIZON_HOURS, tolerance_for
+from .state_io import atomic_write_json
 from .trade_outcome import TradeOutcome, evaluate_trade_outcomes, json_safe
 
 MVP_SYMBOLS: tuple[str, ...] = ("USDJPY", "EURUSD", "GBPUSD")
@@ -28,6 +30,7 @@ FACTOR_MAX = 1.10
 WEAK_HIT_RATE = 0.45
 STRONG_HIT_RATE = 0.60
 CONFIDENCE_BINS = ((0, 25), (25, 50), (50, 75), (75, 101))
+TIMEFRAME_TP_SL_CACHE_CONTRACT = "fx-codex-timeframe-tp-sl-learning-v1"
 
 
 @dataclass(frozen=True)
@@ -358,6 +361,7 @@ def save_timeframe_tp_sl_learning(learning: TimeframeTpSlLearning, path: str | P
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "cache_contract": TIMEFRAME_TP_SL_CACHE_CONTRACT,
         "generated_at": learning.generated_at,
         "profiles": {
             f"{symbol}|{timeframe}": profile.to_dict()
@@ -367,10 +371,104 @@ def save_timeframe_tp_sl_learning(learning: TimeframeTpSlLearning, path: str | P
             timeframe: profile.to_dict() for timeframe, profile in learning.per_timeframe.items()
         },
     }
-    target.write_text(
-        json.dumps(json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
+    atomic_write_json(target, json_safe(payload))
+
+
+def load_timeframe_tp_sl_learning(path: str | Path) -> TimeframeTpSlLearning:
+    """Load a saved TP/SL learning cache; invalid cells are ignored."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return TimeframeTpSlLearning()
+    if not isinstance(payload, Mapping):
+        return TimeframeTpSlLearning()
+    if payload.get("cache_contract") != TIMEFRAME_TP_SL_CACHE_CONTRACT:
+        return TimeframeTpSlLearning()
+    generated_at = str(payload.get("generated_at") or "")
+    profiles: dict[tuple[str, str], TpSlProfile] = {}
+    raw_profiles = payload.get("profiles")
+    raw_per_timeframe = payload.get("per_timeframe")
+    if not isinstance(raw_profiles, Mapping) or not isinstance(raw_per_timeframe, Mapping):
+        return TimeframeTpSlLearning()
+    for raw_key, raw_profile in raw_profiles.items():
+        parts = str(raw_key).split("|", 1)
+        if len(parts) != 2 or not all(parts) or not isinstance(raw_profile, Mapping):
+            return TimeframeTpSlLearning()
+        profile = _tp_sl_profile_from_mapping(raw_profile)
+        profile_key = (parts[0].upper(), parts[1])
+        if (
+            profile is None
+            or profile.generated_at != generated_at
+            or profile_key in profiles
+            or dict(raw_profile) != profile.to_dict()
+        ):
+            return TimeframeTpSlLearning()
+        profiles[profile_key] = profile
+    per_timeframe: dict[str, TpSlProfile] = {}
+    for raw_key, raw_profile in raw_per_timeframe.items():
+        timeframe_key = str(raw_key)
+        if (
+            not timeframe_key
+            or not isinstance(raw_profile, Mapping)
+            or timeframe_key in per_timeframe
+        ):
+            return TimeframeTpSlLearning()
+        profile = _tp_sl_profile_from_mapping(raw_profile)
+        if (
+            profile is None
+            or profile.generated_at != generated_at
+            or dict(raw_profile) != profile.to_dict()
+        ):
+            return TimeframeTpSlLearning()
+        per_timeframe[timeframe_key] = profile
+    return TimeframeTpSlLearning(
+        generated_at=generated_at,
+        profiles=profiles,
+        per_timeframe=per_timeframe,
     )
+
+
+def _tp_sl_profile_from_mapping(payload: Mapping[str, Any]) -> TpSlProfile | None:
+    try:
+        bins = [
+            TpSlBin(
+                low=int(item["low"]),
+                high=int(item["high"]),
+                evaluated=int(item["evaluated"]),
+                hits=int(item["hits"]),
+            )
+            for item in payload.get("bins", [])
+            if isinstance(item, Mapping)
+        ]
+        by_direction = {
+            str(direction): TpSlStats(
+                evaluated=int(stats.get("evaluated", 0)),
+                hits=int(stats.get("hits", 0)),
+                unresolved=int(stats.get("unresolved", 0)),
+                unscored=int(stats.get("unscored", 0)),
+            )
+            for direction, stats in dict(payload.get("by_direction", {})).items()
+            if direction in {"long", "short"} and isinstance(stats, Mapping)
+        }
+        return TpSlProfile(
+            generated_at=str(payload.get("generated_at") or ""),
+            evaluated=int(payload.get("evaluated", 0)),
+            hits=int(payload.get("hits", 0)),
+            unresolved=int(payload.get("unresolved", 0)),
+            unscored=int(payload.get("unscored", 0)),
+            brier=_optional_float(payload.get("brier")),
+            adjusted_brier=_optional_float(payload.get("adjusted_brier")),
+            brier_base=_optional_float(payload.get("brier_base")),
+            bins=bins,
+            by_direction=by_direction,
+            notes_ja=[str(note) for note in payload.get("notes_ja", [])],
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def _call_from_outcome(outcome: TradeOutcome, timeframe: str) -> TpSlCall:

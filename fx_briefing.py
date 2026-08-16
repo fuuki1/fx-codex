@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+import hashlib
 import json
 import os
 import sys
@@ -125,6 +126,7 @@ DEFAULT_TF_JOURNAL_PATH = PROJECT_ROOT / "logs" / "briefing_tf_journal.jsonl"
 DEFAULT_TF_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tf_learning.json"
 DEFAULT_TP_SL_LEARNING_PATH = PROJECT_ROOT / "logs" / "briefing_tp_sl_learning.json"
 DEFAULT_MAXIMIZATION_PATH = PROJECT_ROOT / "logs" / "briefing_maximization.json"
+DEFAULT_TF_LEARNING_MONITOR_PATH = PROJECT_ROOT / "logs" / "timeframe_learning_monitor.json"
 # 時間足別採点用の価格専用系列(fx_tf_snapshot.py が5分ごとに追記)。
 # 判断ジャーナルだけでは短い足の採点窓に十分な価格点が得られないため、
 # この密な価格系列を採点入力に結合して 15m/1h/4h/1d を採点可能にする。
@@ -798,6 +800,116 @@ def load_pit_decision_outcome_report(path: Path) -> dict[str, object]:
     return report
 
 
+def learning_cache_is_fresh(generated_at: str, *, now: datetime, max_age_seconds: float) -> bool:
+    try:
+        timestamp = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return False
+    age = (now.astimezone(UTC) - timestamp.astimezone(UTC)).total_seconds()
+    return 0 <= age <= max_age_seconds
+
+
+def timeframe_learning_bundle_is_valid(
+    manifest_path: Path,
+    *,
+    generated_at: str,
+    now: datetime,
+    max_age_seconds: float,
+) -> bool:
+    """Verify the monitor-published cache bundle and its PIT watermarks."""
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, Mapping):
+        return False
+    if (
+        manifest.get("monitor_contract") != "fx-codex-timeframe-learning-monitor-v1"
+        or manifest.get("status") != "ok"
+        or str(manifest.get("generated_at") or "") != generated_at
+        or not learning_cache_is_fresh(generated_at, now=now, max_age_seconds=max_age_seconds)
+    ):
+        return False
+    artifacts = manifest.get("cache_artifacts")
+    expected = {
+        "timeframe_direction": DEFAULT_TF_LEARNING_PATH,
+        "timeframe_tp_sl": DEFAULT_TP_SL_LEARNING_PATH,
+        "timeframe_maximization": DEFAULT_MAXIMIZATION_PATH,
+    }
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(expected):
+        return False
+    for key, path in expected.items():
+        evidence = artifacts.get(key)
+        if not isinstance(evidence, Mapping):
+            return False
+        try:
+            body = path.read_bytes()
+        except OSError:
+            return False
+        claimed_size = evidence.get("size")
+        claimed_hash = evidence.get("sha256")
+        if (
+            type(claimed_size) is not int  # noqa: E721
+            or claimed_size != len(body)
+            or evidence.get("path") != path.name
+            or not isinstance(claimed_hash, str)
+            or claimed_hash != hashlib.sha256(body).hexdigest()
+        ):
+            return False
+    watermarks = manifest.get("input_watermarks")
+    if not isinstance(watermarks, Mapping) or set(watermarks) != {"decisions", "prices"}:
+        return False
+    for scope, timestamp_key, source_path in (
+        ("decisions", "max_prediction_time", DEFAULT_TF_JOURNAL_PATH),
+        ("prices", "max_available_time", DEFAULT_TF_PRICES_PATH),
+    ):
+        evidence = watermarks.get(scope)
+        if not isinstance(evidence, Mapping):
+            return False
+        expected_evidence_keys = {
+            "source_path",
+            "device",
+            "inode",
+            "read_offset_bytes",
+            "mtime_ns",
+            "sha256",
+            "raw_rows",
+            "eligible_rows",
+            timestamp_key,
+        }
+        if set(evidence) != expected_evidence_keys:
+            return False
+        if evidence.get("source_path") != str(source_path.resolve()):
+            return False
+        for key in (
+            "device",
+            "inode",
+            "read_offset_bytes",
+            "mtime_ns",
+            "raw_rows",
+            "eligible_rows",
+        ):
+            value = evidence.get(key)
+            if type(value) is not int or value < 0:  # noqa: E721
+                return False
+        if int(evidence["eligible_rows"]) > int(evidence["raw_rows"]):
+            return False
+        digest = evidence.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            return False
+        watermark = evidence.get(timestamp_key)
+        if watermark is not None and not learning_cache_is_fresh(
+            str(watermark),
+            now=datetime.fromisoformat(generated_at.replace("Z", "+00:00")),
+            max_age_seconds=float("inf"),
+        ):
+            return False
+    return True
+
+
 def attach_decision_pit_metadata(
     events: list[dict[str, object]],
     plans: Sequence[object],
@@ -1057,8 +1169,15 @@ def _run_per_timeframe(
     自己採点・学習して次回の確信度に反映する。融合1判断モードとは
     ジャーナル・学習ファイルを分ける(スキーマも採点ホライズンも異なるため)。
     """
-    with timing.stage("timeframe_journal_read"):
-        journal_entries = list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
+    with timing.stage(
+        "timeframe_journal_read",
+        source="cache" if args.cached_timeframe_learning else "full_history",
+    ):
+        journal_entries = (
+            []
+            if args.cached_timeframe_learning
+            else list(journal.read_entries(DEFAULT_TF_JOURNAL_PATH))
+        )
     pit_journal_entries = [
         entry for entry in journal_entries if journal.is_pit_eligible_entry(entry)
     ]
@@ -1097,11 +1216,22 @@ def _run_per_timeframe(
     # 学習: 時間足別ジャーナルを (symbol, timeframe) 別に採点しプロファイル導出
     tf_learn = tf_learning.TimeframeLearning()
     learning_note = ""
+    stale_learning_caches: list[str] = []
     with timing.stage("timeframe_direction_learning"):
         if not args.no_learning:
-            tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+            tf_learn = (
+                tf_learning.load_timeframe_learning(DEFAULT_TF_LEARNING_PATH)
+                if args.cached_timeframe_learning
+                else tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+            )
+            if args.cached_timeframe_learning and not learning_cache_is_fresh(
+                tf_learn.generated_at,
+                now=datetime.now(UTC),
+                max_age_seconds=args.learning_cache_max_age_seconds,
+            ):
+                stale_learning_caches.append("timeframe_direction")
             learning_note = tf_learn.summary_ja()
-            if not args.dry_run:
+            if not args.dry_run and not args.cached_timeframe_learning:
                 try:
                     tf_learning.save_timeframe_learning(tf_learn, DEFAULT_TF_LEARNING_PATH)
                 except OSError as error:
@@ -1112,10 +1242,20 @@ def _run_per_timeframe(
     decision_feedback_lookup = None
     with timing.stage("decision_feedback_load_and_derive"):
         if not args.no_learning and not args.no_trade_expectancy:
-            decision_feedback_profile = decision_feedback.derive_decision_feedback(
-                load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
-                now=now,
+            decision_feedback_profile = (
+                decision_feedback.load_decision_feedback(DEFAULT_DECISION_FEEDBACK_PATH)
+                if args.cached_timeframe_learning
+                else decision_feedback.derive_decision_feedback(
+                    load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),
+                    now=now,
+                )
             )
+            if args.cached_timeframe_learning and not learning_cache_is_fresh(
+                decision_feedback_profile.generated_at,
+                now=datetime.now(UTC),
+                max_age_seconds=args.learning_cache_max_age_seconds,
+            ):
+                stale_learning_caches.append("decision_feedback")
             learning_note = append_note(learning_note, decision_feedback_profile.summary_ja())
             if not args.no_trade_expectancy_guard:
                 decision_feedback_lookup = decision_feedback_profile.expectancy_lookup
@@ -1124,10 +1264,20 @@ def _run_per_timeframe(
     tp_sl_learn = None
     with timing.stage("timeframe_tp_sl_learning"):
         if not args.no_learning and not args.no_trade_expectancy:
-            tp_sl_learn = tp_sl_learning.derive_timeframe_tp_sl_learning(scoring_entries, now=now)
+            tp_sl_learn = (
+                tp_sl_learning.load_timeframe_tp_sl_learning(DEFAULT_TP_SL_LEARNING_PATH)
+                if args.cached_timeframe_learning
+                else tp_sl_learning.derive_timeframe_tp_sl_learning(scoring_entries, now=now)
+            )
+            if args.cached_timeframe_learning and not learning_cache_is_fresh(
+                tp_sl_learn.generated_at,
+                now=datetime.now(UTC),
+                max_age_seconds=args.learning_cache_max_age_seconds,
+            ):
+                stale_learning_caches.append("timeframe_tp_sl")
             learning_note = append_note(learning_note, tp_sl_learn.summary_ja())
             tp_sl_lookup = tp_sl_learn.expectancy_lookup
-            if not args.dry_run:
+            if not args.dry_run and not args.cached_timeframe_learning:
                 try:
                     tp_sl_learning.save_timeframe_tp_sl_learning(
                         tp_sl_learn, DEFAULT_TP_SL_LEARNING_PATH
@@ -1143,7 +1293,7 @@ def _run_per_timeframe(
     expectancy_lookup = None
     _expectancy_summaries: dict[str, dict] = {}
     with timing.stage("timeframe_trade_expectancy_lookup"):
-        if not args.no_trade_expectancy:
+        if not args.no_trade_expectancy and not args.cached_timeframe_learning:
             expectancy_lookup, expectancy_note, _expectancy_summaries = (
                 make_timeframe_trade_expectancy_lookup(scoring_entries)
             )
@@ -1154,15 +1304,40 @@ def _run_per_timeframe(
     max_profile = None
     with timing.stage("timeframe_maximization_learning"):
         if not args.no_learning and not args.no_trade_expectancy:
-            max_profile = maximization.derive_timeframe_maximization(scoring_entries, now=now)
+            max_profile = (
+                maximization.load_timeframe_maximization(DEFAULT_MAXIMIZATION_PATH)
+                if args.cached_timeframe_learning
+                else maximization.derive_timeframe_maximization(scoring_entries, now=now)
+            )
+            if args.cached_timeframe_learning and not learning_cache_is_fresh(
+                max_profile.generated_at,
+                now=datetime.now(UTC),
+                max_age_seconds=args.learning_cache_max_age_seconds,
+            ):
+                stale_learning_caches.append("timeframe_maximization")
             learning_note = append_note(learning_note, max_profile.summary_ja())
             if not args.no_trade_expectancy_guard:
                 maximization_lookup = max_profile.expectancy_lookup
-            if not args.dry_run:
+            if not args.dry_run and not args.cached_timeframe_learning:
                 try:
                     maximization.save_timeframe_maximization(max_profile, DEFAULT_MAXIMIZATION_PATH)
                 except OSError as error:
                     fetch_warnings.append(f"最大化プロファイル保存失敗: {error}")
+    if args.cached_timeframe_learning and not args.no_learning and not args.no_trade_expectancy:
+        learning_generations = {
+            tf_learn.generated_at,
+            tp_sl_learn.generated_at if tp_sl_learn is not None else "",
+            max_profile.generated_at if max_profile is not None else "",
+        }
+        if len(learning_generations) != 1 or "" in learning_generations:
+            stale_learning_caches.append("timeframe_learning_generation_mismatch")
+        elif not timeframe_learning_bundle_is_valid(
+            DEFAULT_TF_LEARNING_MONITOR_PATH,
+            generated_at=tf_learn.generated_at,
+            now=datetime.now(UTC),
+            max_age_seconds=args.learning_cache_max_age_seconds,
+        ):
+            stale_learning_caches.append("timeframe_learning_bundle_invalid")
     if maximization_lookup is not None:
         expectancy_lookup = maximization_lookup
     expectancy_lookup = compose_timeframe_expectancy_lookups(
@@ -1170,6 +1345,13 @@ def _run_per_timeframe(
         expectancy_lookup,
     )
     expectancy_lookup = compose_timeframe_expectancy_lookups(tp_sl_lookup, expectancy_lookup)
+
+    if stale_learning_caches:
+        operational_data_ok = False
+        operational_data_reason = "cached learning unavailable/stale: " + ", ".join(
+            stale_learning_caches
+        )
+        fetch_warnings.append(f"⛔ {operational_data_reason}")
 
     # 各ペア・各時間足の独立判断
     plans_by_symbol: dict[str, list[timeframe.TimeframePlan]] = {}
@@ -1399,6 +1581,17 @@ def main(argv: list[str] | None = None) -> int:
         "--no-learning",
         action="store_true",
         help="学習プロファイルによる重み・確信度の自動調整を行わない(既定重みで実行)",
+    )
+    parser.add_argument(
+        "--cached-timeframe-learning",
+        action="store_true",
+        help="時間足全履歴を再採点せずmonitorが原子的に公開した学習cacheを使う",
+    )
+    parser.add_argument(
+        "--learning-cache-max-age-seconds",
+        type=float,
+        default=1800.0,
+        help="cached timeframe learningの最大許容経過秒数",
     )
     parser.add_argument(
         "--no-trade-expectancy",
@@ -1861,7 +2054,14 @@ def main(argv: list[str] | None = None) -> int:
     # baseline.  Each symbol gets one context shared by fusion and every
     # timeframe; the context is record/shadow-only at this stage.
     with timing.stage("price_history_read"):
-        input_price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
+        if args.cached_timeframe_learning:
+            input_price_rows = [
+                row
+                for row in price_history.read_recent_snapshot_entries(DEFAULT_TF_PRICES_PATH)
+                if price_history.is_pit_eligible_snapshot_entry(row, as_of=now)
+            ]
+        else:
+            input_price_rows = list(journal.read_entries(DEFAULT_TF_PRICES_PATH))
     with timing.stage("decision_input_context_build"):
         input_contexts = build_decision_input_contexts(
             data_symbols,

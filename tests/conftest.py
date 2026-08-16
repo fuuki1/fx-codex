@@ -22,6 +22,7 @@ _RUNTIME_ARTIFACTS = {
     "DEFAULT_TF_LEARNING_PATH": ("logs", "briefing_tf_learning.json"),
     "DEFAULT_TP_SL_LEARNING_PATH": ("logs", "briefing_tp_sl_learning.json"),
     "DEFAULT_MAXIMIZATION_PATH": ("logs", "briefing_maximization.json"),
+    "DEFAULT_TF_LEARNING_MONITOR_PATH": ("logs", "timeframe_learning_monitor.json"),
     "DEFAULT_TF_PRICES_PATH": ("logs", "briefing_tf_prices.jsonl"),
     "DEFAULT_CALENDAR_CACHE": ("logs", "calendar_cache.json"),
     "DEFAULT_MACRO_CACHE": ("logs", "macro_cache.json"),
@@ -31,6 +32,10 @@ _RUNTIME_ARTIFACTS = {
     "DEFAULT_TRADE_MONITOR_PATH": ("logs", "trade_outcome_monitor.json"),
     "DEFAULT_DECISION_LOG_PATH": ("logs", "briefing_decisions.jsonl"),
     "DEFAULT_DECISION_LATEST_PATH": ("logs", "briefing_decisions_latest.json"),
+    "DEFAULT_FUSION_DECISION_LATEST_PATH": (
+        "logs",
+        "briefing_fusion_decisions_latest.json",
+    ),
     "DEFAULT_DECISION_OUTCOMES_PATH": ("logs", "briefing_decision_outcomes.json"),
     "DEFAULT_DECISION_FEEDBACK_PATH": ("logs", "briefing_decision_feedback.json"),
 }

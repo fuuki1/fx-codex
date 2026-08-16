@@ -46,6 +46,7 @@ from .learning import (
     TECH_WEIGHT,
     derive_profile,
     evaluate_history,
+    profile_from_mapping,
     thin_calls,
 )
 from .timeframe import (
@@ -54,6 +55,9 @@ from .timeframe import (
     PRIMARY_HORIZON_HOURS,
     tolerance_for,
 )
+from .state_io import atomic_write_json
+
+TIMEFRAME_LEARNING_CACHE_CONTRACT = "fx-codex-timeframe-learning-v1"
 
 ConditionAdjuster = Callable[[Mapping[str, float], str], tuple[float, str]]
 ProfileLookup = Callable[[str, str], tuple[float, float, float, ConditionAdjuster | None]]
@@ -248,6 +252,7 @@ def save_timeframe_learning(learning: TimeframeLearning, path: str | Path) -> No
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "cache_contract": TIMEFRAME_LEARNING_CACHE_CONTRACT,
         "generated_at": learning.generated_at,
         "profiles": {
             f"{symbol}|{timeframe}": _profile_to_dict(profile)
@@ -258,7 +263,56 @@ def save_timeframe_learning(learning: TimeframeLearning, path: str | Path) -> No
             for timeframe, profile in learning.per_timeframe.items()
         },
     }
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(target, payload)
+
+
+def load_timeframe_learning(path: str | Path) -> TimeframeLearning:
+    """Load the atomically published timeframe learning cache fail-closed."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return TimeframeLearning()
+    if not isinstance(payload, Mapping):
+        return TimeframeLearning()
+    if payload.get("cache_contract") != TIMEFRAME_LEARNING_CACHE_CONTRACT:
+        return TimeframeLearning()
+    generated_at = str(payload.get("generated_at") or "")
+    raw_profiles = payload.get("profiles")
+    raw_per_timeframe = payload.get("per_timeframe")
+    if not isinstance(raw_profiles, Mapping) or not isinstance(raw_per_timeframe, Mapping):
+        return TimeframeLearning()
+    profiles: dict[tuple[str, str], LearnedProfile] = {}
+    for raw_key, raw_profile in raw_profiles.items():
+        parts = str(raw_key).split("|", 1)
+        if len(parts) != 2 or not all(parts) or not isinstance(raw_profile, Mapping):
+            return TimeframeLearning()
+        profile = profile_from_mapping(raw_profile)
+        profile_key = (parts[0].upper(), parts[1])
+        if (
+            profile.generated_at != generated_at
+            or profile_key in profiles
+            or dict(raw_profile) != _profile_to_dict(profile)
+        ):
+            return TimeframeLearning()
+        profiles[profile_key] = profile
+    per_timeframe: dict[str, LearnedProfile] = {}
+    for raw_key, raw_profile in raw_per_timeframe.items():
+        timeframe_key = str(raw_key)
+        if (
+            not timeframe_key
+            or not isinstance(raw_profile, Mapping)
+            or timeframe_key in per_timeframe
+        ):
+            return TimeframeLearning()
+        profile = profile_from_mapping(raw_profile)
+        if profile.generated_at != generated_at or dict(raw_profile) != _profile_to_dict(profile):
+            return TimeframeLearning()
+        per_timeframe[timeframe_key] = profile
+    return TimeframeLearning(
+        generated_at=generated_at,
+        profiles=profiles,
+        per_timeframe=per_timeframe,
+    )
 
 
 def _profile_to_dict(profile: LearnedProfile) -> dict:
@@ -268,6 +322,7 @@ def _profile_to_dict(profile: LearnedProfile) -> dict:
         "evaluated": profile.evaluated,
         "hits": profile.hits,
         "flat": profile.flat,
+        "counterfactual_evaluated": profile.counterfactual_evaluated,
         "hit_rate": profile.hit_rate,
         "tech_weight": profile.tech_weight,
         "news_weight": profile.news_weight,

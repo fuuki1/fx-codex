@@ -34,6 +34,9 @@ run_monitor() {
 }
 
 overall=0
+run_monitor timeframe-learning logs/timeframe_learning_monitor.json \
+  tools/timeframe_learning_monitor.py \
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?
 # 旧fusion journalの再採点はhistorical/diagnostic専用。canonicalな判断方針を
 # 書き換えないよう、改善registryは読み取りのみとする。
 run_monitor trade-outcome logs/trade_outcome_monitor.json \

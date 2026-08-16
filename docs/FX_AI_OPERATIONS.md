@@ -21,6 +21,13 @@ tail -n 5 logs/briefing_tf_journal.jsonl
 定時時間足判断は旧fusion由来の承認済みTP/SL registryを適用せず、定時monitorもregistryを
 更新しません。decision outcome/feedbackの正規writerは`com.fx-codex.monitors`だけです。
 manual fusionは別latestへ観測記録するだけで、canonical outcome/feedback/policyを更新しません。
+同serviceは時間足別のdirection/TP・SL/maximization cacheも15分ごとに更新します。定時briefingは
+全履歴を読み直さず、この3cacheの契約・30分鮮度・同一生成時刻とdecision feedbackの30分鮮度を
+検証します。不一致時は再計算へfallbackせずneutralに停止するため、まず
+`logs/timeframe_learning_monitor.json`と`logs/launchd/monitors.err.log`を確認してください。
+monitorは生成時刻より未来のdecision/price、hash不一致、時刻順序・provenance不足を学習から除外し、
+入力digest・最大availability・3cache hashをmanifestへ残します。briefing側もmanifestと実ファイルの
+size/hashを照合します。判断時の価格読込は末尾128MiB上限で、履歴成長に対して無界ではありません。
 
 時間足別Discord通知とcanonical仮想口座候補はUSDJPY/EURUSDです。旧融合/GBDT artifactは
 手動研究と監査用に保持しますが、定期更新・canonical入力・自動方針変更には使いません。

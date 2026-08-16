@@ -156,6 +156,34 @@ def test_corrupt_jsonl_tail_is_critical_even_if_fresh(monitor, tmp_path):
     assert report["targets"][0]["reason"] == "jsonl_corrupt_tail"
 
 
+def test_corrupt_json_is_critical_even_if_fresh(monitor, tmp_path):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "learning_cache",
+                "path": "logs/cache.json",
+                "kind": "json",
+                "expected_interval_seconds": 900,
+                "warn_after_seconds": 1800,
+                "critical_after_seconds": 2700,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    cache_path = tmp_path / "logs" / "cache.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("{not-json", encoding="utf-8")
+    stamp = (NOW - timedelta(seconds=60)).timestamp()
+    os.utime(cache_path, (stamp, stamp))
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    assert report["overall"] == "critical"
+    assert report["targets"][0]["reason"] == "json_corrupt"
+
+
 def test_latest_capture_slot_requires_complete_symbol_timeframe_coverage(monitor, tmp_path):
     config = _write_coverage_config(tmp_path)
     slot = "2026-07-10T03:00:00+00:00"
