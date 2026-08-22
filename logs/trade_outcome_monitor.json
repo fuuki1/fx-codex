@@ -1,0 +1,290 @@
+{
+  "schema": 1,
+  "generated_at": "2026-07-15T06:48:54.499486+00:00",
+  "status": "warn",
+  "exit_code": 0,
+  "health": {
+    "status": "warn",
+    "exit_code": 0,
+    "checks": [
+      {
+        "name": "sample",
+        "status": "warn",
+        "message": "期待値監査対象がまだありません",
+        "details": {}
+      },
+      {
+        "name": "expectancy",
+        "status": "warn",
+        "message": "期待Rを計算できません",
+        "details": {}
+      },
+      {
+        "name": "path_quality",
+        "status": "warn",
+        "message": "経路品質の評価対象がありません",
+        "details": {
+          "evaluated": 0,
+          "scored": 0,
+          "low_quality": 0,
+          "avg_path_quality": null
+        }
+      },
+      {
+        "name": "blocked_cells",
+        "status": "ok",
+        "message": "期待値ガード対象セルはありません",
+        "details": {
+          "count": 0
+        }
+      }
+    ]
+  },
+  "summary": {
+    "schema": 1,
+    "overall": {
+      "evaluated": 0,
+      "tradable": 0,
+      "low_quality": 0,
+      "wins": 0,
+      "losses": 0,
+      "win_rate": null,
+      "expectancy_r": null,
+      "avg_win_r": null,
+      "avg_loss_r": null,
+      "profit_factor_r": null,
+      "avg_mfe_r": null,
+      "avg_mae_r": null,
+      "tp1_rate": null,
+      "tp2_rate": null,
+      "sl_rate": null,
+      "avg_path_quality": null,
+      "sample_ok": false,
+      "min_samples": 20
+    },
+    "by_symbol": {},
+    "by_direction": {},
+    "by_symbol_direction": {},
+    "by_target_policy": {},
+    "by_confidence": {},
+    "quality": {
+      "evaluated": 0,
+      "scored": 0,
+      "low_quality": 0,
+      "avg_path_quality": null,
+      "flags": {}
+    }
+  },
+  "registry": {
+    "active_count": 0,
+    "paper_ready_count": 0,
+    "approved_count": 0,
+    "rejected_count": 0,
+    "auto_paused_count": 0,
+    "resolved_count": 11,
+    "paper_ready": [],
+    "approved": [],
+    "rejected": [],
+    "auto_paused": []
+  },
+  "approved_policy_stats": [],
+  "recent_events": [
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-確信度-25-49-sample-guard",
+      "event_type": "detected",
+      "from_stage": "",
+      "to_stage": "watch",
+      "details": {
+        "action_type": "collect_samples",
+        "priority": "low"
+      }
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-通貨ペア-eurusd-sample-guard",
+      "event_type": "detected",
+      "from_stage": "",
+      "to_stage": "watch",
+      "details": {
+        "action_type": "collect_samples",
+        "priority": "low"
+      }
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-通貨ペア-方向-eurusd-short-sample-guard",
+      "event_type": "detected",
+      "from_stage": "",
+      "to_stage": "watch",
+      "details": {
+        "action_type": "collect_samples",
+        "priority": "low"
+      }
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-データ品質-path-quality-warn",
+      "event_type": "resolved",
+      "from_stage": "paper_ready",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-全体-overall-quality-block",
+      "event_type": "resolved",
+      "from_stage": "paper_ready",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-方向-long-quality-block",
+      "event_type": "resolved",
+      "from_stage": "paper_ready",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-方向-short-quality-block",
+      "event_type": "resolved",
+      "from_stage": "paper_ready",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-確信度-0-24-quality-block",
+      "event_type": "resolved",
+      "from_stage": "paper_ready",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-08T15:21:06.923520+00:00",
+      "candidate_id": "trade-improvement-確信度-25-49-quality-block",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-全体-overall-sample-guard",
+      "event_type": "resolved",
+      "from_stage": "watch",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-方向-short-sample-guard",
+      "event_type": "resolved",
+      "from_stage": "watch",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-確信度-25-49-sample-guard",
+      "event_type": "resolved",
+      "from_stage": "watch",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-通貨ペア-eurusd-sample-guard",
+      "event_type": "resolved",
+      "from_stage": "watch",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-通貨ペア-方向-eurusd-short-sample-guard",
+      "event_type": "resolved",
+      "from_stage": "watch",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-データ品質-path-quality-warn",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-全体-overall-quality-block",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-方向-long-quality-block",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-方向-short-quality-block",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-確信度-0-24-quality-block",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    },
+    {
+      "ts": "2026-07-15T06:48:54.499486+00:00",
+      "candidate_id": "trade-improvement-確信度-25-49-quality-block",
+      "event_type": "resolved",
+      "from_stage": "resolved",
+      "to_stage": "resolved"
+    }
+  ],
+  "alerts": [
+    {
+      "type": "health",
+      "severity": "warn",
+      "message_ja": "期待値監査対象がまだありません",
+      "check": "sample"
+    },
+    {
+      "type": "health",
+      "severity": "warn",
+      "message_ja": "期待Rを計算できません",
+      "check": "expectancy"
+    },
+    {
+      "type": "health",
+      "severity": "warn",
+      "message_ja": "経路品質の評価対象がありません",
+      "check": "path_quality"
+    }
+  ],
+  "runner": {
+    "schema": 1,
+    "journal_path": "/Users/takahashifuuki/Desktop/fx-codex/logs/briefing_journal.jsonl",
+    "registry_path": "/Users/takahashifuuki/Desktop/fx-codex/logs/trade_improvement_candidates.json",
+    "monitor_json_path": "/Users/takahashifuuki/Desktop/fx-codex/logs/trade_outcome_monitor.json",
+    "outcome_json_path": "/Users/takahashifuuki/Desktop/fx-codex/logs/trade_outcome_report.json",
+    "variant_json_path": "/Users/takahashifuuki/Desktop/fx-codex/logs/trade_variant_report.json",
+    "registry_updated": true,
+    "retest_variants": true,
+    "outcome_count": 0,
+    "finding_count": 0,
+    "expectancy_candidate_count": 0,
+    "variant_candidate_count": 0,
+    "auto_paused_policy_count": 0,
+    "require_sample_ok": false
+  },
+  "variant_retest": {
+    "enabled": true,
+    "baseline_evaluated": 0,
+    "variant_count": 8,
+    "candidate_count": 0,
+    "best": null,
+    "cell_count": 0
+  },
+  "auto_paused_policies": []
+}

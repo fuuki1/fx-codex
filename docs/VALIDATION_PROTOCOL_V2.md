@@ -19,7 +19,7 @@ train  →  tune  →  calibration  →  test  →  withheld_lockbox
 
 実装: `experiment_pipeline.py` が区画を manifest で固定（`TestManifestContract`）。**同一 validation set を early stopping/較正/Brier に使い回す経路は正式昇格に使用禁止**。
 
-> 【2026-07-29 訂正】この禁止例として挙げていた「旧 `ml.py` のように」は現行コードに当てはまらないため削除した。`fx_intel/ml.py` は上表と同じ5区画を時刻分離し、early stopping を tune、Platt 較正を calibration、最終 Brier/logloss/AUC を test で行っている（`ml.py::train_artifact`、各境界に `EMBARGO_HOURS = 72` の embargo）。`ml.py` を正式昇格に使わない理由は**単一経路の原則**であり、区画の使い回しではない。詳細は [AI_LEARNING_V2_DESIGN.md](AI_LEARNING_V2_DESIGN.md) §6。
+> 【2026-07-29 訂正】この禁止例として挙げていた「旧 `ml.py` のように」は現行コードに当てはまらないため削除した。`fx_intel/ml.py` は上表と同じ5区画を時刻分離し、early stopping を tune、Platt 較正を calibration、最終 Brier/logloss/AUC を test で行っている（`ml.py:872 / 875 / 902-904`、各境界に `EMBARGO_HOURS = 72` の embargo）。`ml.py` を正式昇格に使わない理由は**単一経路の原則**であり、区画の使い回しではない。詳細は [AI_LEARNING_V2_DESIGN.md](AI_LEARNING_V2_DESIGN.md) §6。
 
 ## 2. walk-forward と交差検証
 

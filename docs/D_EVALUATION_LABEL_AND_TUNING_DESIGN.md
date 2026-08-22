@@ -337,9 +337,12 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
 - direction thresholdのtune/test・片側LCB・DSR・auto-pause、ML return headの
   train/test・t検定・PBO/DSR、shadow dimension集計、promotion参考統計、
   dashboardのnet期待値/PF/累積曲線も同じeffective subsetを使う。threshold policyは
-  schema 2、GBDT artifactはschema 5としてraw/effective/overlap/cluster/market-day
-  来歴を保存し、旧schemaを暗黙に有効化しない。過学習検定が実行不能ならML収益ヘッドを
-  採用しない。
+  schema 2、GBDT artifactはschema 6としてraw/effective/overlap/cluster/market-day
+  来歴に加え、正準source/teacher dataset hash、label version/provenance、cost model、
+  join・legacy除外・未一致件数を保存する。ML教師はPIT journalの
+  `decision_id + label_version`とverified canonical outcome storeをjoinしてのみ生成し、
+  直接注入された`realized_net_r`は使わない。旧schemaを暗黙に有効化せず、hash不一致、
+  契約混在、重複、過学習検定不能ならML収益ヘッドを採用しない。
 - canonical outcome storeは `decision_id + label_version` を自然キーにし、
   `flock`、`fsync`、record hashで追記する。同値replayは追記せず、
   競合値、partial JSON、hash不一致、既存duplicateをhard errorにする。
@@ -360,6 +363,40 @@ D 完了は「モデルが学習できる」ではなく、次を満たした状
   条件を満たさなければ`realized_net_r`を生成しない。
   CLIは明示されたローカルJSONLだけを読み、broker接続や注文面を持たない。
 
-この状態はD1の会計・永続化実装済み、runtime配備前である。MLのdecision ID joinと
-consumer移行が完了するまで、
-正準net label coverageは不足または0としてfail-closedに扱う。
+2026-08-01に、仮想ポートフォリオの成熟済み`intraday_capacity`取引については
+full-cost契約`net-r-v3 / virtual_portfolio_simulated_fill`を追加した。entry/exitの
+bid/ask、実現spread、slippage、commission、financing、conversion、quoteの
+event/available/ingested/revision/source record、decision/open/close/observation hashを
+すべて必須とする。`tools/virtual_portfolio_canonical_outcomes.py`がSQLiteの不変closeを
+同じ追記専用canonical storeへ冪等接続し、`scripts/virtual_portfolio_once.sh`は各cycle後に
+対象行の100%接続を検証する。1件でも欠損・交差quote・時刻逆転・会計不一致があれば
+cycleはfail-closedで終了し、ダッシュボードも接続エラーを表示する。
+
+Dukascopy行は`delayed_historical_bid_ask_replay`および
+`historical_download_not_tradable`を保持するresearch-onlyラベルであり、broker約定や
+実時間executabilityを主張しない。既存のpromotion/decision return-headは引き続き
+executableな`net-r-v2 / paper_quote_model`だけを許可する。したがって、仮想口座の成熟行は
+100%接続を要求する一方、briefing decision側のruntime bid/ask pathが未配備なら、その
+スコープの正準net label coverageは不足または0のままfail-closedに扱う。
+
+Phase 2のpath依存フィールドは既存`net-r-v2/v3`の意味・自然キー・hashを変更せず、
+追記専用sidecarの現行版`canonical-label-evidence-v2`へ保存する。v1は不変legacy行として
+load可能なまま残す。自然キーは
+`decision_id + label_version + evidence_version`で、canonical outcome SHA-256と
+完全なcanonical close payload、不変close record SHA-256を必須とし、load時にclose
+payloadからhashを再計算してMAE/MFE・exit・net-R・path hashを結合する。同値replayはno-op、競合値・duplicate・
+partial JSON・record hash不一致・outcome binding不一致はhard errorとする。
+sidecarはentry/exit bid/ask、全cost R、`mae_r/mfe_r`、TP/SL到達秒、holding秒、
+path件数、順序付きsource ID hash、raw payload hash列のhash、label qualityを保持する。
+Dukascopyのpath集約hashと有限excursionだけが揃うlegacy行は
+`hash_bound_unrecomputed_path`とし、verified扱いにしない。新規closeはquote JSONLの
+prefix byte長とSHA-256を固定する。独立verifierがそのprefixだけを読み、参照された全content-addressed
+`.bi5` blobのhashを検証して再展開し、bid/ask側、first trigger、exit、MAE/MFE、順序付きpath hashを
+すべて再計算できた行だけ`raw_replayed_research_path`とする。
+途中pathを保存していないcontemporaneous quote行は値が注入されていても`incomplete`とする。readiness gateは
+canonical outcome storeとsidecar storeの双方をhash検証し、全行のbinding・coverage・
+qualityが揃うまでPhase 2完了を主張しない。raw blob欠損・prefix変更・再計算不一致・v1の
+unpinned pathはfail-closedであり、research-only/non-tradable制約を変更しない。
+現時点のverified quality集合は空である。readiness時のfresh raw replay、path全時間を覆う
+immutable hour manifest、open payloadと`open_record_sha256`の結合、availability preimage、
+同一pinned snapshotのhash+parseが実装されるまで`raw_replayed_research_path`も診断証拠に限る。

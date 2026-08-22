@@ -28,13 +28,17 @@ cat > ~/.config/fx-codex/collector.env <<'EOF'
 FX_OANDA_API_TOKEN=<read-only token>
 FX_OANDA_ACCOUNT_ID=<account id>
 FX_OANDA_ENV=practice
+FX_RAW_LEDGER_ENABLED=false
 EOF
 chmod 600 ~/.config/fx-codex/collector.env
 ```
 
-Only the three `FX_OANDA_*` keys are accepted. The daemon parses the file as
-data; it does not source or evaluate it as shell code. Token and account values
-are masked in dry-run output and must never be committed.
+Only the three `FX_OANDA_*` keys and `FX_RAW_LEDGER_ENABLED` are accepted. The
+daemon parses the file as data; it does not source or evaluate it as shell code.
+Token and account values are masked in dry-run output and must never be committed.
+Keep the raw-ledger flag `false` until a separate activation approval has verified
+Mac mini capacity and permissions, prospective all-symbol coverage, backup/restore,
+retention, and freshness-alert routing.
 
 Use `FX_OANDA_ENV=live` only when the account and token are explicitly approved
 for prospective non-demo data collection. Read-only pricing access does not
@@ -56,6 +60,14 @@ The command must fail when:
 - the approved virtual-environment Python is unavailable
 - the plist is malformed
 - the Python collector configuration is invalid
+
+The wrapper always launches the collector with
+`-I -S -B -X pycache_prefix=/dev/null`. This ignores `PYTHONHOME`, `PYTHONPATH`, user-site,
+`.pth`/`sitecustomize`, and repository or site-package bytecode caches. The collector adds only
+the reviewed repository root and `.venv` site-packages explicitly. Raw-ledger mode also verifies
+these runtime flags and the installed transport lock itself before a dry-run or collection begins.
+The OANDA HTTP session sets `trust_env=false`; proxy, CA-bundle, and netrc environment settings
+are not accepted by the pricing transport.
 
 A successful dry-run prints the rendered plist and a validation result without
 printing credential values.
@@ -209,7 +221,129 @@ secondary_up is true
 Renaming or copying a report to manufacture another day is rejected because the
 filename must equal `daily_report_<report_date>.json`.
 
-## 9. Known remaining operational blockers
+## 9. Raw Ledger backup and activation evidence
+
+The backup command uses SQLite's online backup API, copies only blobs referenced by that
+database snapshot, verifies every content hash, and writes `completion.json` last. Destinations
+are create-only. If a run fails before completion, retain the incomplete directory as incident
+evidence and use a new destination; never reuse or overwrite it.
+The destination entry is directory-fsynced before completion is published; the final target
+directory fsync is the completion commit point.
+
+The backup destination must be on an independently retained device or mount. A snapshot on the
+same filesystem is useful for testing but fails the activation gate.
+
+```bash
+SNAPSHOT="/Volumes/<reviewed-backup-volume>/fx-codex/raw-ledger/$(date -u +%Y%m%dT%H%M%SZ)"
+.venv/bin/python tools/raw_event_ledger_backup.py create \
+  --collection-root "$HOME/srv/fx-codex/collect" \
+  --destination "$SNAPSHOT"
+.venv/bin/python tools/raw_event_ledger_backup.py verify --backup "$SNAPSHOT"
+```
+
+After a separately approved, time-bounded shadow trial has produced prospective data for every
+required pair, run the comprehensive read-only gate. Every threshold is mandatory and must be
+replaced with a reviewed operational value; the example numbers are not approvals.
+
+```bash
+.venv/bin/python -I -S -B -X pycache_prefix=/dev/null \
+  tools/raw_ledger_activation_preflight.py \
+  --collection-root "$HOME/srv/fx-codex/collect" \
+  --env-file "$HOME/.config/fx-codex/collector.env" \
+  --expected-hostname '<approved-mac-mini-hostname>' \
+  --expected-oanda-environment live \
+  --required-symbol USD_JPY --required-symbol EUR_USD --required-symbol GBP_USD \
+  --stale-after-seconds 60 \
+  --max-duplicate-ratio 0.10 \
+  --max-quarantine-ratio 0.01 \
+  --max-raw-failure-ratio 0 \
+  --max-raw-queue-overflow-ratio 0 \
+  --max-annotation-failure-ratio 0 \
+  --max-annotation-queue-overflow-ratio 0 \
+  --max-raw-attempt-rate-per-second '<reviewed-provider-rate-ceiling>' \
+  --max-queue-backlog 0 \
+  --min-shadow-observation-seconds 86400 \
+  --min-raw-attempts '<reviewed-minimum-for-the-trial-window>' \
+  --min-live-events-per-symbol '<reviewed-minimum-for-each-required-pair>' \
+  --min-free-bytes 21474836480 \
+  --min-backup-free-bytes 21474836480 \
+  --retention-days 30 \
+  --backup-retention-snapshots 30 \
+  --max-daily-growth-bytes 1073741824 \
+  --backup-root "$SNAPSHOT" \
+  --max-backup-age-seconds 86400 \
+  --max-backup-lag-events 0 \
+  --max-backup-lag-annotations 0 \
+  --alert-evidence '<independently-captured-alert-evidence.json>' \
+  --max-alert-evidence-age-seconds 86400 \
+  --clock-evidence '<independently-captured-clock-evidence.json>' \
+  --max-clock-evidence-age-seconds 3600 \
+  --max-clock-offset-ms 100 \
+  --attestation '<independent-reviewer-attestation.json>' \
+  --attestation-signature '<independent-reviewer-attestation.sig>' \
+  --attestation-public-key '<approved-reviewer-public-key.pem>' \
+  --expected-attestation-public-key-sha256 '<pinned-lowercase-sha256>' \
+  --max-attestation-age-seconds 3600 \
+  --expected-deployed-sha '<reviewed-40-character-git-sha>' \
+  --output '<outside-repository-audit-root>/raw-ledger-preflight.json'
+```
+
+The alert evidence contract is `raw-ledger-alert-route-evidence-v1` and must bind the Mac mini
+hostname, aware `observed_at`, `route_configured=true`, `delivery_test_passed=true`, and
+`raw_ledger_health_routed=true`. The clock contract is
+`host-clock-synchronization-evidence-v1` and must bind hostname, aware `observed_at`,
+`synchronized=true`, and measured `offset_ms`. The preflight does not manufacture these claims,
+send a notification, change the flag, install/restart a service, or delete retained data.
+
+The final attestation contract is `raw-ledger-activation-attestation-v1`. It must be created and
+signed by the independent reviewer after the alert, clock, backup, trial metrics, capacity policy,
+and deployed release have been inspected. The approved public-key SHA-256 is pinned separately;
+supplying a new key beside a new signature is not approval. The signed JSON must contain:
+
+- `hostname` and aware `observed_at`;
+- `bindings` equal to the preflight's canonical policy hash, collection-root hash, collector-env
+  hash, backup-manifest hash, alert/clock hashes, canonical required-symbol list, and deployed SHA;
+- `metrics` as the checkpoint frozen by the signed attestation: its reviewed source-file SHA-256,
+  run/observation times, full raw/annotation/aggregate counter snapshot, raw
+  attempted/failed/overflow counters,
+  per-symbol trial-window counts and event-ID digest, writer PID, process command/executable hashes,
+  process start, lock inode, loaded critical-code digest, interpreter hash, installed transport
+  environment digest, and reviewed environment-lock hash. The current live metrics may advance
+  monotonically after signing, but only under the reviewed raw-attempt rate ceiling and on the same
+  run/process/code/environment identity;
+- boolean `controls` for independent retention, physical-device separation, single writer,
+  deployed-SHA verification, clean worktree, reviewed risk configuration, reviewed daily-growth
+  cap, reviewed backup capacity, reviewed Python executable, reviewed collector-environment lock,
+  and the full-snapshot capacity model;
+  and
+- `capacity` with positive observed daily growth, the matching reviewed daily cap and retention
+  days, `backup_strategy=full_create_only`, retained snapshot count, collection bytes at review,
+  and the matching full-snapshot-series projection.
+
+The local `st_dev` comparison is only a necessary first check: separate APFS volumes on one
+physical disk are not independent retention. The signed `backup_physical_device_separate` and
+`backup_independently_retained` controls are therefore also mandatory. Alert, clock, reviewed
+metrics checkpoint, and backup evidence that are not bound by the reviewer attestation cannot
+produce `ready`. Evidence JSON is parsed and hashed from the same stable open file,
+and signature verification uses those exact bytes, preventing path-replacement races.
+The deployed repository must match `--expected-deployed-sha` and have a clean worktree. A live
+metrics writer PID must exist. Its absolute collector script/env/output-root arguments, start time,
+approved Python executable hash, critical-code digest, and actual flock ownership are verified;
+the `requests` transport closure (`requests`, urllib3, certifi, charset-normalizer, and idna) must
+exactly match `ops/raw_ledger_collector_environment.lock.json`; and the reviewer must also
+independently attest single-writer topology. The collector process and preflight must both use the
+isolated/no-site/no-bytecode-cache flags above. Dependency upgrades require a newly reviewed lock.
+
+Retention is enforced as a capacity projection:
+`min_free_bytes + retention_days * max_daily_growth_bytes`. No automatic raw deletion is
+implemented. Backups are full create-only snapshots, not incremental. For `n` retained future
+snapshots, current collection bytes `C`, and daily growth cap `g`, backup projection is
+`n*C + g*n*(n+1)/2`; `min_backup_free_bytes` is added on the backup volume. The attested observed
+growth must be positive and no greater than the reviewed cap. A `ready`
+report therefore proves the supplied capacity policy at one observation time; it does not replace
+periodic monitoring or off-host retention controls.
+
+## 10. Known remaining operational blockers
 
 Before the 30-day clock can legitimately start:
 

@@ -1,6 +1,6 @@
 # AI 学習ロジック V2 設計
 
-**ステータス:** 構造実装済み（authoritative pipeline に結線、708テスト緑）／実データOOS未実証（判定2）。
+**ステータス:** 構造実装済み（authoritative pipeline に結線）／実データOOS未実証（判定2）。
 **一次コード:** `fx_backtester/{labeling,experiment_pipeline,calibration,drift}.py`。**このドキュメントとコードが食い違う場合はコードが正。**
 
 ## 1. 目的関数の再定義
@@ -65,14 +65,29 @@ action = argmax(E[net R | long], E[net R | short], 0.0)   # 0.0 = no-trade
 | ma_crossover / rsi_reversion | baseline | ✅ |
 | logistic_ridge / ridge_regression | complex | ✅ |
 | **GBDT** | complex | ✅ **登録済み**（`MODEL_FAMILY_KIND["gbdt"]="complex"`、`experiment_pipeline.py:693`。標準ライブラリのみの gradient boosting 実装。Newton step で学習）。**実データ run で `gbdt-small` が選択されたことを実証**（[evidence](../reports/evidence/histdata-usdjpy-real-2024-1h-20260713/README.md)） |
+| **regime_mixture_gbdt** | complex | ✅ 全期間GBDT＋低・中・高ボラGBDT expert。学習区間内の分位点だけで gate をfitし、各expertをサンプル数に応じて全期間モデルへ縮約。tune区画でbaseline優越を満たすまで不採用 |
+| **dual_net_r_gbdt** | complex | ✅ 方向確率に加え、long/shortそれぞれのコスト控除後net Rを独立回帰。`1-P(long)`をshort収益と誤認せず、`max(E[long net R], E[short net R], floor)`でaction/no-tradeを決定 |
 
 **複雑モデルは tune 区画で best baseline を厳密に上回る場合のみ admissible**（`test_evaluation_gates.py`）。的中率ではなく**コスト控除後期待R**が主指標。
+
+見送り過多を避けたいexperimentでは、primary metricに
+`net_opportunity_expectancy_r = coverage × net_expectancy_r` を使う。この指標は
+abstainを0Rとして全予測機会で平均するため、少数の良い取引だけを残して見かけの
+1取引平均を上げる候補より、正の期待値を広い範囲で供給する候補を優先する。
+ただし個別判断の期待net Rが非正の場合は引き続きabstainし、取引数だけを増やすことはしない。
+
+`experiment_pipeline_v2` では、方向モデルの閾値をtune時と同じraw score空間で適用し、
+表示・Brier評価にはcalibration後の確率を使う。v1のようにraw score用の閾値をcalibrated
+確率へそのまま適用すると、較正後の基準率シフトだけで全件short等になるためである。
+既存v1 evidenceのlockbox replayはv1挙動を維持する。標準テンプレートは
+`0.55 / 0.45`、dual net-R floorは`0.0R`とし、全機会期待Rによるcoverage評価と
+組み合わせて、完全常時参加ではなく中強気を狙う。
 
 > 【2026-07-13 訂正】初版で「GBDTは pipeline 未登録」と記したのは誤り。定数名を `_FAMILY_KIND` と誤認したもので、正しくは `MODEL_FAMILY_KIND` に登録済み。実データ run で GBDT が選択候補として動作することを確認済み。
 >
 > 【2026-07-29 訂正】上記訂正の末尾にあった「`fx_intel/gbm.py`（committee側）とは別に pipeline 独自の GBDT 実装が存在する」は誤り。**GBDT 実装は1つだけ**で、pipeline は committee と同一のクラスを import している（`experiment_pipeline.py:79` の `from fx_intel.gbm import GradientBoostingClassifier`）。`_GbdtModel`（同 670行）は `_TrainedModel` インターフェースへ合わせるための薄いラッパで、学習アルゴリズムを再実装していない。したがって「2実装が乖離する」二重管理リスクは存在せず、`gbm.py` の変更は pipeline 側へ直接波及する（変更時は `test_gbm.py` と `test_experiment_pipeline.py` の両方を回すこと）。
 
-## 5. 階層型学習（設計、pipeline 実装は残作業）
+## 5. 階層型学習
 
 データ不足時に `symbol×timeframe×direction×regime` ごとの完全別モデルを**作らない**。優先:
 
@@ -80,7 +95,44 @@ action = argmax(E[net R | long], E[net R | short], 0.0)   # 0.0 = no-trade
 global model + pair adjustment + timeframe adjustment + regime adjustment
 ```
 
-各補正は十分サンプルがある場合のみ有効化。**現状 pipeline は単一 global。** 階層縮退の結線は P2-2 として登記。
+### 実装済み: volatility regime 階層
+
+`regime_mixture_gbdt` は以下を同じ train 区画だけで学習する。
+
+1. 全行の global GBDT
+2. `regime_feature`（標準は `vol_24`）の train 内 1/3・2/3 分位点
+3. 低・中・高ボラの GBDT expert
+
+expert の確率をそのまま採用せず、`n / (n + shrinkage_samples)` で global 確率へ縮約する。二値クラスと `min_expert_samples` を満たさないセルは global にfallbackし、expertが1つも成立しなければ候補全体を `insufficient_sample` で不成立にする。gate、expert、縮約係数に test・calibration・lockbox は一切使わない。
+
+### 実装済み: long / short 独立 net-R head
+
+`dual_net_r_gbdt` は同じ特徴量から3つのheadをtrain区画だけで学習する。
+
+1. 方向確率の分類head（Brier・log loss・較正の診断用）
+2. longのコスト控除後 `net_r` 回帰head
+3. shortのコスト控除後 `net_r` 回帰head
+
+actionは方向確率の0.5上下ではなく、2つの期待net Rを比較して決める。両方が
+`min_expected_net_r` 以下なら必ずabstainする。これにより、2R target / 1R stopのように
+long成功率の基準率が0.5でないラベルを「低いlong確率＝short優位」と誤解する経路を避ける。
+方向確率のcalibrationは説明値を改善するが、net-R actionを上書きしない。
+
+### 未実装: pair / timeframe 間の部分プーリング
+
+現在の formal experiment は1 symbol・1 timeframe単位なので、実装済みなのは
+
+```
+global model + volatility regime adjustment
+```
+
+まで。pair・timeframe間で学習を共有する
+
+```
+global model + pair adjustment + timeframe adjustment + regime adjustment
+```
+
+は残作業。これを実装するには複数系列を同一manifest・同一PIT契約で扱うdataset schemaが先に必要。
 
 ## 6. `fx_intel/ml.py` の扱い
 
@@ -88,11 +140,11 @@ global model + pair adjustment + timeframe adjustment + regime adjustment
 
 > 【2026-07-29 訂正】この禁止の**理由**として初版が挙げた「同一 validation set を early stopping・較正・最終Brier に使い回す」は、現行コードでは解消済みであり根拠として無効。`ml.py` は train/tune/calibration/test/lockbox の5区間を時刻分離し、3者を別区間で行っている:
 >
-> - early stopping → **tune**（`ml.py::train_artifact` の `model.fit(x_train, y_train, x_tune, y_tune)`）
-> - Platt 較正 → **calibration**（同 `platt_calibrate(calibration_margins, y_calibration)`）
-> - 最終 Brier/logloss/AUC → **test**（同 `artifact.val_brier` / `val_logloss` / `test_auc` への代入）
+> - early stopping → **tune**（`model.fit(x_train, y_train, x_tune, y_tune)`, `ml.py:872`）
+> - Platt 較正 → **calibration**（`platt_calibrate(calibration_margins, y_calibration)`, 同875行）
+> - 最終 Brier/logloss/AUC → **test**（同902-904行）
 >
-> 加えて各境界で 72時間の embargo を引き（`EMBARGO_HOURS`、`ml.py::_temporal_partitions`）、基準率も train 有病率ではなく calibration 窓で当てた切片モデルを使う（同 `baseline = [calibration_base_rate] * len(y_test)`）。
+> 加えて各境界で 72時間の embargo を引き（`EMBARGO_HOURS`、`_temporal_partitions`）、基準率も train 有病率ではなく calibration 窓で当てた切片モデルを使う（同883行）。
 >
 > **禁止という結論自体は維持する**が、その根拠は「validation 再利用」ではなく**単一経路の原則**（正式 artifact の生成元を `experiment_pipeline.py` 1つに限定し、昇格判定の来歴を一本化する）である。`ml.py` は committee 用の shadow 診断器として位置づける。
 
@@ -110,3 +162,32 @@ global model + pair adjustment + timeframe adjustment + regime adjustment
 | **実データで再現可能なOOS証拠** | ❌ **未**（COT PIT は特徴量ソースの実証であり価格ラベル学習ではない） |
 
 → **構造 70相当 / 実証 50未満**。実価格OHLC接続＋pipeline 実データ完走が最大のボトルネック。
+
+## 8. 中強気ポリシーの通知runtime接続
+
+`ops/moderate_aggressive_shadow_policy.json` を、通常の融合判断・時間足別判断・
+シグナルボードが読む。これは research pipeline の `0.55 / 0.45` 確率閾値を
+runtime複合スコアへ流用したものではない。尺度が異なるため、runtime専用の
+counterfactual policy として `abs(runtime_composite) >= 0.12` を記録する。
+
+- producer: `moderate_aggressive_policy`
+- stage: `shadow`
+- activation mode: `counterfactual_only`
+- primary metric: `net_opportunity_expectancy_r`
+- 目標coverage: 70%〜85%（prospective shadowで検証する目標であり実績値ではない）
+- 本番方向閾値: 従来どおり `0.15` 以上。候補policyは本番方向・確信度・SL/TPを変更しない
+- hard veto: 休場、運用データstale、重要イベント窓、テクニカル欠損、低品質、
+  期待値ガード、ATR欠損
+
+判断時点にはpolicy IDとcanonical JSONのSHA-256、候補閾値、本番閾値、veto理由を
+`shadow_predictions[]` に凍結する。Discordでは「中強気shadow（本番不使用）」と
+明記し、価格チャートでは本番の塗りマーカー、raw分析の枠マーカーと分けて
+点付きマーカーで表示する。canonical bid/ask経路で将来の純Rへ成熟させる。
+壊れた・active化された・来歴不足のpolicyはロードせず、
+`--no-moderate-aggressive-shadow` で即時停止できる。
+
+2024 USDJPY 1h close-only再利用testでは、候補coverage 74.70%に対して
+`net_expectancy_r=-0.143584R`、`net_opportunity_expectancy_r=-0.107257R` だった。
+このデータは正式昇格に必要なcanonical bid/ask cost契約も満たさない。したがって
+設定には `promotion_eligible=false` と、負の再利用test・cost coverage欠損・
+lockbox未開封・runtime尺度未検証をblockerとして固定している。

@@ -1,0 +1,513 @@
+{
+  "code_hash": "7f2a633c3668de13ded7b72607712bce09028e96ce4dbeae4b4ada28a8414da2",
+  "config_hash": "79c9aca1c3ddd48ce8c94b76734b7b1e55ff9e4aed8046c0eda0e9e7c2bcecf1",
+  "contract": "pnl-contract-audit-v1",
+  "dimension_coverage": {
+    "cost_model_id": {
+      "virtual-replay-cost-policy": 48
+    },
+    "cost_status": {
+      "complete_simulated_full_cost_research_only": 48
+    },
+    "costs_complete": {
+      "True": 48
+    },
+    "direction": {
+      "long": 21,
+      "short": 27
+    },
+    "entry_quote_source": {
+      "dukascopy_historical_datafeed": 48
+    },
+    "execution_observation_mode": {
+      "delayed_historical_bid_ask_replay": 48
+    },
+    "exit_quote_source": {
+      "dukascopy_historical_datafeed": 48
+    },
+    "first_touch": {
+      "stop_loss": 23,
+      "target1": 14,
+      "time_exit": 11
+    },
+    "label_provenance": {
+      "virtual_portfolio_simulated_fill": 48
+    },
+    "label_version": {
+      "net-r-v3": 48
+    },
+    "net_label_eligible": {
+      "True": 48
+    },
+    "observation_type": {
+      "simulated": 48
+    },
+    "promotion_eligible": {
+      "False": 48
+    },
+    "research_only": {
+      "True": 48
+    },
+    "session": {
+      "<absent>": 48
+    },
+    "symbol": {
+      "EURUSD": 31,
+      "USDJPY": 17
+    },
+    "timeframe": {
+      "15m": 25,
+      "1h": 23
+    }
+  },
+  "field_summary": {
+    "additional_cost_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 0.04574756,
+        "mean": 0.04359261,
+        "median": 0.0452183,
+        "min": 0.04000816,
+        "negative": 0,
+        "p10": 0.0401533,
+        "p90": 0.04568744,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "commission_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 59.0,
+        "mean": 54.85416667,
+        "median": 57.5,
+        "min": 48.0,
+        "negative": 0,
+        "p10": 48.7,
+        "p90": 59.0,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "commission_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 0.01019758,
+        "mean": 0.01010222,
+        "median": 0.01010274,
+        "min": 0.01000204,
+        "negative": 0,
+        "p10": 0.01002306,
+        "p90": 0.01018288,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "conversion_cost_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 30.0,
+        "mean": 18.0625,
+        "median": 25.0,
+        "min": 0.0,
+        "negative": 0,
+        "p10": 0.0,
+        "p90": 30.0,
+        "positive": 31,
+        "zero": 17
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "conversion_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 0.00519859,
+        "mean": 0.00329206,
+        "median": 0.00502426,
+        "min": 0.0,
+        "negative": 0,
+        "p10": 0.0,
+        "p90": 0.00517805,
+        "positive": 31,
+        "zero": 17
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "entry_spread_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 1.37250882,
+        "mean": 0.22587524,
+        "median": 0.10191228,
+        "min": 0.00537588,
+        "negative": 0,
+        "p10": 0.02908689,
+        "p90": 0.69154645,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "executable_pnl_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 219831.0,
+        "mean": 2994.54166667,
+        "median": -3323.0,
+        "min": -6471.0,
+        "negative": 31,
+        "p10": -6050.6,
+        "p90": 6485.8,
+        "positive": 17,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "execution_cost_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 1.35263047,
+        "mean": 0.25768442,
+        "median": 0.15152568,
+        "min": 0.04865095,
+        "negative": 0,
+        "p10": 0.07389703,
+        "p90": 0.55453168,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "financing_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 59.0,
+        "mean": 54.85416667,
+        "median": 57.5,
+        "min": 48.0,
+        "negative": 0,
+        "p10": 48.7,
+        "p90": 59.0,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "financing_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 0.01019758,
+        "mean": 0.01010222,
+        "median": 0.01010274,
+        "min": 0.01000204,
+        "negative": 0,
+        "p10": 0.01002306,
+        "p90": 0.01018288,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "gross_market_pnl_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 222723.0,
+        "mean": 4090.85416667,
+        "median": -757.5,
+        "min": -5885.0,
+        "negative": 28,
+        "p10": -5598.7,
+        "p90": 6868.1,
+        "positive": 20,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "gross_realized_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 47.05746884,
+        "mean": 0.87692101,
+        "median": -0.13736842,
+        "min": -1.01430541,
+        "negative": 28,
+        "p10": -0.96403172,
+        "p90": 1.18842395,
+        "positive": 20,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "net_pnl_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 219640.0,
+        "mean": 2757.64583333,
+        "median": -3535.0,
+        "min": -6736.0,
+        "negative": 31,
+        "p10": -6291.8,
+        "p90": 6224.8,
+        "positive": 17,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "planned_payoff_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 74.32746536,
+        "mean": 4.22667494,
+        "median": 0.93446605,
+        "min": 0.07198046,
+        "negative": 0,
+        "p10": 0.24890246,
+        "p90": 4.03100042,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "planned_risk_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 5847.0,
+        "mean": 5430.45833333,
+        "median": 5700.0,
+        "min": 4707.0,
+        "negative": 0,
+        "p10": 4805.1,
+        "p90": 5819.3,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "quote_realized_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 46.44643989,
+        "mean": 0.6628292,
+        "median": -0.62316901,
+        "min": -1.30010152,
+        "negative": 31,
+        "p10": -1.08218413,
+        "p90": 1.12222465,
+        "positive": 17,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "realized_net_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 46.40608494,
+        "mean": 0.61923659,
+        "median": -0.66323645,
+        "min": -1.34558376,
+        "negative": 31,
+        "p10": -1.12769535,
+        "p90": 1.0770602,
+        "positive": 17,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "realized_spread_cost_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 1.31227551,
+        "mean": 0.21409181,
+        "median": 0.10599071,
+        "min": 0.00807308,
+        "negative": 0,
+        "p10": 0.03118205,
+        "p90": 0.51433649,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "slippage_cost_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 117.0,
+        "mean": 109.125,
+        "median": 114.5,
+        "min": 95.0,
+        "negative": 0,
+        "p10": 96.7,
+        "p90": 117.0,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "slippage_r": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 0.02019786,
+        "mean": 0.02009612,
+        "median": 0.02009702,
+        "min": 0.02000348,
+        "negative": 0,
+        "p10": 0.02001708,
+        "p90": 0.02016698,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "spread_quote_cost_jpy": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 6211.0,
+        "mean": 1096.3125,
+        "median": 555.5,
+        "min": 38.0,
+        "negative": 0,
+        "p10": 180.7,
+        "p90": 2748.5,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    },
+    "units": {
+      "coverage_rate": 1.0,
+      "distribution": {
+        "count": 48,
+        "max": 1242134.0,
+        "mean": 148125.16666667,
+        "median": 87898.5,
+        "min": 20189.0,
+        "negative": 0,
+        "p10": 40292.9,
+        "p90": 174094.1,
+        "positive": 48,
+        "zero": 0
+      },
+      "finite": 48,
+      "non_finite_or_non_numeric": 0,
+      "non_null": 48,
+      "total_records": 48
+    }
+  },
+  "identity_audit": {
+    "contract_clean": 48,
+    "contract_flagged": 0,
+    "flag_counts": {},
+    "records_with_label_version": 48,
+    "records_without_label_version": 0
+  },
+  "known_label_versions": {
+    "net_r_v2": "net-r-v2",
+    "net_r_v3_full_cost": "net-r-v3",
+    "promotion_eligible": [
+      "net-r-v2"
+    ]
+  },
+  "label_version_counts": {
+    "net-r-v3": 48
+  },
+  "read_only": true,
+  "sources": [
+    {
+      "bytes": 197914,
+      "malformed_lines": 0,
+      "parsed_objects": 48,
+      "path": "logs/canonical_outcomes.jsonl",
+      "record_path": "outcome",
+      "record_path_missing": 0,
+      "sha256": "abe42dc6f6177c7fce9fb60079a6b09c0e2a2d83c3abceb4f85e592b17111a1c",
+      "total_lines": 48
+    }
+  ]
+}

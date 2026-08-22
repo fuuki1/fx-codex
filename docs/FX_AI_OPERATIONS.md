@@ -89,8 +89,12 @@ cd /Users/fuuki/srv/fx-codex
 「実績 + expectancy_guard単独見送り行のシャドー計画(反実仮想)」で毎時更新する。
 
 - 反実仮想は判断時に凍結記録された値のみから合成する(`journal.counterfactual_guard_entries`):
-  ゲート前の `analysis_direction` / `analysis_conviction` と、`shadow_predictions` の
-  `fusion_raw` に記録済みのSL/TP。事後の再計算はしない(PIT安全)。記録が欠けた行は除外(fail-closed)。
+  producerがガード直前に凍結した `pre_guard_direction` / `pre_guard_conviction` /
+  `pre_guard_stop` / `pre_guard_target1` / `pre_guard_target2` / `pre_guard_target_policy` /
+  `pre_guard_execution_snapshot` / `pre_guard_cost_model_id`。raw scoreや別producerの
+  shadow predictionからは復元しない。事後の再計算はしない(PIT安全)。PIT非適格、明示
+  mode/producerが現行契約と不一致、または凍結SL/TP・target policy・execution snapshotが
+  欠けた行は除外(fail-closed)。
 - `event_window` / `low_data_quality` 等が併発した行は含めない。ガードが無くても
   見送っていた行であり、根拠に混ぜると反実仮想が汚染されるため。
 - 推奨(`direction`)はガード判定に従いneutralのまま。反実仮想がcanonical bid/ask
