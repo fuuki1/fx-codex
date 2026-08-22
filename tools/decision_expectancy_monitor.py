@@ -45,7 +45,6 @@ def run_decision_expectancy_monitor(
     """Run the full complete-decision expectancy monitoring pass."""
 
     generated_at = _utc(now or datetime.now(UTC))
-    events = list(decision_log.read_decision_events(decision_log_path))
     price_rows = list(journal.read_entries(prices_path)) if prices_path is not None else []
     price_health = _price_file_health(
         prices_path,
@@ -53,8 +52,8 @@ def run_decision_expectancy_monitor(
         now=generated_at,
         stale_minutes=price_stale_minutes,
     )
-    outcome_report = decision_log.score_decision_events(
-        events,
+    outcome_report = decision_log.score_persisted_decision_log(
+        decision_log_path,
         price_entries=price_rows,
         now=generated_at,
     )
@@ -73,7 +72,7 @@ def run_decision_expectancy_monitor(
         "outcome_json_path": str(outcome_json_path) if outcome_json_path else None,
         "feedback_json_path": str(feedback_json_path) if feedback_json_path else None,
         "monitor_json_path": str(monitor_json_path),
-        "decision_event_count": len(events),
+        "decision_event_count": decision_log.scored_input_event_count(outcome_report),
         "price_row_count": len(price_rows),
         "require_sample_ok": require_sample_ok,
         "price_stale_minutes": price_stale_minutes,

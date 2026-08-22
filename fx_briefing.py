@@ -1090,11 +1090,9 @@ def _run_per_timeframe(
             print(f"時間足別ジャーナル書き込み失敗: {error}", file=sys.stderr)
             return JOURNAL_WRITE_FAILURE_EXIT_CODE
         try:
-            prior_decision_events = list(
-                decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-            )
-            decision_outcome_report = decision_log.score_decision_events(
-                [*prior_decision_events, *decision_events],
+            decision_outcome_report = decision_log.score_persisted_decision_log(
+                DEFAULT_DECISION_LOG_PATH,
+                decision_events,
                 price_entries=[*price_rows, *current_snapshot],
                 now=prediction_time,
                 require_pit=True,
@@ -1969,11 +1967,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"判断ジャーナル書き込み失敗: {error}", file=sys.stderr)
                 return JOURNAL_WRITE_FAILURE_EXIT_CODE
             try:
-                prior_decision_events = list(
-                    decision_log.read_decision_events(DEFAULT_DECISION_LOG_PATH)
-                )
-                decision_outcome_report = decision_log.score_decision_events(
-                    [*prior_decision_events, *decision_events],
+                decision_outcome_report = decision_log.score_persisted_decision_log(
+                    DEFAULT_DECISION_LOG_PATH,
+                    decision_events,
                     now=prediction_time,
                     require_pit=True,
                 )

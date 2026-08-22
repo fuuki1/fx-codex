@@ -13,6 +13,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, UTC
 import fcntl
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -867,6 +868,57 @@ def score_decision_events(
             "learning_observations": learning_observations,
         }
     )
+
+
+def score_persisted_decision_log(
+    path: str | Path,
+    new_events: Sequence[Mapping[str, object]] = (),
+    *,
+    price_entries: Iterable[Mapping[str, object]] = (),
+    now: datetime | None = None,
+    require_pit: bool = False,
+) -> dict[str, object]:
+    """Score the persisted audit log followed by ``new_events``, streaming the file.
+
+    ``read_decision_events`` is a generator because a production audit log
+    exceeds one gigabyte; ``score_decision_events`` consumes its input in a
+    single pass and retains only compact projections. Both properties are
+    defeated the moment a caller materializes the reader — ``list(...)`` holds
+    every decoded event, and splatting it into a new list copies the whole
+    corpus a second time. That is the documented root cause of the 2026-07-27
+    cadence incident: per-cycle runtime grew with history until it exceeded the
+    five-minute interval and launchd coalesced the following runs, so decisions
+    (and therefore learning samples) were lost.
+
+    Neither ``read_decision_events`` nor ``score_decision_events`` can observe
+    that mistake from the inside, so the lazy hand-off is owned here rather than
+    repeated at each call site. Scoring order and content are unchanged: the
+    persisted events still precede ``new_events``.
+    """
+
+    return score_decision_events(
+        itertools.chain(read_decision_events(path), new_events),
+        price_entries=price_entries,
+        now=now,
+        require_pit=require_pit,
+    )
+
+
+def scored_input_event_count(report: Mapping[str, object]) -> int:
+    """Total events fed to the scorer, recovered from the counters it reports.
+
+    Callers used to keep their own materialized list purely to report its
+    length. The scorer already counts every event it consumes and splits the
+    total across the two PIT counters, so the number is available without
+    holding the corpus.
+    """
+
+    total = 0
+    for key in ("pit_eligible_decision_events", "pit_ineligible_decision_events"):
+        value = report.get(key)
+        if isinstance(value, int):
+            total += value
+    return total
 
 
 def _shadow_inventory_view(event: Mapping[str, object]) -> dict[str, object] | None:
