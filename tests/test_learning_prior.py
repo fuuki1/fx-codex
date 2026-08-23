@@ -518,7 +518,8 @@ def test_audit_emits_a_proposal_only_for_features_history_cannot_measure(tmp_pat
     assert learning_prior.prior_from_mapping(proposed) is not None
 
 
-def test_audit_is_quiet_without_journals(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+def test_audit_explains_a_missing_journal(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """runtime dataが無いチェックアウトでは、0件の理由を明示する。"""
     code = learning_prior_audit.main(
         [
             "--fusion-journal",
@@ -530,7 +531,51 @@ def test_audit_is_quiet_without_journals(tmp_path: Path, capsys: pytest.CaptureF
         ]
     )
     assert code == 0
-    assert "ジャーナルが見つからない" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "が存在しない" in output
+    assert "実機で実行する必要があります" in output
+
+
+def test_audit_explains_an_empty_and_an_immature_journal(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert "が空" in str(
+        learning_prior_audit.explain_empty(
+            learning_prior_audit._journal_diagnostics(empty, pit_only=True), 0
+        )
+    )
+
+    # 直近1日ぶんだけ書くと、24hホライズンの将来価格がまだ無いので未成熟になる
+    immature = tmp_path / "immature.jsonl"
+    _fusion_journal(immature, count=10)
+    note = learning_prior_audit.explain_empty(
+        learning_prior_audit._journal_diagnostics(immature, pit_only=True), 0
+    )
+    assert note is not None and "成熟した判断が0件" in note
+
+    # 採点できているときは何も言わない
+    assert (
+        learning_prior_audit.explain_empty(
+            learning_prior_audit._journal_diagnostics(immature, pit_only=True), 5
+        )
+        is None
+    )
+
+
+def test_audit_reports_pit_ineligible_rows(tmp_path: Path) -> None:
+    """行はあるがPIT契約を満たさない場合を、未成熟と区別して報告する。"""
+    path = tmp_path / "ineligible.jsonl"
+    _fusion_journal(path, count=200)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for row in rows:
+        row["producer"] = "someone-else"
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8"
+    )
+    note = learning_prior_audit.explain_empty(
+        learning_prior_audit._journal_diagnostics(path, pit_only=True), 0
+    )
+    assert note is not None and "PIT不適格" in note
 
 
 def test_overlap_factor_matches_the_label_horizon() -> None:

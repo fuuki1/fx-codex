@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fx_intel import journal, learning, learning_prior, tf_learning  # noqa: E402
+from fx_intel.learning_prior import TIMEFRAME_KEY_PREFIX  # noqa: E402
 from fx_intel.learning import (  # noqa: E402
     DERIVE_THIN_GAP_HOURS,
     MIN_CONDITION_SAMPLES,
@@ -213,11 +214,62 @@ def audit_slice(
     }
 
 
+def _journal_diagnostics(path: Path, pit_only: bool) -> dict[str, object]:
+    """ジャーナル1本の素性。採点0件の原因を「無い/不適格/未成熟」へ切り分ける。"""
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    entries = list(journal.read_entries(path))
+    eligible = [entry for entry in entries if journal.is_pit_eligible_entry(entry)]
+    stamps = sorted(str(entry.get("ts") or "") for entry in entries if entry.get("ts"))
+    directional = sum(1 for entry in entries if entry.get("direction") in ("long", "short"))
+    return {
+        "path": str(path),
+        "exists": True,
+        "rows": len(entries),
+        "directional_rows": directional,
+        "pit_eligible_rows": len(eligible) if pit_only else None,
+        "first_ts": stamps[0] if stamps else None,
+        "last_ts": stamps[-1] if stamps else None,
+    }
+
+
+def explain_empty(diagnostics: Mapping[str, object], scored: int) -> str | None:
+    """採点0件のときだけ、次に何をすればよいかを1行で返す。"""
+    if scored > 0:
+        return None
+    if not diagnostics.get("exists"):
+        return f"{diagnostics['path']} が存在しない(このチェックアウトに runtime data が無い)"
+    rows = int(diagnostics.get("rows") or 0)
+    if rows == 0:
+        return f"{diagnostics['path']} が空"
+    if not diagnostics.get("directional_rows"):
+        return f"{diagnostics['path']} に方向判断の行が無い(価格行のみ)"
+    eligible = diagnostics.get("pit_eligible_rows")
+    if eligible is not None and int(eligible) == 0:
+        return (
+            f"{diagnostics['path']} の{rows}行はすべてPIT不適格"
+            "(producer/decision_id/source_record_ids/時刻順序のいずれかが契約を満たさない)"
+        )
+    return (
+        f"{diagnostics['path']} に{rows}行あるが、成熟した判断が0件"
+        "(ホライズン先の価格がまだジャーナルに無い)"
+    )
+
+
 def collect_slices(
     fusion_journal: Path, tf_journal: Path, tf_prices: Path
-) -> list[tuple[str, list[learning.EvaluatedCall], float, str]]:
-    """スライスごとの採点済み判断を、本番と同じ経路で組み立てる。"""
+) -> tuple[list[tuple[str, list[learning.EvaluatedCall], float, str]], dict[str, object]]:
+    """スライスごとの採点済み判断を、本番と同じ経路で組み立てる。
+
+    返り値の2つ目は診断。採点0件のときに「ファイルが無い」「PIT不適格」
+    「未成熟」のどれなのかを呼び出し側が説明できるようにする。
+    """
     out: list[tuple[str, list[learning.EvaluatedCall], float, str]] = []
+    diagnostics: dict[str, object] = {
+        "fusion_journal": _journal_diagnostics(fusion_journal, pit_only=True),
+        "tf_journal": _journal_diagnostics(tf_journal, pit_only=True),
+        "tf_prices": _journal_diagnostics(tf_prices, pit_only=False),
+    }
     if fusion_journal.exists():
         entries = list(journal.read_entries(fusion_journal))
         calls = learning.evaluate_history(
@@ -232,8 +284,10 @@ def collect_slices(
         ]
         if tf_prices.exists():
             entries = entries + list(journal.read_entries(tf_prices))
+        scored_by_timeframe: dict[str, int] = {}
         for timeframe in DEFAULT_TIMEFRAMES:
             calls = tf_learning.evaluate_timeframe_history(entries, timeframe)
+            scored_by_timeframe[timeframe] = len(calls)
             if not calls:
                 continue
             horizon = PRIMARY_HORIZON_HOURS.get(timeframe, 24.0)
@@ -245,7 +299,8 @@ def collect_slices(
                     f"約{horizon:g}時間後",
                 )
             )
-    return out
+        diagnostics["tf_scored_by_timeframe"] = scored_by_timeframe
+    return out, diagnostics
 
 
 def propose_artifact(
@@ -339,6 +394,27 @@ def render_text(report: Mapping[str, object]) -> str:
                 f" (上限{float(measurement['tau_upper95']) * 100:.2f}%)"
                 f" / artifact {shown} → {measurement['verdict']}"
             )
+    diagnostics = report.get("journals")
+    if isinstance(diagnostics, Mapping):
+        fusion = diagnostics.get("fusion_journal")
+        tf_journal = diagnostics.get("tf_journal")
+        scored = {entry["slice"]: entry["scored"] for entry in report.get("slices", [])}
+        notes: list[str] = []
+        if isinstance(fusion, Mapping):
+            note = explain_empty(fusion, int(scored.get(learning_prior.FUSION_KEY, 0)))
+            if note:
+                notes.append(f"融合: {note}")
+        if isinstance(tf_journal, Mapping):
+            tf_scored = sum(
+                value for key, value in scored.items() if key.startswith(TIMEFRAME_KEY_PREFIX)
+            )
+            note = explain_empty(tf_journal, tf_scored)
+            if note:
+                notes.append(f"時間足別: {note}")
+        if notes:
+            lines.append("")
+            lines.extend(notes)
+            lines.append("この監査は runtime data(logs/)がある実機で実行する必要があります。")
     if not lines:
         lines.append("ジャーナルが見つからないか、採点済み判断がありません。")
     return "\n".join(lines)
@@ -361,13 +437,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "generated_at": datetime.now(UTC).isoformat(),
         "prior_path": str(args.prior),
         "prior_loaded": prior is not None,
-        "slices": [
-            audit_slice(slice_key, calls, horizon, prior, label)
-            for slice_key, calls, horizon, label in collect_slices(
-                args.fusion_journal, args.tf_journal, args.tf_prices
-            )
-        ],
+        "slices": [],
     }
+    collected, journals = collect_slices(args.fusion_journal, args.tf_journal, args.tf_prices)
+    report["journals"] = journals
+    report["slices"] = [
+        audit_slice(slice_key, calls, horizon, prior, label)
+        for slice_key, calls, horizon, label in collected
+    ]
     exceeded = [
         f"{slice_report['slice']}/{feature}"
         for slice_report in report["slices"]
