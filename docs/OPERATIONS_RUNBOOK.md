@@ -110,6 +110,24 @@ zero-write確認は正規runtimeと分離したcopyで行う。
   （HistDataはclose-onlyで、ライセンス上も研究用途に限る）。
 - 設計と測定根拠は[docs/design/P1_HISTORICAL_PRIOR.md](design/P1_HISTORICAL_PRIOR.md)。
 
+実機ジャーナルがある環境では、priorの前提を検証してから使う。
+
+```bash
+# 転移の検証(G7)と prior 有無の効果測定(G8)。読み取り専用。
+.venv/bin/python tools/learning_prior_audit.py --json logs/learning_prior_audit.json
+
+# 履歴で測れない特徴量(rating_4h/rating_1d/tf_agreement/news_count)を
+# 運用実測で足した「提案版」を書き出す。自動採用しない。diffを人間がレビューして
+# config/learning_prior_v1.json へ反映し、PRとしてcommitする。
+.venv/bin/python tools/learning_prior_audit.py --emit-artifact /tmp/learning_prior_proposed.json
+
+# M5 bid/askコーパスがあるなら tf:15m を含めて再生成できる。
+.venv/bin/python tools/build_learning_prior.py --corpus m5 --dry-run
+```
+
+監査の終了コード3は「運用実測のセル間分散が履歴の上限を超えた」= artifact見直しが必要。
+該当特徴量を `parity: "excluded"` にすれば、その特徴量だけ収縮せず現行挙動へ戻る。
+
 ### 0-3. COT PITは手動research境界（未配備）
 
 `fx_briefing.py --cot-pit-dataset <artifact>`は既存artifactを監査してas-of読込するだけで、CFTC取得、release evidence作成、materialize、更新は行わない。省略時はlegacy TTL COTへfallbackせず、COTを判断入力から除外する。invalid/unavailable/incomplete/staleもCOTだけを除外してtyped warningを残し、現状ではbriefing全体を停止しない。

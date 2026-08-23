@@ -37,7 +37,7 @@
       "start": "2024-01-01T22:00:00+00:00"
     }
   },
-  "generated_at": "2026-08-23T07:25:07.644648+00:00",
+  "generated_at": "2026-08-23T08:32:30.691787+00:00",
   "generator": "tools/build_learning_prior.py",
   "method": {
     "decay_trigger": 0.45,
@@ -60,7 +60,7 @@
     "tau_estimator": "dersimonian_laird",
     "tau_used": "upper95"
   },
-  "payload_sha256": "76486beeced06c350dd768e805c41d27935aeb365758744bdece96d0b2e63431",
+  "payload_sha256": "bf249ce6092342f9dd96c07264d5576358d93f3cea65ec93a5ed86a4a0ac01c3",
   "promotion_admissible": false,
   "schema": 1,
   "slices": {
@@ -271,7 +271,7 @@
         "cells": 2,
         "cells_detail": {
           "高ボラ(0.25%以上)|long": {
-            "deviation": -0.0,
+            "deviation": 0.0,
             "n_eff": 489.0
           },
           "高ボラ(0.25%以上)|short": {

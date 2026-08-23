@@ -14,12 +14,19 @@
 測るもの(スライス別):
 
     fusion   1h足の特徴量 × 24時間先ラベル   (融合判断と同じ組み合わせ)
+    tf:15m   15m足の特徴量 × 15分先ラベル    (--corpus m5 のときだけ)
     tf:1h    1h足の特徴量 × 1時間先ラベル    (時間足別判断と同じ組み合わせ)
     tf:4h    4h足の特徴量 × 4時間先ラベル
     tf:1d    1d足の特徴量 × 24時間先ラベル
 
-`tf:15m` は1時間足コーパスからは作れないため生成しない(未測定として扱われ、
-学習ループは従来挙動のままになる)。M5コーパスを使う経路は未実装。
+コーパスは2種類。
+
+    --corpus csv1h (既定)  data/real/histdata/*_2024_1h.csv (コミット済み)
+    --corpus m5            data/historical_training/histdata/bars_m5 (実機のみ)
+
+`tf:15m` は1時間足を分割できないため csv1h では生成しない(未測定として扱われ、
+学習ループはその時間足だけ従来挙動のままになる)。M5コーパスがある環境で
+`--corpus m5` を使えば埋まる。
 
 必須の前処理は2つあり、どちらも欠かすと結論が壊れる。
 
@@ -40,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import hashlib
 import json
 import math
@@ -67,6 +75,15 @@ DEFAULT_SOURCES: tuple[tuple[str, str], ...] = (
     ("EURUSD", "data/real/histdata/eurusd_2024_1h.csv"),
     ("GBPUSD", "data/real/histdata/gbpusd_2024_1h.csv"),
 )
+# M5 bid/askコーパス。fx_intel/historical_chart.py が使う配置と同じものを読む
+# (<root>/<PAIR>/<PAIR>_*_m5_bidask.csv.gz、mid = (bid+ask)/2)。
+DEFAULT_M5_ROOT = REPO_ROOT / "data" / "historical_training" / "histdata" / "bars_m5"
+DEFAULT_M5_PAIRS: tuple[str, ...] = ("USDJPY", "EURUSD", "GBPUSD")
+DEFAULT_M5_CORPUS_ID = "histdata-m5-bidask"
+M5_LICENSE_NOTE = (
+    "HistData.com M1 -> M5 bid/ask bars. Personal/research use per HistData terms. "
+    "NOT admissible for any promotion or performance claim."
+)
 LICENSE_NOTE = (
     "HistData.com free ASCII M1, EST->UTC, resampled to 1h. Personal/research use per "
     "HistData terms. CLOSE-ONLY (no bid/ask, no real volume): NOT admissible for any "
@@ -82,15 +99,21 @@ MA_FAST, MA_SLOW = 20, 100  # technicals.PairTechnicals の fast/slow と同じ
 FX_DAY_ANCHOR = datetime(2024, 1, 1, 22, 0, tzinfo=UTC)
 BAR_ALIGNMENT = "fx_day_22utc"
 # ラベル先バーとの許容ウォールクロック差。historical_chart.MAX_LABEL_GAPS と同じ思想。
-MAX_LABEL_GAP_HOURS = {"1h": 3.0, "4h": 12.0, "1d": 72.0}
-# スライス定義: (特徴量を計算するバーの時間足, ラベルまでのバー数)
-SLICES: tuple[tuple[str, str, int], ...] = (
+MAX_LABEL_GAP_HOURS = {"15m": 0.75, "1h": 3.0, "4h": 12.0, "1d": 72.0}
+# スライス定義: (特徴量を計算するバーの時間足, ラベルまでのバー数)。
+# 15mはM5コーパスでしか作れない(1時間足からは分割できない)。
+SLICES_1H: tuple[tuple[str, str, int], ...] = (
     (learning_prior.FUSION_KEY, "1h", 24),
     (learning_prior.timeframe_key("1h"), "1h", 1),
     (learning_prior.timeframe_key("4h"), "4h", 1),
     (learning_prior.timeframe_key("1d"), "1d", 1),
 )
-TIMEFRAME_HOURS = {"1h": 1.0, "4h": 4.0, "1d": 24.0}
+SLICES_M5: tuple[tuple[str, str, int], ...] = (
+    (learning_prior.FUSION_KEY, "1h", 24),
+    (learning_prior.timeframe_key("15m"), "15m", 1),
+    *SLICES_1H[1:],
+)
+TIMEFRAME_HOURS = {"15m": 0.25, "1h": 1.0, "4h": 4.0, "1d": 24.0}
 
 Bar = tuple[datetime, float, float, float, float]
 
@@ -112,9 +135,29 @@ def load_bars(path: Path) -> list[Bar]:
     return rows
 
 
-def resample(bars: Sequence[Bar], hours: float) -> list[Bar]:
+def load_m5_bars(root: Path, pair: str) -> list[Bar]:
+    """M5 bid/askコーパスを mid OHLC として読む(historical_chart と同じ配置)。"""
+    paths = sorted((root / pair).glob(f"{pair}_*_m5_bidask.csv.gz"))
+    if not paths:
+        raise FileNotFoundError(f"historical bid/ask files not found: {root / pair}")
+    rows: dict[datetime, Bar] = {}
+    for path in paths:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                stamp = datetime.fromisoformat(row["timestamp"])
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=UTC)
+                mid = tuple(
+                    (float(row[f"bid_{field}"]) + float(row[f"ask_{field}"])) / 2.0
+                    for field in ("open", "high", "low", "close")
+                )
+                rows[stamp] = (stamp, mid[0], mid[1], mid[2], mid[3])
+    return [rows[stamp] for stamp in sorted(rows)]
+
+
+def resample(bars: Sequence[Bar], hours: float, source_hours: float = 1.0) -> list[Bar]:
     """FX日境界に揃えて上位足へ集約する。欠損バケットは作らない。"""
-    if hours <= 1.0:
+    if hours <= source_hours:
         return list(bars)
     buckets: dict[int, list[Bar]] = defaultdict(list)
     for bar in bars:
@@ -256,68 +299,62 @@ def observations(
     return out
 
 
+def bucketize(feature: str, value: float) -> str | None:
+    """learning.FEATURE_SPECS のバケット名を返す(共有ルーチンへ渡す判定器)。"""
+    spec = next((item for item in FEATURE_SPECS if item.key == feature), None)
+    if spec is None:
+        return None
+    bucket = bucket_for(spec, value)
+    return bucket.label_ja if bucket is not None else None
+
+
 def measure_slice(
     per_pair: dict[str, list[tuple[str, dict[str, float], bool]]], overlap: float
 ) -> dict[str, dict[str, object]]:
-    """(ペア×方向)でde-meanし、実効nでセル間分散を測る。"""
-    baseline: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
-    for pair, rows in per_pair.items():
-        for direction, _features, hit in rows:
-            stats = baseline[(pair, direction)]
-            stats[0] += 1
-            stats[1] += int(hit)
-    cells: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: defaultdict(lambda: [0.0, 0.0, 0.0])
-    )
-    for pair, rows in per_pair.items():
-        for direction, features, hit in rows:
-            stats = baseline[(pair, direction)]
-            base_rate = stats[1] / stats[0]
-            for spec in FEATURE_SPECS:
-                if spec.key not in features:
-                    continue
-                bucket = bucket_for(spec, features[spec.key])
-                if bucket is None:
-                    continue
-                cell = cells[spec.key][f"{bucket.label_ja}|{direction}"]
-                cell[0] += 1.0
-                cell[1] += float(hit)
-                cell[2] += base_rate
+    """(ペア×方向)でde-meanし、実効nでセル間分散を測る。
+
+    運用ジャーナル側(tools/learning_prior_audit.py)と同じ
+    learning_prior.cell_deviations を使う。両者の tau が同じ定義で比較できることが、
+    転移の検証(G7)が成立する前提になる。
+    """
+    observations = [
+        (pair, direction, features, hit)
+        for pair, rows in sorted(per_pair.items())
+        for direction, features, hit in rows
+    ]
     measured: dict[str, dict[str, object]] = {}
-    for feature, feature_cells in cells.items():
-        deviations: list[float] = []
-        variances: list[float] = []
-        effective: list[float] = []
-        detail: dict[str, dict[str, float]] = {}
-        for name, (count, hits, base_sum) in sorted(feature_cells.items()):
-            effective_n = count / overlap
-            base_rate = base_sum / count
-            deviation = hits / count - base_rate
-            deviations.append(deviation)
-            variances.append(max(base_rate * (1.0 - base_rate), 1e-6) / effective_n)
-            effective.append(effective_n)
-            detail[name] = {"deviation": round(deviation, 6), "n_eff": round(effective_n, 1)}
-        if len(deviations) < 2:
+    for feature, cells in learning_prior.cell_deviations(
+        observations, overlap, REPLAYABLE_FEATURES, bucketize
+    ).items():
+        if len(cells.deviations) < 2:
             continue
-        tau_hat, tau_upper, q_statistic = learning_prior.dersimonian_laird(deviations, variances)
+        tau_hat, tau_upper, q_statistic = learning_prior.dersimonian_laird(
+            cells.deviations, cells.variances
+        )
+        effective = sorted(cells.effective)
         measured[feature] = {
             "tau_upper95": round(tau_upper, 6),
             "tau_hat": round(tau_hat, 6),
-            "cells": len(deviations),
+            "cells": len(cells.deviations),
             "Q": round(q_statistic, 4),
-            "n_eff_median": round(sorted(effective)[len(effective) // 2], 1),
+            "n_eff_median": round(effective[len(effective) // 2], 1),
             "parity": learning_prior.PARITY_UNVERIFIED,
-            "max_abs_deviation": round(max(abs(value) for value in deviations), 6),
+            "max_abs_deviation": round(max(abs(value) for value in cells.deviations), 6),
             # cells_detail は監査・将来利用のみ。学習ループは読まない。
-            "cells_detail": detail,
+            "cells_detail": {
+                name: {"deviation": values["deviation"], "n_eff": values["n_eff"]}
+                for name, values in cells.detail.items()
+            },
             "advisory_only": ["cells_detail", "max_abs_deviation"],
         }
     return measured
 
 
-def build_payload(sources: Sequence[tuple[str, str]], corpus_id: str) -> dict[str, object]:
-    datasets: list[dict[str, object]] = []
+def _load_csv1h_corpus(
+    sources: Sequence[tuple[str, str]],
+) -> tuple[dict[str, list[Bar]], list[dict[str, object]]]:
     bars_by_pair: dict[str, list[Bar]] = {}
+    datasets: list[dict[str, object]] = []
     for pair, relative in sources:
         path = REPO_ROOT / relative
         raw = path.read_bytes()
@@ -331,11 +368,55 @@ def build_payload(sources: Sequence[tuple[str, str]], corpus_id: str) -> dict[st
                 "license_note": LICENSE_NOTE,
             }
         )
+    return bars_by_pair, datasets
+
+
+def _load_m5_corpus(
+    root: Path, pairs: Sequence[str]
+) -> tuple[dict[str, list[Bar]], list[dict[str, object]]]:
+    """M5コーパスは月次ファイル群なので、ファイル単位のhashをまとめて記録する。"""
+    bars_by_pair: dict[str, list[Bar]] = {}
+    datasets: list[dict[str, object]] = []
+    for pair in pairs:
+        bars_by_pair[pair] = load_m5_bars(root, pair)
+        files = sorted((root / pair).glob(f"{pair}_*_m5_bidask.csv.gz"))
+        digest = hashlib.sha256()
+        for path in files:
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        datasets.append(
+            {
+                "pair": pair,
+                "path": str(root / pair),
+                "sha256": digest.hexdigest(),
+                "files": len(files),
+                "bars": len(bars_by_pair[pair]),
+                "license_note": M5_LICENSE_NOTE,
+            }
+        )
+    return bars_by_pair, datasets
+
+
+def build_payload(
+    sources: Sequence[tuple[str, str]],
+    corpus_id: str,
+    *,
+    corpus: str = "csv1h",
+    m5_root: Path | None = None,
+    m5_pairs: Sequence[str] = DEFAULT_M5_PAIRS,
+) -> dict[str, object]:
+    if corpus == "m5":
+        bars_by_pair, datasets = _load_m5_corpus(m5_root or DEFAULT_M5_ROOT, m5_pairs)
+        source_hours, slice_specs = 5.0 / 60.0, SLICES_M5
+    else:
+        bars_by_pair, datasets = _load_csv1h_corpus(sources)
+        source_hours, slice_specs = 1.0, SLICES_1H
     stamps = [bar[0] for bars in bars_by_pair.values() for bar in bars]
     slices: dict[str, dict[str, object]] = {}
-    for slice_key, timeframe, horizon_bars in SLICES:
+    for slice_key, timeframe, horizon_bars in slice_specs:
         per_pair = {
-            pair: observations(resample(bars, TIMEFRAME_HOURS[timeframe]), timeframe, horizon_bars)
+            pair: observations(
+                resample(bars, TIMEFRAME_HOURS[timeframe], source_hours), timeframe, horizon_bars
+            )
             for pair, bars in bars_by_pair.items()
         }
         if not any(per_pair.values()):
@@ -352,7 +433,7 @@ def build_payload(sources: Sequence[tuple[str, str]], corpus_id: str) -> dict[st
             "datasets": datasets,
             "pairs": sorted(bars_by_pair),
             "window": {"start": min(stamps).isoformat(), "end": max(stamps).isoformat()},
-            "bar_interval_hours": 1.0,
+            "bar_interval_hours": round(source_hours, 6),
             "bar_alignment": BAR_ALIGNMENT,
         },
         "method": {
@@ -407,14 +488,30 @@ def summarize(payload: dict[str, object]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--corpus-id", default=DEFAULT_CORPUS_ID)
+    parser.add_argument(
+        "--corpus",
+        choices=("csv1h", "m5"),
+        default="csv1h",
+        help="csv1h=コミット済み1時間足(既定) / m5=M5 bid/askコーパス(15mスライスを含む)",
+    )
+    parser.add_argument("--bars-root", type=Path, default=DEFAULT_M5_ROOT, help="--corpus m5 用")
+    parser.add_argument("--corpus-id", default=None)
     parser.add_argument(
         "--generated-at", default=None, help="ISO時刻を固定する(再現検証用。既定は現在時刻)"
     )
     parser.add_argument("--dry-run", action="store_true", help="書き込まず差分だけ表示する")
     args = parser.parse_args(argv)
 
-    payload = build_payload(DEFAULT_SOURCES, args.corpus_id)
+    corpus_id = args.corpus_id or (
+        DEFAULT_M5_CORPUS_ID if args.corpus == "m5" else DEFAULT_CORPUS_ID
+    )
+    try:
+        payload = build_payload(
+            DEFAULT_SOURCES, corpus_id, corpus=args.corpus, m5_root=args.bars_root
+        )
+    except FileNotFoundError as error:
+        print(f"コーパスが見つかりません: {error}", file=sys.stderr)
+        return 1
     payload["generated_at"] = args.generated_at or datetime.now(UTC).isoformat()
     print(summarize(payload))
 

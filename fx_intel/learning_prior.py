@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +48,9 @@ PARITY_VERIFIED = "verified"
 PARITY_UNVERIFIED = "unverified"
 PARITY_EXCLUDED = "excluded"
 SHRINKABLE_PARITY = (PARITY_VERIFIED, PARITY_UNVERIFIED)
+SOURCE_HISTORICAL = "historical"
+SOURCE_LIVE_JOURNAL = "live_journal"
+VALID_SOURCES = (SOURCE_HISTORICAL, SOURCE_LIVE_JOURNAL)
 
 
 def timeframe_key(timeframe: str) -> str:
@@ -66,6 +69,9 @@ class FeaturePrior:
     q_statistic: float
     n_eff_median: float
     parity: str = PARITY_UNVERIFIED
+    # 測定元。"historical"=履歴コーパス、"live_journal"=運用ジャーナル実測。
+    # 履歴再現できない特徴量は後者でしか測れないため区別して記録する。
+    source: str = SOURCE_HISTORICAL
 
     @property
     def shrinkable(self) -> bool:
@@ -204,12 +210,95 @@ def dersimonian_laird(
     return math.sqrt(tau2_hat), math.sqrt(tau2_upper), q_statistic
 
 
+@dataclass(frozen=True)
+class CellMeasurement:
+    """特徴量1個ぶんのセル偏差。dersimonian_laird へそのまま渡せる形。"""
+
+    feature: str
+    deviations: tuple[float, ...]
+    variances: tuple[float, ...]
+    effective: tuple[float, ...]
+    detail: Mapping[str, Mapping[str, float]]
+
+
+def cell_deviations(
+    observations: Iterable[tuple[str, str, Mapping[str, float], bool]],
+    overlap: float,
+    features: Sequence[str],
+    bucketize: Callable[[str, float], str | None],
+) -> dict[str, CellMeasurement]:
+    """(グループ×方向)の無条件的中率を差し引いたセル偏差を、実効nつきで作る。
+
+    observations は (グループ, 方向, 特徴量, hit)。グループは de-mean の単位で、
+    履歴コーパスでは通貨ペア、運用ジャーナルでも通貨ペアを渡す。ここで
+    de-mean しないと、その期間の相場方向がセルの優位に化ける
+    (2024年24hのUSDJPYは long 58.0% / short 42.0% で16ポイントの無条件差)。
+
+    overlap は重複ラベル係数。1時間間隔の標本に24時間ラベルを貼れば24を渡す。
+    生の件数のまま分散を測ると、標本誤差を24倍過小評価する。
+
+    履歴側と運用側でこの関数を共有することで、両者の tau が同じ定義で比較できる。
+    """
+    materialized = list(observations)
+    baseline: dict[tuple[str, str], list[float]] = {}
+    for group, direction, _features, hit in materialized:
+        stats = baseline.setdefault((group, direction), [0.0, 0.0])
+        stats[0] += 1.0
+        stats[1] += float(hit)
+    cells: dict[str, dict[str, list[float]]] = {}
+    for group, direction, values, hit in materialized:
+        stats = baseline[(group, direction)]
+        base_rate = stats[1] / stats[0]
+        for feature in features:
+            value = values.get(feature)
+            if not isinstance(value, (int, float)):
+                continue
+            label = bucketize(feature, float(value))
+            if label is None:
+                continue
+            cell = cells.setdefault(feature, {}).setdefault(f"{label}|{direction}", [0.0, 0.0, 0.0])
+            cell[0] += 1.0
+            cell[1] += float(hit)
+            cell[2] += base_rate
+    measured: dict[str, CellMeasurement] = {}
+    for feature, feature_cells in cells.items():
+        deviations: list[float] = []
+        variances: list[float] = []
+        effective: list[float] = []
+        detail: dict[str, dict[str, float]] = {}
+        for name, (count, hits, base_sum) in sorted(feature_cells.items()):
+            effective_n = count / overlap if overlap > 0 else count
+            base_rate = base_sum / count
+            deviation = hits / count - base_rate
+            deviations.append(deviation)
+            variances.append(max(base_rate * (1.0 - base_rate), 1e-6) / effective_n)
+            effective.append(effective_n)
+            detail[name] = {
+                # 0.0 + は負のゼロを正規化する。丸め後に -0.0 が残ると、
+                # 浮動小数の加算順序が変わっただけでartifactのhashがぶれる。
+                "deviation": round(deviation, 6) + 0.0,
+                "n_eff": round(effective_n, 1),
+                "n_raw": count,
+            }
+        measured[feature] = CellMeasurement(
+            feature=feature,
+            deviations=tuple(deviations),
+            variances=tuple(variances),
+            effective=tuple(effective),
+            detail=detail,
+        )
+    return measured
+
+
 def _feature_from_mapping(feature: str, payload: Mapping[str, object]) -> FeaturePrior | None:
     tau = payload.get("tau_upper95")
     if not isinstance(tau, (int, float)) or tau < 0:
         return None
     parity = str(payload.get("parity") or PARITY_UNVERIFIED)
     if parity not in (PARITY_VERIFIED, PARITY_UNVERIFIED, PARITY_EXCLUDED):
+        return None
+    source = str(payload.get("source") or SOURCE_HISTORICAL)
+    if source not in VALID_SOURCES:
         return None
     tau_hat = payload.get("tau_hat")
     q_statistic = payload.get("Q")
@@ -223,6 +312,7 @@ def _feature_from_mapping(feature: str, payload: Mapping[str, object]) -> Featur
         q_statistic=float(q_statistic) if isinstance(q_statistic, (int, float)) else 0.0,
         n_eff_median=float(n_eff) if isinstance(n_eff, (int, float)) else 0.0,
         parity=parity,
+        source=source,
     )
 
 

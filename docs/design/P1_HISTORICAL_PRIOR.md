@@ -183,7 +183,7 @@ Tier Cを黙って0扱いにしないことが重要である。**未測定と�
       "features": {
         "rsi_1h": {
           "tau_upper95": 0.0143, "tau_hat": 0.0, "cells": 6, "Q": 2.0,
-          "n_eff_median": 260.7, "parity": "verified",
+          "n_eff_median": 260.7, "parity": "unverified", "source": "historical",
           "cells_detail": {"oversold|long": {"deviation": -0.010, "n_eff": 120.0}},
           "advisory_only": ["cells_detail"]
         }
@@ -196,6 +196,14 @@ Tier Cを黙って0扱いにしないことが重要である。**未測定と�
 
 `cells_detail` は監査・将来利用のためだけに残し、**P1のコードは読まない**
 （`advisory_only` に列挙して契約として明示する）。
+
+`source` は測定元（`historical` = 履歴コーパス / `live_journal` = 運用ジャーナル実測）。
+履歴再現できない特徴量は後者でしか測れないため区別する。
+`tools/learning_prior_audit.py --emit-artifact` が書き出す提案版は、追加した項目の
+一覧を `live_audit` に残す。
+
+浮動小数の加算順序が変わっただけで hash がぶれないよう、丸めた偏差の負のゼロは
+`cell_deviations` で正規化する（回帰テストあり）。
 
 ## 4. 実装計画
 
@@ -264,12 +272,43 @@ if rate >= CONDITION_HIT_RATE_TRIGGER:
 > ただし Phase 3 の実機パリティ計測（§4.1）と shadow比較（G8）は未実施のままであり、
 > **未実施であることを承知の上での導入**である。
 
-### Phase 3 — Tier B とロールアウト
+### Phase 3 — 実機検証と Tier B（`tools/learning_prior_audit.py`、実装済み）
 
-1. Mac mini でパリティ計測（4.1）。合格したTier B特徴量をartifactへ追加。
-2. shadow比較: 同一ジャーナルに対し prior 有無の両プロファイルを算出し、
-   確信度分布・発火セル数・的中率の差を30市場日ぶん記録する。
-3. 独立レビュー後に既定ON。
+> 【設計変更】初版は Tier B を「TradingViewレーティングを履歴から再構成し、
+> 特徴量パリティを測って合格したら追加する」としていた。実装時に、**運用ジャーナルで
+> tau を直接測るほうが正しい**と判明したので方針を変えた。理由:
+>
+> - パリティは「特徴量が一致するか」という**代理指標**にすぎない。本当に知りたいのは
+>   「そのセル間分散の上限が運用母集団でも成り立つか」で、運用ジャーナルは
+>   それを直接測れる。
+> - TVレーティングの再構成は26指標の再実装を要し、FXでは出来高依存指標
+>   （VWMA）が原理的に一致しない。パリティは構造的に不完全になる。
+> - 運用ジャーナルには `rating_4h` / `rating_1d` / `tf_agreement` / `news_count` が
+>   そのまま記録されている。**履歴再現できない4件も運用側なら測れる。**
+> - 運用実測は選択バイアス（判断条件付き母集団）とレジーム差を同時に織り込む。
+
+`tools/learning_prior_audit.py` が次を1コマンドで行う。
+
+1. **転移の検証（G7）** — 運用ジャーナルの `condition_stats` に同じDL推定量を当て、
+   実効n（`overlap_factor = ホライズン / 間引き幅`）で補正して tau を測る。
+   artifact の上限と突き合わせ、`confirms` / `exceeds` / `inconclusive` / `live_only`
+   を出す。`exceeds` があれば終了コード3。
+2. **効果の測定（G8）** — 同一ジャーナルで prior 有無の両プロファイルを算出し、
+   **ジャーナルに実際に記録された特徴量分布の上で** `condition_adjustment` を
+   突き合わせる。減衰セル数・減衰される判断の割合・係数平均・変化した割合を出す。
+3. **Tier B/C の測定（`--emit-artifact`）** — 履歴で測れない特徴量へ運用実測の tau を
+   足した**提案版**を書き出す。自動採用はしない。人間がdiffをレビューしてcommitする
+   ことで「挙動を変える入力は必ずPRを通る」性質を保つ。
+
+キャップ規則: 提案版で運用実測を採るとき、**点推定 `tau_hat = 0`（有意な異質性なし）**
+なら履歴で測った最大upperでキャップする（標本の少ないスライスの緩い上限が
+可動域を広げすぎるのを防ぐ）。`tau_hat > 0` なら統計的に支持される差なので
+キャップしない（ここで潰すと本物の調整を殺す）。
+
+`tf:15m` は `tools/build_learning_prior.py --corpus m5` で生成する。M5 bid/ask
+コーパス（`data/historical_training/histdata/bars_m5`、`fx_intel/historical_chart.py`
+と同じ配置）を読み、15m/1h/4h/1d の全スライスを作る。1時間足コーパスからは
+15mを分割できないため、こちらだけが `tf:15m` を埋められる。
 
 ## 5. 失敗モードと検知
 
@@ -285,7 +324,9 @@ if rate >= CONDITION_HIT_RATE_TRIGGER:
 | 8 | priorが隠れた権威になる | `gate_trace` と学習メモに tau と収縮量を必ず記録 | 可動域は [0.7, 1.0] のまま。priorは範囲を**狭める**方向にしか働かない |
 | 9 | 規約分裂（RSI/ATRの3実装） | パリティ計測で数値差を記録 | P1経路は単一実装。差分はartifactへ残す |
 | 10 | ライセンス逸脱 | artifactに `license_note` と `promotion_admissible: false` | 昇格証拠には使わない。conviction減衰の可動域制限にのみ使う |
-| 11 | 未測定と測定済み0の混同 | Tier Cは `parity: "unverified"`、収縮対象外 | 表示で区別。黙って0にしない |
+| 11 | 未測定と測定済み0の混同 | 学習メモが「未測定のまま無補正: ...」を毎回出す | 表示で区別。黙って0にしない |
+| 12 | artifact hash の非決定性 | 負のゼロ検査を回帰テスト化。同一コーパスで `payload_sha256` 一致 | 丸め後に `+ 0.0` で正規化 |
+| 13 | 履歴と運用で tau の定義がずれる | 両者が `learning_prior.cell_deviations` を共有 | 定義が割れると転移の検証(G7)が無意味になるため単一実装にする |
 
 ## 6. 受け入れゲート（すべて事前に固定、falsifiable）
 
@@ -297,24 +338,29 @@ if rate >= CONDITION_HIT_RATE_TRIGGER:
 | G4 | 推定器の陽性対照 | 注入 tau=0.03 を回収（推定 > 0.01） | 新規テスト |
 | G5 | 真の劣位の検出保持 | tau=0.05 の世界では検出率が現行と同等以上 | 合成世界テスト |
 | G6 | 決定論 | 同一コーパスで artifact の sha256 が一致 | 生成器テスト |
-| G7 | 特徴量パリティ | Tier A各特徴量で Spearman >= 0.9 かつバケット一致率 >= 0.8 | 4.1（Mac mini） |
-| G8 | shadow比較 | 30市場日で確信度分布の変化と発火セル数を記録。**改善が出なければ「改善なし」と記録して既定ONにしない** | 実機 |
+| G7 | 転移の検証 | 運用実測の tau が artifact の上限を超えない（`exceeds` ゼロ） | `tools/learning_prior_audit.py`（実機） |
+| G8 | 効果の測定 | 30市場日で減衰セル数・減衰される判断の割合を記録。**改善が出なければ「改善なし」と記録する** | 同上（実機） |
 
 G3とG5は同時に満たす必要がある。片方だけなら「常に減衰しない」か
 「常に減衰する」で通ってしまう。
 
-### 4.1 パリティ計測（G7の手順）
+### 4.1 実機検証の手順（G7・G8）
 
-Mac mini上で、同一 `(symbol, timestamp)` について
-運用ジャーナルに記録済みの `features` と、履歴コーパスから再計算した値を突き合わせる。
+Mac mini上で次を実行する。ジャーナルが無ければ何も出さずに終わる（読み取り専用）。
 
-- Spearman順位相関 >= 0.9
-- `FEATURE_SPECS` のバケット一致率 >= 0.8
-- 系統的バイアス（中央値差 / IQR）を記録
+```bash
+.venv/bin/python tools/learning_prior_audit.py --json logs/learning_prior_audit.json
+```
 
-不合格の特徴量は `parity: "excluded"` として収縮対象から外す。
+- `exceeds` が出た特徴量は、artifact の上限が運用母集団に対して**狭すぎる**。
+  該当スライス/特徴量を `parity: "excluded"` にする（= 収縮せず現行挙動）か、
+  運用実測で artifact を更新する。
+- `confirms` が並べば履歴の上限が運用でも成り立っている。
+- `inconclusive` は標本不足。判断を変えず、標本が貯まるまで待つ。
+
 **除外しても現行より悪化しない**（現行挙動が維持されるだけ）ことが、この設計の
-フェイルセーフ性である。
+フェイルセーフ性である。特徴量パリティ（Spearman・バケット一致率）は、
+上記が `exceeds` を出したときの原因切り分けに使う補助指標として残す。
 
 ## 7. 運用
 
@@ -371,10 +417,11 @@ Mac mini上で、同一 `(symbol, timestamp)` について
   `_estimate_weights` への適用は本設計の対象外。契約を分けて順次行う。
 - 分解能の下限は現在 0.01〜0.02。2020-2025 M5コーパスを使えば
   24hホライズンの実効nが約6倍になり、分解能は約0.008まで改善する見込み。
-- `tf:15m` スライスは1時間足コーパスから作れないため未生成で、15m判断のセル学習は
-  従来どおり無補正のまま。M5コーパス（`data/historical_training/histdata/bars_m5`）を
-  読む生成経路は未実装。
-- 実機での `--no-learning-prior` 有無のA/B比較（G8）は未実施。
+- `tf:15m` スライスは、コミット済みartifactには未収録（1時間足コーパスから作れない）。
+  M5コーパスがある実機で `--corpus m5` で再生成すれば埋まる。生成経路は実装・テスト済み。
+- 実機でのG7・G8は未実施（ツールは実装・テスト済み。実機ジャーナルが必要）。
+- Tier B/C（`rating_4h` / `rating_1d` / `tf_agreement` / `news_count`）は
+  運用実測でしか測れず、実機での `--emit-artifact` 実行と人間レビューが必要。
 
 ## 10. 非主張
 

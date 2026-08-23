@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import statistics
 from datetime import datetime, timedelta, UTC
@@ -19,8 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from fx_intel import learning, learning_prior
-from tools import build_learning_prior
+from fx_intel import journal, learning, learning_prior
+from tools import build_learning_prior, learning_prior_audit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMMITTED_ARTIFACT = REPO_ROOT / "config" / "learning_prior_v1.json"
@@ -348,3 +349,323 @@ def test_generator_demeans_before_measuring(
         for entry in features.values():
             # トレンドが焼き込まれていれば上限は数十%になる。de-mean後はそうならない。
             assert entry["tau_upper95"] < 0.15
+
+
+# --- G7/G8: 運用ジャーナルでの検証（tools/learning_prior_audit.py） ------------
+
+
+def _weekday_hours(start: datetime, count: int) -> list[datetime]:
+    """市場オープン中(平日)の1時間刻み時刻列。週末はまたがずに飛ばす。"""
+    stamps: list[datetime] = []
+    cursor = start
+    while len(stamps) < count:
+        if cursor.weekday() < 5:
+            stamps.append(cursor)
+        cursor += timedelta(hours=1)
+    return stamps
+
+
+def _fusion_journal(path: Path, count: int = 700, bad_cell: bool = False, seed: int = 3) -> None:
+    """PIT適格な融合ジャーナルを合成する。24市場時間先の終値で採点される。"""
+    rng = random.Random(seed)
+    stamps = _weekday_hours(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), count)
+    prices = [150.0]
+    for _ in range(count):
+        prices.append(prices[-1] + rng.gauss(0.0, 0.10))
+    atr = 0.30
+    rows: list[dict] = []
+    for index, stamp in enumerate(stamps):
+        move = prices[index + 24] - prices[index] if index + 24 < len(prices) else 0.0
+        direction = rng.choice(["long", "short"])
+        features = _features(rng)
+        features["tf_agreement"] = rng.choice([0.25, 0.5, 0.75, 1.0])
+        features["news_count"] = float(rng.randint(0, 6))
+        features["rating_4h"] = rng.uniform(-1.0, 1.0)
+        features["rating_1d"] = rng.uniform(-1.0, 1.0)
+        if bad_cell:
+            # rating_4h が売り寄りのときだけ、必ず順行しない方向を選ぶ。
+            if features["rating_4h"] < -0.25:
+                direction = "short" if move > 0 else "long"
+        rows.append(
+            {
+                "ts": stamp.isoformat(),
+                "prediction_time": stamp.isoformat(),
+                "source_cutoff": (stamp - timedelta(minutes=2)).isoformat(),
+                "max_feature_available_time": (stamp - timedelta(seconds=1)).isoformat(),
+                "pit_eligible": True,
+                "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+                "decision_id": f"decision:USDJPY:{stamp.isoformat()}",
+                "mode": "fusion",
+                "producer": journal.FUSION_PRODUCER,
+                "producer_version": journal.FUSION_PRODUCER_VERSION,
+                "input_context_id": f"context:{stamp.isoformat()}",
+                "source_record_ids": [f"source:{stamp.isoformat()}"],
+                "symbol": "USDJPY",
+                "direction": direction,
+                "conviction": rng.randint(20, 80),
+                "composite": 0.4,
+                "tech_score": rng.uniform(-1.0, 1.0),
+                "news_score": rng.uniform(-1.0, 1.0),
+                "close": round(prices[index], 4),
+                "atr": atr,
+                "data_quality": 0.9,
+                "features": features,
+            }
+        )
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8"
+    )
+
+
+def test_audit_measures_live_tau_and_compares_with_the_artifact(tmp_path: Path) -> None:
+    fusion = tmp_path / "briefing_journal.jsonl"
+    _fusion_journal(fusion)
+    report_path = tmp_path / "report.json"
+    code = learning_prior_audit.main(
+        [
+            "--fusion-journal",
+            str(fusion),
+            "--tf-journal",
+            str(tmp_path / "absent.jsonl"),
+            "--tf-prices",
+            str(tmp_path / "absent-prices.jsonl"),
+            "--json",
+            str(report_path),
+        ]
+    )
+    assert code == 0  # コイン投げ相当の入力では履歴上限を超えない
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["prior_loaded"] is True
+    slices = {entry["slice"]: entry for entry in report["slices"]}
+    fusion_report = slices[learning_prior.FUSION_KEY]
+    assert fusion_report["scored"] > 100
+    assert fusion_report["overlap_factor"] == 24.0  # 24hラベル ÷ 1h間引き
+    features = fusion_report["features"]
+    # 履歴で測れた4件は artifact_tau を持ち、測れない4件は live_only になる
+    assert features["rsi_1h"]["artifact_tau"] is not None
+    assert features["rating_4h"]["artifact_tau"] is None
+    assert features["rating_4h"]["verdict"] in {
+        learning_prior_audit.VERDICT_LIVE_ONLY,
+        learning_prior_audit.VERDICT_INCONCLUSIVE,
+    }
+    comparison = fusion_report["adjustment_comparison"]
+    assert comparison["probes"] > 100
+    # 収縮は減衰を増やさない
+    assert comparison["decayed_share_after"] <= comparison["decayed_share_before"]
+    assert fusion_report["fired_cells_after"] <= fusion_report["fired_cells_before"]
+
+
+def test_audit_flags_dispersion_that_exceeds_the_historical_bound(tmp_path: Path) -> None:
+    fusion = tmp_path / "briefing_journal.jsonl"
+    _fusion_journal(fusion, bad_cell=True)
+    code = learning_prior_audit.main(
+        [
+            "--fusion-journal",
+            str(fusion),
+            "--tf-journal",
+            str(tmp_path / "absent.jsonl"),
+            "--tf-prices",
+            str(tmp_path / "absent-prices.jsonl"),
+            "--json",
+            str(tmp_path / "report.json"),
+        ]
+    )
+    # rating_4h は履歴に無いので live_only。tau自体は大きく出るが exceeds にはしない。
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    fusion_report = report["slices"][0]
+    rating = fusion_report["features"]["rating_4h"]
+    assert rating["tau_hat"] is not None and float(rating["tau_hat"]) > 0.02
+    assert code in (0, learning_prior_audit.EXIT_TAU_EXCEEDED)
+
+
+def test_audit_emits_a_proposal_only_for_features_history_cannot_measure(tmp_path: Path) -> None:
+    fusion = tmp_path / "briefing_journal.jsonl"
+    _fusion_journal(fusion, bad_cell=True)
+    proposed_path = tmp_path / "proposed.json"
+    learning_prior_audit.main(
+        [
+            "--fusion-journal",
+            str(fusion),
+            "--tf-journal",
+            str(tmp_path / "absent.jsonl"),
+            "--tf-prices",
+            str(tmp_path / "absent-prices.jsonl"),
+            "--emit-artifact",
+            str(proposed_path),
+        ]
+    )
+    proposed = json.loads(proposed_path.read_text(encoding="utf-8"))
+    committed = json.loads(COMMITTED_ARTIFACT.read_text(encoding="utf-8"))
+    fusion_slice = proposed["slices"][learning_prior.FUSION_KEY]
+    historical_cap = max(
+        float(entry["tau_upper95"]) for entry in committed["slices"]["fusion"].values()
+    )
+    for feature, entry in fusion_slice.items():
+        if feature in committed["slices"]["fusion"]:
+            # 履歴で測れているものは書き換えない
+            assert entry == committed["slices"]["fusion"][feature]
+        else:
+            assert entry["source"] == learning_prior.SOURCE_LIVE_JOURNAL
+            if entry["tau_hat"] > 0.0:
+                # 統計的に支持される差はキャップせず、実測をそのまま使う
+                assert entry["tau_upper95"] == entry["measured_tau_upper95"]
+                assert entry["capped_by_historical_max"] is None
+            else:
+                # 標本誤差だけの上限は履歴の最大upperで抑える
+                assert entry["tau_upper95"] <= historical_cap + 1e-9
+    assert proposed["live_audit"]["added"]
+    # 提案版もそのまま読み込める契約であること
+    assert learning_prior.prior_from_mapping(proposed) is not None
+
+
+def test_audit_is_quiet_without_journals(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    code = learning_prior_audit.main(
+        [
+            "--fusion-journal",
+            str(tmp_path / "a.jsonl"),
+            "--tf-journal",
+            str(tmp_path / "b.jsonl"),
+            "--tf-prices",
+            str(tmp_path / "c.jsonl"),
+        ]
+    )
+    assert code == 0
+    assert "ジャーナルが見つからない" in capsys.readouterr().out
+
+
+def test_overlap_factor_matches_the_label_horizon() -> None:
+    assert learning_prior_audit.overlap_factor(24.0) == 24.0
+    assert learning_prior_audit.overlap_factor(1.0) == 1.0
+    assert learning_prior_audit.overlap_factor(0.25) == 1.0  # 間引きより短い足は重ならない
+
+
+# --- M5コーパス経路（tf:15m を含む） -----------------------------------------
+
+
+def _write_m5_corpus(root: Path, pair: str, bars: int = 4000, seed: int = 4) -> None:
+    """historical_chart と同じ配置の M5 bid/ask 月次ファイルを1本だけ作る。"""
+    import gzip
+
+    directory = root / pair
+    directory.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    stamp = datetime(2024, 1, 1, 22, 0, tzinfo=UTC)
+    mid = 150.0
+    spread = 0.01
+    lines = ["timestamp,bid_open,bid_high,bid_low,bid_close,ask_open,ask_high,ask_low,ask_close"]
+    for _ in range(bars):
+        close = mid + rng.gauss(0.0, 0.02)
+        high, low = max(mid, close) + 0.01, min(mid, close) - 0.01
+        values = [mid, high, low, close]
+        bid = [value - spread / 2 for value in values]
+        ask = [value + spread / 2 for value in values]
+        lines.append(stamp.isoformat() + "," + ",".join(f"{value:.5f}" for value in (*bid, *ask)))
+        mid = close
+        stamp += timedelta(minutes=5)
+    path = directory / f"{pair}_2024_m5_bidask.csv.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def test_m5_corpus_produces_the_15m_slice(tmp_path: Path) -> None:
+    root = tmp_path / "bars_m5"
+    _write_m5_corpus(root, "USDJPY")
+    _write_m5_corpus(root, "EURUSD", seed=5)
+    payload = build_learning_prior.build_payload(
+        (), "m5-unit-test", corpus="m5", m5_root=root, m5_pairs=("USDJPY", "EURUSD")
+    )
+    slices = payload["slices"]
+    assert isinstance(slices, dict)
+    assert learning_prior.timeframe_key("15m") in slices
+    assert learning_prior.FUSION_KEY in slices
+    corpus = payload["corpus"]
+    assert isinstance(corpus, dict)
+    assert corpus["bar_interval_hours"] == pytest.approx(5 / 60, abs=1e-6)
+    assert corpus["pairs"] == ["EURUSD", "USDJPY"]
+    for dataset in corpus["datasets"]:
+        assert dataset["files"] == 1
+        assert dataset["bars"] > 0
+    prior = learning_prior.prior_from_mapping(payload)
+    assert prior is not None
+    assert prior.feature(learning_prior.timeframe_key("15m"), "rsi_1h") is not None
+
+
+def test_m5_corpus_reports_a_missing_root(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        build_learning_prior.build_payload(
+            (), "m5-unit-test", corpus="m5", m5_root=tmp_path / "absent", m5_pairs=("USDJPY",)
+        )
+
+
+def test_resample_keeps_source_bars_when_target_is_not_coarser() -> None:
+    bars = [
+        (datetime(2024, 1, 1, 22, 0, tzinfo=UTC) + timedelta(minutes=5 * i), 1.0, 2.0, 0.5, 1.5)
+        for i in range(24)
+    ]
+    assert build_learning_prior.resample(bars, 5 / 60, 5 / 60) == bars
+    quarter = build_learning_prior.resample(bars, 0.25, 5 / 60)
+    assert len(quarter) == 8  # 24本のM5 -> 8本の15m
+    assert quarter[0][2] == 2.0 and quarter[0][3] == 0.5  # high/low が集約されている
+
+
+# --- 共有ルーチン: de-mean と負のゼロ ----------------------------------------
+
+
+def _flat_bucketize(feature: str, value: float) -> str | None:
+    return "high" if value >= 0.5 else "low"
+
+
+def test_cell_deviations_removes_the_group_direction_baseline() -> None:
+    """一方向だけ勝ち続けるグループがあっても、セル偏差には出ない。"""
+    observations: list[tuple[str, str, dict[str, float], bool]] = []
+    for index in range(400):
+        # USDJPY の long は常に勝ち、short は常に負ける(強いトレンド期)
+        observations.append(("USDJPY", "long", {"x": index % 2}, True))
+        observations.append(("USDJPY", "short", {"x": index % 2}, False))
+    measured = learning_prior.cell_deviations(observations, 1.0, ["x"], _flat_bucketize)
+    assert set(measured["x"].detail) == {"low|long", "high|long", "low|short", "high|short"}
+    # 方向の勝敗差は baseline に吸収され、セル偏差はゼロになる
+    assert max(abs(value) for value in measured["x"].deviations) < 1e-9
+    tau_hat, tau_upper, _q = learning_prior.dersimonian_laird(
+        measured["x"].deviations, measured["x"].variances
+    )
+    assert tau_hat == 0.0 and tau_upper == 0.0
+
+
+def test_cell_deviations_applies_the_overlap_factor() -> None:
+    observations = [("USDJPY", "long", {"x": index % 2}, index % 3 == 0) for index in range(240)]
+    dense = learning_prior.cell_deviations(observations, 1.0, ["x"], _flat_bucketize)["x"]
+    sparse = learning_prior.cell_deviations(observations, 24.0, ["x"], _flat_bucketize)["x"]
+    assert dense.deviations == sparse.deviations  # 偏差は同じ
+    # 重複を数えれば実効nは1/24、分散は24倍
+    assert sparse.effective[0] == pytest.approx(dense.effective[0] / 24.0)
+    assert sparse.variances[0] == pytest.approx(dense.variances[0] * 24.0)
+
+
+def _negative_zeros(node: object, path: str = "") -> list[str]:
+    if isinstance(node, dict):
+        return [
+            item for key, value in node.items() for item in _negative_zeros(value, f"{path}/{key}")
+        ]
+    if isinstance(node, list):
+        return [
+            item
+            for index, value in enumerate(node)
+            for item in _negative_zeros(value, f"{path}[{index}]")
+        ]
+    if isinstance(node, float) and node == 0.0 and math.copysign(1.0, node) < 0:
+        return [path]
+    return []
+
+
+def test_committed_artifact_has_no_negative_zero() -> None:
+    """-0.0 が残ると、加算順序の違いだけで payload_sha256 がぶれる。"""
+    payload = json.loads(COMMITTED_ARTIFACT.read_text(encoding="utf-8"))
+    assert _negative_zeros(payload) == []
+
+
+def test_cell_deviations_normalises_negative_zero() -> None:
+    observations = [("USDJPY", "long", {"x": index % 2}, index % 2 == 0) for index in range(200)]
+    measured = learning_prior.cell_deviations(observations, 1.0, ["x"], _flat_bucketize)
+    for values in measured["x"].detail.values():
+        assert math.copysign(1.0, values["deviation"]) > 0 or values["deviation"] != 0.0
