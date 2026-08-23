@@ -1,0 +1,282 @@
+{
+  "generated_by": "reports/research/p1-historical-prior-feasibility-20260823/feasibility_probe.py",
+  "data": {
+    "USDJPY": {
+      "rows": 6166,
+      "path": "data/real/histdata/usdjpy_2024_1h.csv"
+    },
+    "EURUSD": {
+      "rows": 6196,
+      "path": "data/real/histdata/eurusd_2024_1h.csv"
+    },
+    "GBPUSD": {
+      "rows": 6182,
+      "path": "data/real/histdata/gbpusd_2024_1h.csv"
+    }
+  },
+  "positive_control": [
+    {
+      "tau_true": 0.0,
+      "tau_hat_mean": 0.0,
+      "tau_hat_min": 0.0,
+      "tau_hat_max": 0.0
+    },
+    {
+      "tau_true": 0.01,
+      "tau_hat_mean": 0.0,
+      "tau_hat_min": 0.0,
+      "tau_hat_max": 0.0
+    },
+    {
+      "tau_true": 0.02,
+      "tau_hat_mean": 0.00764,
+      "tau_hat_min": 0.0,
+      "tau_hat_max": 0.02588
+    },
+    {
+      "tau_true": 0.03,
+      "tau_hat_mean": 0.01851,
+      "tau_hat_min": 0.0,
+      "tau_hat_max": 0.04517
+    },
+    {
+      "tau_true": 0.05,
+      "tau_hat_mean": 0.03983,
+      "tau_hat_min": 0.0,
+      "tau_hat_max": 0.07791
+    }
+  ],
+  "horizons": {
+    "1h": {
+      "labeled_observations": 30978,
+      "decision_points": 15489,
+      "non_overlapping_windows": 15489,
+      "median_effective_n_per_cell": 5412.0,
+      "unconditional_hit_rate": {
+        "EURUSD|long": 0.504,
+        "EURUSD|short": 0.496,
+        "GBPUSD|long": 0.5092,
+        "GBPUSD|short": 0.4908,
+        "USDJPY|long": 0.5172,
+        "USDJPY|short": 0.4828
+      },
+      "unconditional_spread": 0.0344,
+      "all_features": {
+        "cells": 24,
+        "Q": 22.33,
+        "Q_df": 23,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00445,
+        "max_abs_deviation": 0.0168
+      },
+      "rsi_1h": {
+        "cells": 6,
+        "Q": 4.89,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00656,
+        "max_abs_deviation": 0.016
+      },
+      "adx_1h": {
+        "cells": 6,
+        "Q": 7.31,
+        "Q_df": 5,
+        "tau_hat": 0.00473,
+        "tau_upper95": 0.00773,
+        "max_abs_deviation": 0.0118
+      },
+      "ma_gap_atr": {
+        "cells": 6,
+        "Q": 3.29,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00468,
+        "max_abs_deviation": 0.0072
+      },
+      "atr_pct": {
+        "cells": 6,
+        "Q": 6.84,
+        "Q_df": 5,
+        "tau_hat": 0.00442,
+        "tau_upper95": 0.00776,
+        "max_abs_deviation": 0.0168
+      },
+      "overlap_correction": {
+        "holm_survivors_raw_n": 0,
+        "holm_survivors_effective_n": 0
+      },
+      "demean_comparison": {
+        "with_demean": {
+          "cells": 24,
+          "Q": 22.33,
+          "Q_df": 23,
+          "tau_hat": 0.0,
+          "tau_upper95": 0.00445,
+          "max_abs_deviation": 0.0168
+        },
+        "without_demean": {
+          "cells": 24,
+          "Q": 69.52,
+          "Q_df": 23,
+          "tau_hat": 0.00998,
+          "tau_upper95": 0.01099,
+          "max_abs_deviation": 0.0176
+        }
+      }
+    },
+    "4h": {
+      "labeled_observations": 34164,
+      "decision_points": 17082,
+      "non_overlapping_windows": 4270,
+      "median_effective_n_per_cell": 1492.8,
+      "unconditional_hit_rate": {
+        "EURUSD|long": 0.5133,
+        "EURUSD|short": 0.4867,
+        "GBPUSD|long": 0.5169,
+        "GBPUSD|short": 0.4831,
+        "USDJPY|long": 0.5349,
+        "USDJPY|short": 0.4651
+      },
+      "unconditional_spread": 0.0698,
+      "all_features": {
+        "cells": 24,
+        "Q": 13.4,
+        "Q_df": 23,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00154,
+        "max_abs_deviation": 0.0282
+      },
+      "rsi_1h": {
+        "cells": 6,
+        "Q": 5.5,
+        "Q_df": 5,
+        "tau_hat": 0.00457,
+        "tau_upper95": 0.01349,
+        "max_abs_deviation": 0.0282
+      },
+      "adx_1h": {
+        "cells": 6,
+        "Q": 3.1,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00829,
+        "max_abs_deviation": 0.0122
+      },
+      "ma_gap_atr": {
+        "cells": 6,
+        "Q": 2.82,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00787,
+        "max_abs_deviation": 0.0126
+      },
+      "atr_pct": {
+        "cells": 6,
+        "Q": 1.97,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.00563,
+        "max_abs_deviation": 0.022
+      },
+      "overlap_correction": {
+        "holm_survivors_raw_n": 0,
+        "holm_survivors_effective_n": 0
+      },
+      "demean_comparison": {
+        "with_demean": {
+          "cells": 24,
+          "Q": 13.4,
+          "Q_df": 23,
+          "tau_hat": 0.0,
+          "tau_upper95": 0.00154,
+          "max_abs_deviation": 0.0282
+        },
+        "without_demean": {
+          "cells": 24,
+          "Q": 76.42,
+          "Q_df": 23,
+          "tau_hat": 0.02036,
+          "tau_upper95": 0.02217,
+          "max_abs_deviation": 0.0333
+        }
+      }
+    },
+    "24h": {
+      "labeled_observations": 35956,
+      "decision_points": 17978,
+      "non_overlapping_windows": 749,
+      "median_effective_n_per_cell": 260.7,
+      "unconditional_hit_rate": {
+        "EURUSD|long": 0.4875,
+        "EURUSD|short": 0.5125,
+        "GBPUSD|long": 0.5255,
+        "GBPUSD|short": 0.4745,
+        "USDJPY|long": 0.5802,
+        "USDJPY|short": 0.4198
+      },
+      "unconditional_spread": 0.1604,
+      "all_features": {
+        "cells": 24,
+        "Q": 9.25,
+        "Q_df": 23,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.0,
+        "max_abs_deviation": 0.0533
+      },
+      "rsi_1h": {
+        "cells": 6,
+        "Q": 2.0,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.01429,
+        "max_abs_deviation": 0.0416
+      },
+      "adx_1h": {
+        "cells": 6,
+        "Q": 1.72,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.0107,
+        "max_abs_deviation": 0.0224
+      },
+      "ma_gap_atr": {
+        "cells": 6,
+        "Q": 1.95,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.01302,
+        "max_abs_deviation": 0.0244
+      },
+      "atr_pct": {
+        "cells": 6,
+        "Q": 3.58,
+        "Q_df": 5,
+        "tau_hat": 0.0,
+        "tau_upper95": 0.02302,
+        "max_abs_deviation": 0.0533
+      },
+      "overlap_correction": {
+        "holm_survivors_raw_n": 12,
+        "holm_survivors_effective_n": 0
+      },
+      "demean_comparison": {
+        "with_demean": {
+          "cells": 24,
+          "Q": 9.25,
+          "Q_df": 23,
+          "tau_hat": 0.0,
+          "tau_upper95": 0.0,
+          "max_abs_deviation": 0.0533
+        },
+        "without_demean": {
+          "cells": 24,
+          "Q": 29.4,
+          "Q_df": 23,
+          "tau_hat": 0.01683,
+          "tau_upper95": 0.02687,
+          "max_abs_deviation": 0.0542
+        }
+      }
+    }
+  }
+}
