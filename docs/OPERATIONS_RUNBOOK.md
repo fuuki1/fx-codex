@@ -88,6 +88,28 @@ zero-write確認は正規runtimeと分離したcopyで行う。
 `DISCORD_OPS_WEBHOOK_URL`が未設定で分析Webhookへのfallbackも失敗する場合、通知到達は保証されない。
 そのため`status_fx_services.sh`、launchd stderr、`freshness_report.json`の確認を移行完了条件に含める。
 
+### 0-3. 学習prior（`config/learning_prior_v1.json`）
+
+状態×方向セル学習の可動域を縛る**版管理下の入力**。runtime dataではないため
+`logs/`には置かず、実機へは`git pull`で配る。writer所有権の対象外。
+
+- 生成は人間が明示的に実行する。定期実行しない。
+
+```bash
+.venv/bin/python tools/build_learning_prior.py --dry-run   # 差分だけ確認
+.venv/bin/python tools/build_learning_prior.py             # config/へ書き出す
+```
+
+- 再生成が必要なのは、コーパス更新時か、`generated_at`から18か月経過時。
+  出力は決定論的で、`payload_sha256`が変わらなければ内容は同一。
+- ロールバックは2経路。どちらも従来の推定へ**厳密に**戻る。
+  1. `fx_briefing.py --no-learning-prior`
+  2. artifactを削除または破損させる（読み込み失敗はfail-openで従来挙動）
+- 破損・契約違反・未知スライスはすべてfail-openで、briefingを停止させない。
+- artifactは`promotion_admissible: false`。昇格証拠には使えない
+  （HistDataはclose-onlyで、ライセンス上も研究用途に限る）。
+- 設計と測定根拠は[docs/design/P1_HISTORICAL_PRIOR.md](design/P1_HISTORICAL_PRIOR.md)。
+
 ### 0-3. COT PITは手動research境界（未配備）
 
 `fx_briefing.py --cot-pit-dataset <artifact>`は既存artifactを監査してas-of読込するだけで、CFTC取得、release evidence作成、materialize、更新は行わない。省略時はlegacy TTL COTへfallbackせず、COTを判断入力から除外する。invalid/unavailable/incomplete/staleもCOTだけを除外してtyped warningを残し、現状ではbriefing全体を停止しない。

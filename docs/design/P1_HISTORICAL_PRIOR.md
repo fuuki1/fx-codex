@@ -1,6 +1,6 @@
 # 設計P1: 履歴priorによるセル学習の分散上限化
 
-実装ステータス: **設計のみ（コード未実装）**。本文書は
+実装ステータス: **Phase 1・2 実装済み（既定ON）／Phase 3（Tier B・実機パリティ）未着手**。本文書は
 [AI学習の適合性レビュー](../research/LEARNING_FITNESS_REVIEW_20260823.md) の
 提案P1を、実データ測定に基づいて実装可能な仕様まで落とす。
 測定の一次証拠は
@@ -73,13 +73,20 @@ factor = clip(rate_c / 0.5, [0.7, 1.0])   (rate_c < 0.45 のとき発火)
 **セル間分散 tau = ∞** を仮定した推定量である。P1はこの仮定を実測値へ置き換える。
 
 ```
-lambda_c = tau^2 / (tau^2 + sigma_c^2),  sigma_c^2 = b(1-b) / n_eff_c
+lambda_c = tau^2 / (tau^2 + sigma_c^2),  sigma_c^2 = b(1-b) / n_c
 rate_c'  = b + lambda_c * (rate_c - b)          # James-Stein 収縮
 factor   = clip(rate_c' / 0.5, [0.7, 1.0])      # 発火条件も rate_c' で判定
 ```
 
-`b` はそのスライスの全体的中率。`tau -> ∞` で `lambda -> 1` となり現行と一致する。
+`b` は減衰係数の分母と同じ 0.5（中立）。`tau -> ∞` で `lambda -> 1` となり現行と一致する。
 つまり**現行挙動は本設計の特殊ケース**であり、後方互換は数学的に保証される。
+
+> 【実装時の修正】初版はスライス全体の的中率を寄せ先にしていたが、実装中の
+> テストで欠陥が出た。全体が不調な期間（全体的中率 < 0.45）には、収縮によって
+> **全セルが基準割れして「どのセルも苦手」になる**。スライス全体の不調は
+> `symbol_factors` の責務であり、状態別セルは「中立と区別できるほど悪いか」だけを
+> 判定すべきなので、寄せ先を 0.5 固定にした
+> （`tests/test_learning_prior.py::test_prior_removes_false_decay_under_a_coin_flip_null`）。
 
 ### 2.3 tau の推定（DerSimonian-Laird）
 
@@ -234,21 +241,28 @@ def derive_profile(
 
 ```python
 rate = cell["hits"] / cell["evaluated"]
-if prior is not None:
-    feature_prior = prior.feature(horizon_key, key)
-    if feature_prior is not None and feature_prior.parity != "excluded":
-        rate = shrink_rate(rate, cell["evaluated"], overall_rate, feature_prior.tau)
+if key in prior_features:  # parity が excluded の特徴量は入らない
+    rate = learning_prior.shrink_rate(
+        rate, cell["evaluated"], SYMBOL_HIT_RATE_BASELINE, prior_features[key]
+    )
 if rate >= CONDITION_HIT_RATE_TRIGGER:
     continue
 ```
 
-`LearnedProfile` に `prior_contract` / `prior_tau` を保存し、`gate_trace` と
-学習メモへ「どの上限で収縮したか」を残す。**tauが0でも黙らない**:
-「セル間の差は統計的に検出できない（上限 x.x%）」と明示する。
+`LearnedProfile` に `prior_taus` / `prior_corpus_id` / `prior_slice` を保存し、
+学習メモへ「どの上限で収縮したか」と「どの特徴量が未測定のまま無補正か」を残す。
+**tauが0でも黙らない**し、未測定を測定済み0と混同させない。
 
-`fx_briefing.py` は artifact を1回読み、`learning.derive_profile` と
-`tf_learning.derive_timeframe_learning` へ渡す。CLIは `--no-learning-prior` を追加
-（既定は Phase 2 では OFF、Phase 3 の shadow比較を経て ON）。
+`fx_briefing.py` は artifact を読み、`learning.derive_profile` と
+`tf_learning.derive_timeframe_learning` へ渡す。CLIは `--no-learning-prior` を追加。
+
+> 【運用判断】初版は「Phase 2 は既定OFF、shadow比較を経てON」としていたが、
+> 利用者の明示的な導入要求により**既定ONで導入した**。根拠は3つ。
+> (1) 本変更は既存挙動を*狭める*方向にしか働かない（lambda <= 1）。
+> (2) `tau -> ∞` で現行と厳密に一致することがテストで保証されている（G2）。
+> (3) `--no-learning-prior` と artifact 削除の二重のロールバック経路がある。
+> ただし Phase 3 の実機パリティ計測（§4.1）と shadow比較（G8）は未実施のままであり、
+> **未実施であることを承知の上での導入**である。
 
 ### Phase 3 — Tier B とロールアウト
 
@@ -313,9 +327,27 @@ Mac mini上で、同一 `(symbol, timestamp)` について
 
 ## 8. 期待される効果と、期待してはいけないこと
 
+### 実装後の実測（無情報入力・30シード・コミット済みartifact）
+
+| 実効n | 減衰セル 前→後 | 新規判断が減衰される割合 前→後 |
+|---:|---|---|
+| 200 | 11.2 → 6.6 | 71.9% → 59.6% |
+| 500 | 9.5 → 4.8 | 61.0% → 48.1% |
+| 1000 | 5.2 → 2.2 | 35.9% → 21.8% |
+| 2000 | 2.2 → 0.8 | 16.1% → 8.4% |
+
+**偽減衰はおよそ半減にとどまる。** 測定できた特徴量（Tier A 4件）のセルでは
+ほぼゼロになる（`test_prior_removes_false_decay_under_a_coin_flip_null` で
+平均0.0を要求）が、残る4件（`rating_4h` / `rating_1d` / `tf_agreement` /
+`news_count`）は履歴再現できず未測定のため、従来どおり無補正で動く。
+**残り半分を消すにはPhase 3（Tier Bのパリティ計測）が必要**であり、
+本実装だけで「偽減衰が消えた」とは言えない。学習メモには
+「未測定のまま無補正: ...」として該当特徴量を毎回明示する。
+
 期待される（測定で裏付けあり）:
 
-- 無情報入力での偽減衰が実質ゼロになる（G3）。現行は新規判断の43〜72%が対象。
+- Tier A 特徴量のセルでは無情報入力での偽減衰が実質ゼロになる（G3）。
+  全体では上表のとおり約半減。
 - 学習メモから根拠のない「苦手パターン」の断定が消え、
   「セル間の差は検出できない（上限 x.x%）」という**正しい不確実性の報告**に変わる。
 - 「状態別の調整は最大どれだけ正当化できるか」という数値が、以後の全提案の基準になる。
@@ -339,10 +371,15 @@ Mac mini上で、同一 `(symbol, timestamp)` について
   `_estimate_weights` への適用は本設計の対象外。契約を分けて順次行う。
 - 分解能の下限は現在 0.01〜0.02。2020-2025 M5コーパスを使えば
   24hホライズンの実効nが約6倍になり、分解能は約0.008まで改善する見込み。
+- `tf:15m` スライスは1時間足コーパスから作れないため未生成で、15m判断のセル学習は
+  従来どおり無補正のまま。M5コーパス（`data/historical_training/histdata/bars_m5`）を
+  読む生成経路は未実装。
+- 実機での `--no-learning-prior` 有無のA/B比較（G8）は未実施。
 
 ## 10. 非主張
 
-- 本設計はまだ実装されておらず、実機での効果は測定されていない。
+- Phase 1・2 は実装済みだが、**実機での効果は測定されていない**。上表は合成入力での
+  実測であり、運用ジャーナルの実分布では偽減衰率もその削減幅も変わりうる。
 - 測定はTier A 4特徴量・1年・3ペア・1時間足に基づく（本番コーパスでは拡張予定）。
 - HistDataはclose-only（1hコーパス）で、昇格証拠には使えない。
 - 発注、live/paper昇格、自動売買に関する提案は一切含まない。恒久的に対象外。

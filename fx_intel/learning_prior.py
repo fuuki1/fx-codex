@@ -1,0 +1,275 @@
+"""履歴コーパスで測ったセル間分散の上限を、学習ループの収縮に渡す。
+
+`learning.derive_profile` の状態×方向セル学習は、セルごとの的中率をそのセルの
+標本だけで推定する。これは「セル間の真の分散は無限大」＝「他のセルの情報は
+一切参考にならない」という仮定と等価で、標本が少ないセルでは推定が標本誤差に
+支配される(無情報入力でも新規判断の4〜7割が減衰される)。
+
+本モジュールは、履歴バーで測った**セル間分散の片側95%上限** tau を受け取り、
+James-Stein 収縮でセル率推定を全体率へ寄せる。
+
+    lambda = tau^2 / (tau^2 + sigma^2),  sigma^2 = b(1-b)/n
+    rate'  = b + lambda * (rate - b)
+
+tau -> ∞ で lambda -> 1 となり現行の推定量と一致する。したがって現行挙動は
+本モジュールの特殊ケースであり、prior を渡さなければ挙動は変わらない。
+
+設計上の制約(意図的な非対称性):
+
+- 履歴は「位置」ではなく「分散の上限」だけを渡す。セル偏差を事前平均として
+  注入しないため、履歴期間のトレンドやレジームが将来の判断へ流れ込まない。
+- 収縮は可動域を**狭める**方向にしか働かない(lambda <= 1)。priorが壊れていても
+  減衰が強くなることはない。
+- artifactが無い/壊れている/対象セルを含まない場合は None を返し、
+  呼び出し側は現行挙動へfail-openする。
+
+詳細な根拠は docs/design/P1_HISTORICAL_PRIOR.md と
+reports/research/p1-historical-prior-feasibility-20260823/ を参照。
+
+ネットワークアクセスと追加依存を持たない純粋ロジックで、テストから直接検証できる。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+PRIOR_CONTRACT = "learning-prior-v1"
+DEFAULT_PRIOR_PATH = "config/learning_prior_v1.json"
+# 融合判断(1h特徴量・24hホライズン)と時間足別スライスのキー。
+FUSION_KEY = "fusion"
+TIMEFRAME_KEY_PREFIX = "tf:"
+# パリティ未検証・除外の特徴量は収縮に使わない(現行挙動を維持する)。
+PARITY_VERIFIED = "verified"
+PARITY_UNVERIFIED = "unverified"
+PARITY_EXCLUDED = "excluded"
+SHRINKABLE_PARITY = (PARITY_VERIFIED, PARITY_UNVERIFIED)
+
+
+def timeframe_key(timeframe: str) -> str:
+    """時間足別スライスのpriorキー。"""
+    return f"{TIMEFRAME_KEY_PREFIX}{timeframe}"
+
+
+@dataclass(frozen=True)
+class FeaturePrior:
+    """特徴量1個ぶんのセル間分散の測定結果。"""
+
+    feature: str
+    tau: float  # 運用で使う上限(片側95%)
+    tau_hat: float  # 点推定(参考)
+    cells: int
+    q_statistic: float
+    n_eff_median: float
+    parity: str = PARITY_UNVERIFIED
+
+    @property
+    def shrinkable(self) -> bool:
+        """このpriorで収縮してよいか。パリティ不合格は使わない。"""
+        return self.parity in SHRINKABLE_PARITY and self.tau >= 0.0
+
+
+@dataclass(frozen=True)
+class LearningPrior:
+    """artifact1本ぶん。スライスキー×特徴量で FeaturePrior を引く。"""
+
+    contract: str
+    generated_at: str
+    corpus_id: str
+    slices: Mapping[str, Mapping[str, FeaturePrior]]
+    promotion_admissible: bool = False
+
+    def feature(self, slice_key: str, feature: str) -> FeaturePrior | None:
+        bucket = self.slices.get(slice_key)
+        if bucket is None:
+            return None
+        return bucket.get(feature)
+
+    def summary_ja(self, slice_key: str) -> str:
+        """学習メモ用の1行。測定済みと未測定を区別して出す。"""
+        bucket = self.slices.get(slice_key)
+        if not bucket:
+            return f"状態別prior: {slice_key}は未測定(現行の無補正推定)"
+        worst = max(bucket.values(), key=lambda item: item.tau)
+        return (
+            f"状態別prior: {len(bucket)}特徴量を{self.corpus_id}で測定"
+            f"(セル間分散の上限 最大{worst.tau * 100:.2f}%)"
+        )
+
+
+def shrink_rate(rate: float, samples: float, baseline: float, tau: float) -> float:
+    """セル率をJames-Stein収縮で全体率へ寄せる。
+
+    tau は「セル間の真の分散の上限」。tau が大きいほどセル固有の推定を信じ、
+    小さいほど全体率へ寄せる。tau -> ∞ で rate をそのまま返す(現行挙動)。
+    """
+    if samples <= 0:
+        return rate
+    if tau <= 0.0:
+        # 分散ゼロ = 全セルは基準値と区別できない。
+        return baseline
+    variance = max(baseline * (1.0 - baseline), 1e-9) / samples
+    weight = tau * tau / (tau * tau + variance)
+    return baseline + weight * (rate - baseline)
+
+
+def _lower_gamma_regularized(shape: float, value: float) -> float:
+    """正則化下側不完全ガンマ関数 P(a, x)。chi2 CDF に使う。"""
+    if value <= 0.0:
+        return 0.0
+    log_gamma = math.lgamma(shape)
+    if value < shape + 1.0:
+        # 級数展開
+        term = 1.0 / shape
+        total = term
+        for index in range(1, 1000):
+            term *= value / (shape + index)
+            total += term
+            if abs(term) < abs(total) * 1e-15:
+                break
+        return total * math.exp(-value + shape * math.log(value) - log_gamma)
+    # 連分数展開(Lentz)
+    tiny = 1e-300
+    b = value + 1.0 - shape
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for index in range(1, 1000):
+        an = -index * (index - shape)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return 1.0 - math.exp(-value + shape * math.log(value) - log_gamma) * h
+
+
+def chi_square_cdf(value: float, degrees: int) -> float:
+    return _lower_gamma_regularized(degrees / 2.0, value / 2.0)
+
+
+def chi_square_quantile(probability: float, degrees: int) -> float:
+    """chi2 分位点を二分法で求める(scipy非依存、決定論的)。"""
+    if degrees <= 0:
+        return 0.0
+    low, high = 0.0, max(10.0, float(degrees) * 10.0)
+    while chi_square_cdf(high, degrees) < probability:
+        high *= 2.0
+        if high > 1e6:
+            break
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        if chi_square_cdf(mid, degrees) < probability:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def dersimonian_laird(
+    deviations: Sequence[float], variances: Sequence[float], alpha: float = 0.05
+) -> tuple[float, float, float]:
+    """メタ分析標準の tau^2 推定。返り値は (tau_hat, tau_upper, Q)。
+
+    deviations は各セルの偏差、variances はその標本分散(実効nに基づくもの)。
+    tau_upper は Q の帰無分布(chi2, df=k-1)の下側 alpha 点を使った片側上限で、
+    「統計的に否定できない最大のセル間分散」を意味する。
+    """
+    count = len(deviations)
+    if count < 2 or len(variances) != count:
+        return 0.0, 0.0, 0.0
+    weights = [1.0 / variance for variance in variances if variance > 0]
+    if len(weights) != count:
+        return 0.0, 0.0, 0.0
+    weight_sum = sum(weights)
+    weighted_mean = sum(w * d for w, d in zip(weights, deviations)) / weight_sum
+    q_statistic = sum(w * (d - weighted_mean) ** 2 for w, d in zip(weights, deviations))
+    scale = weight_sum - sum(w * w for w in weights) / weight_sum
+    if scale <= 0:
+        return 0.0, 0.0, q_statistic
+    tau2_hat = max(0.0, (q_statistic - (count - 1)) / scale)
+    chi2_low = chi_square_quantile(alpha, count - 1)
+    tau2_upper = max(0.0, (q_statistic - chi2_low) / scale)
+    return math.sqrt(tau2_hat), math.sqrt(tau2_upper), q_statistic
+
+
+def _feature_from_mapping(feature: str, payload: Mapping[str, object]) -> FeaturePrior | None:
+    tau = payload.get("tau_upper95")
+    if not isinstance(tau, (int, float)) or tau < 0:
+        return None
+    parity = str(payload.get("parity") or PARITY_UNVERIFIED)
+    if parity not in (PARITY_VERIFIED, PARITY_UNVERIFIED, PARITY_EXCLUDED):
+        return None
+    tau_hat = payload.get("tau_hat")
+    q_statistic = payload.get("Q")
+    cells = payload.get("cells")
+    n_eff = payload.get("n_eff_median")
+    return FeaturePrior(
+        feature=feature,
+        tau=float(tau),
+        tau_hat=float(tau_hat) if isinstance(tau_hat, (int, float)) else 0.0,
+        cells=int(cells) if isinstance(cells, int) else 0,
+        q_statistic=float(q_statistic) if isinstance(q_statistic, (int, float)) else 0.0,
+        n_eff_median=float(n_eff) if isinstance(n_eff, (int, float)) else 0.0,
+        parity=parity,
+    )
+
+
+def prior_from_mapping(payload: Mapping[str, object]) -> LearningPrior | None:
+    """artifactのdictを検証して LearningPrior にする。契約違反は None。"""
+    if payload.get("contract") != PRIOR_CONTRACT:
+        return None
+    if payload.get("schema") != SCHEMA_VERSION:
+        return None
+    raw_slices = payload.get("slices")
+    if not isinstance(raw_slices, Mapping):
+        return None
+    slices: dict[str, dict[str, FeaturePrior]] = {}
+    for slice_key, raw_features in raw_slices.items():
+        if not isinstance(raw_features, Mapping):
+            continue
+        features: dict[str, FeaturePrior] = {}
+        for feature, raw in raw_features.items():
+            if not isinstance(raw, Mapping):
+                continue
+            parsed = _feature_from_mapping(str(feature), raw)
+            if parsed is not None:
+                features[str(feature)] = parsed
+        if features:
+            slices[str(slice_key)] = features
+    if not slices:
+        return None
+    corpus = payload.get("corpus")
+    corpus_id = ""
+    if isinstance(corpus, Mapping):
+        corpus_id = str(corpus.get("corpus_id") or "")
+    return LearningPrior(
+        contract=PRIOR_CONTRACT,
+        generated_at=str(payload.get("generated_at") or ""),
+        corpus_id=corpus_id,
+        slices=slices,
+        promotion_admissible=bool(payload.get("promotion_admissible")),
+    )
+
+
+def load_prior(path: str | Path = DEFAULT_PRIOR_PATH) -> LearningPrior | None:
+    """artifactを読む。存在しない・壊れている場合は None(現行挙動へfail-open)。"""
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    return prior_from_mapping(payload)
