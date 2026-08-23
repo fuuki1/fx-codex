@@ -1,0 +1,153 @@
+{
+  "generated_by": "reports/research/learning-null-power-20260823/null_power_experiment.py",
+  "seeds": 40,
+  "probes_per_seed": 3000,
+  "constants": {
+    "MIN_CONDITION_SAMPLES": 12,
+    "CONDITION_HIT_RATE_TRIGGER": 0.45,
+    "CONDITION_FACTOR_MIN": 0.7,
+    "MIN_WEIGHT_SAMPLES": 20,
+    "WEIGHT_SHRINK_HALFWAY": 40,
+    "TECH_WEIGHT_MIN": 0.35,
+    "TECH_WEIGHT_MAX": 0.7,
+    "DERIVE_THIN_GAP_HOURS": 1.0
+  },
+  "null": [
+    {
+      "n_scored_per_slice": 200,
+      "market_weeks_at_one_per_hour": 1.7,
+      "false_decay_cells_mean": 12,
+      "false_decay_cells_max": 27,
+      "total_cells": 48,
+      "share_of_new_decisions_decayed": 0.7164,
+      "tech_weight_default": 0.55,
+      "tech_weight_mean": 0.5333,
+      "tech_weight_sd": 0.1416,
+      "tech_weight_min": 0.35,
+      "tech_weight_max": 0.7,
+      "share_seeds_weight_moved": 0.675
+    },
+    {
+      "n_scored_per_slice": 500,
+      "market_weeks_at_one_per_hour": 4.2,
+      "false_decay_cells_mean": 9.75,
+      "false_decay_cells_max": 22,
+      "total_cells": 48,
+      "share_of_new_decisions_decayed": 0.589,
+      "tech_weight_default": 0.55,
+      "tech_weight_mean": 0.5021,
+      "tech_weight_sd": 0.1325,
+      "tech_weight_min": 0.35,
+      "tech_weight_max": 0.7,
+      "share_seeds_weight_moved": 0.65
+    },
+    {
+      "n_scored_per_slice": 1000,
+      "market_weeks_at_one_per_hour": 8.3,
+      "false_decay_cells_mean": 6.08,
+      "false_decay_cells_max": 14,
+      "total_cells": 48,
+      "share_of_new_decisions_decayed": 0.4333,
+      "tech_weight_default": 0.55,
+      "tech_weight_mean": 0.5043,
+      "tech_weight_sd": 0.1506,
+      "tech_weight_min": 0.35,
+      "tech_weight_max": 0.7,
+      "share_seeds_weight_moved": 0.775
+    },
+    {
+      "n_scored_per_slice": 2000,
+      "market_weeks_at_one_per_hour": 16.7,
+      "false_decay_cells_mean": 3.02,
+      "false_decay_cells_max": 10,
+      "total_cells": 48,
+      "share_of_new_decisions_decayed": 0.2292,
+      "tech_weight_default": 0.55,
+      "tech_weight_mean": 0.5368,
+      "tech_weight_sd": 0.1432,
+      "tech_weight_min": 0.35,
+      "tech_weight_max": 0.7,
+      "share_seeds_weight_moved": 0.675
+    },
+    {
+      "n_scored_per_slice": 4000,
+      "market_weeks_at_one_per_hour": 33.3,
+      "false_decay_cells_mean": 0.88,
+      "false_decay_cells_max": 3,
+      "total_cells": 48,
+      "share_of_new_decisions_decayed": 0.053,
+      "tech_weight_default": 0.55,
+      "tech_weight_mean": 0.5369,
+      "tech_weight_sd": 0.1435,
+      "tech_weight_min": 0.35,
+      "tech_weight_max": 0.7,
+      "share_seeds_weight_moved": 0.7
+    }
+  ],
+  "power": [
+    {
+      "n_scored_per_slice": 500,
+      "true_bad_cell_hit_rate": 0.4,
+      "true_cell_samples_mean": 30.8,
+      "detection_rate": 0.7,
+      "false_cells_mean": 11.65,
+      "precision": 0.0567
+    },
+    {
+      "n_scored_per_slice": 1000,
+      "true_bad_cell_hit_rate": 0.4,
+      "true_cell_samples_mean": 61.8,
+      "detection_rate": 0.8,
+      "false_cells_mean": 6.83,
+      "precision": 0.1049
+    },
+    {
+      "n_scored_per_slice": 2000,
+      "true_bad_cell_hit_rate": 0.4,
+      "true_cell_samples_mean": 124.0,
+      "detection_rate": 0.825,
+      "false_cells_mean": 3.45,
+      "precision": 0.193
+    },
+    {
+      "n_scored_per_slice": 4000,
+      "true_bad_cell_hit_rate": 0.4,
+      "true_cell_samples_mean": 247.4,
+      "detection_rate": 0.925,
+      "false_cells_mean": 1.38,
+      "precision": 0.4022
+    },
+    {
+      "n_scored_per_slice": 500,
+      "true_bad_cell_hit_rate": 0.45,
+      "true_cell_samples_mean": 30.8,
+      "detection_rate": 0.4,
+      "false_cells_mean": 10.65,
+      "precision": 0.0362
+    },
+    {
+      "n_scored_per_slice": 1000,
+      "true_bad_cell_hit_rate": 0.45,
+      "true_cell_samples_mean": 61.8,
+      "detection_rate": 0.4,
+      "false_cells_mean": 6.22,
+      "precision": 0.0604
+    },
+    {
+      "n_scored_per_slice": 2000,
+      "true_bad_cell_hit_rate": 0.45,
+      "true_cell_samples_mean": 124.0,
+      "detection_rate": 0.45,
+      "false_cells_mean": 2.8,
+      "precision": 0.1385
+    },
+    {
+      "n_scored_per_slice": 4000,
+      "true_bad_cell_hit_rate": 0.45,
+      "true_cell_samples_mean": 247.4,
+      "detection_rate": 0.525,
+      "false_cells_mean": 1.02,
+      "precision": 0.3387
+    }
+  ]
+}
