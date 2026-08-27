@@ -38,6 +38,7 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from .journal import DEFAULT_ATR_FRACTION
+from .learning_prior import LearningPrior, timeframe_key
 from .learning import (
     DERIVE_THIN_GAP_HOURS,
     EvaluatedCall,
@@ -171,11 +172,15 @@ def derive_timeframe_learning(
     now: datetime | None = None,
     timeframes: Sequence[str] = DEFAULT_TIMEFRAMES,
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
+    prior: LearningPrior | None = None,
 ) -> TimeframeLearning:
     """時間足別ジャーナルから (symbol, timeframe) 別の学習を導く。
 
     各時間足をその主ホライズンで採点し、(symbol, timeframe) のスライスごとに
     derive_profile を呼ぶ。時間足全体の合算プロファイルも表示用に作る。
+
+    prior は履歴コーパスで測ったセル間分散の上限。時間足ごとに別スライス
+    ("tf:15m" 等)として引くため、未測定の時間足は自動的に従来挙動へ落ちる。
     """
     now = now or datetime.now(UTC)
     materialized = list(entries)
@@ -187,9 +192,15 @@ def derive_timeframe_learning(
         if not calls:
             continue
         horizon_label = _fmt_hours(PRIMARY_HORIZON_HOURS.get(timeframe, 24.0))
+        prior_slice = timeframe_key(timeframe)
         # 時間足全体(全ペア合算)のプロファイル(表示用)
         per_timeframe[timeframe] = derive_profile(
-            calls, now=now, thin_gap_hours=thin_gap_hours, horizon_label=horizon_label
+            calls,
+            now=now,
+            thin_gap_hours=thin_gap_hours,
+            horizon_label=horizon_label,
+            prior=prior,
+            prior_slice=prior_slice,
         )
         # (symbol, timeframe) 別プロファイル(注入元)
         for symbol in {call.symbol for call in calls}:
@@ -199,6 +210,8 @@ def derive_timeframe_learning(
                 now=now,
                 thin_gap_hours=thin_gap_hours,
                 horizon_label=horizon_label,
+                prior=prior,
+                prior_slice=prior_slice,
             )
 
     return TimeframeLearning(

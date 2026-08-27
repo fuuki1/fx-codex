@@ -88,6 +88,74 @@ zero-write確認は正規runtimeと分離したcopyで行う。
 `DISCORD_OPS_WEBHOOK_URL`が未設定で分析Webhookへのfallbackも失敗する場合、通知到達は保証されない。
 そのため`status_fx_services.sh`、launchd stderr、`freshness_report.json`の確認を移行完了条件に含める。
 
+### 0-3. 学習prior（`config/learning_prior_v1.json`）
+
+状態×方向セル学習の可動域を縛る**版管理下の入力**。runtime dataではないため
+`logs/`には置かず、実機へは`git pull`で配る。writer所有権の対象外。
+
+- 生成は人間が明示的に実行する。定期実行しない。
+
+```bash
+.venv/bin/python tools/build_learning_prior.py --dry-run   # 差分だけ確認
+.venv/bin/python tools/build_learning_prior.py             # config/へ書き出す
+```
+
+- 再生成が必要なのは、コーパス更新時か、`generated_at`から18か月経過時。
+  出力は決定論的で、`payload_sha256`が変わらなければ内容は同一。
+- ロールバックは2経路。どちらも従来の推定へ**厳密に**戻る。
+  1. `fx_briefing.py --no-learning-prior`
+  2. artifactを削除または破損させる（読み込み失敗はfail-openで従来挙動）
+- 破損・契約違反・未知スライスはすべてfail-openで、briefingを停止させない。
+- artifactは`promotion_admissible: false`。昇格証拠には使えない
+  （HistDataはclose-onlyで、ライセンス上も研究用途に限る）。
+- 設計と測定根拠は[docs/design/P1_HISTORICAL_PRIOR.md](design/P1_HISTORICAL_PRIOR.md)。
+
+実機ジャーナルがある環境では、priorの前提を検証してから使う。
+
+稼働中のチェックアウトはブランチを切り替えない。別worktreeへ展開し、
+ログは実機のものを読むだけにする。2回目以降は `worktree add` が失敗するので
+fast-forwardへフォールバックする(この1行はどちらの状態でも通る)。
+
+```bash
+FX=/path/to/fx-codex
+BRANCH=<検証したいブランチ>
+git -C "$FX" fetch origin "$BRANCH"
+git -C "$FX" worktree add /tmp/fx-prior "$BRANCH" 2>/dev/null || git -C /tmp/fx-prior merge --ff-only "origin/$BRANCH"
+```
+
+監査ツールは worktree 側を、ジャーナルは実機側を指す。
+
+```bash
+"$FX/.venv/bin/python" /tmp/fx-prior/tools/learning_prior_audit.py \
+  --prior /tmp/fx-prior/config/learning_prior_v1.json \
+  --fusion-journal "$FX/logs/briefing_journal.jsonl" \
+  --tf-journal "$FX/logs/briefing_tf_journal.jsonl" \
+  --tf-prices "$FX/logs/briefing_tf_prices.jsonl" \
+  --json /tmp/fx-prior-audit.json
+```
+
+採点0件のときは、ファイル欠如・空・PIT不適格・未成熟のどれなのかを監査自身が出す。
+「全行がPIT不適格」が出た場合は prior 以前の問題(学習ループが一切動いていない)なので、
+そちらを先に調べる。
+
+正規のチェックアウトで直接実行する場合は次を使う。
+
+```bash
+# 転移の検証(G7)と prior 有無の効果測定(G8)。読み取り専用。
+.venv/bin/python tools/learning_prior_audit.py --json logs/learning_prior_audit.json
+
+# 履歴で測れない特徴量(rating_4h/rating_1d/tf_agreement/news_count)を
+# 運用実測で足した「提案版」を書き出す。自動採用しない。diffを人間がレビューして
+# config/learning_prior_v1.json へ反映し、PRとしてcommitする。
+.venv/bin/python tools/learning_prior_audit.py --emit-artifact /tmp/learning_prior_proposed.json
+
+# M5 bid/askコーパスがあるなら tf:15m を含めて再生成できる。
+.venv/bin/python tools/build_learning_prior.py --corpus m5 --dry-run
+```
+
+監査の終了コード3は「運用実測のセル間分散が履歴の上限を超えた」= artifact見直しが必要。
+該当特徴量を `parity: "excluded"` にすれば、その特徴量だけ収縮せず現行挙動へ戻る。
+
 ### 0-3. COT PITは手動research境界（未配備）
 
 `fx_briefing.py --cot-pit-dataset <artifact>`は既存artifactを監査してas-of読込するだけで、CFTC取得、release evidence作成、materialize、更新は行わない。省略時はlegacy TTL COTへfallbackせず、COTを判断入力から除外する。invalid/unavailable/incomplete/staleもCOTだけを除外してtyped warningを残し、現状ではbriefing全体を停止しない。

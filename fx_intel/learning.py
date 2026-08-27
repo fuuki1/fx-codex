@@ -64,6 +64,7 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
 
+from . import learning_prior
 from .briefing import CONFLICT_THRESHOLD, NEWS_WEIGHT, TECH_WEIGHT
 from .journal import (
     COUNTERFACTUAL_ENTRY_KEY,
@@ -73,6 +74,7 @@ from .journal import (
     counterfactual_guard_entries,
     is_pit_eligible_entry,
 )
+from .learning_prior import LearningPrior
 from .market import WEEKEND_CLOSURE, WeekendOpenHours
 from .market_session import dimensions_from_mapping
 
@@ -300,6 +302,11 @@ class LearnedProfile:
     dimension_stats: dict[str, dict[str, dict[str, dict[str, object]]]] = field(
         default_factory=dict
     )
+    # 収縮に使った履歴priorの来歴。{特徴量キー: セル間分散の上限}。
+    # 空なら prior 未適用(= セル標本だけで推定した従来の値)。
+    prior_taus: dict[str, float] = field(default_factory=dict)
+    prior_corpus_id: str = ""
+    prior_slice: str = ""
     notes_ja: list[str] = field(default_factory=list)
 
     @property
@@ -713,6 +720,8 @@ def derive_profile(
     now: datetime | None = None,
     thin_gap_hours: float = DERIVE_THIN_GAP_HOURS,
     horizon_label: str = "約24時間後",
+    prior: LearningPrior | None = None,
+    prior_slice: str = learning_prior.FUSION_KEY,
 ) -> LearnedProfile:
     """採点済みの判断一覧から学習プロファイルを導く。
 
@@ -723,6 +732,11 @@ def derive_profile(
     horizon_label は学習メモに載せる採点ホライズンの表記(既定「約24時間後」)。
     時間足別学習(tf_learning)はここに「約1時間後」等を渡す。融合1判断は
     既定のままで従来の表示と一致する。
+
+    prior は履歴コーパスで測ったセル間分散の上限(learning_prior)。渡すと
+    状態×方向セルの率推定をJames-Stein収縮してから減衰判定する。None なら
+    従来どおりセル標本だけで推定する(= セル間分散を無限大と仮定する)。
+    prior_slice は artifact 内のスライスキー(融合は "fusion"、時間足別は "tf:1h" 等)。
     """
     now = now or datetime.now(UTC)
     if thin_gap_hours > 0:
@@ -772,13 +786,25 @@ def derive_profile(
             )
             cell["evaluated"] += 1
             cell["hits"] += 1 if call.outcome == "hit" else 0
+    # 収縮の寄せ先は減衰係数の分母と同じ 0.5(中立)。スライス全体の的中率へ寄せると、
+    # 全体が不調な期間に全セルが基準割れして「どのセルも苦手」になってしまう。
+    # スライス全体の不調は symbol_factors 側が扱う責務であり、ここでは
+    # 「中立と区別できるほどこのセルは悪いか」だけを判定する。
+    prior_features: dict[str, float] = {}
     condition_factors: dict[str, dict[str, dict[str, float]]] = {}
     for key, buckets in condition_stats.items():
+        feature_prior = prior.feature(prior_slice, key) if prior is not None else None
+        if feature_prior is not None and feature_prior.shrinkable:
+            prior_features[key] = feature_prior.tau
         for label, directions in buckets.items():
             for direction, cell in directions.items():
                 if cell["evaluated"] < MIN_CONDITION_SAMPLES:
                     continue
                 rate = cell["hits"] / cell["evaluated"]
+                if key in prior_features:
+                    rate = learning_prior.shrink_rate(
+                        rate, cell["evaluated"], SYMBOL_HIT_RATE_BASELINE, prior_features[key]
+                    )
                 if rate >= CONDITION_HIT_RATE_TRIGGER:
                     continue
                 condition_factors.setdefault(key, {}).setdefault(label, {})[direction] = max(
@@ -815,6 +841,9 @@ def derive_profile(
         condition_stats=condition_stats,
         condition_factors=condition_factors,
         dimension_stats=_derive_dimension_stats(calls),
+        prior_taus=prior_features,
+        prior_corpus_id=prior.corpus_id if prior is not None else "",
+        prior_slice=prior_slice if prior is not None else "",
     )
     profile.notes_ja = _build_notes_ja(profile, weights_adjusted, tech_n, news_n, horizon_label)
     profile.notes_ja.extend(reflection_report_ja(scored))
@@ -926,6 +955,22 @@ def _build_notes_ja(
         if weak:
             weak.sort()
             notes.append("⚠️ 苦手なチャート状態: " + " / ".join(text for _, text in weak[:3]))
+
+    # 履歴priorの来歴。「測定した結果ゼロ」と「そもそも未測定」を混同させない。
+    if profile.prior_taus:
+        worst = max(profile.prior_taus.values())
+        line = (
+            f"状態別の減衰は履歴priorで収縮済み"
+            f"({profile.prior_corpus_id or 'prior'}/{profile.prior_slice}、"
+            f"{len(profile.prior_taus)}特徴量、セル間差の上限 最大{worst * 100:.2f}%)"
+            "。上限が小さいセルは標本誤差と区別できないため調整しない"
+        )
+        unmeasured = sorted(set(profile.condition_stats) - set(profile.prior_taus))
+        if unmeasured:
+            line += f"。未測定のまま無補正: {'/'.join(unmeasured)}"
+        notes.append(line)
+    elif profile.condition_stats:
+        notes.append("状態別の減衰は履歴prior未適用(セル標本のみの推定。標本誤差を含む)")
 
     for symbol, factor in sorted(profile.symbol_factors.items()):
         stats = profile.symbol_stats.get(symbol, {})

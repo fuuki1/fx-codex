@@ -1,0 +1,676 @@
+{
+  "contract": "learning-prior-v1",
+  "corpus": {
+    "bar_alignment": "fx_day_22utc",
+    "bar_interval_hours": 1.0,
+    "corpus_id": "histdata-1h-2024-3pairs",
+    "datasets": [
+      {
+        "bars": 6265,
+        "license_note": "HistData.com free ASCII M1, EST->UTC, resampled to 1h. Personal/research use per HistData terms. CLOSE-ONLY (no bid/ask, no real volume): NOT admissible for any promotion or performance claim.",
+        "pair": "USDJPY",
+        "path": "data/real/histdata/usdjpy_2024_1h.csv",
+        "sha256": "9e2b632decc8f9bfb1e77564b493b3d8711406a096c6ef3c119482d0c4823839"
+      },
+      {
+        "bars": 6295,
+        "license_note": "HistData.com free ASCII M1, EST->UTC, resampled to 1h. Personal/research use per HistData terms. CLOSE-ONLY (no bid/ask, no real volume): NOT admissible for any promotion or performance claim.",
+        "pair": "EURUSD",
+        "path": "data/real/histdata/eurusd_2024_1h.csv",
+        "sha256": "799f3c9f1cbf86a6e56545d83f0220f6834c14727ad0a1a438eb583037eed668"
+      },
+      {
+        "bars": 6281,
+        "license_note": "HistData.com free ASCII M1, EST->UTC, resampled to 1h. Personal/research use per HistData terms. CLOSE-ONLY (no bid/ask, no real volume): NOT admissible for any promotion or performance claim.",
+        "pair": "GBPUSD",
+        "path": "data/real/histdata/gbpusd_2024_1h.csv",
+        "sha256": "98824aa825cf467215dd27bfef3ae1431213dd72029ea4d4221ae05ea666b639"
+      }
+    ],
+    "pairs": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY"
+    ],
+    "window": {
+      "end": "2024-12-31T22:00:00+00:00",
+      "start": "2024-01-01T22:00:00+00:00"
+    }
+  },
+  "generated_at": "2026-08-23T08:32:30.691787+00:00",
+  "generator": "tools/build_learning_prior.py",
+  "method": {
+    "decay_trigger": 0.45,
+    "demean": "pair_direction",
+    "effective_n": "raw / horizon_bars",
+    "features": [
+      "rsi_1h",
+      "adx_1h",
+      "ma_gap_atr",
+      "atr_pct"
+    ],
+    "flat_band": "atr * 0.1",
+    "label": "direction_hit_at_slice_horizon",
+    "not_replayable": [
+      "rating_4h",
+      "rating_1d",
+      "tf_agreement",
+      "news_count"
+    ],
+    "tau_estimator": "dersimonian_laird",
+    "tau_used": "upper95"
+  },
+  "payload_sha256": "bf249ce6092342f9dd96c07264d5576358d93f3cea65ec93a5ed86a4a0ac01c3",
+  "promotion_admissible": false,
+  "schema": 1,
+  "slices": {
+    "fusion": {
+      "adx_1h": {
+        "Q": 1.7174,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "レンジ(20未満)|long": {
+            "deviation": 0.022441,
+            "n_eff": 270.9
+          },
+          "レンジ(20未満)|short": {
+            "deviation": -0.022441,
+            "n_eff": 270.9
+          },
+          "弱トレンド(20-30)|long": {
+            "deviation": -0.013233,
+            "n_eff": 260.7
+          },
+          "弱トレンド(20-30)|short": {
+            "deviation": 0.013233,
+            "n_eff": 260.7
+          },
+          "強トレンド(30以上)|long": {
+            "deviation": -0.012086,
+            "n_eff": 217.5
+          },
+          "強トレンド(30以上)|short": {
+            "deviation": 0.012086,
+            "n_eff": 217.5
+          }
+        },
+        "max_abs_deviation": 0.022441,
+        "n_eff_median": 260.7,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.010691
+      },
+      "atr_pct": {
+        "Q": 3.58,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中ボラ(0.10-0.25%)|long": {
+            "deviation": -0.017767,
+            "n_eff": 408.9
+          },
+          "中ボラ(0.10-0.25%)|short": {
+            "deviation": 0.017767,
+            "n_eff": 408.9
+          },
+          "低ボラ(0.10%未満)|long": {
+            "deviation": 0.027674,
+            "n_eff": 313.6
+          },
+          "低ボラ(0.10%未満)|short": {
+            "deviation": -0.027674,
+            "n_eff": 313.6
+          },
+          "高ボラ(0.25%以上)|long": {
+            "deviation": -0.053272,
+            "n_eff": 26.5
+          },
+          "高ボラ(0.25%以上)|short": {
+            "deviation": 0.053272,
+            "n_eff": 26.5
+          }
+        },
+        "max_abs_deviation": 0.053272,
+        "n_eff_median": 313.6,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.023022
+      },
+      "ma_gap_atr": {
+        "Q": 1.9507,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中(0.5-2)|long": {
+            "deviation": -0.024409,
+            "n_eff": 249.7
+          },
+          "中(0.5-2)|short": {
+            "deviation": 0.024409,
+            "n_eff": 249.7
+          },
+          "大(2以上)|long": {
+            "deviation": 0.015243,
+            "n_eff": 405.0
+          },
+          "大(2以上)|short": {
+            "deviation": -0.015243,
+            "n_eff": 405.0
+          },
+          "小(0.5未満)|long": {
+            "deviation": -0.000836,
+            "n_eff": 94.3
+          },
+          "小(0.5未満)|short": {
+            "deviation": 0.000836,
+            "n_eff": 94.3
+          }
+        },
+        "max_abs_deviation": 0.024409,
+        "n_eff_median": 249.7,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.013014
+      },
+      "rsi_1h": {
+        "Q": 2.0042,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中立圏(35-65)|long": {
+            "deviation": 0.009787,
+            "n_eff": 566.5
+          },
+          "中立圏(35-65)|short": {
+            "deviation": -0.009787,
+            "n_eff": 566.5
+          },
+          "売られすぎ圏(35未満)|long": {
+            "deviation": -0.017352,
+            "n_eff": 84.4
+          },
+          "売られすぎ圏(35未満)|short": {
+            "deviation": 0.017352,
+            "n_eff": 84.4
+          },
+          "買われすぎ圏(65超)|long": {
+            "deviation": -0.04157,
+            "n_eff": 98.2
+          },
+          "買われすぎ圏(65超)|short": {
+            "deviation": 0.04157,
+            "n_eff": 98.2
+          }
+        },
+        "max_abs_deviation": 0.04157,
+        "n_eff_median": 98.2,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.014289
+      }
+    },
+    "tf:1d": {
+      "adx_1h": {
+        "Q": 15.029,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "レンジ(20未満)|long": {
+            "deviation": 0.111594,
+            "n_eff": 102.0
+          },
+          "レンジ(20未満)|short": {
+            "deviation": -0.111594,
+            "n_eff": 102.0
+          },
+          "弱トレンド(20-30)|long": {
+            "deviation": 0.000681,
+            "n_eff": 169.0
+          },
+          "弱トレンド(20-30)|short": {
+            "deviation": -0.000681,
+            "n_eff": 169.0
+          },
+          "強トレンド(30以上)|long": {
+            "deviation": -0.052742,
+            "n_eff": 218.0
+          },
+          "強トレンド(30以上)|short": {
+            "deviation": 0.052742,
+            "n_eff": 218.0
+          }
+        },
+        "max_abs_deviation": 0.111594,
+        "n_eff_median": 169.0,
+        "parity": "unverified",
+        "tau_hat": 0.055917,
+        "tau_upper95": 0.065791
+      },
+      "atr_pct": {
+        "Q": 0.0,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 2,
+        "cells_detail": {
+          "高ボラ(0.25%以上)|long": {
+            "deviation": 0.0,
+            "n_eff": 489.0
+          },
+          "高ボラ(0.25%以上)|short": {
+            "deviation": 0.0,
+            "n_eff": 489.0
+          }
+        },
+        "max_abs_deviation": 0.0,
+        "n_eff_median": 489.0,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.0
+      },
+      "ma_gap_atr": {
+        "Q": 4.0432,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中(0.5-2)|long": {
+            "deviation": 0.048769,
+            "n_eff": 147.0
+          },
+          "中(0.5-2)|short": {
+            "deviation": -0.048769,
+            "n_eff": 147.0
+          },
+          "大(2以上)|long": {
+            "deviation": -0.022313,
+            "n_eff": 305.0
+          },
+          "大(2以上)|short": {
+            "deviation": 0.022313,
+            "n_eff": 305.0
+          },
+          "小(0.5未満)|long": {
+            "deviation": -0.009821,
+            "n_eff": 37.0
+          },
+          "小(0.5未満)|short": {
+            "deviation": 0.009821,
+            "n_eff": 37.0
+          }
+        },
+        "max_abs_deviation": 0.048769,
+        "n_eff_median": 147.0,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.031254
+      },
+      "rsi_1h": {
+        "Q": 10.0735,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中立圏(35-65)|long": {
+            "deviation": 0.031215,
+            "n_eff": 348.0
+          },
+          "中立圏(35-65)|short": {
+            "deviation": -0.031215,
+            "n_eff": 348.0
+          },
+          "売られすぎ圏(35未満)|long": {
+            "deviation": -0.103011,
+            "n_eff": 65.0
+          },
+          "売られすぎ圏(35未満)|short": {
+            "deviation": 0.103011,
+            "n_eff": 65.0
+          },
+          "買われすぎ圏(65超)|long": {
+            "deviation": -0.054831,
+            "n_eff": 76.0
+          },
+          "買われすぎ圏(65超)|short": {
+            "deviation": 0.054831,
+            "n_eff": 76.0
+          }
+        },
+        "max_abs_deviation": 0.103011,
+        "n_eff_median": 76.0,
+        "parity": "unverified",
+        "tau_hat": 0.04224,
+        "tau_upper95": 0.056034
+      }
+    },
+    "tf:1h": {
+      "adx_1h": {
+        "Q": 7.511,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "レンジ(20未満)|long": {
+            "deviation": 0.003296,
+            "n_eff": 5562.0
+          },
+          "レンジ(20未満)|short": {
+            "deviation": -0.003296,
+            "n_eff": 5562.0
+          },
+          "弱トレンド(20-30)|long": {
+            "deviation": 0.006545,
+            "n_eff": 5377.0
+          },
+          "弱トレンド(20-30)|short": {
+            "deviation": -0.006545,
+            "n_eff": 5377.0
+          },
+          "強トレンド(30以上)|long": {
+            "deviation": -0.012101,
+            "n_eff": 4423.0
+          },
+          "強トレンド(30以上)|short": {
+            "deviation": 0.012101,
+            "n_eff": 4423.0
+          }
+        },
+        "max_abs_deviation": 0.012101,
+        "n_eff_median": 5377.0,
+        "parity": "unverified",
+        "tau_hat": 0.004955,
+        "tau_upper95": 0.00789
+      },
+      "atr_pct": {
+        "Q": 7.1606,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中ボラ(0.10-0.25%)|long": {
+            "deviation": -0.005609,
+            "n_eff": 8348.0
+          },
+          "中ボラ(0.10-0.25%)|short": {
+            "deviation": 0.005609,
+            "n_eff": 8348.0
+          },
+          "低ボラ(0.10%未満)|long": {
+            "deviation": 0.008619,
+            "n_eff": 6477.0
+          },
+          "低ボラ(0.10%未満)|short": {
+            "deviation": -0.008619,
+            "n_eff": 6477.0
+          },
+          "高ボラ(0.25%以上)|long": {
+            "deviation": -0.016762,
+            "n_eff": 537.0
+          },
+          "高ボラ(0.25%以上)|short": {
+            "deviation": 0.016762,
+            "n_eff": 537.0
+          }
+        },
+        "max_abs_deviation": 0.016762,
+        "n_eff_median": 6477.0,
+        "parity": "unverified",
+        "tau_hat": 0.0048,
+        "tau_upper95": 0.008008
+      },
+      "ma_gap_atr": {
+        "Q": 3.6305,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中(0.5-2)|long": {
+            "deviation": -0.007224,
+            "n_eff": 5104.0
+          },
+          "中(0.5-2)|short": {
+            "deviation": 0.007224,
+            "n_eff": 5104.0
+          },
+          "大(2以上)|long": {
+            "deviation": 0.002478,
+            "n_eff": 8317.0
+          },
+          "大(2以上)|short": {
+            "deviation": -0.002478,
+            "n_eff": 8317.0
+          },
+          "小(0.5未満)|long": {
+            "deviation": 0.008377,
+            "n_eff": 1941.0
+          },
+          "小(0.5未満)|short": {
+            "deviation": -0.008377,
+            "n_eff": 1941.0
+          }
+        },
+        "max_abs_deviation": 0.008377,
+        "n_eff_median": 5104.0,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.005057
+      },
+      "rsi_1h": {
+        "Q": 5.2066,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中立圏(35-65)|long": {
+            "deviation": 0.003027,
+            "n_eff": 11571.0
+          },
+          "中立圏(35-65)|short": {
+            "deviation": -0.003027,
+            "n_eff": 11571.0
+          },
+          "売られすぎ圏(35未満)|long": {
+            "deviation": -0.001143,
+            "n_eff": 1784.0
+          },
+          "売られすぎ圏(35未満)|short": {
+            "deviation": 0.001143,
+            "n_eff": 1784.0
+          },
+          "買われすぎ圏(65超)|long": {
+            "deviation": -0.016435,
+            "n_eff": 2007.0
+          },
+          "買われすぎ圏(65超)|short": {
+            "deviation": 0.016435,
+            "n_eff": 2007.0
+          }
+        },
+        "max_abs_deviation": 0.016435,
+        "n_eff_median": 2007.0,
+        "parity": "unverified",
+        "tau_hat": 0.001548,
+        "tau_upper95": 0.006864
+      }
+    },
+    "tf:4h": {
+      "adx_1h": {
+        "Q": 2.8672,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "レンジ(20未満)|long": {
+            "deviation": -0.003229,
+            "n_eff": 1076.0
+          },
+          "レンジ(20未満)|short": {
+            "deviation": 0.003229,
+            "n_eff": 1076.0
+          },
+          "弱トレンド(20-30)|long": {
+            "deviation": 0.011757,
+            "n_eff": 1419.0
+          },
+          "弱トレンド(20-30)|short": {
+            "deviation": -0.011757,
+            "n_eff": 1419.0
+          },
+          "強トレンド(30以上)|long": {
+            "deviation": -0.011407,
+            "n_eff": 1158.0
+          },
+          "強トレンド(30以上)|short": {
+            "deviation": 0.011407,
+            "n_eff": 1158.0
+          }
+        },
+        "max_abs_deviation": 0.011757,
+        "n_eff_median": 1158.0,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.008416
+      },
+      "atr_pct": {
+        "Q": 4.6558,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 4,
+        "cells_detail": {
+          "中ボラ(0.10-0.25%)|long": {
+            "deviation": 0.010006,
+            "n_eff": 2242.0
+          },
+          "中ボラ(0.10-0.25%)|short": {
+            "deviation": -0.010006,
+            "n_eff": 2242.0
+          },
+          "高ボラ(0.25%以上)|long": {
+            "deviation": -0.015899,
+            "n_eff": 1411.0
+          },
+          "高ボラ(0.25%以上)|short": {
+            "deviation": 0.015899,
+            "n_eff": 1411.0
+          }
+        },
+        "max_abs_deviation": 0.015899,
+        "n_eff_median": 2242.0,
+        "parity": "unverified",
+        "tau_hat": 0.008762,
+        "tau_upper95": 0.014127
+      },
+      "ma_gap_atr": {
+        "Q": 2.4082,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中(0.5-2)|long": {
+            "deviation": 0.005103,
+            "n_eff": 1070.0
+          },
+          "中(0.5-2)|short": {
+            "deviation": -0.005103,
+            "n_eff": 1070.0
+          },
+          "大(2以上)|long": {
+            "deviation": 0.002006,
+            "n_eff": 2212.0
+          },
+          "大(2以上)|short": {
+            "deviation": -0.002006,
+            "n_eff": 2212.0
+          },
+          "小(0.5未満)|long": {
+            "deviation": -0.026676,
+            "n_eff": 371.0
+          },
+          "小(0.5未満)|short": {
+            "deviation": 0.026676,
+            "n_eff": 371.0
+          }
+        },
+        "max_abs_deviation": 0.026676,
+        "n_eff_median": 1070.0,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.007494
+      },
+      "rsi_1h": {
+        "Q": 1.4322,
+        "advisory_only": [
+          "cells_detail",
+          "max_abs_deviation"
+        ],
+        "cells": 6,
+        "cells_detail": {
+          "中立圏(35-65)|long": {
+            "deviation": 0.002767,
+            "n_eff": 2702.0
+          },
+          "中立圏(35-65)|short": {
+            "deviation": -0.002767,
+            "n_eff": 2702.0
+          },
+          "売られすぎ圏(35未満)|long": {
+            "deviation": 0.003293,
+            "n_eff": 434.0
+          },
+          "売られすぎ圏(35未満)|short": {
+            "deviation": -0.003293,
+            "n_eff": 434.0
+          },
+          "買われすぎ圏(65超)|long": {
+            "deviation": -0.017225,
+            "n_eff": 517.0
+          },
+          "買われすぎ圏(65超)|short": {
+            "deviation": 0.017225,
+            "n_eff": 517.0
+          }
+        },
+        "max_abs_deviation": 0.017225,
+        "n_eff_median": 517.0,
+        "parity": "unverified",
+        "tau_hat": 0.0,
+        "tau_upper95": 0.003717
+      }
+    }
+  }
+}

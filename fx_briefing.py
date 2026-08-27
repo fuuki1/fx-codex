@@ -30,6 +30,10 @@
    学習メモとして表示する。
    分析を重ねるほど自分の当たり外れから学習して調整が効いてくる
    (--no-learning で無効化)
+   状態別セルの率推定は、履歴コーパスで測ったセル間分散の上限
+   (config/learning_prior_v1.json)で収縮してから減衰判定する。少数標本の
+   セルが標本誤差だけで「苦手な状態」と断定されるのを防ぐ
+   (--no-learning-prior で無効化して従来推定へ戻す)
 
 8. 複数AI委員会(fx_intel/committee.py) — テクニカル/ニュース/マクロ/MLの
    4委員が意見を出し、複合スコアを重み付き平均で合成。リスクオフィサー
@@ -89,6 +93,7 @@ from fx_intel import (
     ibkr_prices,
     journal,
     learning,
+    learning_prior,
     input_context,
     liquidity,
     macro,
@@ -144,11 +149,21 @@ NOTIFICATION_FAILURE_EXIT_CODE = 5
 DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
 DEFAULT_DIRECTION_THRESHOLD_POLICY_PATH = PROJECT_ROOT / "logs" / "direction_threshold_policy.json"
 DEFAULT_INPUT_POLICY_PATH = PROJECT_ROOT / "ops" / "input_policy.json"
+# 履歴コーパスで測ったセル間分散の上限(版管理下。runtime dataではない)。
+# 状態×方向セルの率推定をこの上限で収縮し、標本誤差由来の減衰を止める。
+DEFAULT_LEARNING_PRIOR_PATH = PROJECT_ROOT / "config" / "learning_prior_v1.json"
 
 # MLモデルの自動再学習: 学習済みモデルがこの日数より古いか、まだ一度も
 # 学習に成功していない場合に再学習を試みる(train_artifactのサンプル不足
 # ガードが早期returnするため、データが足りないうちは実質ノーコスト)
 ML_RETRAIN_DAYS = 7.0
+
+
+def load_learning_prior(args: argparse.Namespace) -> learning_prior.LearningPrior | None:
+    """履歴priorを読む。--no-learning-prior と読み込み失敗は None(従来挙動)。"""
+    if getattr(args, "no_learning_prior", False):
+        return None
+    return learning_prior.load_prior(DEFAULT_LEARNING_PRIOR_PATH)
 
 
 def _attach_cot_pit_dataset(
@@ -939,7 +954,9 @@ def _run_per_timeframe(
     tf_learn = tf_learning.TimeframeLearning()
     learning_note = ""
     if not args.no_learning:
-        tf_learn = tf_learning.derive_timeframe_learning(scoring_entries, now=now)
+        tf_learn = tf_learning.derive_timeframe_learning(
+            scoring_entries, now=now, prior=load_learning_prior(args)
+        )
         learning_note = tf_learn.summary_ja()
         if not args.dry_run:
             try:
@@ -1235,6 +1252,14 @@ def main(argv: list[str] | None = None) -> int:
         "--no-learning",
         action="store_true",
         help="学習プロファイルによる重み・確信度の自動調整を行わない(既定重みで実行)",
+    )
+    parser.add_argument(
+        "--no-learning-prior",
+        action="store_true",
+        help=(
+            "履歴priorによる状態別セルの収縮を行わない"
+            "(セル標本だけで推定する従来挙動へ戻す。ロールバック用)"
+        ),
     )
     parser.add_argument(
         "--no-trade-expectancy",
@@ -1678,7 +1703,9 @@ def main(argv: list[str] | None = None) -> int:
         calls = learning.evaluate_history(
             journal_entries, require_pit=True, include_guard_counterfactuals=True
         )
-        profile = learning.derive_profile(calls, now=now)
+        profile = learning.derive_profile(
+            calls, now=now, prior=load_learning_prior(args), prior_slice=learning_prior.FUSION_KEY
+        )
         learning_note = profile.summary_ja()
         # ホライズン別(4h/24h/72h)の的中率観測。学習は24hのみを使う
         horizon_line = learning.horizon_report_ja(
