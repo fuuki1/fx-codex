@@ -829,6 +829,39 @@ def test_audit_does_not_flag_a_clean_timeframe_journal(tmp_path: Path) -> None:
     assert report["tau_exceeded"] == []
 
 
+def test_proposal_review_table_separates_capped_noise_from_real_dispersion(
+    tmp_path: Path,
+) -> None:
+    """レビュー表が、上限だけの項目と本物の分散を持つ項目を区別して出す。"""
+    fusion = tmp_path / "briefing_journal.jsonl"
+    _fusion_journal(fusion, count=1400, bad_cell=True, seed=9)
+    proposed_path = tmp_path / "proposed.json"
+    learning_prior_audit.main(
+        [
+            "--fusion-journal",
+            str(fusion),
+            "--tf-journal",
+            str(tmp_path / "absent.jsonl"),
+            "--tf-prices",
+            str(tmp_path / "absent-prices.jsonl"),
+            "--emit-artifact",
+            str(proposed_path),
+        ]
+    )
+    proposed = json.loads(proposed_path.read_text(encoding="utf-8"))
+    table = learning_prior_audit.render_proposal(proposed)
+    assert "fusion/rating_4h" in table
+    assert "点推定0 = 有意な異質性なし" in table
+    # 本物の分散(rating_4h)はキャップされず、ノイズだけの項目はキャップされる
+    fusion_slice = proposed["slices"][learning_prior.FUSION_KEY]
+    assert fusion_slice["rating_4h"]["capped_by_historical_max"] is None
+    assert fusion_slice["tf_agreement"]["capped_by_historical_max"] is not None
+
+
+def test_proposal_review_table_handles_an_empty_proposal() -> None:
+    assert "追加なし" in learning_prior_audit.render_proposal({"live_audit": {"added": []}})
+
+
 def test_holm_correction_suppresses_chance_findings() -> None:
     """無補正なら通る弱い証拠が、比較件数を考慮すると通らない。"""
     p_values = [0.03] + [0.4] * 39

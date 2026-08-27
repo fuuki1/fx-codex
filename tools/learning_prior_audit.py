@@ -409,6 +409,49 @@ def propose_artifact(
     return proposed
 
 
+def render_proposal(proposed: Mapping[str, object]) -> str:
+    """提案artifactの追加分だけを、人間がレビューできる表にする。
+
+    採否の判断に要るのは4点。点推定が0か(=測れた効果ではなく上限か)、
+    履歴の最大upperでキャップされたか、実効標本はどれだけか、来歴は何か。
+    """
+    audit = proposed.get("live_audit")
+    added = audit.get("added") if isinstance(audit, Mapping) else None
+    if not isinstance(added, list) or not added:
+        return "追加なし(履歴で測れない特徴量に、判定可能な実測が無い)"
+    slices = proposed.get("slices")
+    if not isinstance(slices, Mapping):
+        return ""
+    lines = [
+        "",
+        "提案artifactの追加分(人間のレビュー用。commitはしていない):",
+        f"  {'スライス/特徴量':<26}{'採用tau':>9}{'実測upper':>11}{'点推定':>8}"
+        f"{'実効n中央':>10}{'キャップ':>10}",
+    ]
+    for key in added:
+        slice_key, _, feature = str(key).partition("/")
+        bucket = slices.get(slice_key)
+        entry = bucket.get(feature) if isinstance(bucket, Mapping) else None
+        if not isinstance(entry, Mapping):
+            continue
+        cap = entry.get("capped_by_historical_max")
+        lines.append(
+            f"  {key:<26}{float(entry['tau_upper95']) * 100:>8.2f}%"
+            f"{float(entry['measured_tau_upper95']) * 100:>10.2f}%"
+            f"{float(entry['tau_hat']) * 100:>7.2f}%"
+            f"{float(entry['n_eff_median']):>10.1f}"
+            f"{'—' if cap is None else f'{float(cap) * 100:.2f}%':>10}"
+        )
+    lines.append(
+        "  点推定0 = 有意な異質性なし。採用tauは上側95%限界であって測定された効果ではない。"
+    )
+    lines.append(
+        "  採否を決める前に、この提案版を --prior に渡して再監査し、"
+        "減衰される判断の割合がどれだけ動くかを見ること。"
+    )
+    return "\n".join(lines)
+
+
 def render_text(report: Mapping[str, object]) -> str:
     lines: list[str] = []
     for slice_report in report.get("slices", []):
@@ -524,7 +567,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             encoding="utf-8",
         )
         added = proposed["live_audit"]["added"]
-        print(f"wrote {args.emit_artifact} (追加 {len(added)}件: {', '.join(added) or 'なし'})")
+        print(f"wrote {args.emit_artifact} (追加 {len(added)}件)")
+        print(render_proposal(proposed))
     return EXIT_TAU_EXCEEDED if exceeded else 0
 
 
