@@ -82,7 +82,7 @@ def bucketize(feature: str, value: float) -> str | None:
 
 def measure_live_tau(
     calls: Sequence[learning.EvaluatedCall], overlap: float
-) -> dict[str, dict[str, object]]:
+) -> tuple[dict[str, dict[str, object]], dict[str, learning_prior.CellMeasurement]]:
     """採点済み判断から特徴量別に tau を推定する。
 
     履歴コーパス側(tools/build_learning_prior.py)と同一の
@@ -98,9 +98,8 @@ def measure_live_tau(
     ]
     features = [spec.key for spec in learning.FEATURE_SPECS]
     measured: dict[str, dict[str, object]] = {}
-    for feature, cells in learning_prior.cell_deviations(
-        observations, overlap, features, bucketize
-    ).items():
+    by_feature = learning_prior.cell_deviations(observations, overlap, features, bucketize)
+    for feature, cells in by_feature.items():
         usable = sum(
             1 for values in cells.detail.values() if values["n_raw"] >= MIN_CONDITION_SAMPLES
         )
@@ -111,20 +110,19 @@ def measure_live_tau(
                 "tau_hat": None,
             }
             continue
-        tau_hat, tau_upper, q_statistic = learning_prior.dersimonian_laird(
-            cells.deviations, cells.variances
-        )
+        fit = learning_prior.fit_heterogeneity(cells.deviations, cells.variances)
         effective = sorted(cells.effective)
         measured[feature] = {
             "cells": len(cells.deviations),
             "usable_cells": usable,
-            "tau_hat": round(tau_hat, 6),
-            "tau_upper95": round(tau_upper, 6),
-            "Q": round(q_statistic, 4),
+            "tau_hat": round(fit.tau_hat, 6),
+            "tau_upper95": round(fit.tau_upper, 6),
+            "Q": round(fit.q_statistic, 4),
+            "Q_df": fit.degrees,
             "n_eff_median": round(effective[len(effective) // 2], 1),
             "max_abs_deviation": round(max(abs(value) for value in cells.deviations), 6),
         }
-    return measured
+    return measured, by_feature
 
 
 def compare_adjustments(
@@ -166,12 +164,46 @@ def _fired_cells(profile: LearnedProfile) -> int:
     )
 
 
-def _verdict(live: Mapping[str, object], artifact_tau: float | None) -> str:
-    if live.get("tau_hat") is None:
-        return VERDICT_INCONCLUSIVE
-    if artifact_tau is None:
-        return VERDICT_LIVE_ONLY
-    return VERDICT_EXCEEDS if float(live["tau_hat"]) > artifact_tau else VERDICT_CONFIRMS
+def assign_verdicts(report: dict[str, object], alpha: float = 0.05) -> int:
+    """全比較が出そろってから判定する。返り値は Holm を適用した比較件数。
+
+    `exceeds` は「点推定が artifact の上限を超えた」では出さない。8特徴量 ×
+    最大5スライスで最大40回比較するため、無補正だと偶然だけで数件出る。
+    それはこの道具自身が、元の学習ループで批判したのと同じ多重比較の罠に
+    はまることを意味する。
+
+    判定は「artifact の tau では説明しきれない異質性か」の片側p値
+    (ランダム効果重み 1/(v+tau^2) で組み直した Q を chi2(k-1) と比較)へ、
+    Holm-Bonferroni をかけて行う。棄却されたものだけを `exceeds` にする。
+    """
+    slices = report.get("slices")
+    if not isinstance(slices, list):
+        return 0
+    targets = [
+        measurement
+        for slice_report in slices
+        for measurement in slice_report["features"].values()
+        if measurement.get("p_value_vs_artifact") is not None
+    ]
+    rejections = learning_prior.holm_rejections(
+        [float(measurement["p_value_vs_artifact"]) for measurement in targets], alpha
+    )
+    for measurement, rejected in zip(targets, rejections):
+        measurement["holm_rejected"] = rejected
+    for slice_report in slices:
+        for measurement in slice_report["features"].values():
+            if measurement.get("tau_hat") is None:
+                measurement["verdict"] = VERDICT_INCONCLUSIVE
+            elif measurement.get("artifact_tau") is None:
+                measurement["verdict"] = VERDICT_LIVE_ONLY
+            elif measurement.get("holm_rejected"):
+                measurement["verdict"] = VERDICT_EXCEEDS
+            else:
+                measurement["verdict"] = VERDICT_CONFIRMS
+    report["comparisons"] = len(targets)
+    report["multiple_testing"] = "holm_bonferroni"
+    report["alpha"] = alpha
+    return len(targets)
 
 
 def audit_slice(
@@ -190,16 +222,30 @@ def audit_slice(
         else baseline
     )
     overlap = overlap_factor(horizon_hours)
-    live = measure_live_tau(calls, overlap)
+    live, cells_by_feature = measure_live_tau(calls, overlap)
     features: dict[str, object] = {}
     for feature, measurement in live.items():
         entry = prior.feature(slice_key, feature) if prior is not None else None
         artifact_tau = entry.tau if entry is not None else None
+        # 「artifactのtauでは説明しきれない異質性か」の片側p値。
+        # 補正は assign_verdicts が全比較を見てから Holm でかける。
+        p_value = None
+        cells = cells_by_feature.get(feature)
+        if (
+            artifact_tau is not None
+            and cells is not None
+            and measurement.get("tau_hat") is not None
+        ):
+            p_value = learning_prior.heterogeneity_pvalue(
+                cells.deviations, cells.variances, float(artifact_tau)
+            )
         features[feature] = {
             **measurement,
             "artifact_tau": artifact_tau,
             "artifact_source": entry.source if entry is not None else None,
-            "verdict": _verdict(measurement, artifact_tau),
+            "p_value_vs_artifact": None if p_value is None else round(p_value, 8),
+            # verdict は assign_verdicts が全比較を見てから入れる。
+            "verdict": VERDICT_INCONCLUSIVE,
         }
     return {
         "slice": slice_key,
@@ -389,10 +435,12 @@ def render_text(report: Mapping[str, object]) -> str:
                 continue
             artifact_tau = measurement["artifact_tau"]
             shown = "なし" if artifact_tau is None else f"{artifact_tau * 100:.2f}%"
+            p_value = measurement.get("p_value_vs_artifact")
+            evidence = "" if p_value is None else f" p={float(p_value):.3g}"
             lines.append(
                 f"  {feature:<14} 実測tau {float(measurement['tau_hat']) * 100:.2f}%"
                 f" (上限{float(measurement['tau_upper95']) * 100:.2f}%)"
-                f" / artifact {shown} → {measurement['verdict']}"
+                f" / artifact {shown}{evidence} → {measurement['verdict']}"
             )
     diagnostics = report.get("journals")
     if isinstance(diagnostics, Mapping):
@@ -445,6 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         audit_slice(slice_key, calls, horizon, prior, label)
         for slice_key, calls, horizon, label in collected
     ]
+    assign_verdicts(report)
     exceeded = [
         f"{slice_report['slice']}/{feature}"
         for slice_report in report["slices"]

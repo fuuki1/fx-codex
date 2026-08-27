@@ -365,7 +365,13 @@ def _weekday_hours(start: datetime, count: int) -> list[datetime]:
     return stamps
 
 
-def _fusion_journal(path: Path, count: int = 700, bad_cell: bool = False, seed: int = 3) -> None:
+def _fusion_journal(
+    path: Path,
+    count: int = 700,
+    bad_cell: bool = False,
+    seed: int = 3,
+    bad_feature: str = "rating_4h",
+) -> None:
     """PIT適格な融合ジャーナルを合成する。24市場時間先の終値で採点される。"""
     rng = random.Random(seed)
     stamps = _weekday_hours(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), count)
@@ -383,8 +389,13 @@ def _fusion_journal(path: Path, count: int = 700, bad_cell: bool = False, seed: 
         features["rating_4h"] = rng.uniform(-1.0, 1.0)
         features["rating_1d"] = rng.uniform(-1.0, 1.0)
         if bad_cell:
-            # rating_4h が売り寄りのときだけ、必ず順行しない方向を選ぶ。
-            if features["rating_4h"] < -0.25:
+            # 指定セルに入ったときだけ、必ず順行しない方向を選ぶ。
+            in_bad_cell = (
+                features["rating_4h"] < -0.25
+                if bad_feature == "rating_4h"
+                else features["rsi_1h"] < 35.0
+            )
+            if in_bad_cell:
                 direction = "short" if move > 0 else "long"
         rows.append(
             {
@@ -714,3 +725,125 @@ def test_cell_deviations_normalises_negative_zero() -> None:
     measured = learning_prior.cell_deviations(observations, 1.0, ["x"], _flat_bucketize)
     for values in measured["x"].detail.values():
         assert math.copysign(1.0, values["deviation"]) > 0 or values["deviation"] != 0.0
+
+
+def _timeframe_journal(
+    path: Path, count: int = 1400, bad_cell: bool = False, seed: int = 21
+) -> None:
+    """PIT適格な時間足別ジャーナル(1h)。次のエントリの終値が1時間先の将来価格になる。"""
+    rng = random.Random(seed)
+    stamps = _weekday_hours(datetime(2026, 1, 5, 0, 0, tzinfo=UTC), count)
+    prices = [150.0]
+    for _ in range(count):
+        prices.append(prices[-1] + rng.gauss(0.0, 0.10))
+    atr = 0.30
+    rows: list[dict] = []
+    for index, stamp in enumerate(stamps):
+        move = prices[index + 1] - prices[index]
+        direction = rng.choice(["long", "short"])
+        features = _features(rng)
+        features["tf_agreement"] = rng.choice([0.25, 0.5, 0.75, 1.0])
+        features["news_count"] = float(rng.randint(0, 6))
+        features["rating_4h"] = rng.uniform(-1.0, 1.0)
+        features["rating_1d"] = rng.uniform(-1.0, 1.0)
+        if bad_cell and features["rsi_1h"] < 35.0:
+            direction = "short" if move > 0 else "long"
+        rows.append(
+            {
+                "ts": stamp.isoformat(),
+                "prediction_time": stamp.isoformat(),
+                "source_cutoff": (stamp - timedelta(minutes=2)).isoformat(),
+                "max_feature_available_time": (stamp - timedelta(seconds=1)).isoformat(),
+                "pit_eligible": True,
+                "pit_contract": journal.DECISION_JOURNAL_PIT_CONTRACT,
+                "decision_id": f"decision:USDJPY:1h:{stamp.isoformat()}",
+                "mode": "per_timeframe",
+                "producer": journal.TIMEFRAME_PRODUCER,
+                "producer_version": journal.TIMEFRAME_PRODUCER_VERSION,
+                "input_context_id": f"context:{stamp.isoformat()}",
+                "source_record_ids": [f"source:{stamp.isoformat()}"],
+                "symbol": "USDJPY",
+                "timeframe": "1h",
+                "horizon_hours": 1.0,
+                "direction": direction,
+                "conviction": rng.randint(20, 80),
+                "composite": 0.4,
+                "tech_score": rng.uniform(-1.0, 1.0),
+                "news_score": rng.uniform(-1.0, 1.0),
+                "close": round(prices[index], 4),
+                "atr": atr,
+                "data_quality": 0.9,
+                "features": features,
+            }
+        )
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8"
+    )
+
+
+def _run_audit(tmp_path: Path, *, tf_journal: Path, report: Path) -> int:
+    return learning_prior_audit.main(
+        [
+            "--fusion-journal",
+            str(tmp_path / "absent-fusion.jsonl"),
+            "--tf-journal",
+            str(tf_journal),
+            "--tf-prices",
+            str(tmp_path / "absent-prices.jsonl"),
+            "--json",
+            str(report),
+        ]
+    )
+
+
+def test_audit_flags_a_feature_whose_live_dispersion_beats_the_artifact(tmp_path: Path) -> None:
+    """exceeds の陽性対照。artifactに上限がある特徴量が実運用で大きく散る場合。
+
+    重複係数1の tf:1h スライスで行う。融合スライスは24時間ラベルを1時間刻みで
+    貼るため実効標本が1/24になり、真の分散が大きくても検出力が出ない
+    (それ自体は統計的に正しい挙動で、下の陰性対照で確認する)。
+    """
+    tf_journal = tmp_path / "briefing_tf_journal.jsonl"
+    _timeframe_journal(tf_journal, bad_cell=True)
+    report_path = tmp_path / "report.json"
+    code = _run_audit(tmp_path, tf_journal=tf_journal, report=report_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    slices = {entry["slice"]: entry for entry in report["slices"]}
+    hourly = slices[learning_prior.timeframe_key("1h")]
+    assert hourly["overlap_factor"] == 1.0
+    assert hourly["features"]["rsi_1h"]["verdict"] == learning_prior_audit.VERDICT_EXCEEDS
+    assert code == learning_prior_audit.EXIT_TAU_EXCEEDED
+    assert report["multiple_testing"] == "holm_bonferroni"
+    # 壊していない特徴量は巻き込まれない
+    assert hourly["features"]["adx_1h"]["verdict"] == learning_prior_audit.VERDICT_CONFIRMS
+
+
+def test_audit_does_not_flag_a_clean_timeframe_journal(tmp_path: Path) -> None:
+    """陰性対照。同じ経路でも、真の分散が無ければ exceeds は出ない。"""
+    tf_journal = tmp_path / "briefing_tf_journal.jsonl"
+    _timeframe_journal(tf_journal, bad_cell=False)
+    report_path = tmp_path / "report.json"
+    code = _run_audit(tmp_path, tf_journal=tf_journal, report=report_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert code == 0
+    assert report["tau_exceeded"] == []
+
+
+def test_holm_correction_suppresses_chance_findings() -> None:
+    """無補正なら通る弱い証拠が、比較件数を考慮すると通らない。"""
+    p_values = [0.03] + [0.4] * 39
+    assert p_values[0] <= 0.05  # 無補正なら「有意」
+    assert learning_prior.holm_rejections(p_values) == [False] * 40
+    # 十分強い証拠は残る
+    assert learning_prior.holm_rejections([0.0001] + [0.4] * 39)[0] is True
+
+
+def test_heterogeneity_pvalue_accounts_for_the_assumed_tau() -> None:
+    variances = [0.0025] * 6
+    deviations = [0.20, -0.01, 0.0, 0.005, -0.005, 0.0]
+    strict = learning_prior.heterogeneity_pvalue(deviations, variances, 0.0)
+    lenient = learning_prior.heterogeneity_pvalue(deviations, variances, 0.10)
+    assert strict is not None and lenient is not None
+    # 同じ観測でも、広いtauを仮定すれば「説明できる」ので p は大きくなる
+    assert strict < 0.05 < lenient
+    assert learning_prior.heterogeneity_pvalue([0.01], [0.0025], 0.0) is None

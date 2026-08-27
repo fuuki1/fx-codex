@@ -183,31 +183,114 @@ def chi_square_quantile(probability: float, degrees: int) -> float:
     return (low + high) / 2.0
 
 
-def dersimonian_laird(
+@dataclass(frozen=True)
+class HeterogeneityFit:
+    """DerSimonian-Laird の推定結果。任意の alpha で境界を引き直せるよう scale を持つ。"""
+
+    tau_hat: float
+    tau_upper: float
+    q_statistic: float
+    degrees: int
+    scale: float
+
+    def bound(self, alpha: float, *, upper: bool) -> float:
+        """片側境界。upper=True で上限(否定できない最大)、False で下限(示せる最小)。
+
+        上限は Q の帰無分布の下側 alpha 点、下限は上側 alpha 点を使う。
+        下限が 0 を超えるのは「Q が帰無分布のほぼ全域より大きい」場合だけなので、
+        「実測の異質性が確かに存在する」と言えるときにしか正の値にならない。
+        """
+        return tau_bound(self.q_statistic, self.degrees, self.scale, alpha, upper=upper)
+
+
+def tau_bound(
+    q_statistic: float, degrees: int, scale: float, alpha: float, *, upper: bool
+) -> float:
+    if scale <= 0 or degrees < 1:
+        return 0.0
+    probability = alpha if upper else 1.0 - alpha
+    critical = chi_square_quantile(probability, degrees)
+    return math.sqrt(max(0.0, (q_statistic - critical) / scale))
+
+
+def fit_heterogeneity(
     deviations: Sequence[float], variances: Sequence[float], alpha: float = 0.05
-) -> tuple[float, float, float]:
-    """メタ分析標準の tau^2 推定。返り値は (tau_hat, tau_upper, Q)。
+) -> HeterogeneityFit:
+    """メタ分析標準の tau^2 推定(DerSimonian-Laird)。
 
     deviations は各セルの偏差、variances はその標本分散(実効nに基づくもの)。
-    tau_upper は Q の帰無分布(chi2, df=k-1)の下側 alpha 点を使った片側上限で、
-    「統計的に否定できない最大のセル間分散」を意味する。
     """
     count = len(deviations)
     if count < 2 or len(variances) != count:
-        return 0.0, 0.0, 0.0
+        return HeterogeneityFit(0.0, 0.0, 0.0, 0, 0.0)
     weights = [1.0 / variance for variance in variances if variance > 0]
     if len(weights) != count:
-        return 0.0, 0.0, 0.0
+        return HeterogeneityFit(0.0, 0.0, 0.0, 0, 0.0)
     weight_sum = sum(weights)
     weighted_mean = sum(w * d for w, d in zip(weights, deviations)) / weight_sum
     q_statistic = sum(w * (d - weighted_mean) ** 2 for w, d in zip(weights, deviations))
     scale = weight_sum - sum(w * w for w in weights) / weight_sum
+    degrees = count - 1
     if scale <= 0:
-        return 0.0, 0.0, q_statistic
-    tau2_hat = max(0.0, (q_statistic - (count - 1)) / scale)
-    chi2_low = chi_square_quantile(alpha, count - 1)
-    tau2_upper = max(0.0, (q_statistic - chi2_low) / scale)
-    return math.sqrt(tau2_hat), math.sqrt(tau2_upper), q_statistic
+        return HeterogeneityFit(0.0, 0.0, q_statistic, degrees, 0.0)
+    tau2_hat = max(0.0, (q_statistic - degrees) / scale)
+    return HeterogeneityFit(
+        tau_hat=math.sqrt(tau2_hat),
+        tau_upper=tau_bound(q_statistic, degrees, scale, alpha, upper=True),
+        q_statistic=q_statistic,
+        degrees=degrees,
+        scale=scale,
+    )
+
+
+def heterogeneity_pvalue(
+    deviations: Sequence[float], variances: Sequence[float], tau: float
+) -> float | None:
+    """帰無仮説「セル間分散はちょうど tau」に対する片側p値。
+
+    ランダム効果の重み 1/(v_i + tau^2) で Q を組み直すと、tau が正しいとき
+    Q は近似的に chi2(k-1) に従う。したがって Q が上側にずれた度合いが
+    「tau では説明しきれない異質性」の証拠になる。
+
+    tau=0 を渡せば通常の異質性検定と一致する。セルが2件未満なら None。
+    """
+    count = len(deviations)
+    if count < 2 or len(variances) != count:
+        return None
+    weights = [1.0 / (variance + tau * tau) for variance in variances if variance > 0]
+    if len(weights) != count:
+        return None
+    weight_sum = sum(weights)
+    weighted_mean = sum(w * d for w, d in zip(weights, deviations)) / weight_sum
+    q_statistic = sum(w * (d - weighted_mean) ** 2 for w, d in zip(weights, deviations))
+    return 1.0 - chi_square_cdf(q_statistic, count - 1)
+
+
+def holm_rejections(p_values: Sequence[float], alpha: float = 0.05) -> list[bool]:
+    """Holm-Bonferroni。返り値は入力順の棄却フラグ。
+
+    多重比較を補正しないと、8特徴量×5スライスの比較で偶然だけで数件が
+    「有意」になる。Bonferroniより検出力が高く、family-wise error は同じく制御する。
+    """
+    total = len(p_values)
+    if total == 0:
+        return []
+    order = sorted(range(total), key=lambda index: p_values[index])
+    rejected = [False] * total
+    for rank, index in enumerate(order):
+        if p_values[index] <= alpha / (total - rank):
+            rejected[index] = True
+        else:
+            break
+    return rejected
+
+
+def dersimonian_laird(
+    deviations: Sequence[float], variances: Sequence[float], alpha: float = 0.05
+) -> tuple[float, float, float]:
+    """後方互換の3-tuple版。返り値は (tau_hat, tau_upper, Q)。"""
+    fit = fit_heterogeneity(deviations, variances, alpha)
+    return fit.tau_hat, fit.tau_upper, fit.q_statistic
 
 
 @dataclass(frozen=True)
