@@ -112,6 +112,34 @@ zero-write確認は正規runtimeと分離したcopyで行う。
 
 実機ジャーナルがある環境では、priorの前提を検証してから使う。
 
+稼働中のチェックアウトはブランチを切り替えない。別worktreeへ展開し、
+ログは実機のものを読むだけにする。2回目以降は `worktree add` が失敗するので
+fast-forwardへフォールバックする(この1行はどちらの状態でも通る)。
+
+```bash
+FX=/path/to/fx-codex
+BRANCH=<検証したいブランチ>
+git -C "$FX" fetch origin "$BRANCH"
+git -C "$FX" worktree add /tmp/fx-prior "$BRANCH" 2>/dev/null || git -C /tmp/fx-prior merge --ff-only "origin/$BRANCH"
+```
+
+監査ツールは worktree 側を、ジャーナルは実機側を指す。
+
+```bash
+"$FX/.venv/bin/python" /tmp/fx-prior/tools/learning_prior_audit.py \
+  --prior /tmp/fx-prior/config/learning_prior_v1.json \
+  --fusion-journal "$FX/logs/briefing_journal.jsonl" \
+  --tf-journal "$FX/logs/briefing_tf_journal.jsonl" \
+  --tf-prices "$FX/logs/briefing_tf_prices.jsonl" \
+  --json /tmp/fx-prior-audit.json
+```
+
+採点0件のときは、ファイル欠如・空・PIT不適格・未成熟のどれなのかを監査自身が出す。
+「全行がPIT不適格」が出た場合は prior 以前の問題(学習ループが一切動いていない)なので、
+そちらを先に調べる。
+
+正規のチェックアウトで直接実行する場合は次を使う。
+
 ```bash
 # 転移の検証(G7)と prior 有無の効果測定(G8)。読み取り専用。
 .venv/bin/python tools/learning_prior_audit.py --json logs/learning_prior_audit.json
