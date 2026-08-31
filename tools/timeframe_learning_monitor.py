@@ -7,10 +7,13 @@ import argparse
 from collections.abc import Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
+import time
 import unicodedata
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fx_intel import (  # noqa: E402
+    decision_commit,
     journal,
     maximization,
     price_history,
@@ -35,6 +39,7 @@ DEFAULT_MAXIMIZATION = REPO_ROOT / "logs" / "briefing_maximization.json"
 DEFAULT_MONITOR = REPO_ROOT / "logs" / "timeframe_learning_monitor.json"
 MONITOR_CONTRACT = "fx-codex-timeframe-learning-monitor-v1"
 BUNDLE_LOCK_TIMEOUT_SECONDS = 5.0
+SOURCE_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -51,20 +56,75 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         stage_timing_path,
         pipeline="timeframe_learning_monitor",
     )
+    previous_sources = _previous_source_evidence(monitor_path)
     decision_audit: dict[str, object] = {}
     with timing.stage("timeframe_learning_journal_read"):
-        decision_source_before = _source_identity(journal_path)
-        decisions = list(journal.read_entries(journal_path, strict=True, audit=decision_audit))
-        decision_source = _source_identity(journal_path)
-        if decision_source != decision_source_before:
-            raise RuntimeError("decision journal changed during timeframe learning read")
+        decision_source, decision_full_source = _source_snapshot(
+            journal_path,
+            previous_source=previous_sources.get("decisions"),
+            previous_full_source=previous_sources.get("cross_log_commit"),
+        )
+        decisions = list(
+            journal.read_entries(
+                journal_path,
+                strict=True,
+                audit=decision_audit,
+                end_offset=int(decision_source["read_offset_bytes"]),
+                full_log_end_offset=(
+                    int(decision_full_source["read_offset_bytes"])
+                    if decision_full_source is not None
+                    else None
+                ),
+            )
+        )
+        _assert_snapshot_prefix_available(
+            journal_path,
+            decision_source,
+            observed_sha256=_audit_digest(decision_audit),
+        )
+        if decision_full_source is not None:
+            _assert_snapshot_prefix_available(
+                decision_commit.commit_path_for(journal_path),
+                decision_full_source,
+            )
+            _assert_previous_prefix_unchanged(
+                decision_full_source,
+                previous_sources.get("cross_log_commit"),
+                label="decision cross-log commit source",
+            )
+        _assert_previous_prefix_unchanged(
+            decision_source,
+            previous_sources.get("decisions"),
+            label="decision learning source",
+        )
+        decision_source.pop("_previous_prefix_sha256", None)
+        if decision_full_source is not None:
+            decision_full_source.pop("_previous_prefix_sha256", None)
     price_audit: dict[str, object] = {}
     with timing.stage("timeframe_learning_price_read"):
-        price_source_before = _source_identity(prices_path)
-        raw_prices = list(journal.read_entries(prices_path, strict=True, audit=price_audit))
-        price_source = _source_identity(prices_path)
-        if price_source != price_source_before:
-            raise RuntimeError("price journal changed during timeframe learning read")
+        price_source, _ = _source_snapshot(
+            prices_path,
+            previous_source=previous_sources.get("prices"),
+        )
+        raw_prices = list(
+            journal.read_entries(
+                prices_path,
+                strict=True,
+                audit=price_audit,
+                end_offset=int(price_source["read_offset_bytes"]),
+            )
+        )
+        _assert_snapshot_prefix_available(
+            prices_path,
+            price_source,
+            observed_sha256=_audit_digest(price_audit),
+        )
+        _assert_previous_prefix_unchanged(
+            price_source,
+            previous_sources.get("prices"),
+            label="price learning source",
+        )
+        price_source.pop("_previous_prefix_sha256", None)
     generated_at = datetime.now(UTC)
     with timing.stage("timeframe_learning_pit_filter"):
         pit_decisions = [
@@ -135,6 +195,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 monitor_path,
                 generated_at=generated_at,
                 input_watermarks=input_watermarks,
+                cross_log_commit_snapshot=decision_full_source,
             )
         with timing.stage("timeframe_learning_bundle_publish"):
             tf_learning.save_timeframe_learning(direction, tf_learning_path)
@@ -162,6 +223,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     "timeframe_maximization": _artifact(maximization_path),
                 },
                 "stage_timing": stage_timing.summarize(timing.records),
+                "cross_log_commit_snapshot": decision_full_source,
             }
             atomic_write_json(monitor_path, payload)
     return payload
@@ -245,6 +307,7 @@ def _assert_not_source_rollback(
     *,
     generated_at: datetime,
     input_watermarks: dict[str, dict[str, object]],
+    cross_log_commit_snapshot: dict[str, object] | None,
 ) -> None:
     """Reject a fresh-looking generation built from truncated/replaced inputs."""
 
@@ -298,6 +361,30 @@ def _assert_not_source_rollback(
             old_eligible_hash = old.get("sha256")
             if isinstance(old_eligible_hash, str) and old_eligible_hash != new.get("sha256"):
                 raise RuntimeError(f"{scope} eligible learning population changed")
+    previous_commit_source = previous.get("cross_log_commit_snapshot")
+    if isinstance(previous_commit_source, dict) and cross_log_commit_snapshot is not None:
+        if previous_commit_source.get("source_path") != cross_log_commit_snapshot.get(
+            "source_path"
+        ):
+            raise RuntimeError("decision cross-log commit source path changed")
+        for key in ("device", "inode"):
+            if type(
+                previous_commit_source.get(key)
+            ) is int and previous_commit_source.get(  # noqa: E721
+                key
+            ) != cross_log_commit_snapshot.get(
+                key
+            ):
+                raise RuntimeError("decision cross-log commit source identity changed")
+        for key in ("read_offset_bytes", "mtime_ns"):
+            old_value = previous_commit_source.get(key)
+            new_value = cross_log_commit_snapshot.get(key)
+            if (
+                type(old_value) is int  # noqa: E721
+                and type(new_value) is int  # noqa: E721
+                and new_value < old_value
+            ):
+                raise RuntimeError(f"decision cross-log commit source regressed at {key}")
 
 
 def _aware_timestamp(value: object) -> datetime | None:
@@ -375,6 +462,171 @@ def _source_identity(path: Path) -> dict[str, object]:
         "read_offset_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def _source_snapshot(
+    path: Path,
+    *,
+    previous_source: dict[str, object] | None = None,
+    previous_full_source: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    """Pin complete append-only source boundaries under the writers' file locks."""
+
+    source = path.resolve()
+    full_source = decision_commit.commit_path_for(source).resolve()
+    candidates = sorted({source, full_source})
+    handles = []
+    try:
+        deadline = time.monotonic() + SOURCE_LOCK_TIMEOUT_SECONDS
+        for candidate in candidates:
+            handle = candidate.open("rb")
+            try:
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                f"timed out waiting for learning source lock: {candidate}"
+                            )
+                        time.sleep(min(0.01, remaining))
+            except BaseException:
+                handle.close()
+                raise
+            handles.append((candidate, handle))
+        identities = {
+            candidate: _handle_identity(candidate, handle.fileno()) for candidate, handle in handles
+        }
+        for candidate, handle in handles:
+            boundary = int(identities[candidate]["read_offset_bytes"])
+            if boundary:
+                handle.seek(boundary - 1)
+                if handle.read(1) != b"\n":
+                    raise journal.JournalIntegrityError(
+                        f"incomplete JSONL snapshot boundary at {candidate}"
+                    )
+        for candidate, handle in handles:
+            previous = previous_source if candidate == source else previous_full_source
+            previous_end_offset = _evidence_offset(previous)
+            snapshot_sha256, previous_prefix_sha256 = _handle_prefix_hashes(
+                handle.fileno(),
+                int(identities[candidate]["read_offset_bytes"]),
+                previous_end_offset=previous_end_offset,
+            )
+            identities[candidate]["source_sha256"] = snapshot_sha256
+            if previous_end_offset is not None:
+                identities[candidate]["_previous_prefix_sha256"] = previous_prefix_sha256
+        return identities[source], identities.get(full_source) if full_source != source else None
+    finally:
+        for _candidate, handle in reversed(handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def _handle_identity(path: Path, file_descriptor: int) -> dict[str, object]:
+    stat = os.fstat(file_descriptor)
+    return {
+        "source_path": str(path),
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "read_offset_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _handle_prefix_hashes(
+    file_descriptor: int,
+    end_offset: int,
+    *,
+    previous_end_offset: int | None,
+) -> tuple[str, str | None]:
+    if previous_end_offset is not None and previous_end_offset > end_offset:
+        raise RuntimeError("learning source regressed before previous snapshot boundary")
+    snapshot_digest = hashlib.sha256()
+    previous_digest = hashlib.sha256() if previous_end_offset is not None else None
+    os.lseek(file_descriptor, 0, os.SEEK_SET)
+    remaining = end_offset
+    position = 0
+    while remaining:
+        chunk = os.read(file_descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            raise journal.JournalIntegrityError("source is shorter than snapshot boundary")
+        snapshot_digest.update(chunk)
+        if previous_digest is not None and position < int(previous_end_offset):
+            previous_digest.update(chunk[: int(previous_end_offset) - position])
+        position += len(chunk)
+        remaining -= len(chunk)
+    return (
+        snapshot_digest.hexdigest(),
+        previous_digest.hexdigest() if previous_digest is not None else None,
+    )
+
+
+def _assert_snapshot_prefix_available(
+    path: Path,
+    snapshot: dict[str, object],
+    *,
+    observed_sha256: str | None = None,
+) -> None:
+    current = _source_identity(path.resolve())
+    if current["source_path"] != snapshot["source_path"]:
+        raise RuntimeError("learning source path changed during snapshot read")
+    if any(current[key] != snapshot[key] for key in ("device", "inode")):
+        raise RuntimeError("learning source identity changed during snapshot read")
+    if int(current["read_offset_bytes"]) < int(snapshot["read_offset_bytes"]):
+        raise RuntimeError("learning source truncated during snapshot read")
+    expected_sha256 = snapshot.get("source_sha256")
+    if observed_sha256 is not None and observed_sha256 != expected_sha256:
+        raise RuntimeError("learning source prefix changed during snapshot read")
+
+
+def _previous_source_evidence(manifest_path: Path) -> dict[str, dict[str, object]]:
+    try:
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if (
+        not isinstance(previous, dict)
+        or previous.get("monitor_contract") != MONITOR_CONTRACT
+        or previous.get("status") != "ok"
+    ):
+        return {}
+    output: dict[str, dict[str, object]] = {}
+    watermarks = previous.get("input_watermarks")
+    if isinstance(watermarks, dict):
+        for scope in ("decisions", "prices"):
+            evidence = watermarks.get(scope)
+            if isinstance(evidence, dict):
+                output[scope] = evidence
+    commit_source = previous.get("cross_log_commit_snapshot")
+    if isinstance(commit_source, dict):
+        output["cross_log_commit"] = commit_source
+    return output
+
+
+def _evidence_offset(evidence: dict[str, object] | None) -> int | None:
+    if not isinstance(evidence, dict):
+        return None
+    value = evidence.get("read_offset_bytes")
+    return value if type(value) is int and value >= 0 else None  # noqa: E721
+
+
+def _assert_previous_prefix_unchanged(
+    snapshot: dict[str, object],
+    previous: dict[str, object] | None,
+    *,
+    label: str,
+) -> None:
+    if previous is None:
+        return
+    expected = previous.get("source_sha256")
+    observed = snapshot.get("_previous_prefix_sha256")
+    if isinstance(expected, str) and len(expected) == 64 and observed != expected:
+        raise RuntimeError(f"{label} previous prefix changed")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import fcntl
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -816,7 +818,7 @@ def test_timeframe_learning_monitor_excludes_non_pit_decisions(tmp_path) -> None
                 "physical_rows": len(rows),
                 "parsed_object_rows": len(rows),
                 "blank_rows": 0,
-                "source_sha256": "0" * 64,
+                "source_sha256": hashlib.sha256(Path(_path).read_bytes()).hexdigest(),
             }
         )
         return iter(rows)
@@ -928,7 +930,7 @@ def test_timeframe_learning_monitor_rejects_future_price(tmp_path, monkeypatch) 
     assert [row["close"] for row in captured[0]] == [150.0]
 
 
-def test_timeframe_learning_monitor_rejects_source_change_during_read(tmp_path) -> None:
+def test_timeframe_learning_monitor_accepts_append_after_snapshot_boundary(tmp_path) -> None:
     script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
     spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_race", script)
     assert spec and spec.loader
@@ -955,17 +957,203 @@ def test_timeframe_learning_monitor_rejects_source_change_during_read(tmp_path) 
         ]
     )
 
-    def changing_read(_path, **_kwargs):
-        journal_path.write_text("{}\n", encoding="utf-8")
-        return iter(())
+    original_read_entries = module.journal.read_entries
+    appended = False
+
+    def appending_read(path, **kwargs):
+        nonlocal appended
+        if Path(path) == journal_path and not appended:
+            with journal_path.open("a", encoding="utf-8") as handle:
+                handle.write('{"appended": true}\n')
+            appended = True
+        return original_read_entries(path, **kwargs)
+
+    with mock.patch.object(module.journal, "read_entries", side_effect=appending_read):
+        result = module.run(args)
+
+    assert result["decision_rows"] == 0
+    watermark = result["input_watermarks"]["decisions"]
+    assert watermark["read_offset_bytes"] == 0
+    assert journal_path.stat().st_size > watermark["read_offset_bytes"]
+
+
+def test_timeframe_learning_monitor_rejects_source_replacement_during_read(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_replace", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    journal_path.write_text("{}\n", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(tmp_path / "tf.json"),
+            "--tp-sl-learning",
+            str(tmp_path / "tp.json"),
+            "--maximization",
+            str(tmp_path / "max.json"),
+            "--monitor-json",
+            str(tmp_path / "monitor.json"),
+        ]
+    )
+    original_read_entries = module.journal.read_entries
+    replaced = False
+
+    def replacing_read(path, **kwargs):
+        nonlocal replaced
+        rows = original_read_entries(path, **kwargs)
+        if Path(path) == journal_path and not replaced:
+            replacement = tmp_path / "replacement.jsonl"
+            replacement.write_text("{}\n", encoding="utf-8")
+            replacement.replace(journal_path)
+            replaced = True
+        return rows
 
     with (
-        mock.patch.object(module.journal, "read_entries", side_effect=changing_read),
-        pytest.raises(RuntimeError, match="decision journal changed"),
+        mock.patch.object(module.journal, "read_entries", side_effect=replacing_read),
+        pytest.raises(RuntimeError, match="source identity changed"),
     ):
         module.run(args)
 
     assert not (tmp_path / "monitor.json").exists()
+
+
+def test_timeframe_learning_monitor_rejects_same_inode_prefix_rewrite(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_rewrite", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    journal_path.write_bytes(b'{"id": 1}\n')
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(tmp_path / "tf.json"),
+            "--tp-sl-learning",
+            str(tmp_path / "tp.json"),
+            "--maximization",
+            str(tmp_path / "max.json"),
+            "--monitor-json",
+            str(tmp_path / "monitor.json"),
+        ]
+    )
+    original_read_entries = module.journal.read_entries
+    rewritten = False
+
+    def rewriting_read(path, **kwargs):
+        nonlocal rewritten
+        if Path(path) == journal_path and not rewritten:
+            with journal_path.open("r+b") as handle:
+                handle.write(b'{"id": 2}\n')
+                handle.flush()
+            rewritten = True
+        return original_read_entries(path, **kwargs)
+
+    with (
+        mock.patch.object(module.journal, "read_entries", side_effect=rewriting_read),
+        pytest.raises(RuntimeError, match="source prefix changed"),
+    ):
+        module.run(args)
+
+    assert not (tmp_path / "monitor.json").exists()
+
+
+@pytest.mark.parametrize("rewritten_source", ("journal", "prices"))
+def test_timeframe_learning_monitor_rejects_prior_prefix_rewrite_plus_append(
+    tmp_path, rewritten_source
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location(
+        f"timeframe_learning_monitor_prior_rewrite_{rewritten_source}", script
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "journal.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    journal_path.write_bytes(b'{"id": 1}\n')
+    price_path.write_bytes(b'{"id": 1}\n')
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": tmp_path / "monitor.json",
+    }
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+        ]
+    )
+    module.run(args)
+    before = {key: path.read_bytes() for key, path in outputs.items()}
+    target = journal_path if rewritten_source == "journal" else price_path
+    with target.open("r+b") as handle:
+        handle.write(b'{"id": 2}\n')
+        handle.seek(0, 2)
+        handle.write(b'{"id": 3}\n')
+        handle.flush()
+
+    with pytest.raises(RuntimeError, match="previous prefix changed"):
+        module.run(args)
+
+    assert {key: path.read_bytes() for key, path in outputs.items()} == before
+
+
+def test_timeframe_learning_source_snapshot_has_bounded_lock_wait(tmp_path, monkeypatch) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_timeout", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = tmp_path / "prices.jsonl"
+    source.write_text("", encoding="utf-8")
+    writer_locked = threading.Event()
+    release_writer = threading.Event()
+
+    def hold_writer() -> None:
+        with source.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            writer_locked.set()
+            assert release_writer.wait(timeout=5)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    writer = threading.Thread(target=hold_writer)
+    writer.start()
+    assert writer_locked.wait(timeout=5)
+    monkeypatch.setattr(module, "SOURCE_LOCK_TIMEOUT_SECONDS", 0.02)
+    try:
+        with pytest.raises(TimeoutError, match="learning source lock"):
+            module._source_snapshot(source)
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+
+    assert not writer.is_alive()
 
 
 @pytest.mark.parametrize("corrupt_source", ("journal", "prices"))
@@ -1053,6 +1241,102 @@ def test_timeframe_learning_monitor_rejects_valid_but_truncated_source(tmp_path)
     journal_path.write_text("", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="source regressed"):
+        module.run(args)
+
+    assert {key: path.read_bytes() for key, path in outputs.items()} == before
+
+
+def test_timeframe_learning_monitor_rejects_cross_log_commit_replacement(tmp_path) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_full_replace", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "briefing_tf_journal.jsonl"
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": tmp_path / "monitor.json",
+    }
+    journal_path.write_text("", encoding="utf-8")
+    full_path.write_text("", encoding="utf-8")
+    price_path.write_text("", encoding="utf-8")
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+        ]
+    )
+    module.run(args)
+    before = {key: path.read_bytes() for key, path in outputs.items()}
+    replacement = tmp_path / "replacement-full.jsonl"
+    replacement.write_text("", encoding="utf-8")
+    replacement.replace(full_path)
+
+    with pytest.raises(RuntimeError, match="cross-log commit source identity changed"):
+        module.run(args)
+
+    assert {key: path.read_bytes() for key, path in outputs.items()} == before
+
+
+def test_timeframe_learning_monitor_rejects_cross_log_prior_prefix_rewrite_plus_append(
+    tmp_path,
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location("timeframe_learning_monitor_full_rewrite", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal_path = tmp_path / "briefing_tf_journal.jsonl"
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    price_path = tmp_path / "prices.jsonl"
+    journal_path.write_text("", encoding="utf-8")
+    full_path.write_bytes(b'{"id": 1}\n')
+    price_path.write_text("", encoding="utf-8")
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": tmp_path / "monitor.json",
+    }
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+        ]
+    )
+    module.run(args)
+    before = {key: path.read_bytes() for key, path in outputs.items()}
+    with full_path.open("r+b") as handle:
+        handle.write(b'{"id": 2}\n')
+        handle.seek(0, 2)
+        handle.write(b'{"id": 3}\n')
+        handle.flush()
+
+    with pytest.raises(RuntimeError, match="cross-log commit source previous prefix changed"):
         module.run(args)
 
     assert {key: path.read_bytes() for key, path in outputs.items()} == before

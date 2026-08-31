@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
@@ -105,3 +106,27 @@ def test_read_entries_default_remains_tolerant_and_strict_audits_bytes(tmp_path)
     assert audit["parsed_object_rows"] == 2
     assert audit["blank_rows"] == 1
     assert len(str(audit["source_sha256"])) == 64
+
+
+def test_strict_read_entries_pins_complete_prefix_while_source_grows(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    first = b'{"id": 1}\n'
+    path.write_bytes(first)
+    boundary = path.stat().st_size
+    with path.open("ab") as handle:
+        handle.write(b'{"id": 2}\n')
+
+    audit: dict[str, object] = {}
+    assert list(journal.read_entries(path, strict=True, audit=audit, end_offset=boundary)) == [
+        {"id": 1}
+    ]
+    assert audit["physical_rows"] == 1
+    assert audit["source_sha256"] == hashlib.sha256(first).hexdigest()
+
+
+def test_strict_read_entries_rejects_boundary_inside_row(tmp_path) -> None:
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(b'{"id": 1}\n')
+
+    with pytest.raises(journal.JournalIntegrityError, match="snapshot ends inside JSONL row"):
+        list(journal.read_entries(path, strict=True, end_offset=5))

@@ -625,6 +625,8 @@ def read_entries(
     *,
     strict: bool = False,
     audit: dict[str, object] | None = None,
+    end_offset: int | None = None,
+    full_log_end_offset: int | None = None,
 ):
     """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。
 
@@ -643,14 +645,26 @@ def read_entries(
                 "source_sha256": "",
             }
         )
+    if end_offset is not None and (type(end_offset) is not int or end_offset < 0):  # noqa: E721
+        raise ValueError("end_offset must be a non-negative integer")
+    if full_log_end_offset is not None and (
+        type(full_log_end_offset) is not int or full_log_end_offset < 0  # noqa: E721
+    ):
+        raise ValueError("full_log_end_offset must be a non-negative integer")
+    from . import decision_commit
+
+    target = Path(path).resolve()
+    is_compact_journal = decision_commit.commit_path_for(target).resolve() != target
+    if is_compact_journal and ((end_offset is None) != (full_log_end_offset is None)):
+        raise ValueError("compact and full-log snapshot boundaries must be provided together")
+    if not is_compact_journal and full_log_end_offset is not None:
+        raise ValueError("full_log_end_offset is valid only for a compact decision journal")
     try:
-        handle = Path(path).open("rb")
+        handle = target.open("rb")
     except OSError:
         if strict:
             raise
         return
-
-    from . import decision_commit
 
     committed: set[str] | None = None
 
@@ -658,7 +672,11 @@ def read_entries(
         nonlocal committed
         if committed is None:
             try:
-                receipts = decision_commit.load_compact_receipts(path)
+                receipts = decision_commit.load_compact_receipts(
+                    path,
+                    compact_end_offset=end_offset,
+                    full_end_offset=full_log_end_offset,
+                )
             except Exception:  # noqa: BLE001 - 証跡が読めない時は隠す側へ倒す
                 receipts = {}
             committed = set(receipts)
@@ -692,7 +710,27 @@ def read_entries(
 
     source_digest = hashlib.sha256()
     with handle:
-        for line_number, raw_line in enumerate(handle, start=1):
+        line_number = 0
+        while end_offset is None or handle.tell() < end_offset:
+            line_start = handle.tell()
+            if end_offset is None:
+                raw_line = handle.readline()
+            else:
+                remaining = end_offset - line_start
+                raw_line = handle.readline(remaining + 1)
+                if len(raw_line) > remaining:
+                    if strict:
+                        raise JournalIntegrityError(
+                            f"snapshot ends inside JSONL row at {Path(path)}:{line_number + 1}"
+                        )
+                    break
+            if not raw_line:
+                if strict and end_offset is not None and handle.tell() < end_offset:
+                    raise JournalIntegrityError(
+                        f"source is shorter than snapshot boundary at {Path(path)}"
+                    )
+                break
+            line_number += 1
             source_digest.update(raw_line)
             if strict and not raw_line.endswith(b"\n"):
                 raise JournalIntegrityError(f"incomplete JSONL row at {Path(path)}:{line_number}")

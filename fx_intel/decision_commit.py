@@ -613,11 +613,41 @@ def load_compact_receipts(
     path: str | Path,
     *,
     full_path: str | Path | None = None,
+    compact_end_offset: int | None = None,
+    full_end_offset: int | None = None,
 ) -> dict[str, dict[str, object]]:
     """Load compact receipts proven by local batches and exact full-log lines."""
 
-    with verified_compact_reader(path, full_path=full_path) as (_handle, receipts):
-        return receipts
+    if (compact_end_offset is None) != (full_end_offset is None):
+        raise ValueError("compact and full-log snapshot boundaries must be provided together")
+    for name, value in (
+        ("compact_end_offset", compact_end_offset),
+        ("full_end_offset", full_end_offset),
+    ):
+        if value is not None and (type(value) is not int or value < 0):  # noqa: E721
+            raise ValueError(f"{name} must be a non-negative integer")
+    if compact_end_offset is None and full_end_offset is None:
+        with verified_compact_reader(path, full_path=full_path) as (_handle, receipts):
+            return receipts
+
+    compact_path = Path(path).resolve()
+    resolved_full_path = Path(
+        full_path if full_path is not None else commit_path_for(compact_path)
+    ).resolve()
+    try:
+        with (
+            compact_path.open("rb") as compact_handle,
+            resolved_full_path.open("rb") as full_handle,
+        ):
+            return _load_compact_receipts_from_handles(
+                compact_handle,
+                full_handle,
+                expected_mode=_mode_for_compact_path(compact_path),
+                compact_end_offset=compact_end_offset,
+                full_end_offset=full_end_offset,
+            )
+    except OSError:
+        return {}
 
 
 def _load_compact_receipts_from_handles(
@@ -625,6 +655,8 @@ def _load_compact_receipts_from_handles(
     full_handle: BinaryIO,
     *,
     expected_mode: str,
+    compact_end_offset: int | None = None,
+    full_end_offset: int | None = None,
 ) -> dict[str, dict[str, object]]:
     if not expected_mode:
         return {}
@@ -638,7 +670,15 @@ def _load_compact_receipts_from_handles(
     compact_handle.seek(0)
     while True:
         line_start_offset = compact_handle.tell()
-        line = compact_handle.readline()
+        if compact_end_offset is not None:
+            if line_start_offset >= compact_end_offset:
+                break
+            remaining = compact_end_offset - line_start_offset
+            line = compact_handle.readline(remaining + 1)
+            if len(line) > remaining:
+                break
+        else:
+            line = compact_handle.readline()
         if not line:
             break
         try:
@@ -736,7 +776,11 @@ def _load_compact_receipts_from_handles(
                 byte_length=cast(int, batch["compact_batch_byte_length"]),
                 payload_sha256=str(batch["compact_batch_payload_sha256"]),
             )
-            and receipt_matches_full_evidence(receipt, full_handle)
+            and receipt_matches_full_evidence(
+                receipt,
+                full_handle,
+                end_offset=full_end_offset,
+            )
         ]
         if len({str(receipt["full_commit_record_sha256"]) for receipt in matching}) == 1:
             verified[transaction_id] = matching[-1]
@@ -938,6 +982,8 @@ def receipt_matches_commit(
 def receipt_matches_full_evidence(
     receipt: Mapping[str, object],
     full_handle: IO[bytes],
+    *,
+    end_offset: int | None = None,
 ) -> bool:
     """Verify the exact wrapper and commit lines named by one receipt."""
 
@@ -948,10 +994,13 @@ def receipt_matches_full_evidence(
     commit_offset = validated["full_commit_line_start_offset"]
     assert isinstance(batch_offset, int)
     assert isinstance(commit_offset, int)
+    if end_offset is not None and (batch_offset >= end_offset or commit_offset >= end_offset):
+        return False
     batch_line = _read_hashed_json_line(
         full_handle,
         offset=batch_offset,
         expected_sha256=str(validated["full_batch_line_sha256"]),
+        end_offset=end_offset,
     )
     if batch_line is None:
         return False
@@ -966,6 +1015,7 @@ def receipt_matches_full_evidence(
         full_handle,
         offset=commit_offset,
         expected_sha256=str(validated["full_commit_line_sha256"]),
+        end_offset=end_offset,
     )
     full = _full_batch_descriptor(batch_line)
     record = _validated_record(commit_line)
@@ -1010,16 +1060,20 @@ def _read_hashed_json_line(
     *,
     offset: int,
     expected_sha256: str,
+    end_offset: int | None = None,
 ) -> object | None:
     stat = os.fstat(handle.fileno())
-    if offset < 0 or offset >= stat.st_size:
+    boundary = stat.st_size if end_offset is None else min(stat.st_size, end_offset)
+    if offset < 0 or offset >= boundary:
         return None
     if offset:
         handle.seek(offset - 1)
         if handle.read(1) != b"\n":
             return None
     handle.seek(offset)
-    line = handle.readline()
+    line = handle.readline(boundary - offset + 1)
+    if len(line) > boundary - offset:
+        return None
     if not line.endswith(b"\n") or hashlib.sha256(line).hexdigest() != expected_sha256:
         return None
     try:
