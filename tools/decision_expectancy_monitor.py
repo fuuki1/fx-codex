@@ -31,6 +31,19 @@ DEFAULT_MONITOR_PATH = REPO_ROOT / "logs" / "decision_expectancy_monitor.json"
 DEFAULT_PRICE_STALE_MINUTES = 15.0
 
 
+def _event_count(value: object) -> int:
+    """レポート由来の件数を安全に整数化する。
+
+    `outcome_report` は `dict[str, object]` なので、値は任意の型でありうる。
+    `int()` へ直接渡すと型検査が通らないうえ、文字列や None が紛れた場合に
+    実行時例外で監視全体が落ちる。数値でなければ 0 として扱う。
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
+
+
 def run_decision_expectancy_monitor(
     *,
     decision_log_path: Path = DEFAULT_DECISION_LOG_PATH,
@@ -74,14 +87,12 @@ def run_decision_expectancy_monitor(
         "outcome_json_path": str(outcome_json_path) if outcome_json_path else None,
         "feedback_json_path": str(feedback_json_path) if feedback_json_path else None,
         "monitor_json_path": str(monitor_json_path),
-        "decision_event_count": (
-            int(input_event_count) if isinstance(input_event_count, (int, float)) else 0
+        "decision_event_count": _event_count(input_event_count),
+        "pit_eligible_decision_events": _event_count(
+            outcome_report.get("pit_eligible_decision_events")
         ),
-        "pit_eligible_decision_events": int(
-            outcome_report.get("pit_eligible_decision_events", 0) or 0
-        ),
-        "pit_ineligible_decision_events": int(
-            outcome_report.get("pit_ineligible_decision_events", 0) or 0
+        "pit_ineligible_decision_events": _event_count(
+            outcome_report.get("pit_ineligible_decision_events")
         ),
         "price_row_count": len(price_rows),
         "require_sample_ok": require_sample_ok,
