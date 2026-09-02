@@ -88,6 +88,11 @@ class VirtualPortfolioPolicy:
     max_open_positions: int = 2
     decision_max_age_seconds: int = 300
     quote_max_age_seconds: int = 300
+    # Delayed historical replay verifies decisions against a bid/ask tape that arrives
+    # hours late by construction, so it cannot reuse the live 5-minute quote window.
+    # This bound applies ONLY to delayed_historical_bid_ask_replay; the live
+    # contemporaneous_quote path keeps quote_max_age_seconds unchanged.
+    replay_quote_max_age_seconds: int = 9_000
     minimum_learning_rows: int = 150
 
     def validate(self) -> None:
@@ -113,6 +118,10 @@ class VirtualPortfolioPolicy:
             raise InvalidVirtualRecord("decision_max_age_seconds must be positive")
         if self.quote_max_age_seconds <= 0:
             raise InvalidVirtualRecord("quote_max_age_seconds must be positive")
+        if self.replay_quote_max_age_seconds < self.quote_max_age_seconds:
+            raise InvalidVirtualRecord(
+                "replay_quote_max_age_seconds must be at least quote_max_age_seconds"
+            )
         if self.minimum_learning_rows <= 1:
             raise InvalidVirtualRecord("minimum_learning_rows must be greater than one")
 
