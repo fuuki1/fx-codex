@@ -92,7 +92,13 @@ class VirtualPortfolioPolicy:
     # the market event. This bounds how late a tick may ARRIVE (received/ingested time)
     # and is never applied to the event-time entry window, which stays at
     # quote_max_age_seconds for every execution mode.
-    replay_max_ingest_delay_seconds: int = 21_600
+    #
+    # Dukascopy publishes hourly files: a tick at an event-hour's start waits the full
+    # hour to be included, then the publication delay (measured 126.9-144.2 min, median
+    # 132.5). Structural worst case is therefore ~204 min (144.2 + 60), and the observed
+    # maximum over 70,706 ticks is 191.4 min. 210 min covers the mechanism with margin;
+    # 180 would reject 854 already-observed ticks (one whole hourly file).
+    replay_max_ingest_delay_seconds: int = 12_600
     minimum_learning_rows: int = 150
 
     def validate(self) -> None:
