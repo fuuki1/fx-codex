@@ -878,6 +878,13 @@ def run_replay_cycle(
         )
         assignment = classify_virtual_horizon(decision.get("timeframe"))
         if assignment["capacity_eligible"] is True:
+            # Live service heartbeats gate real-time admission: they attest that the
+            # quote pipeline is current enough to act on now. Delayed replay is a
+            # historical reconciliation that never acts on "now" -- its evidence is a
+            # published tape bounded by the replay ingest-delay budget and by
+            # validate_replay's PIT ordering. Applying a liveness gate to it would
+            # reject settled history for being observed late, which is what stalled
+            # measured net-R learning entirely.
             pending.append({**intake, "decision": decision})
             continue
         try:

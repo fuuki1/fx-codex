@@ -88,6 +88,11 @@ class VirtualPortfolioPolicy:
     max_open_positions: int = 2
     decision_max_age_seconds: int = 300
     quote_max_age_seconds: int = 300
+    # Delayed replay reconciles against a historical tape that is published hours after
+    # the market event. This bounds how late a tick may ARRIVE (received/ingested time)
+    # and is never applied to the event-time entry window, which stays at
+    # quote_max_age_seconds for every execution mode.
+    replay_max_ingest_delay_seconds: int = 21_600
     minimum_learning_rows: int = 150
 
     def validate(self) -> None:
@@ -113,6 +118,8 @@ class VirtualPortfolioPolicy:
             raise InvalidVirtualRecord("decision_max_age_seconds must be positive")
         if self.quote_max_age_seconds <= 0:
             raise InvalidVirtualRecord("quote_max_age_seconds must be positive")
+        if self.replay_max_ingest_delay_seconds <= 0:
+            raise InvalidVirtualRecord("replay_max_ingest_delay_seconds must be positive")
         if self.minimum_learning_rows <= 1:
             raise InvalidVirtualRecord("minimum_learning_rows must be greater than one")
 
@@ -2543,6 +2550,18 @@ class VirtualPortfolioStore:
                             "historical replay as_of",
                         )
                         quote.validate_replay(as_of=replay_moment)
+                        if historical_replay:
+                            # Receive/ingest-time bound: a delayed tick is admissible
+                            # only if it arrived within the replay reconciliation
+                            # budget. The event-time entry window below is unchanged.
+                            ingest_delay = (
+                                _as_utc(quote.ingested_time, "quote ingested_time")
+                                - _as_utc(quote.event_time, "quote event_time")
+                            ).total_seconds()
+                            if ingest_delay > policy.replay_max_ingest_delay_seconds:
+                                raise InvalidVirtualRecord(
+                                    "delayed quote exceeds the replay ingest delay budget"
+                                )
                         quote_time = _as_utc(quote.event_time, "quote event_time")
                         delay = (quote_time - decision_time).total_seconds()
                         if delay < 0 or delay > policy.quote_max_age_seconds:
