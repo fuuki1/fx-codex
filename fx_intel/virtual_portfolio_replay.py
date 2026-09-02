@@ -1051,19 +1051,14 @@ def run_replay_cycle(
             serial += 1
             continue
         symbol = str(decision.get("symbol") or "").upper()
-        # Delayed replay matches against a tape whose ingestion lag is measured in hours.
-        deadline = decision_time + timedelta(seconds=decision_policy.replay_quote_max_age_seconds)
+        deadline = decision_time + timedelta(seconds=decision_policy.quote_max_age_seconds)
         entry = _first_at_or_after(tape, symbol, decision_time, deadline)
         if entry is None:
             if tape.watermark.get(symbol, datetime.min.replace(tzinfo=UTC)) >= deadline:
                 payload = {
                     "decision": dict(decision),
                     "observed_at": observed_at,
-                    "reasons": [
-                        "判断後"
-                        f"{decision_policy.replay_quote_max_age_seconds // 60}"
-                        "分以内に検証可能なDukascopy bid/ask tickが無い"
-                    ],
+                    "reasons": ["判断後5分以内に検証可能なDukascopy bid/ask tickが無い"],
                 }
                 heapq.heappush(events, (deadline, 1, serial, "abstain", payload))
                 serial += 1
