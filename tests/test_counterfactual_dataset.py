@@ -160,3 +160,60 @@ def test_completion_hashes_every_published_file(tmp_path) -> None:
     completion = json.loads((run / "completion.json").read_text())
     assert set(completion["files"]) == {"dataset.jsonl", "manifest.json", "label_schema.json"}
     assert completion["row_count"] == 2
+
+
+def _git_repo(root: Path) -> None:
+    import subprocess
+
+    def run(*args: str) -> None:
+        subprocess.run(args, cwd=root, capture_output=True, check=False)
+
+    run("git", "init", "-q")
+    run("git", "config", "user.email", "t@example.com")
+    run("git", "config", "user.name", "t")
+    (root / "seed.txt").write_text("seed\n")
+    run("git", "add", "-A")
+    run("git", "commit", "-q", "-m", "seed")
+
+
+def test_clean_tree_is_reproducible_from_its_commit(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    manifest = _manifest(_rows(), repo)
+    assert manifest["dirty_worktree"] is False
+    assert manifest["reproducible_from_commit_alone"] is True
+    assert manifest["working_tree_diff_sha256"] is None
+
+
+def test_dirty_tree_pins_the_difference_it_was_built_from(tmp_path) -> None:
+    """A commit alone cannot rebuild a dirty tree, so the diff is hashed too."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    (repo / "seed.txt").write_text("seed\nmodified\n")
+    dirty = _manifest(_rows(), repo)
+    assert dirty["dirty_worktree"] is True
+    assert dirty["reproducible_from_commit_alone"] is False
+    assert isinstance(dirty["working_tree_diff_sha256"], str)
+    assert len(str(dirty["working_tree_diff_sha256"])) == 64
+
+    # A different working tree, same commit, must produce a different digest.
+    (repo / "seed.txt").write_text("seed\nmodified differently\n")
+    other = _manifest(_rows(), repo)
+    assert other["git_commit"] == dirty["git_commit"]
+    assert other["working_tree_diff_sha256"] != dirty["working_tree_diff_sha256"]
+
+
+def test_untracked_files_change_the_working_tree_digest(tmp_path) -> None:
+    """Untracked files never appear in `git diff`, so they are hashed separately."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    (repo / "seed.txt").write_text("seed\nmodified\n")
+    before = _manifest(_rows(), repo)
+    (repo / "brand_new_module.py").write_text("# produced this dataset\n")
+    after = _manifest(_rows(), repo)
+    assert after["working_tree_diff_sha256"] != before["working_tree_diff_sha256"]

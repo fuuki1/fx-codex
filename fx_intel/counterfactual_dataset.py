@@ -50,8 +50,13 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
 
 
-def _git_binding(root: Path) -> tuple[str, bool]:
-    """Record the source commit and whether the tree was dirty when run."""
+def _git_binding(root: Path) -> tuple[str, bool, str | None]:
+    """Record the source commit, whether the tree was dirty, and what differed.
+
+    A dataset produced from a dirty tree cannot be rebuilt from its commit
+    alone. ``working_tree_diff_sha256`` pins the exact difference so a later
+    reader can tell whether two runs came from identical producing code.
+    """
 
     def _run(*args: str) -> str:
         try:
@@ -63,7 +68,34 @@ def _git_binding(root: Path) -> tuple[str, bool]:
 
     commit = _run("git", "rev-parse", "HEAD")
     status = _run("git", "status", "--porcelain")
-    return commit, bool(status)
+    dirty = bool(status)
+    if not dirty:
+        return commit, False, None
+    # A dirty tree makes the commit alone insufficient to rebuild the producing
+    # code, so pin the difference too. `git diff HEAD` covers tracked edits;
+    # untracked files never appear there, so hash their content separately and
+    # fold both into one digest. The result identifies the working tree, not just
+    # the commit it was based on.
+    tracked = _run("git", "diff", "HEAD")
+    untracked_names = [line[3:] for line in status.splitlines() if line.startswith("?? ")]
+    untracked: list[tuple[str, str]] = []
+    for name in sorted(untracked_names):
+        target = root / name
+        if target.is_file():
+            try:
+                untracked.append((name, hashlib.sha256(target.read_bytes()).hexdigest()))
+            except OSError:
+                untracked.append((name, "unreadable"))
+        elif target.is_dir():
+            # Directories appear as a single porcelain entry; hash their contents.
+            for child in sorted(p for p in target.rglob("*") if p.is_file()):
+                try:
+                    digest = hashlib.sha256(child.read_bytes()).hexdigest()
+                except OSError:
+                    digest = "unreadable"
+                untracked.append((str(child.relative_to(root)), digest))
+    diff_sha = _sha256({"tracked_diff": tracked, "untracked": untracked})
+    return commit, True, diff_sha
 
 
 def build_label_schema() -> dict[str, object]:
@@ -130,7 +162,7 @@ def build_dataset_manifest(
     times = [str(row["t"]) for row in ordered if row.get("t")]
     symbols = sorted({str(row.get("symbol")) for row in ordered})
     timeframes = sorted({str(row.get("timeframe")) for row in ordered})
-    commit, dirty = _git_binding(repo_root)
+    commit, dirty, diff_sha = _git_binding(repo_root)
     excluded = sum(int(v) for v in unavailable_reasons.values())
     manifest: dict[str, object] = {
         "contract": DATASET_CONTRACT,
@@ -158,6 +190,8 @@ def build_dataset_manifest(
         "counterfactual_unavailable_reasons": dict(unavailable_reasons),
         "git_commit": commit,
         "dirty_worktree": dirty,
+        "working_tree_diff_sha256": diff_sha,
+        "reproducible_from_commit_alone": (not dirty),
     }
     manifest["manifest_sha256"] = _sha256(manifest)
     return manifest
