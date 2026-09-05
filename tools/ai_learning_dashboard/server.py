@@ -11,6 +11,7 @@ import argparse
 from bisect import bisect_left
 from collections.abc import Mapping
 from functools import lru_cache
+import hashlib
 import json
 import math
 import mimetypes
@@ -67,14 +68,15 @@ JOURNAL_BATCH_COMMIT = "journal_batch_commit"
 TF_PRICES_STALE_MINUTES = 15
 DEFAULT_OPERATIONAL_READ_API_URL = "http://127.0.0.1:8770"
 DEFAULT_VIRTUAL_PORTFOLIO_API_URL = "http://127.0.0.1:8771"
-DEFAULT_VIRTUAL_PORTFOLIO_DB = DEFAULT_LOG_DIR / "fx_virtual_portfolio.sqlite3"
+DEFAULT_VIRTUAL_PORTFOLIO_DB = DEFAULT_LOG_DIR / "fx_virtual_portfolio_canonical_v2.sqlite3"
 # portfolio_snapshot() は CPU 律速で、実機の負荷に強く依存する。
 # 2026-08-05 の実測 (load 6-9): ttfb 7.0/7.8/10.9/11.5/13.4/30.1 秒。
 # 旧値の 5 秒は最良ケースでも届かず、ダッシュボードは常時 503 を返して
 # 仮想口座パネル全体が空になっていた。実測の最悪値に余裕を持たせて 45 秒とする。
 # 環境変数で上書きできるため、負荷特性の違う実機では調整可能。
-VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS = float(
-    os.environ.get("FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS", "45")
+VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS = max(
+    45.0,
+    float(os.environ.get("FX_VIRTUAL_PORTFOLIO_READ_TIMEOUT_SECONDS", "45")),
 )
 DEFAULT_DASHBOARD_STATE_CACHE = DEFAULT_LOG_DIR / "dashboard_state_cache.json"
 # 状態キャッシュは com.fx-codex.dashboard-state が15分周期(:07/:22/:37/:52)で
@@ -2173,7 +2175,7 @@ def build_state(
         HORIZON_LEARNING_FILE: _file_status(horizon_learning_path),
     }
 
-    portfolio_path = portfolio_db or log_dir / "fx_virtual_portfolio.sqlite3"
+    portfolio_path = portfolio_db or log_dir / "fx_virtual_portfolio_canonical_v2.sqlite3"
     if portfolio_api_url is None:
         virtual_portfolio = portfolio_snapshot(portfolio_path, now=now)
     else:
@@ -2369,6 +2371,91 @@ def _dashboard_state_cache(
     return payload
 
 
+COUNTERFACTUAL_RUN_CONTRACT = "virtual-decision-counterfactual-run-completion-v1"
+
+
+def _counterfactual_runs_payload(run_root: Path) -> dict[str, Any]:
+    """公開済み反実仮想datasetのrunを読み取り専用で要約する。
+
+    immutable run artifact をそのまま読むだけで、再計算も書き込みもしない。
+    completion.json の sha256 と実ファイルを照合し、**一致しない run は
+    verified=False として明示する**(壊れた成果物を正常として見せない)。
+
+    このエンドポイントは研究成果の可視化専用であり、判断・建玉・学習の
+    いずれにも影響しない。表示される net_r は shadow の反実仮想ラベルであって
+    実約定ではない。
+    """
+
+    if not run_root.is_dir():
+        return {"contract": COUNTERFACTUAL_RUN_CONTRACT, "runs": [], "run_root": str(run_root)}
+
+    runs: list[dict[str, Any]] = []
+    for run_dir in sorted(run_root.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        completion_path = run_dir / "completion.json"
+        manifest_path = run_dir / "manifest.json"
+        if not completion_path.is_file() or not manifest_path.is_file():
+            continue
+        try:
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            runs.append({"run_id": run_dir.name, "verified": False, "error": "unreadable"})
+            continue
+        if not isinstance(completion, dict) or not isinstance(manifest, dict):
+            runs.append({"run_id": run_dir.name, "verified": False, "error": "malformed"})
+            continue
+
+        files = completion.get("files")
+        verified = isinstance(files, dict)
+        if isinstance(files, dict):
+            for name, expected in files.items():
+                target = run_dir / str(name)
+                try:
+                    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                except OSError:
+                    verified = False
+                    break
+                if digest != expected:
+                    verified = False
+                    break
+
+        runs.append(
+            {
+                "run_id": str(completion.get("run_id") or run_dir.name),
+                "verified": verified,
+                "row_count": manifest.get("row_count"),
+                "coverage": manifest.get("coverage"),
+                "window_start": manifest.get("window_start"),
+                "window_end": manifest.get("window_end"),
+                "generated_at": manifest.get("generated_at"),
+                "cost_policy_sha256": manifest.get("replay_cost_policy_sha256"),
+                "quote_policy_sha256": manifest.get("replay_quote_policy_sha256"),
+                "dataset_sha256": manifest.get("dataset_sha256"),
+                "git_commit": manifest.get("git_commit"),
+                "dirty_worktree": manifest.get("dirty_worktree"),
+                "measured": manifest.get("measured"),
+                "tradable": manifest.get("tradable"),
+                "promotion_eligible": manifest.get("promotion_eligible"),
+                "symbols": manifest.get("symbols"),
+                "timeframes": manifest.get("timeframes"),
+                "excluded_count": manifest.get("excluded_count"),
+                "unavailable_reasons": manifest.get("counterfactual_unavailable_reasons"),
+            }
+        )
+
+    return {
+        "contract": COUNTERFACTUAL_RUN_CONTRACT,
+        "run_root": str(run_root),
+        "runs": runs,
+        "basis": (
+            "reconstructed counterfactual labels from shadow decisions; "
+            "not measured executions and not promotion evidence"
+        ),
+    }
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "FxLearningDashboard/1.0"
 
@@ -2427,6 +2514,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except RuntimeError as error:
                 self._send_json_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
                 return
+            self._send_json(payload)
+            return
+        if parsed.path == "/api/counterfactual-runs":
+            if parsed.query:
+                self._send_json_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "counterfactual-runs endpoint does not accept filesystem paths",
+                )
+                return
+            payload = _counterfactual_runs_payload(
+                self.server.counterfactual_run_root,  # type: ignore[attr-defined]
+            )
             self._send_json(payload)
             return
         if parsed.path in {"", "/"}:
@@ -2535,6 +2634,17 @@ def main() -> int:
         ),
         help="Fixed server-side cache generated by dashboard_state_snapshot.py",
     )
+    parser.add_argument(
+        "--counterfactual-runs",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "FX_COUNTERFACTUAL_RUN_ROOT",
+                "runs/counterfactual_dataset",
+            )
+        ),
+        help="Read-only root of published counterfactual dataset runs",
+    )
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
@@ -2545,12 +2655,16 @@ def main() -> int:
         args.portfolio_api_url
     )
     server.state_cache_path = args.state_cache.expanduser().resolve()  # type: ignore[attr-defined]
+    server.counterfactual_run_root = (  # type: ignore[attr-defined]
+        args.counterfactual_runs.expanduser().resolve()
+    )
     url = f"http://{args.host}:{args.port}/"
     print(f"AI learning dashboard: {url}")
     print(f"Reading logs from: {server.log_dir}")  # type: ignore[attr-defined]
     print(f"Reading virtual portfolio from: {server.portfolio_db}")  # type: ignore[attr-defined]
     print(f"Virtual portfolio query API: {server.portfolio_api_url}")  # type: ignore[attr-defined]
     print(f"Dashboard state cache: {server.state_cache_path}")  # type: ignore[attr-defined]
+    print(f"Counterfactual runs: {server.counterfactual_run_root}")  # type: ignore[attr-defined]
     print("Read-only mode. Press Ctrl-C to stop.")
     try:
         server.serve_forever()
