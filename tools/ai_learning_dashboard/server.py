@@ -292,47 +292,61 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _read_journal(path: Path) -> list[dict[str, Any]]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
+    """ジャーナルを1行ずつ読む。ファイル全体を文字列に載せない。
+
+    以前は ``path.read_text().splitlines()`` でファイル全体を文字列として持ち、
+    さらに行リストも作っていた。この時点でファイルサイズの約2倍を消費する。
+    実機の対象は briefing_tf_journal.jsonl 815MB / horizon 270MB /
+    tf_prices 146MB で、8GB機ではこれだけでswapを叩き、
+    本来90秒程度の処理が67分に膨らんでいた
+    (その結果 dashboard state cache が生成時点で既に35分の鮮度上限を超え、
+    /api/state が恒常的に503になっていた)。
+
+    行ごとの逐次読みにすると、保持するのは解析後の row だけになる。
+    バッチ確定の判定ロジックは一切変更していない。
+    """
+
     rows: list[dict[str, Any]] = []
     pending_id = ""
     pending_rows: list[dict[str, Any]] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        batch_id = str(payload.get("journal_batch_id") or "")
-        if payload.get("event_type") == JOURNAL_BATCH_COMMIT:
-            expected_size = payload.get("journal_batch_size")
-            indices = [row.get("journal_batch_index") for row in pending_rows]
-            if (
-                batch_id
-                and batch_id == pending_id
-                and isinstance(expected_size, int)
-                and expected_size == len(pending_rows)
-                and indices == list(range(expected_size))
-            ):
-                rows.extend(pending_rows)
-            pending_id = ""
-            pending_rows = []
-            continue
-        if batch_id:
-            if batch_id != pending_id:
-                pending_id = batch_id
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                batch_id = str(payload.get("journal_batch_id") or "")
+                if payload.get("event_type") == JOURNAL_BATCH_COMMIT:
+                    expected_size = payload.get("journal_batch_size")
+                    indices = [row.get("journal_batch_index") for row in pending_rows]
+                    if (
+                        batch_id
+                        and batch_id == pending_id
+                        and isinstance(expected_size, int)
+                        and expected_size == len(pending_rows)
+                        and indices == list(range(expected_size))
+                    ):
+                        rows.extend(pending_rows)
+                    pending_id = ""
+                    pending_rows = []
+                    continue
+                if batch_id:
+                    if batch_id != pending_id:
+                        pending_id = batch_id
+                        pending_rows = []
+                    pending_rows.append(payload)
+                    continue
+                pending_id = ""
                 pending_rows = []
-            pending_rows.append(payload)
-            continue
-        pending_id = ""
-        pending_rows = []
-        rows.append(payload)
+                rows.append(payload)
+    except OSError:
+        return []
     return rows
 
 
