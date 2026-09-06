@@ -41,6 +41,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from .counterfactual_cost_policy import (
+    CounterfactualAccountingCostPolicy,
+    accounting_cost_r,
+)
 from .virtual_portfolio_replay import (
     QuoteTape,
     ReplayDataError,
@@ -213,12 +217,26 @@ def _resolve_path(
 
 def _cost_r(
     *,
-    cost_policy: VirtualReplayCostPolicy,
+    cost_policy: VirtualReplayCostPolicy | CounterfactualAccountingCostPolicy,
     symbol: str,
     entry_time: datetime,
     exit_time: datetime,
 ) -> float:
-    """Modeled cost expressed in R, mirroring the replay writer's bps schedule."""
+    """Modeled cost expressed in R.
+
+    ``CounterfactualAccountingCostPolicy`` は観測可能性で分解した会計policy
+    (③)。スプレッドは ``gross_r`` で控除済みなので課金せず、financing は
+    跨いだNY 17:00ロールオーバー回数で課金する。
+    ``VirtualReplayCostPolicy`` は旧policyで、既存runの再現用に残す。
+    """
+
+    if isinstance(cost_policy, CounterfactualAccountingCostPolicy):
+        return accounting_cost_r(
+            policy=cost_policy,
+            symbol=symbol,
+            entry_time=entry_time,
+            exit_time=exit_time,
+        )
 
     started_days = max(1, int((exit_time - entry_time).total_seconds() // 86_400) + 1)
     bps = (
@@ -236,7 +254,7 @@ def reconstruct_action_outcome(
     action: Action,
     tape: QuoteTape,
     quote_policy: VirtualReplayQuotePolicy,
-    cost_policy: VirtualReplayCostPolicy,
+    cost_policy: VirtualReplayCostPolicy | CounterfactualAccountingCostPolicy,
     quote_max_age_seconds: int = 300,
 ) -> CounterfactualOutcome:
     """Reconstruct one action's outcome, or record why it cannot be reconstructed."""
@@ -389,7 +407,7 @@ def reconstruct_decision_counterfactuals(
     *,
     tape: QuoteTape,
     quote_policy: VirtualReplayQuotePolicy | None = None,
-    cost_policy: VirtualReplayCostPolicy | None = None,
+    cost_policy: VirtualReplayCostPolicy | CounterfactualAccountingCostPolicy | None = None,
     quote_max_age_seconds: int = 300,
 ) -> dict[str, object]:
     """Reconstruct LONG, SHORT and ABSTAIN outcomes for one decision."""

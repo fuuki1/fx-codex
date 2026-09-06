@@ -4019,18 +4019,24 @@ function renderPortfolioTradeDetail(trade) {
 function renderVirtualPortfolio(data) {
   const portfolio = data.virtual_portfolio || {};
   const configured = portfolio.configured === true;
+  const freeSnapshot = portfolio.free_snapshot_simulation || {};
+  const challenge = portfolio.three_day_challenge || {};
   const banner = $("portfolioReality");
   banner.classList.toggle("is-good", configured);
   banner.classList.toggle("is-waiting", !configured);
-  setText("portfolioMode", "delayed bid/ask replay / broker disconnected");
+  setText("portfolioMode", "無料5分スナップショット仮想取引 / ブローカー未接続");
   setText(
     "portfolioRealityTitle",
-    configured ? "100万円の仮想口座を追記専用台帳で監視中" : "仮想口座はまだ初期化されていません",
+    configured
+      ? "100万円の仮想口座で3日間チャレンジを実行"
+      : "仮想口座はまだ初期化されていません",
   );
   setText(
     "portfolioRealityBody",
     configured
-      ? "15m/1hだけを既存リスク上限内の仮想取引評価枠にし、4h/1dはポジションを持たない観測専用として記録します。遅延履歴bid/askによる分析で、実時間約定ではありません。"
+      ? `15m/1hを5分価格と保守的な推定スプレッドで暫定約定します。実注文・リアルタイムBid/Askではありません。遅延Bid/Ask照合 ${Number(
+          freeSnapshot.reconciled_bid_ask_legs || 0,
+        )}件 / 待機 ${Number(freeSnapshot.pending_bid_ask_reconciliation_legs || 0)}件。`
       : portfolio.risk_gate?.reason || "tools/virtual_portfolio.py init を実行してください。",
   );
 
@@ -4044,21 +4050,46 @@ function renderVirtualPortfolio(data) {
           portfolio.unrealized_pnl_jpy,
         )}`,
   );
-  setText("portfolioTodayPnl", signedYen(portfolio.today_pnl_jpy));
-  portfolioTone($("portfolioTodayPnl"), num(portfolio.today_pnl_jpy));
+  const challengeDay = challenge.current_day || {};
+  const sessionPnl = challengeDay.realized_net_pnl_jpy ?? portfolio.today_pnl_jpy;
+  setText("portfolioTodayPnl", signedYen(sessionPnl));
+  portfolioTone($("portfolioTodayPnl"), num(sessionPnl));
+  const challengeStatusLabels = {
+    scheduled: "開始待ち",
+    active: "実行中",
+    ended: "終了",
+    settling: "最終精算中",
+    settlement_overdue: "精算期限超過",
+    stale: "更新停止",
+    completed: "3日達成",
+    failed: "未達で終了",
+  };
+  setText(
+    "portfolioChallengeStatus",
+    `3日間チャレンジ：${challengeStatusLabels[challenge.status] || "確認不能"}`,
+  );
+  setText(
+    "portfolioChallengeWindow",
+    `期間 ${shortDate(challenge.start_at_jst)}〜${shortDate(challenge.end_at_jst)} / ` +
+      `本セッション残り ${yen(challengeDay.remaining_jpy)} / 達成保証なし`,
+  );
   const horizonAllocation = portfolio.horizon_allocation || {};
   const dailyTask = portfolio.daily_profit_task || {};
   const dailyTaskStatus =
-    dailyTask.status === "completed"
+    challenge.status === "scheduled"
+      ? "開始待ち"
+      : challengeDay.status === "completed" || dailyTask.status === "completed"
       ? "必須タスク完了"
-      : dailyTask.status === "unavailable"
+      : challengeDay.status === "failed"
+        ? "必須タスク未達"
+        : dailyTask.status === "unavailable"
         ? "進捗取得不可"
         : "必須タスク進行中";
   setText(
     "portfolioTargetText",
     `${dailyTaskStatus} / 残り ${yen(
-      dailyTask.remaining_jpy ?? portfolio.remaining_daily_target_jpy,
-    )} / 目標 ${yen(dailyTask.target_jpy ?? portfolio.daily_target_jpy)}`,
+      challengeDay.remaining_jpy ?? dailyTask.remaining_jpy ?? portfolio.remaining_daily_target_jpy,
+    )} / 目標 ${yen(challengeDay.target_jpy ?? dailyTask.target_jpy ?? portfolio.daily_target_jpy)}`,
   );
   const researchKpis = portfolio.research_kpis || {};
   const rollingKpi = researchKpis.rolling_20d || {};
@@ -4222,13 +4253,24 @@ function renderVirtualPortfolio(data) {
       canonicalNetR.label_version || "--"
     } / bid/ask・全費用後 / research-only`,
   );
-  const multiAxis = learning.multi_axis || {};
+  const challengeModeledLearning = learning.challenge_modeled || {};
+  const multiAxis = challengeModeledLearning.multi_axis || learning.multi_axis || {};
   const multiAxisBadge = $("portfolioMultiAxisBadge");
   const axisInputsReady = multiAxis.status === "axis_inputs_ready";
-  multiAxisBadge.textContent = axisInputsReady
-    ? "入力準備済み / 判断不使用"
-    : "PIT入力を収集中";
-  multiAxisBadge.classList.toggle("is-good", axisInputsReady);
+  const modeledRows = Number(challengeModeledLearning.processed_rows || 0);
+  const minimumModeledRows = Number(challengeModeledLearning.minimum_model_rows || 150);
+  const modeledTrainingReady = challengeModeledLearning.ready_for_model_training === true;
+  multiAxisBadge.textContent = challengeModeledLearning.contract
+    ? axisInputsReady && modeledTrainingReady
+      ? `推定約定 ${modeledRows}/${minimumModeledRows} / 検証準備済み・判断不使用`
+      : `推定約定 ${modeledRows}/${minimumModeledRows} / 収集中・判断不使用`
+    : axisInputsReady
+      ? "入力準備済み / 判断不使用"
+      : "PIT入力を収集中";
+  multiAxisBadge.classList.toggle(
+    "is-good",
+    challengeModeledLearning.contract ? axisInputsReady && modeledTrainingReady : axisInputsReady,
+  );
   const axisGrid = $("portfolioMultiAxisGrid");
   axisGrid.replaceChildren();
   const axisOrder = [
@@ -4540,6 +4582,63 @@ function render(data) {
   loadForecastChart();
 }
 
+// 反実仮想datasetのrunを読み取り専用で表示する。
+// 再計算はせず、サーバーが照合した verified をそのまま示す。
+// 判断・建玉・学習には一切影響しない研究成果の可視化。
+async function loadCounterfactualRuns() {
+  const list = $("counterfactualRunList");
+  const updated = $("counterfactualRunsUpdated");
+  if (!list) return;
+  try {
+    const response = await fetch("/api/counterfactual-runs", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const runs = Array.isArray(data.runs) ? data.runs : [];
+    list.textContent = "";
+    if (!runs.length) {
+      list.appendChild(textRow("公開済みrunがありません。"));
+      if (updated) updated.textContent = "0件";
+      return;
+    }
+    for (const run of runs) {
+      const row = document.createElement("div");
+      row.className = "condition-item";
+      const head = document.createElement("strong");
+      head.textContent = run.run_id || "(unknown)";
+      row.appendChild(head);
+      const meta = document.createElement("small");
+      const rows = run.row_count == null ? "—" : run.row_count;
+      const cov =
+        typeof run.coverage === "number" ? `${(run.coverage * 100).toFixed(2)}%` : "—";
+      const flag = run.verified ? "sha256照合OK" : "⚠ sha256不一致";
+      const cost = String(run.cost_policy_sha256 || "").slice(0, 12);
+      meta.style.display = "block";
+      meta.textContent =
+        `${flag} / ${rows}行 / coverage ${cov} / cost_policy ${cost}… / ` +
+        `measured=${run.measured} tradable=${run.tradable} 昇格可=${run.promotion_eligible}`;
+      row.appendChild(meta);
+      const window_ = document.createElement("small");
+      window_.className = "subtle";
+      window_.style.display = "block";
+      window_.textContent = `窓 ${run.window_start || "—"} → ${run.window_end || "—"}`;
+      row.appendChild(window_);
+      list.appendChild(row);
+    }
+    if (updated) updated.textContent = `${runs.length}件`;
+  } catch (error) {
+    list.textContent = "";
+    list.appendChild(textRow(`取得できません: ${error.message}`));
+    if (updated) updated.textContent = "エラー";
+  }
+}
+
+function textRow(message) {
+  const row = document.createElement("div");
+  row.className = "condition-item";
+  row.textContent = message;
+  return row;
+}
+
 async function load() {
   if (window.location.protocol === "file:") {
     setReality({
@@ -4593,6 +4692,9 @@ async function load() {
     console.error(error);
     alert(`読み込みに失敗しました: ${error.message}`);
   } finally {
+    // 研究成果パネルは本体の描画と独立に更新する。
+    // ここで失敗しても主要画面を巻き添えにしない。
+    loadCounterfactualRuns();
     $("refreshBtn").disabled = false;
   }
 }
