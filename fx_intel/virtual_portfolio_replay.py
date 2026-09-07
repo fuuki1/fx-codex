@@ -907,6 +907,10 @@ def run_replay_cycle(
     pre_abstained = 0
     pre_waiting = 0
     pre_conflicts: list[dict[str, str]] = []
+    # Materialise the caller-supplied reasons once. They are recorded verbatim in
+    # the result payload and never gate admission, so replay stays a historical
+    # reconciliation rather than a live admission decision.
+    admission_reasons = list(admission_rejection_reasons or [])
     for intake in initial_pending:
         raw_decision = intake["decision"]
         assert isinstance(raw_decision, Mapping)
