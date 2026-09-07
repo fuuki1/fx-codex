@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 資格情報不要の bid/ask 収集器(Dukascopy 公開 datafeed)。
+       OANDA の read-only pricing 資格情報が用意できるまでの代替。
+
+       切り替え方:
+         今            : com.fx-codex.datafeed-collector を有効(provider=dukascopy)
+         OANDA 入手後  : com.fx-codex.quote-collector を有効(provider=oanda)
+       出力先は同一(collect/)で、下流の raw-first 経路も同一。
+       両方を同時に動かすこともでき、CollectedQuote.provider で区別される。 -->
+  <key>Label</key>
+  <string>com.fx-codex.datafeed-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ROOT__/.venv/bin/python</string>
+    <string>__ROOT__/tools/fx_datafeed_collector.py</string>
+    <string>--output-root</string>
+    <string>__HOME__/srv/fx-codex/collect</string>
+    <string>--instruments</string>
+    <string>USDJPY</string>
+    <string>EURUSD</string>
+    <string>GBPUSD</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- 確定済みの過去1時間を取り込む一回実行。毎時 7 分に起動して
+       provider 側の確定を待つ(--lag-hours の既定は 2)。 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Minute</key>
+    <integer>7</integer>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/srv/fx-codex/logs/launchd/datafeed-collector.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/srv/fx-codex/logs/launchd/datafeed-collector.err.log</string>
+</dict>
+</plist>
