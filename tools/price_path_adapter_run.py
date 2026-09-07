@@ -100,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     for bar in bars:
         symbols[bar.symbol] = symbols.get(bar.symbol, 0) + 1
 
-    report = {
+    report: dict[str, object] = {
         "mode": "write" if args.write else "dry-run",
         "as_of": now.isoformat(),
         "ticks_usable": len(ticks),
