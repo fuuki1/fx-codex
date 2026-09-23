@@ -242,3 +242,281 @@ def test_writer_id_is_stable_across_runs() -> None:
 
     assert a["writer_id"] == b["writer_id"] == ADAPTER_WRITER_ID
     assert str(os.getpid()) not in str(a["writer_id"])
+
+
+# --- collector 完了判定(2026-09-16 実機の未完成足の再発防止) -------------------
+
+import importlib.util  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+
+from fx_intel.price_history import PriceHistoryWriteError  # noqa: E402
+from fx_intel.price_path_adapter import (  # noqa: E402
+    WINDOW_LOOKBACK,
+    PricePathAdapterError,
+    adapter_window_start,
+    iter_quote_file,
+    load_collector_completion,
+)
+
+INCIDENT_HOUR = datetime(2026, 9, 15, 9, 0, 0, tzinfo=UTC)
+
+
+def _dk(
+    at: datetime,
+    mid: float,
+    *,
+    symbol: str = "EURUSD",
+    provider: str = "dukascopy",
+    received: datetime | None = None,
+) -> dict:
+    return {
+        "provider": provider,
+        "instrument": symbol,
+        "quality_state": "usable",
+        "provider_event_time": at.isoformat(),
+        "received_at": (received or at + timedelta(hours=2)).isoformat(),
+        "mid": mid,
+        "bid": mid - 0.00002,
+        "ask": mid + 0.00002,
+    }
+
+
+def _dk_ticks(payloads: list[dict]):
+    return list(iter_ticks(json.dumps(p) for p in payloads))
+
+
+def _hour_batch(symbol: str = "EURUSD") -> list[dict]:
+    # 09:30 足に 6 tick、09:35 足に 2 tick
+    base = INCIDENT_HOUR + timedelta(minutes=30)
+    mids = [1.1535, 1.1536, 1.1534, 1.15345, 1.1537, 1.15348]
+    rows = [_dk(base + timedelta(seconds=40 * i), mid, symbol=symbol) for i, mid in enumerate(mids)]
+    rows += [
+        _dk(base + timedelta(minutes=5, seconds=10 * i), 1.154, symbol=symbol) for i in range(2)
+    ]
+    return rows
+
+
+def test_gated_bars_wait_until_collector_finishes_the_hour() -> None:
+    ticks = _dk_ticks(_hour_batch())
+    as_of = INCIDENT_HOUR + timedelta(days=1)
+
+    not_yet = build_closed_bars(
+        ticks, as_of=as_of, complete_through={"EURUSD": INCIDENT_HOUR}  # 08 時台まで完了
+    )
+    done = build_closed_bars(
+        ticks, as_of=as_of, complete_through={"EURUSD": INCIDENT_HOUR + timedelta(hours=1)}
+    )
+
+    assert not_yet == []
+    assert [bar.tick_count for bar in done] == [6, 2]
+
+
+def test_gated_mode_drops_symbols_without_collector_state() -> None:
+    ticks = _dk_ticks(_hour_batch("GBPUSD"))
+    bars = build_closed_bars(
+        ticks,
+        as_of=INCIDENT_HOUR + timedelta(days=1),
+        complete_through={"EURUSD": INCIDENT_HOUR + timedelta(hours=1)},
+    )
+    assert bars == []
+
+
+def test_gated_mode_uses_only_the_provider_the_state_certifies() -> None:
+    payloads = [_dk(INCIDENT_HOUR + timedelta(minutes=1), 1.15, provider="oanda")]
+    bars = build_closed_bars(
+        _dk_ticks(payloads),
+        as_of=INCIDENT_HOUR + timedelta(days=1),
+        complete_through={"EURUSD": INCIDENT_HOUR + timedelta(hours=1)},
+    )
+    assert bars == []
+
+
+def test_gated_mode_never_emits_a_bar_observed_after_as_of() -> None:
+    at = INCIDENT_HOUR + timedelta(minutes=1)
+    as_of = INCIDENT_HOUR + timedelta(hours=3)
+    payloads = [_dk(at, 1.15, received=as_of + timedelta(seconds=1))]
+    bars = build_closed_bars(
+        _dk_ticks(payloads),
+        as_of=as_of,
+        complete_through={"EURUSD": INCIDENT_HOUR + timedelta(hours=1)},
+    )
+    assert bars == []
+
+
+def test_load_collector_completion_returns_end_of_completed_hour(tmp_path) -> None:
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps({"completed_hours": {"eurusd": "2026-09-23T03:00:00+00:00"}}), encoding="utf-8"
+    )
+    assert load_collector_completion(state) == {"EURUSD": datetime(2026, 9, 23, 4, 0, tzinfo=UTC)}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        "not json",
+        json.dumps({"x": 1}),
+        json.dumps({"completed_hours": {"EURUSD": "2026-09-23T03:00:00"}}),
+    ],
+)
+def test_load_collector_completion_fails_closed(tmp_path, content) -> None:
+    state = tmp_path / "state.json"
+    if content is not None:
+        state.write_text(content, encoding="utf-8")
+    with pytest.raises(PricePathAdapterError):
+        load_collector_completion(state)
+
+
+def test_iter_quote_file_never_reads_past_the_fixed_offset(tmp_path) -> None:
+    quotes = tmp_path / "quotes.jsonl"
+    first = json.dumps(_dk(INCIDENT_HOUR, 1.15)) + "\n"
+    second = json.dumps(_dk(INCIDENT_HOUR + timedelta(seconds=1), 1.16)) + "\n"
+    quotes.write_text(first + second, encoding="utf-8")
+
+    whole_first = list(iter_quote_file(quotes, end_offset=len(first)))
+    cut_second = list(iter_quote_file(quotes, end_offset=len(first) + len(second) // 2))
+
+    assert [tick.mid for tick in whole_first] == [1.15]
+    assert [tick.mid for tick in cut_second] == [1.15]
+
+
+def test_iter_quote_file_skips_ticks_before_window(tmp_path) -> None:
+    quotes = tmp_path / "quotes.jsonl"
+    rows = [_dk(INCIDENT_HOUR - timedelta(days=3), 1.1), _dk(INCIDENT_HOUR, 1.2)]
+    quotes.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    ticks = list(iter_quote_file(quotes, end_offset=quotes.stat().st_size, since=INCIDENT_HOUR))
+
+    assert [tick.mid for tick in ticks] == [1.2]
+
+
+def test_adapter_window_start_uses_oldest_latest_bar_per_symbol(tmp_path) -> None:
+    prices = tmp_path / "prices.jsonl"
+    late = build_rows(
+        build_closed_bars(
+            _dk_ticks(_hour_batch("EURUSD")), as_of=INCIDENT_HOUR + timedelta(days=1)
+        ),
+        run_id="a",
+    )
+    early = build_rows(
+        build_closed_bars(
+            _dk_ticks([_dk(INCIDENT_HOUR - timedelta(hours=5), 150.0, symbol="USDJPY")]),
+            as_of=INCIDENT_HOUR + timedelta(days=1),
+        ),
+        run_id="b",
+    )
+    append_snapshot_entries(prices, late + early)
+
+    assert adapter_window_start(prices, ["EURUSD", "USDJPY"]) == (
+        INCIDENT_HOUR - timedelta(hours=5) - WINDOW_LOOKBACK
+    )
+    assert adapter_window_start(prices, ["EURUSD", "GBPUSD"]) is None
+    assert adapter_window_start(tmp_path / "missing.jsonl", ["EURUSD"]) is None
+
+
+def test_append_isolates_a_conflicting_key_only_when_asked(tmp_path) -> None:
+    prices = tmp_path / "prices.jsonl"
+    batch = _hour_batch()
+    as_of = INCIDENT_HOUR + timedelta(days=1)
+    partial = build_rows(build_closed_bars(_dk_ticks(batch[:4]), as_of=as_of), run_id="old")
+    append_snapshot_entries(prices, partial)
+    full = build_rows(build_closed_bars(_dk_ticks(batch), as_of=as_of), run_id="new")
+    before = prices.read_bytes()
+
+    with pytest.raises(PriceHistoryWriteError):
+        append_snapshot_entries(prices, full)
+    assert prices.read_bytes() == before
+
+    conflicts: list[dict] = []
+    appended = append_snapshot_entries(prices, full, conflicts=conflicts)
+
+    assert appended == 1  # 09:35 足だけ
+    assert [c["natural_key"][0] for c in conflicts] == [partial[0]["capture_slot"]]
+    written = [json.loads(line) for line in prices.read_text().splitlines()]
+    assert written[0] == partial[0]  # 既存行は書き換えない
+
+
+def _load_runner():
+    script = Path(__file__).resolve().parents[1] / "tools" / "price_path_adapter_run.py"
+    spec = importlib.util.spec_from_file_location("price_path_adapter_run_under_test", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_state(path: Path, completed_hour: datetime) -> None:
+    path.write_text(
+        json.dumps({"completed_hours": {"EURUSD": completed_hour.isoformat()}}), encoding="utf-8"
+    )
+
+
+def test_runner_reproduces_and_contains_the_2026_09_16_partial_bar(tmp_path, capsys) -> None:
+    runner = _load_runner()
+    quotes = tmp_path / "quotes.jsonl"
+    prices = tmp_path / "prices.jsonl"
+    state = tmp_path / "state.json"
+    ledger = tmp_path / "conflicts.jsonl"
+    batch = _hour_batch()
+    args = [
+        "--quotes",
+        str(quotes),
+        "--prices",
+        str(prices),
+        "--collector-state",
+        str(state),
+        "--conflict-ledger",
+        str(ledger),
+        "--write",
+    ]
+
+    # collector が 09 時台を追記している途中: state はまだ 08 時台まで。
+    quotes.write_text("".join(json.dumps(row) + "\n" for row in batch[:4]), encoding="utf-8")
+    _write_state(state, INCIDENT_HOUR - timedelta(hours=1))
+    assert runner.main(args) == 0
+    assert not prices.exists() or prices.read_text() == ""
+
+    # 旧実装が書いてしまった未完成足(先頭 4 tick)が既にある状態を再現する。
+    as_of = INCIDENT_HOUR + timedelta(days=1)
+    stale = build_rows(build_closed_bars(_dk_ticks(batch[:4]), as_of=as_of), run_id="legacy")
+    append_snapshot_entries(prices, stale)
+
+    # 時間帯の追記が終わり state が進む。
+    quotes.write_text("".join(json.dumps(row) + "\n" for row in batch), encoding="utf-8")
+    _write_state(state, INCIDENT_HOUR)
+    capsys.readouterr()
+    assert runner.main(args) == runner.EX_IOERR  # 新しい衝突は 1 回だけ知らせる
+    report = json.loads(capsys.readouterr().out)
+    assert report["appended"] == 1 and report["conflicts_new"] == 1
+    rows = [json.loads(line) for line in prices.read_text().splitlines()]
+    assert rows[0] == stale[0]
+    assert rows[1]["tick_count"] == 2
+    assert len(ledger.read_text().splitlines()) == 1
+
+    # 次回: 同じ衝突は記録済みなので止まらない。
+    assert runner.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["conflicts_total"] == 1 and report["conflicts_new"] == 0
+    assert report["appended"] == 0
+    assert len(ledger.read_text().splitlines()) == 1
+
+
+def test_runner_fails_closed_without_collector_state(tmp_path) -> None:
+    runner = _load_runner()
+    assert (
+        runner.main(
+            [
+                "--quotes",
+                str(tmp_path / "q.jsonl"),
+                "--prices",
+                str(tmp_path / "p.jsonl"),
+                "--collector-state",
+                str(tmp_path / "missing.json"),
+                "--write",
+            ]
+        )
+        == runner.EX_NOINPUT
+    )
