@@ -24,6 +24,13 @@
   取り込み時刻(`received_at` の最大)。両者を分離することで、
   「いつ成立したか」と「いつ我々が知り得たか」を混同しない。
 - `quality_state != "usable"` の tick は捨てる。
+- 確定足とは「期間が終わった足」ではなく「その期間の tick が全部そろった足」。
+  collector は 1 時間分を tick 1 行ずつ追記し、時間帯を書き終えてから
+  `collect/state/dukascopy_history.json` の `completed_hours` を原子的に進める。
+  追記途中の時間帯を読むと未完成の足を確定足として永続化してしまうため
+  (実機 2026-09-16: EURUSD 09:30 足を 264 tick 中 185 tick で書いた)、
+  launchd 経路では `completed_hours` を完成の唯一の合図として使う
+  (`load_collector_completion` / `build_closed_bars(complete_through=...)`)。
 
 ## 既存経路との非干渉
 
@@ -67,6 +74,11 @@ ADAPTER_WRITER_ID = "price_path_adapter"
 # capture_slot の量子化単位と一致させる(これより細かいと 1 スロットで衝突する)。
 BAR_SECONDS = SNAPSHOT_CADENCE_SECONDS
 USABLE_QUALITY_STATE = "usable"
+# completed_hours が完成を保証するのはこの provider の tick だけ。
+COLLECTOR_PROVIDER = "dukascopy"
+# 既に書いた最新足より少し前から読み直し、境界の足を再検証する。
+WINDOW_LOOKBACK = timedelta(hours=1)
+_EVENT_TIME_MARKER = b'"provider_event_time": "'
 
 
 class PricePathAdapterError(RuntimeError):
@@ -83,6 +95,7 @@ class TickQuote:
     mid: float
     bid: float | None
     ask: float | None
+    provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -189,6 +202,7 @@ def parse_tick(payload: Mapping[str, object]) -> TickQuote | None:
         mid=mid,
         bid=bid,
         ask=ask,
+        provider=str(payload.get("provider") or ""),
     )
 
 
@@ -222,14 +236,23 @@ def build_closed_bars(
     ticks: Iterable[TickQuote],
     *,
     as_of: datetime,
+    complete_through: Mapping[str, datetime] | None = None,
 ) -> list[ClosedBar]:
     """tick を確定足へ畳む。期間が終了していないバーは返さない。
 
     `as_of` より後に終わるバーを落とすことが PIT 保護の本体で、これがないと
     形成中バーの high/low を確定値として書いてしまう。
+
+    `complete_through`(銘柄→完了済み時間帯の終端)を渡すと、さらに
+    collector が書き終えた時間帯の足だけを返す。このときは完成を保証できる
+    `COLLECTOR_PROVIDER` の tick だけを使い、`as_of` より後に観測可能になった
+    足(available_time > as_of)も返さない。
     """
+    gated = complete_through is not None
     buckets: dict[tuple[str, datetime], list[TickQuote]] = {}
     for tick in ticks:
+        if gated and tick.provider != COLLECTOR_PROVIDER:
+            continue
         key = (tick.symbol, _bar_start(tick.event_time))
         buckets.setdefault(key, []).append(tick)
 
@@ -239,6 +262,13 @@ def build_closed_bars(
         if end > as_of:
             # まだ期間が終わっていない = 確定足ではない
             continue
+        if complete_through is not None:
+            limit = complete_through.get(symbol)
+            if limit is None or end > limit:
+                # 期間は終わっていても collector がその時間帯を書き終えていない
+                continue
+            if max(tick.received_at for tick in group) > as_of:
+                continue
         group.sort(key=lambda tick: tick.event_time)
         mids = [tick.mid for tick in group]
         last = group[-1]
@@ -285,3 +315,122 @@ def load_quotes(path: str | Path) -> list[TickQuote]:
             return list(iter_ticks(handle))
     except OSError as error:
         raise PricePathAdapterError(f"quotes を読めません: {error}") from error
+
+
+def load_collector_completion(path: str | Path) -> dict[str, datetime]:
+    """collector state から銘柄ごとの「書き終えた時間帯の終端」を返す。
+
+    `completed_hours[symbol]` は tick を全部追記し終えた最後の時間帯の開始時刻で、
+    collector は追記の後にこの state を原子的に置き換える。したがって
+    返す終端以前の足は、この state を読んだ後に quotes.jsonl を読めば
+    必ず全 tick がそろっている。読めない・壊れている state は fail-closed。
+    """
+    target = Path(path)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PricePathAdapterError(f"collector state を読めません: {target}: {error}") from error
+    completed = payload.get("completed_hours") if isinstance(payload, Mapping) else None
+    if not isinstance(completed, Mapping):
+        raise PricePathAdapterError(f"collector state に completed_hours がありません: {target}")
+    output: dict[str, datetime] = {}
+    for raw_symbol, raw_hour in completed.items():
+        hour = _parse_time(raw_hour)
+        if hour is None:
+            raise PricePathAdapterError(
+                f"completed_hours の時刻が不正です(timezone 必須): {raw_symbol}={raw_hour!r}"
+            )
+        symbol = str(raw_symbol).strip().upper()
+        output[symbol] = hour + timedelta(hours=1)
+    return output
+
+
+def iter_quote_file(
+    path: str | Path,
+    *,
+    end_offset: int,
+    since: datetime | None = None,
+) -> Iterator[TickQuote]:
+    """quotes.jsonl を先頭から `end_offset` バイトまでだけ流す。
+
+    run 開始時に固定したサイズより先(読んでいる間に追記された分)は読まない。
+    `since` より前の tick は捨てる。全行を JSON にすると 9GB 級の tape で
+    遅いため、provider_event_time の先頭 19 文字で 1 日の余裕をもって
+    先に間引き、残りだけを厳密に判定する。全件をメモリに載せない。
+    """
+    target = Path(path)
+    if end_offset <= 0 or not target.exists():
+        return
+    coarse: bytes | None = None
+    if since is not None:
+        coarse = (since - timedelta(days=1)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S").encode()
+    try:
+        with target.open("rb") as handle:
+            remaining = end_offset
+            for raw in handle:
+                if remaining <= 0:
+                    break
+                if len(raw) > remaining:
+                    raw = raw[:remaining]
+                remaining -= len(raw)
+                if coarse is not None:
+                    marker = raw.find(_EVENT_TIME_MARKER)
+                    if marker >= 0:
+                        start = marker + len(_EVENT_TIME_MARKER)
+                        if raw[start : start + 19] < coarse:
+                            continue
+                try:
+                    payload = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                tick = parse_tick(payload)
+                if tick is None:
+                    continue
+                if since is not None and tick.event_time < since:
+                    continue
+                yield tick
+    except OSError as error:
+        raise PricePathAdapterError(f"quotes を読めません: {error}") from error
+
+
+def adapter_window_start(
+    prices_path: str | Path,
+    symbols: Iterable[str],
+) -> datetime | None:
+    """既に書いた足から、読み直しが必要な最古の時刻を返す。
+
+    銘柄ごとの最新足の開始時刻の最小値から `WINDOW_LOOKBACK` 戻る。
+    1 銘柄でも足が無ければ None(全量を読む)。collector は時間帯を
+    古い順にしか完了させないため、これより前に新しい完成足は現れない。
+    """
+    wanted = {str(symbol).strip().upper() for symbol in symbols}
+    if not wanted:
+        return None
+    latest: dict[str, datetime] = {}
+    target = Path(prices_path)
+    if not target.exists():
+        return None
+    marker = f'"timeframe": "{ADAPTER_TIMEFRAME}"'.encode()
+    try:
+        with target.open("rb") as handle:
+            for raw in handle:
+                if marker not in raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(row, Mapping) or row.get("timeframe") != ADAPTER_TIMEFRAME:
+                    continue
+                symbol = str(row.get("symbol") or "").upper()
+                slot = _parse_time(row.get("capture_slot"))
+                if symbol in wanted and slot is not None:
+                    if symbol not in latest or slot > latest[symbol]:
+                        latest[symbol] = slot
+    except OSError as error:
+        raise PricePathAdapterError(f"prices を読めません: {error}") from error
+    if set(latest) != wanted:
+        return None
+    return min(latest.values()) - WINDOW_LOOKBACK

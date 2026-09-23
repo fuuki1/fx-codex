@@ -184,7 +184,12 @@ def snapshot_entries(
     return rows
 
 
-def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object]]) -> int:
+def append_snapshot_entries(
+    path: str | Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    conflicts: list[dict[str, object]] | None = None,
+) -> int:
     """Append unique snapshots under an OS advisory lock.
 
     The natural key is ``(capture_slot, symbol, timeframe)``. Replaying the same
@@ -192,6 +197,11 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
     competing writer or a non-deterministic retry and is rejected instead of
     silently choosing a winner. ``flock`` is released by the kernel on process
     death, so it cannot leave a stale PID lock behind.
+
+    When ``conflicts`` is given, a conflicting candidate is still never written
+    and the existing row is never replaced, but instead of aborting the whole
+    batch the pair is appended to ``conflicts`` and the remaining rows proceed.
+    A conflict already present inside the file always raises.
     """
 
     target = Path(path)
@@ -228,8 +238,12 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
                 prior = existing.get(key)
                 if prior is not None:
                     if not _same_snapshot(prior, row):
-                        raise PriceHistoryWriteError(
-                            f"conflicting snapshot from duplicate writer for natural key {key}"
+                        if conflicts is None:
+                            raise PriceHistoryWriteError(
+                                f"conflicting snapshot from duplicate writer for natural key {key}"
+                            )
+                        conflicts.append(
+                            {"natural_key": list(key), "existing": dict(prior), "candidate": row}
                         )
                     continue
                 existing[key] = row
