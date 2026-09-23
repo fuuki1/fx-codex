@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import importlib.util
 import json
 import os
@@ -931,7 +932,28 @@ def test_feedback_refresh_rejects_same_inode_prefix_rewrite(monitor, tmp_path) -
     assert feedback_path.read_bytes() == published
 
 
-def test_feedback_refresh_rejects_source_inode_replacement(monitor, tmp_path) -> None:
+def _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, minutes):
+    return monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5, minutes=minutes),
+    )
+
+
+def test_feedback_refresh_accepts_identical_inode_replacement_as_relocation(
+    monitor, tmp_path
+) -> None:
+    # 2026-09 production: a byte-identical copy gets a new inode (and, after a
+    # block clone, a new st_dev). The previously scored prefix still matches,
+    # so this is a relocation, not a rollback; refusing it deadlocked refresh
+    # forever because the anchor only advances on success.
     full_path = tmp_path / "briefing_decisions.jsonl"
     events, prices = _losing_rows()
     compact_path = _write_decisions_with_flat_compact(full_path, events)
@@ -942,43 +964,125 @@ def test_feedback_refresh_rejects_source_inode_replacement(monitor, tmp_path) ->
     )
     feedback_path = tmp_path / "feedback.json"
     monitor_path = tmp_path / "refresh-monitor.json"
-    first = monitor.run_decision_expectancy_monitor(
-        decision_log_path=None,
-        decision_journal_paths=[compact_path],
-        prices_path=prices_path,
-        outcome_json_path=None,
-        feedback_json_path=feedback_path,
-        monitor_json_path=monitor_path,
-        price_stale_minutes=None,
-        feedback_refresh_only=True,
-        allow_continuity_bootstrap=True,
-        now=NOW + timedelta(days=5),
-    )
-    published = feedback_path.read_bytes()
+    first = _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, 0)
     old_inode = prices_path.stat().st_ino
     replacement = tmp_path / "replacement-prices.jsonl"
     replacement.write_bytes(prices_path.read_bytes())
     replacement.replace(prices_path)
 
-    second = monitor.run_decision_expectancy_monitor(
-        decision_log_path=None,
-        decision_journal_paths=[compact_path],
-        prices_path=prices_path,
-        outcome_json_path=None,
-        feedback_json_path=feedback_path,
-        monitor_json_path=monitor_path,
-        price_stale_minutes=None,
-        feedback_refresh_only=True,
-        allow_continuity_bootstrap=True,
-        now=NOW + timedelta(days=5, minutes=1),
+    second = _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, 1)
+
+    continuity = second["monitor"]["summary"]["source_continuity"]
+    assert first["exit_code"] == 0
+    assert prices_path.stat().st_ino != old_inode
+    assert continuity["status"] == "pass", continuity["failures"]
+    assert [row["previous_inode"] for row in continuity["relocated_sources"]] == [old_inode]
+    assert second["exit_code"] == 0
+
+
+def test_feedback_refresh_rejects_replacement_that_rewrites_prior_prefix(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    events, prices = _losing_rows()
+    compact_path = _write_decisions_with_flat_compact(full_path, events)
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
     )
+    feedback_path = tmp_path / "feedback.json"
+    monitor_path = tmp_path / "refresh-monitor.json"
+    first = _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, 0)
+    published = feedback_path.read_bytes()
+    payload = prices_path.read_bytes()
+    changed = payload.replace(b'"close": 99.0', b'"close": 98.0', 1)
+    assert changed != payload
+    replacement = tmp_path / "replacement-prices.jsonl"
+    replacement.write_bytes(changed)
+    replacement.replace(prices_path)
+
+    second = _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, 1)
 
     failures = second["monitor"]["summary"]["source_continuity"]["failures"]
     assert first["exit_code"] == 0
-    assert prices_path.stat().st_ino != old_inode
-    assert any(item.startswith("source_identity_changed:") for item in failures)
+    assert any(item.startswith("source_prefix_changed:") for item in failures)
     assert second["exit_code"] == 1
     assert feedback_path.read_bytes() == published
+
+
+def test_feedback_refresh_accepts_logs_relocated_behind_symlinks(monitor, tmp_path) -> None:
+    logs = tmp_path / "logs"
+    hot = tmp_path / "hot"
+    logs.mkdir()
+    hot.mkdir()
+    full_path = logs / "briefing_decisions.jsonl"
+    events, prices = _losing_rows()
+    compact_path = _write_decisions_with_flat_compact(full_path, events)
+    prices_path = logs / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    monitor_path = tmp_path / "refresh-monitor.json"
+    first = _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, 0)
+    for source in (full_path, compact_path):
+        moved = hot / source.name
+        moved.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(moved)
+
+    second = _refresh(monitor, compact_path, prices_path, feedback_path, monitor_path, 1)
+
+    continuity = second["monitor"]["summary"]["source_continuity"]
+    assert first["exit_code"] == 0
+    assert continuity["status"] == "pass", continuity["failures"]
+    moved_paths = sorted(Path(row["source_path"]).name for row in continuity["relocated_sources"])
+    assert moved_paths == ["briefing_decisions.jsonl", "briefing_tf_journal.jsonl"]
+    assert second["exit_code"] == 0
+
+
+def _continuity_snapshot(path: Path) -> dict:
+    stat = path.stat()
+    return {
+        "source_path": str(path),
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "read_offset_bytes": stat.st_size,
+        "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("prior_offset", ["full", "empty"])
+def test_feedback_continuity_device_change_needs_nonempty_prefix_proof(
+    monitor, tmp_path, prior_offset
+) -> None:
+    source = tmp_path / "briefing_tf_prices.jsonl"
+    source.write_bytes(b'{"id": 1}\n')
+    present = _continuity_snapshot(source)
+    prior = {**present, "device": present["device"] + 1}
+    if prior_offset == "empty":
+        prior.update(read_offset_bytes=0, source_sha256=hashlib.sha256(b"").hexdigest())
+    previous = tmp_path / "refresh-monitor.json"
+    previous.write_text(
+        json.dumps(
+            {
+                "monitor_contract": "fx-codex-decision-feedback-refresh-v1",
+                "status": "ok",
+                "continuity_anchor_snapshots": [prior],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    continuity, _anchor = monitor._source_continuity(
+        [present], previous_monitor_path=previous, allow_bootstrap=False
+    )
+
+    if prior_offset == "full":
+        assert continuity["status"] == "pass"
+        assert continuity["relocated_sources"][0]["previous_device"] == prior["device"]
+    else:
+        assert continuity["failures"] == [f"source_identity_changed:{source}"]
 
 
 def test_feedback_refresh_cannot_bootstrap_after_monitor_deletion(monitor, tmp_path) -> None:
