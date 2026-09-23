@@ -1353,3 +1353,180 @@ def test_learning_cache_freshness_rejects_future_and_stale() -> None:
     assert not fx_briefing.learning_cache_is_fresh(
         (now + timedelta(seconds=1)).isoformat(), now=now, max_age_seconds=1800
     )
+
+
+def _load_learning_monitor(name: str):
+    script = Path(__file__).resolve().parents[1] / "tools" / "timeframe_learning_monitor.py"
+    spec = importlib.util.spec_from_file_location(name, script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _learning_monitor_args(module, tmp_path: Path, journal_path: Path, price_path: Path):
+    outputs = {
+        "tf": tmp_path / "tf.json",
+        "tp": tmp_path / "tp.json",
+        "max": tmp_path / "max.json",
+        "monitor": tmp_path / "monitor.json",
+    }
+    args = module.build_parser().parse_args(
+        [
+            "--journal",
+            str(journal_path),
+            "--prices",
+            str(price_path),
+            "--tf-learning",
+            str(outputs["tf"]),
+            "--tp-sl-learning",
+            str(outputs["tp"]),
+            "--maximization",
+            str(outputs["max"]),
+            "--monitor-json",
+            str(outputs["monitor"]),
+        ]
+    )
+    return args, outputs
+
+
+def _relocate_behind_symlink(source: Path, destination: Path, appended: bytes) -> None:
+    # A copy to another directory gets a new path and inode (and, across
+    # volumes, a new st_dev) while every previously learned byte is preserved.
+    destination.write_bytes(source.read_bytes() + appended)
+    source.unlink()
+    source.symlink_to(destination)
+
+
+@pytest.mark.parametrize("relocated_source", ["journal", "prices"])
+def test_timeframe_learning_monitor_accepts_relocated_source_with_verified_prefix(
+    tmp_path, relocated_source
+) -> None:
+    module = _load_learning_monitor(f"timeframe_learning_monitor_relocate_{relocated_source}")
+    logs = tmp_path / "logs"
+    hot = tmp_path / "hot"
+    logs.mkdir()
+    hot.mkdir()
+    journal_path = logs / "journal.jsonl"
+    price_path = logs / "prices.jsonl"
+    journal_path.write_bytes(b'{"id": 1}\n')
+    price_path.write_bytes(b'{"id": 1}\n')
+    args, outputs = _learning_monitor_args(module, tmp_path, journal_path, price_path)
+    module.run(args)
+    previous = json.loads(outputs["monitor"].read_text(encoding="utf-8"))
+    scope = "decisions" if relocated_source == "journal" else "prices"
+    source = journal_path if relocated_source == "journal" else price_path
+    moved = hot / source.name
+    _relocate_behind_symlink(source, moved, b'{"id": 2}\n')
+
+    result = module.run(args)
+
+    evidence = result["input_watermarks"][scope]
+    assert evidence["source_path"] == str(moved.resolve())
+    assert evidence["inode"] != previous["input_watermarks"][scope]["inode"]
+    assert evidence["read_offset_bytes"] == moved.stat().st_size
+    published = json.loads(outputs["monitor"].read_text(encoding="utf-8"))
+    assert published["generated_at"] == result["generated_at"]
+
+
+@pytest.mark.parametrize("relocated_source", ["journal", "prices"])
+def test_timeframe_learning_monitor_rejects_relocation_that_rewrites_prior_prefix(
+    tmp_path, relocated_source
+) -> None:
+    module = _load_learning_monitor(f"timeframe_learning_monitor_bad_move_{relocated_source}")
+    logs = tmp_path / "logs"
+    hot = tmp_path / "hot"
+    logs.mkdir()
+    hot.mkdir()
+    journal_path = logs / "journal.jsonl"
+    price_path = logs / "prices.jsonl"
+    journal_path.write_bytes(b'{"id": 1}\n')
+    price_path.write_bytes(b'{"id": 1}\n')
+    args, outputs = _learning_monitor_args(module, tmp_path, journal_path, price_path)
+    module.run(args)
+    before = {key: path.read_bytes() for key, path in outputs.items()}
+    source = journal_path if relocated_source == "journal" else price_path
+    moved = hot / source.name
+    moved.write_bytes(b'{"id": 9}\n{"id": 2}\n')
+    source.unlink()
+    source.symlink_to(moved)
+
+    with pytest.raises(RuntimeError, match="previous prefix changed"):
+        module.run(args)
+
+    assert {key: path.read_bytes() for key, path in outputs.items()} == before
+
+
+def test_timeframe_learning_monitor_accepts_relocated_cross_log_commit_with_verified_prefix(
+    tmp_path,
+) -> None:
+    module = _load_learning_monitor("timeframe_learning_monitor_relocate_full")
+    logs = tmp_path / "logs"
+    hot = tmp_path / "hot"
+    logs.mkdir()
+    hot.mkdir()
+    journal_path = logs / "briefing_tf_journal.jsonl"
+    full_path = logs / "briefing_decisions.jsonl"
+    price_path = logs / "prices.jsonl"
+    journal_path.write_text("", encoding="utf-8")
+    full_path.write_bytes(b'{"id": 1}\n')
+    price_path.write_text("", encoding="utf-8")
+    args, outputs = _learning_monitor_args(module, tmp_path, journal_path, price_path)
+    module.run(args)
+    moved = hot / full_path.name
+    _relocate_behind_symlink(full_path, moved, b'{"id": 2}\n')
+
+    result = module.run(args)
+
+    commit_snapshot = result["cross_log_commit_snapshot"]
+    assert commit_snapshot["source_path"] == str(moved.resolve())
+    assert commit_snapshot["read_offset_bytes"] == moved.stat().st_size
+
+
+@pytest.mark.parametrize("proof", ["matching", "none", "stale_manifest"])
+def test_timeframe_learning_rollback_check_device_change_requires_prefix_proof(
+    tmp_path, proof
+) -> None:
+    # Production 2026-09: a block-level clone kept path and inode but changed
+    # st_dev (16777229 -> 16777239); the content prefix was intact.
+    module = _load_learning_monitor(f"timeframe_learning_monitor_device_{proof}")
+    manifest_path = tmp_path / "monitor.json"
+    old_evidence = {
+        "source_path": "/srv/logs/briefing_tf_prices.jsonl",
+        "device": 16777229,
+        "inode": 2764841,
+        "read_offset_bytes": 10,
+        "mtime_ns": 1,
+        "source_sha256": "a" * 64,
+    }
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "monitor_contract": module.MONITOR_CONTRACT,
+                "status": "ok",
+                "generated_at": "2026-09-13T03:39:50+00:00",
+                "input_watermarks": {"prices": old_evidence},
+            }
+        ),
+        encoding="utf-8",
+    )
+    new_evidence = {**old_evidence, "device": 16777239, "read_offset_bytes": 20, "mtime_ns": 2}
+    call = dict(
+        generated_at=datetime(2026, 9, 23, tzinfo=UTC),
+        input_watermarks={"prices": new_evidence},
+        cross_log_commit_snapshot=None,
+    )
+
+    # A proof only licenses the manifest evidence it was computed against; one
+    # taken from an earlier manifest (another publisher raced in) does not.
+    proofs = {
+        "matching": {"prices": (10, "a" * 64)},
+        "none": {},
+        "stale_manifest": {"prices": (4, "b" * 64)},
+    }[proof]
+
+    if proof == "matching":
+        module._assert_not_source_rollback(manifest_path, verified_prefixes=proofs, **call)
+    else:
+        with pytest.raises(RuntimeError, match="prices learning source identity changed"):
+            module._assert_not_source_rollback(manifest_path, verified_prefixes=proofs, **call)
