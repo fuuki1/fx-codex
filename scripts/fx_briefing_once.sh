@@ -22,6 +22,7 @@ per_timeframe_status=0
   --no-price-write \
   --technical-cache-only \
   --require-freshness \
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" \
   --symbols USDJPY EURUSD \
   </dev/null >> logs/fx_integrated_briefing.log 2>&1 || per_timeframe_status=$?
 
@@ -48,6 +49,8 @@ case "$schedule_status" in
       --no-price-write \
       --technical-cache-only \
       --require-freshness \
+      --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" \
+      --decision-latest-output "$PWD/logs/briefing_fusion_decisions_latest.json" \
       --symbols USDJPY EURUSD GBPUSD \
       </dev/null >> logs/fx_fusion_capture.log 2>&1 || fusion_status=$?
     if [ "$fusion_status" -ne 0 ]; then

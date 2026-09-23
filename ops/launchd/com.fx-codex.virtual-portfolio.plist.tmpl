@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.fx-codex.virtual-portfolio</string>
-  <!-- 5分ごとのワンショット。ブローカー接続・paper注文・価格writerは持たない。 -->
+  <!-- 3分ごとのワンショット。300秒の判断受付期限にwrapper実行時間の余白を残す。 -->
   <key>ProgramArguments</key>
   <array>
     <string>__PYTHON__</string>
@@ -15,7 +15,7 @@
     <string>__FX_ROOT__/scripts/virtual_portfolio_once.sh</string>
   </array>
   <key>WorkingDirectory</key><string>__FX_ROOT__</string>
-  <key>StartInterval</key><integer>300</integer>
+  <key>StartInterval</key><integer>180</integer>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>ThrottleInterval</key><integer>30</integer>
