@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 import fcntl
@@ -57,6 +57,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         pipeline="timeframe_learning_monitor",
     )
     previous_sources = _previous_source_evidence(monitor_path)
+    # (offset, sha256) of each previously learned byte range that was re-read
+    # and matched. Only these may legitimately change path/device/inode (a
+    # relocated or cloned append-only log); see _assert_not_source_rollback.
+    verified_prefixes: dict[str, tuple[int, str]] = {}
     decision_audit: dict[str, object] = {}
     with timing.stage("timeframe_learning_journal_read"):
         decision_source, decision_full_source = _source_snapshot(
@@ -87,16 +91,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 decision_commit.commit_path_for(journal_path),
                 decision_full_source,
             )
-            _assert_previous_prefix_unchanged(
+            proof = _assert_previous_prefix_unchanged(
                 decision_full_source,
                 previous_sources.get("cross_log_commit"),
                 label="decision cross-log commit source",
             )
-        _assert_previous_prefix_unchanged(
+            if proof is not None:
+                verified_prefixes["cross_log_commit"] = proof
+        proof = _assert_previous_prefix_unchanged(
             decision_source,
             previous_sources.get("decisions"),
             label="decision learning source",
         )
+        if proof is not None:
+            verified_prefixes["decisions"] = proof
         decision_source.pop("_previous_prefix_sha256", None)
         if decision_full_source is not None:
             decision_full_source.pop("_previous_prefix_sha256", None)
@@ -119,11 +127,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             price_source,
             observed_sha256=_audit_digest(price_audit),
         )
-        _assert_previous_prefix_unchanged(
+        proof = _assert_previous_prefix_unchanged(
             price_source,
             previous_sources.get("prices"),
             label="price learning source",
         )
+        if proof is not None:
+            verified_prefixes["prices"] = proof
         price_source.pop("_previous_prefix_sha256", None)
     generated_at = datetime.now(UTC)
     with timing.stage("timeframe_learning_pit_filter"):
@@ -196,6 +206,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 generated_at=generated_at,
                 input_watermarks=input_watermarks,
                 cross_log_commit_snapshot=decision_full_source,
+                verified_prefixes=verified_prefixes,
             )
         with timing.stage("timeframe_learning_bundle_publish"):
             tf_learning.save_timeframe_learning(direction, tf_learning_path)
@@ -308,8 +319,27 @@ def _assert_not_source_rollback(
     generated_at: datetime,
     input_watermarks: dict[str, dict[str, object]],
     cross_log_commit_snapshot: dict[str, object] | None,
+    verified_prefixes: Mapping[str, tuple[int, str]] | None = None,
 ) -> None:
-    """Reject a fresh-looking generation built from truncated/replaced inputs."""
+    """Reject a fresh-looking generation built from truncated/replaced inputs.
+
+    A changed path/device/inode alone is not evidence of rollback: moving an
+    append-only log to another volume, or booting from a block-level clone,
+    changes them while preserving every byte. ``verified_prefixes`` holds the
+    (offset, sha256) of each previously learned, non-empty byte range that this
+    run re-read and matched. A new location is accepted only when that proof
+    covers the very evidence in the manifest re-read here; otherwise the
+    filesystem identity must match as before.
+    """
+
+    proofs = verified_prefixes or {}
+
+    def relocation_proven(scope: str, evidence: Mapping[str, object]) -> bool:
+        proof = proofs.get(scope)
+        return proof is not None and proof == (
+            evidence.get("read_offset_bytes"),
+            evidence.get("source_sha256"),
+        )
 
     try:
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -332,11 +362,12 @@ def _assert_not_source_rollback(
         new = input_watermarks.get(scope)
         if not isinstance(old, dict) or not isinstance(new, dict):
             continue
-        if old.get("source_path") != new.get("source_path"):
-            raise RuntimeError(f"{scope} learning source path changed")
-        for key in ("device", "inode"):
-            if type(old.get(key)) is int and old.get(key) != new.get(key):  # noqa: E721
-                raise RuntimeError(f"{scope} learning source identity changed")
+        if not relocation_proven(scope, old):
+            if old.get("source_path") != new.get("source_path"):
+                raise RuntimeError(f"{scope} learning source path changed")
+            for key in ("device", "inode"):
+                if type(old.get(key)) is int and old.get(key) != new.get(key):  # noqa: E721
+                    raise RuntimeError(f"{scope} learning source identity changed")
         for key in (
             "read_offset_bytes",
             "mtime_ns",
@@ -363,19 +394,20 @@ def _assert_not_source_rollback(
                 raise RuntimeError(f"{scope} eligible learning population changed")
     previous_commit_source = previous.get("cross_log_commit_snapshot")
     if isinstance(previous_commit_source, dict) and cross_log_commit_snapshot is not None:
-        if previous_commit_source.get("source_path") != cross_log_commit_snapshot.get(
-            "source_path"
-        ):
-            raise RuntimeError("decision cross-log commit source path changed")
-        for key in ("device", "inode"):
-            if type(
-                previous_commit_source.get(key)
-            ) is int and previous_commit_source.get(  # noqa: E721
-                key
-            ) != cross_log_commit_snapshot.get(
-                key
+        if not relocation_proven("cross_log_commit", previous_commit_source):
+            if previous_commit_source.get("source_path") != cross_log_commit_snapshot.get(
+                "source_path"
             ):
-                raise RuntimeError("decision cross-log commit source identity changed")
+                raise RuntimeError("decision cross-log commit source path changed")
+            for key in ("device", "inode"):
+                if type(
+                    previous_commit_source.get(key)
+                ) is int and previous_commit_source.get(  # noqa: E721
+                    key
+                ) != cross_log_commit_snapshot.get(
+                    key
+                ):
+                    raise RuntimeError("decision cross-log commit source identity changed")
         for key in ("read_offset_bytes", "mtime_ns"):
             old_value = previous_commit_source.get(key)
             new_value = cross_log_commit_snapshot.get(key)
@@ -620,13 +652,25 @@ def _assert_previous_prefix_unchanged(
     previous: dict[str, object] | None,
     *,
     label: str,
-) -> None:
+) -> tuple[int, str] | None:
+    """Fail on a rewritten prior prefix; return the proof for a non-empty match.
+
+    An empty prior range hashes identically for any file, so it proves nothing
+    about continuity and must not license a path/device/inode change.
+    """
+
     if previous is None:
-        return
+        return None
     expected = previous.get("source_sha256")
+    if not isinstance(expected, str) or len(expected) != 64:
+        return None
     observed = snapshot.get("_previous_prefix_sha256")
-    if isinstance(expected, str) and len(expected) == 64 and observed != expected:
+    if observed != expected:
         raise RuntimeError(f"{label} previous prefix changed")
+    previous_end_offset = _evidence_offset(previous)
+    if previous_end_offset is None or previous_end_offset <= 0:
+        return None
+    return previous_end_offset, expected
 
 
 def build_parser() -> argparse.ArgumentParser:
