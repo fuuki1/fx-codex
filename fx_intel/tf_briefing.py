@@ -25,6 +25,10 @@ COLOR_CLOSED = 0x607D8B
 MAX_EMBEDS = 10
 MAX_CONTENT = 2000
 MAX_FIELD = 1024
+# Discord intermittently returns HTTP 500 for this dense multi-line field at
+# the documented 1024-character boundary.  Keep the operational summary well
+# below that boundary; the complete learning evidence remains in JSON caches.
+MAX_LEARNING_FIELD = 512
 MAX_EMBED_CHARS = 5800
 
 _DIRECTION_COLOR = {
@@ -416,7 +420,7 @@ def build_timeframe_discord_payload(
         [
             {
                 "name": "🧠 自動学習の信頼性",
-                "value": _clip(reliability, MAX_FIELD),
+                "value": _clip(reliability, MAX_LEARNING_FIELD),
                 "inline": False,
             },
             {

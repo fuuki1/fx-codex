@@ -10,6 +10,7 @@ LABELS=(
   com.fx-codex.horizon
   com.fx-codex.monitors
   com.fx-codex.monitor-diagnostics
+  com.fx-codex.decision-outcome-audit
   com.fx-codex.dukascopy-history
   com.fx-codex.quote-index
   com.fx-codex.virtual-portfolio
@@ -217,7 +218,7 @@ fi
 
 echo ""
 echo "=== 主要ログの最終更新 ==="
-for f in logs/tradingview_technicals.json logs/briefing_tf_prices.jsonl logs/briefing_journal.jsonl logs/briefing_tf_journal.jsonl logs/briefing_horizon_forecasts.jsonl logs/briefing_horizon_learning.json logs/trade_outcome_monitor.json logs/decision_expectancy_monitor.json; do
+for f in logs/tradingview_technicals.json logs/briefing_tf_prices.jsonl logs/briefing_journal.jsonl logs/briefing_tf_journal.jsonl logs/briefing_horizon_forecasts.jsonl logs/briefing_horizon_learning.json logs/trade_outcome_monitor.json logs/decision_feedback_refresh_monitor.json logs/decision_expectancy_monitor.json; do
   if [ -f "$ROOT/$f" ]; then
     ls -laT "$ROOT/$f" | awk '{printf "  %s %s %s %s  %s\n", $6, $7, $8, $9, $NF}'
   fi

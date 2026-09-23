@@ -60,13 +60,22 @@
       "manual_action_ja": "timeframe_learning_monitor.json とcache contractを確認"
     },
     {
-      "name": "decision_feedback_profile",
-      "path": "logs/briefing_decision_feedback.json",
-      "kind": "json",
+      "name": "decision_feedback_refresh_monitor",
+      "path": "logs/decision_feedback_refresh_monitor.json",
+      "kind": "json_generated_at",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
-      "manual_action_ja": "decision_expectancy_monitor.json とcache contractを確認し、com.fx-codex.monitor-diagnostics を restart"
+      "manual_action_ja": "decision_feedback_refresh_monitor.json を確認し、com.fx-codex.monitor-diagnostics を restart"
+    },
+    {
+      "name": "decision_feedback_profile",
+      "path": "logs/briefing_decision_feedback.json",
+      "kind": "json_generated_at",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "decision_feedback_refresh_monitor.json とcache contractを確認し、com.fx-codex.monitor-diagnostics を restart"
     }
   ]
 }

@@ -135,3 +135,8 @@ def test_discord_payload_stays_within_platform_limits() -> None:
         assert len(embed.get("fields", [])) <= 25
         for field in embed.get("fields", []):
             assert len(field["value"]) <= 1024
+    learning_field = next(
+        field for field in payload["embeds"][0]["fields"] if field["name"] == "🧠 自動学習の信頼性"
+    )
+    assert len(learning_field["value"]) == 512
+    assert learning_field["value"].endswith("…")

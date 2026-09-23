@@ -22,6 +22,7 @@ def test_timeframe_freshness_config_contains_active_gating_targets() -> None:
         "learning_profile",
         "tp_sl_learning_profile",
         "maximization_profile",
+        "decision_feedback_refresh_monitor",
         "decision_feedback_profile",
     }
     assert "fusion_journal" not in names

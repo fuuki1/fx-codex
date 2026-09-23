@@ -163,6 +163,7 @@ PLIST_TEMPLATES = [
     "com.fx-codex.health.plist.tmpl",
     "com.fx-codex.horizon.plist.tmpl",
     "com.fx-codex.monitors.plist.tmpl",
+    "com.fx-codex.decision-outcome-audit.plist.tmpl",
     "com.fx-codex.virtual-portfolio.plist.tmpl",
 ]
 
@@ -257,6 +258,40 @@ def test_briefing_plist_runs_on_five_minute_boundaries():
     assert children[process_index + 1].text == "Standard"
 
 
+def test_feedback_refresh_avoids_hourly_price_adapter_write_window():
+    root = ET.parse(_ROOT / "ops" / "launchd" / "com.fx-codex.monitor-diagnostics.plist.tmpl")
+    dictionary = root.find("dict")
+    assert dictionary is not None
+    children = list(dictionary)
+    schedule_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "StartCalendarInterval"
+    )
+    schedule = children[schedule_index + 1]
+    minutes = []
+    for entry in schedule.findall("dict"):
+        fields = list(entry)
+        minute_index = next(
+            index
+            for index, node in enumerate(fields)
+            if node.tag == "key" and node.text == "Minute"
+        )
+        minutes.append(int(fields[minute_index + 1].text or "-1"))
+
+    # The cache publisher starts at :02/:17/:32/:47 and needs about ten minutes;
+    # the price adapter occupies roughly :20-:33.  Keep the feedback age within
+    # its 30-minute TTL without contending with either writer.
+    assert minutes == [14, 44, 59]
+    process_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "ProcessType"
+    )
+    assert children[process_index + 1].text == "Standard"
+    assert "LowPriorityIO" not in [node.text for node in root.iter("key")]
+
+
 _ZSH = shutil.which("zsh")  # CI(ubuntu)にはzshが無いためスキップ。macOS実機で検証する
 
 
@@ -314,6 +349,7 @@ def test_install_script_dry_run_makes_no_changes(tmp_path):
         "com.fx-codex.horizon",
         "com.fx-codex.monitors",
         "com.fx-codex.monitor-diagnostics",
+        "com.fx-codex.decision-outcome-audit",
         "com.fx-codex.dukascopy-history",
         "com.fx-codex.quote-index",
         "com.fx-codex.virtual-portfolio",
@@ -339,6 +375,7 @@ def test_shell_scripts_parse(tmp_path):
         "fx_horizon_once.sh",
         "fx_monitors_once.sh",
         "fx_monitor_diagnostics_once.sh",
+        "fx_decision_outcome_audit_once.sh",
         "virtual_portfolio_once.sh",
         "virtual_portfolio_postprocess_once.sh",
         "virtual_portfolio_report_once.sh",
@@ -361,6 +398,7 @@ def test_managed_launchd_python_imports_are_pinned_to_release_root():
         "horizon",
         "monitors",
         "monitor-diagnostics",
+        "decision-outcome-audit",
         "dukascopy-history",
         "quote-index",
         "virtual-portfolio",
@@ -395,6 +433,7 @@ def test_manual_tool_wrappers_prepend_release_root_to_pythonpath():
     for name in (
         "fx_monitors_once.sh",
         "fx_monitor_diagnostics_once.sh",
+        "fx_decision_outcome_audit_once.sh",
         "virtual_portfolio_once.sh",
         "virtual_portfolio_postprocess_once.sh",
         "virtual_portfolio_report_once.sh",

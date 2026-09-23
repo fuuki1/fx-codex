@@ -8,6 +8,7 @@ LABELS=(
   com.fx-codex.horizon
   com.fx-codex.monitors
   com.fx-codex.monitor-diagnostics
+  com.fx-codex.decision-outcome-audit
   com.fx-codex.dukascopy-history
   com.fx-codex.quote-index
   com.fx-codex.virtual-portfolio

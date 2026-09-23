@@ -37,7 +37,7 @@
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 5400,
-      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log を確認し、com.fx-codex.monitor-diagnostics を restart"
+      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
     },
     {
       "name": "trade_outcome_monitor",
@@ -51,11 +51,11 @@
     {
       "name": "decision_expectancy_monitor",
       "path": "logs/decision_expectancy_monitor.json",
-      "kind": "json",
-      "expected_interval_seconds": 900,
-      "warn_after_seconds": 1800,
-      "critical_after_seconds": 5400,
-      "manual_action_ja": "logs/launchd/monitors.err.log を確認し、com.fx-codex.monitors を restart"
+      "kind": "decision_expectancy_audit",
+      "expected_interval_seconds": 86400,
+      "warn_after_seconds": 90000,
+      "critical_after_seconds": 172800,
+      "manual_action_ja": "logs/launchd/decision-outcome-audit.err.log と decision_expectancy_monitor.json を確認し、com.fx-codex.decision-outcome-audit を restart"
     },
     {
       "name": "learning_profile",
@@ -85,13 +85,22 @@
       "manual_action_ja": "logs/launchd/monitors.err.log と timeframe_learning_monitor.json を確認し、com.fx-codex.monitors を restart"
     },
     {
-      "name": "decision_feedback_profile",
-      "path": "logs/briefing_decision_feedback.json",
-      "kind": "json",
+      "name": "decision_feedback_refresh_monitor",
+      "path": "logs/decision_feedback_refresh_monitor.json",
+      "kind": "json_generated_at",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
-      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log と decision_expectancy_monitor.json を確認し、com.fx-codex.monitor-diagnostics を restart"
+      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log と decision_feedback_refresh_monitor.json を確認し、com.fx-codex.monitor-diagnostics を restart"
+    },
+    {
+      "name": "decision_feedback_profile",
+      "path": "logs/briefing_decision_feedback.json",
+      "kind": "json_generated_at",
+      "expected_interval_seconds": 900,
+      "warn_after_seconds": 1800,
+      "critical_after_seconds": 2700,
+      "manual_action_ja": "logs/launchd/monitor-diagnostics.err.log と decision_feedback_refresh_monitor.json を確認し、com.fx-codex.monitor-diagnostics を restart"
     }
   ]
 }

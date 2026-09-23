@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, UTC
+import hashlib
+import json
 
 from fx_intel import decision_feedback
 from fx_intel.evaluation_labels import (
@@ -207,3 +209,57 @@ def test_monitoring_snapshot_reports_model_expected_r_delta() -> None:
     assert delta["baseline_model"]["expected_R"] == 0.55
     assert delta["learning_model"]["expected_R"] == 1.8
     assert delta["delta_expected_R"] == 1.25
+
+
+def test_published_feedback_requires_exact_success_manifest_bytes(tmp_path) -> None:
+    feedback_path = tmp_path / "briefing_decision_feedback.json"
+    monitor_path = tmp_path / "decision_feedback_refresh_monitor.json"
+    profile = decision_feedback.DecisionFeedbackProfile(
+        generated_at=NOW.isoformat(),
+        cells={
+            ("USDJPY", "1h", "long"): decision_feedback.DecisionFeedbackCell(
+                "USDJPY", "1h", "long", action="dampen", factor=0.75
+            )
+        },
+    )
+    decision_feedback.save_decision_feedback(profile, feedback_path)
+    body = feedback_path.read_bytes()
+    semantic_sha = decision_feedback.feedback_semantic_sha256(profile)
+    monitor_path.write_text(
+        json.dumps(
+            {
+                "monitor_contract": "fx-codex-decision-feedback-refresh-v1",
+                "generated_at": profile.generated_at,
+                "status": "ok",
+                "summary": {"profile_semantic_sha256": semantic_sha},
+                "feedback_artifact": {
+                    "path": str(feedback_path.resolve()),
+                    "size": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "generated_at": profile.generated_at,
+                    "profile_semantic_sha256": semantic_sha,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = decision_feedback.load_published_decision_feedback(
+        feedback_path,
+        monitor_path,
+    )
+    assert loaded.cell_for("USDJPY", "1h", "long") is not None
+
+    newer = decision_feedback.DecisionFeedbackProfile(
+        generated_at=(NOW + timedelta(minutes=15)).isoformat(),
+        cells=profile.cells,
+    )
+    decision_feedback.save_decision_feedback(newer, feedback_path)
+
+    assert (
+        decision_feedback.load_published_decision_feedback(
+            feedback_path,
+            monitor_path,
+        ).generated_at
+        == ""
+    )

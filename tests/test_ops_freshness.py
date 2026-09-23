@@ -186,6 +186,241 @@ def test_corrupt_json_is_critical_even_if_fresh(monitor, tmp_path):
     assert report["targets"][0]["reason"] == "json_corrupt"
 
 
+def test_json_generated_at_uses_semantic_time_not_fresh_mtime(monitor, tmp_path):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "feedback",
+                "path": "logs/feedback.json",
+                "kind": "json_generated_at",
+                "expected_interval_seconds": 900,
+                "warn_after_seconds": 1800,
+                "critical_after_seconds": 2700,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    cache_path = tmp_path / "logs" / "feedback.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(
+        json.dumps({"generated_at": (NOW - timedelta(hours=2)).isoformat()}),
+        encoding="utf-8",
+    )
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    target = report["targets"][0]
+    assert target["status"] == "critical"
+    assert target["reason"] == "stale_critical"
+    assert target["age_seconds"] == 7200.0
+    assert target["last_update"] == (NOW - timedelta(hours=2)).isoformat()
+
+
+@pytest.mark.parametrize(
+    ("generated_at", "reason"),
+    [
+        ("not-a-time", "json_generated_at_invalid"),
+        (NOW.replace(tzinfo=None).isoformat(), "json_generated_at_invalid"),
+        ((NOW + timedelta(seconds=1)).isoformat(), "json_generated_at_future"),
+    ],
+)
+def test_json_generated_at_rejects_invalid_or_future_time(monitor, tmp_path, generated_at, reason):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "feedback",
+                "path": "logs/feedback.json",
+                "kind": "json_generated_at",
+                "warn_after_seconds": 1800,
+                "critical_after_seconds": 2700,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    cache_path = tmp_path / "logs" / "feedback.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps({"generated_at": generated_at}), encoding="utf-8")
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    assert report["targets"][0]["status"] == "critical"
+    assert report["targets"][0]["reason"] == reason
+
+
+def test_decision_feedback_semantic_monitor_rejects_wrong_contract(monitor, tmp_path):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "decision_feedback_profile",
+                "path": "logs/feedback.json",
+                "kind": "json_generated_at",
+                "warn_after_seconds": 1800,
+                "critical_after_seconds": 2700,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    cache_path = tmp_path / "logs" / "feedback.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "generated_at": NOW.isoformat(),
+                "cache_contract": "wrong",
+                "cells": {},
+                "notes_ja": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    assert report["targets"][0]["status"] == "critical"
+    assert report["targets"][0]["reason"] == "decision_feedback_contract_invalid"
+
+
+def test_feedback_refresh_monitor_requires_successful_pit_health(monitor, tmp_path):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "decision_feedback_refresh_monitor",
+                "path": "logs/refresh.json",
+                "kind": "json_generated_at",
+                "warn_after_seconds": 1800,
+                "critical_after_seconds": 2700,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    monitor_path = tmp_path / "logs" / "refresh.json"
+    monitor_path.parent.mkdir(parents=True)
+    monitor_path.write_text(
+        json.dumps(
+            {
+                "monitor_contract": "fx-codex-decision-feedback-refresh-v1",
+                "generated_at": NOW.isoformat(),
+                "status": "fail",
+                "summary": {
+                    "price_health": {"status": "fail"},
+                    "source_continuity": {"status": "pass"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    assert report["targets"][0]["status"] == "critical"
+    assert report["targets"][0]["reason"] == "decision_feedback_refresh_invalid"
+
+
+def test_complete_audit_target_rejects_failed_price_evidence(monitor, tmp_path):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "decision_expectancy_monitor",
+                "path": "logs/audit.json",
+                "kind": "decision_expectancy_audit",
+                "warn_after_seconds": 90000,
+                "critical_after_seconds": 172800,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    audit_path = tmp_path / "logs" / "audit.json"
+    audit_path.parent.mkdir(parents=True)
+    audit_path.write_text(
+        json.dumps(
+            {
+                "runner": {"scope": "complete_audit"},
+                "summary": {
+                    "scored_outcomes": 25,
+                    "price_health": {"status": "fail"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    assert report["targets"][0]["status"] == "critical"
+    assert report["targets"][0]["reason"] == "decision_expectancy_audit_invalid"
+
+
+@pytest.mark.parametrize("with_snapshots", [False, True])
+def test_complete_audit_target_requires_hashed_decision_snapshots(
+    monitor,
+    tmp_path,
+    with_snapshots,
+):
+    config = {
+        "schema": 1,
+        "targets": [
+            {
+                "name": "decision_expectancy_monitor",
+                "path": "logs/audit.json",
+                "kind": "decision_expectancy_audit",
+                "warn_after_seconds": 90000,
+                "critical_after_seconds": 172800,
+            }
+        ],
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    audit_path = tmp_path / "logs" / "audit.json"
+    audit_path.parent.mkdir(parents=True)
+    snapshots = (
+        [
+            {
+                "source_path": str(tmp_path / "logs" / "decisions.jsonl"),
+                "device": 1,
+                "inode": 2,
+                "read_offset_bytes": 3,
+                "source_sha256": "a" * 64,
+            }
+        ]
+        if with_snapshots
+        else []
+    )
+    audit_path.write_text(
+        json.dumps(
+            {
+                "generated_at": NOW.isoformat(),
+                "runner": {
+                    "scope": "complete_audit",
+                    "decision_source_snapshots": snapshots,
+                },
+                "summary": {
+                    "scored_outcomes": 25,
+                    "price_health": {"status": "pass"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = _run(monitor, tmp_path, config_path, _Sender())
+
+    if with_snapshots:
+        assert report["targets"][0]["reason"] != "decision_expectancy_audit_invalid"
+    else:
+        assert report["targets"][0]["status"] == "critical"
+        assert report["targets"][0]["reason"] == "decision_expectancy_audit_invalid"
+
+
 def _write_learning_bundle(root: Path, *, generation: str) -> Path:
     logs = root / "logs"
     logs.mkdir(parents=True, exist_ok=True)

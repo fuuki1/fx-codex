@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Historical/diagnostic monitor outputs. Never owns canonical learning caches.
+# Fast operational feedback plus lightweight historical diagnostics.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -38,7 +38,8 @@ overall=0
 run_monitor trade-outcome logs/trade_outcome_monitor.json \
   tools/trade_outcome_monitor.py \
   --no-registry-update || overall=$?
-run_monitor decision-expectancy logs/decision_expectancy_monitor.json \
+run_monitor decision-feedback-refresh logs/decision_feedback_refresh_monitor.json \
   tools/decision_expectancy_monitor.py \
+  --compact-feedback-refresh \
   --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?
 exit "$overall"

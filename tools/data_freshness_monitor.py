@@ -40,6 +40,7 @@ except ValueError:
     pass
 sys.path.insert(0, str(REPO_ROOT))
 
+from fx_intel import decision_feedback  # noqa: E402
 from fx_intel.state_io import advisory_file_lock  # noqa: E402
 
 DEFAULT_CONFIG_PATH = "ops/freshness_targets.json"
@@ -206,13 +207,7 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
     age = (now - mtime).total_seconds()
     result.last_update = mtime.isoformat()
     result.age_seconds = round(age, 1)
-
-    if target.critical_after_seconds is not None and age > target.critical_after_seconds:
-        result.status = STATUS_CRITICAL
-        result.reason = "stale_critical"
-    elif age > target.warn_after_seconds:
-        result.status = STATUS_WARNING
-        result.reason = "stale_warning"
+    _apply_age_status(result, age)
 
     # JSONLの末尾行が壊れていたら書込み途中クラッシュや破損の兆候(鮮度より優先)
     if target.kind == "jsonl":
@@ -236,9 +231,152 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
             if not isinstance(parsed, dict):
                 result.status = STATUS_CRITICAL
                 result.reason = "json_non_object"
+    elif target.kind == "json_generated_at":
+        _apply_json_generated_at_freshness(result, file_path, now)
+    elif target.kind == "decision_expectancy_audit":
+        _apply_decision_expectancy_audit_integrity(result, file_path)
     elif target.kind == "timeframe_learning_bundle":
         _apply_timeframe_learning_bundle_integrity(result, file_path, root)
     return result
+
+
+def _apply_age_status(result: TargetResult, age: float) -> None:
+    if result.critical_after_seconds is not None and age > result.critical_after_seconds:
+        result.status = STATUS_CRITICAL
+        result.reason = "stale_critical"
+    elif age > result.warn_after_seconds:
+        result.status = STATUS_WARNING
+        result.reason = "stale_warning"
+    else:
+        result.status = STATUS_OK
+        result.reason = ""
+
+
+def _apply_json_generated_at_freshness(
+    result: TargetResult,
+    path: Path,
+    now: datetime,
+) -> None:
+    """Use the cache's semantic generation time instead of its file mtime."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        result.status = STATUS_CRITICAL
+        result.reason = "json_corrupt"
+        return
+    if not isinstance(payload, dict):
+        result.status = STATUS_CRITICAL
+        result.reason = "json_non_object"
+        return
+    if result.name == "decision_feedback_profile":
+        loaded = decision_feedback.load_published_decision_feedback(
+            path,
+            path.with_name("decision_feedback_refresh_monitor.json"),
+        )
+        raw_cells = payload.get("cells")
+        if (
+            payload.get("cache_contract") != decision_feedback.DECISION_FEEDBACK_CACHE_CONTRACT
+            or not isinstance(raw_cells, dict)
+            or len(loaded.cells) != len(raw_cells)
+            or not loaded.generated_at
+        ):
+            result.status = STATUS_CRITICAL
+            result.reason = "decision_feedback_contract_invalid"
+            return
+    if result.name == "decision_feedback_refresh_monitor":
+        summary = payload.get("summary")
+        price_health = summary.get("price_health") if isinstance(summary, Mapping) else None
+        continuity = summary.get("source_continuity") if isinstance(summary, Mapping) else None
+        if (
+            payload.get("monitor_contract") != "fx-codex-decision-feedback-refresh-v1"
+            or payload.get("status") != "ok"
+            or not isinstance(price_health, Mapping)
+            or price_health.get("status") != "pass"
+            or not isinstance(continuity, Mapping)
+            or continuity.get("status") != "pass"
+        ):
+            result.status = STATUS_CRITICAL
+            result.reason = "decision_feedback_refresh_invalid"
+            return
+        published = decision_feedback.load_published_decision_feedback(
+            path.with_name("briefing_decision_feedback.json"),
+            path,
+        )
+        if published.generated_at != str(payload.get("generated_at") or ""):
+            result.status = STATUS_CRITICAL
+            result.reason = "decision_feedback_publication_mismatch"
+            return
+    raw = payload.get("generated_at")
+    try:
+        generated_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        result.status = STATUS_CRITICAL
+        result.reason = "json_generated_at_invalid"
+        return
+    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+        result.status = STATUS_CRITICAL
+        result.reason = "json_generated_at_invalid"
+        return
+    generated_at = generated_at.astimezone(UTC)
+    age = (now - generated_at).total_seconds()
+    result.last_update = generated_at.isoformat()
+    result.age_seconds = round(age, 1)
+    if age < 0:
+        result.status = STATUS_CRITICAL
+        result.reason = "json_generated_at_future"
+        return
+    _apply_age_status(result, age)
+
+
+def _apply_decision_expectancy_audit_integrity(
+    result: TargetResult,
+    path: Path,
+) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        result.status = STATUS_CRITICAL
+        result.reason = "decision_expectancy_audit_corrupt"
+        return
+    if not isinstance(payload, Mapping):
+        result.status = STATUS_CRITICAL
+        result.reason = "decision_expectancy_audit_invalid"
+        return
+    runner = payload.get("runner")
+    summary = payload.get("summary")
+    price_health = summary.get("price_health") if isinstance(summary, Mapping) else None
+    scored = summary.get("scored_outcomes") if isinstance(summary, Mapping) else None
+    snapshots = runner.get("decision_source_snapshots") if isinstance(runner, Mapping) else None
+    if (
+        not isinstance(runner, Mapping)
+        or runner.get("scope") != "complete_audit"
+        or not isinstance(price_health, Mapping)
+        or price_health.get("status") != "pass"
+        or type(scored) is not int  # noqa: E721
+        or scored <= 0
+        or not isinstance(snapshots, list)
+        or not snapshots
+        or not all(_valid_audit_source_snapshot(row) for row in snapshots)
+    ):
+        result.status = STATUS_CRITICAL
+        result.reason = "decision_expectancy_audit_invalid"
+
+
+def _valid_audit_source_snapshot(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    digest = value.get("source_sha256")
+    return (
+        bool(str(value.get("source_path") or ""))
+        and type(value.get("device")) is int  # noqa: E721
+        and type(value.get("inode")) is int  # noqa: E721
+        and type(value.get("read_offset_bytes")) is int  # noqa: E721
+        and int(value["read_offset_bytes"]) >= 0
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
 
 
 def _apply_timeframe_learning_bundle_integrity(

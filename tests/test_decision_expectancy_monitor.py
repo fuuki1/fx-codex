@@ -5,11 +5,15 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from fx_intel import decision_log
+from fx_intel import decision_log, journal, price_history, price_path_adapter
+from fx_intel.briefing import TradePlan
+from fx_intel.timeframe import TimeframePlan
 
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "tools" / "decision_expectancy_monitor.py"
 NOW = datetime(2026, 7, 6, 8, 0, tzinfo=UTC)
@@ -76,11 +80,129 @@ def _price(ts: datetime, close: float) -> dict:
     }
 
 
+def _pit_price(
+    ts: datetime,
+    close: float,
+    *,
+    symbol: str = "USDJPY",
+    timeframe: str = "1h",
+) -> dict:
+    return price_history.snapshot_entries(
+        {
+            symbol: {
+                timeframe: {
+                    "close": close,
+                    "high": close + 0.05,
+                    "low": close - 0.05,
+                }
+            }
+        },
+        now=ts,
+        run_id=f"test-price-{symbol}-{timeframe}-{ts.timestamp()}",
+        writer_id="test-suite",
+    )[0]
+
+
+def _shared_path_price(
+    ts: datetime,
+    close: float,
+    *,
+    symbol: str = "USDJPY",
+) -> dict:
+    bar = price_path_adapter.ClosedBar(
+        symbol=symbol,
+        bar_start=ts - timedelta(minutes=5),
+        bar_end=ts,
+        open=close,
+        high=close + 0.05,
+        low=close - 0.05,
+        close=close,
+        bid=close - 0.01,
+        ask=close + 0.01,
+        tick_count=5,
+        available_time=ts,
+    )
+    return price_path_adapter.build_rows([bar], run_id=f"test-shared-{symbol}-{ts}")[0]
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text(
         "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize("mode", ["fusion", "per_timeframe"])
+def test_production_compact_builder_preserves_actual_scoring_projection(mode) -> None:
+    common = {
+        "symbol": "USDJPY",
+        "direction": "long",
+        "conviction": 76,
+        "news_score": 0.15,
+        "composite": 0.48,
+        "close": 100.0,
+        "atr": 1.0,
+        "stop": 99.0,
+        "target1": 101.0,
+        "target2": 102.0,
+        "input_context_id": "context:production-builder",
+        "quote_source_record_id": "quote:production-builder",
+        "price_frame": {"basis": "mid", "captured_at": NOW.isoformat()},
+    }
+    if mode == "fusion":
+        plan = TradePlan(tech_score=0.62, **common)
+        event = decision_log.build_fusion_decision_events(
+            [plan], now=NOW, analysis=SimpleNamespace(currencies={}), tech_map={}
+        )[0]
+        compact = journal.build_plan_rows(
+            [plan],
+            NOW,
+            source_cutoff=NOW - timedelta(minutes=2),
+            max_feature_available_time=NOW - timedelta(minutes=1),
+            decision_ids=[str(event["decision_id"])],
+        )[0]
+    else:
+        plan = TimeframePlan(timeframe="1h", horizon_hours=1.0, tf_score=0.62, **common)
+        event = decision_log.build_timeframe_decision_events(
+            {"USDJPY": [plan]},
+            now=NOW,
+            analysis=SimpleNamespace(currencies={}),
+            tech_map={},
+        )[0]
+        compact = journal.build_timeframe_plan_rows(
+            [plan],
+            NOW,
+            source_cutoff=NOW - timedelta(minutes=2),
+            max_feature_available_time=NOW - timedelta(minutes=1),
+            decision_ids=[str(event["decision_id"])],
+        )[0]
+    event.update(
+        journal.pit_metadata_for_plan(
+            plan,
+            prediction_time=NOW,
+            source_cutoff=NOW - timedelta(minutes=2),
+            max_feature_available_time=NOW - timedelta(minutes=1),
+            decision_id=str(event["decision_id"]),
+            mode=mode,
+        )
+    )
+
+    full_projection = decision_log.decision_event_to_scoring_entry(event)
+    compact_projection = decision_log.decision_event_to_scoring_entry(compact)
+
+    assert full_projection is not None and compact_projection is not None
+    assert compact["pit_eligible"] is True
+    assert compact_projection["price_frame"] == common["price_frame"]
+    excluded_complete_audit_only = {"run_id", "learning_context"}
+    assert {
+        key: value
+        for key, value in full_projection.items()
+        if key not in excluded_complete_audit_only
+    } == {
+        key: value
+        for key, value in compact_projection.items()
+        if key not in excluded_complete_audit_only
+    }
 
 
 def _write_decisions(path: Path, rows: list[dict]) -> None:
@@ -92,6 +214,45 @@ def _write_decisions(path: Path, rows: list[dict]) -> None:
         compact_path=path.parent / "briefing_tf_journal.jsonl",
         committed_at=NOW,
     )
+
+
+def _write_decisions_with_flat_compact(path: Path, rows: list[dict]) -> Path:
+    compact_path = path.parent / "briefing_tf_journal.jsonl"
+    compact_rows = []
+    for row in rows:
+        compact = dict(row["decision"])
+        compact.update(
+            {
+                key: row.get(key)
+                for key in (
+                    "ts",
+                    "prediction_time",
+                    "source_cutoff",
+                    "max_feature_available_time",
+                    "pit_eligible",
+                    "pit_contract",
+                    "decision_id",
+                    "mode",
+                    "producer",
+                    "producer_version",
+                    "input_context_id",
+                    "source_record_ids",
+                    "symbol",
+                    "timeframe",
+                    "horizon_hours",
+                )
+            }
+        )
+        compact_rows.append(compact)
+    decision_log.append_decision_transaction(
+        rows,
+        compact_rows,
+        mode="per_timeframe",
+        full_path=path,
+        compact_path=compact_path,
+        committed_at=NOW,
+    )
+    return compact_path
 
 
 def _losing_rows(count: int = 25) -> tuple[list[dict], list[dict]]:
@@ -110,7 +271,7 @@ def _losing_rows(count: int = 25) -> tuple[list[dict], list[dict]]:
     return events, prices
 
 
-def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
+def test_decision_expectancy_monitor_writes_report_feedback_and_warns_on_missing_net_labels(
     monitor,
     tmp_path,
 ) -> None:
@@ -122,7 +283,10 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
     timing_path = tmp_path / "decision_pipeline_stage_timings.jsonl"
     events, prices = _losing_rows()
     _write_decisions(decision_log_path, events)
-    _write_jsonl(prices_path, prices)
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
+    )
 
     result = monitor.run_decision_expectancy_monitor(
         decision_log_path=decision_log_path,
@@ -131,6 +295,7 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
         feedback_json_path=feedback_path,
         monitor_json_path=monitor_path,
         stage_timing_log=timing_path,
+        price_stale_minutes=None,
         now=NOW + timedelta(days=5),
     )
 
@@ -138,12 +303,18 @@ def test_decision_expectancy_monitor_writes_report_feedback_and_fail_status(
     feedback = json.loads(feedback_path.read_text(encoding="utf-8"))
     payload = json.loads(monitor_path.read_text(encoding="utf-8"))
 
-    assert result["exit_code"] == 1
-    assert payload["status"] == "fail"
+    assert result["exit_code"] == 0
+    assert payload["status"] == "warn"
     assert payload["summary"]["overall"]["gross_expectancy_r"] == -1.0
     assert payload["summary"]["overall"]["net_expectancy_r"] is None
     assert payload["summary"]["action_counts"]["quality_guard"] == 1
     assert payload["runner"]["decision_event_count"] == 25
+    audit_snapshots = payload["runner"]["decision_source_snapshots"]
+    assert {Path(row["source_path"]).name for row in audit_snapshots} == {
+        "briefing_decisions.jsonl",
+        "briefing_tf_journal.jsonl",
+    }
+    assert all(len(row["source_sha256"]) == 64 for row in audit_snapshots)
     assert outcome_report["scored_outcomes"] == 25
     assert outcome_report["pit_required"] is True
     assert outcome_report["pit_contract"] == "decision-journal-pit-v2"
@@ -175,14 +346,7 @@ def test_decision_expectancy_monitor_marks_immature_horizon_pending(
     _write_decisions(decision_log_path, [_decision_event(NOW, 1)])
     _write_jsonl(
         prices_path,
-        [
-            {
-                "ts": (NOW + timedelta(minutes=30)).isoformat(),
-                "symbol": "EURUSD",
-                "timeframe": "1h",
-                "close": 1.2,
-            }
-        ],
+        [_pit_price(NOW, 100.0)],
     )
 
     result = monitor.run_decision_expectancy_monitor(
@@ -191,6 +355,7 @@ def test_decision_expectancy_monitor_marks_immature_horizon_pending(
         outcome_json_path=tmp_path / "outcomes.json",
         feedback_json_path=tmp_path / "feedback.json",
         monitor_json_path=monitor_path,
+        price_stale_minutes=60.0,
         now=NOW + timedelta(minutes=30),
     )
 
@@ -209,7 +374,7 @@ def test_decision_expectancy_monitor_fails_stale_price_series(monitor, tmp_path)
     prices_path = tmp_path / "briefing_tf_prices.jsonl"
     monitor_path = tmp_path / "decision_expectancy_monitor.json"
     _write_decisions(decision_log_path, [_decision_event(NOW, 1)])
-    _write_jsonl(prices_path, [_price(NOW, 100.0)])
+    _write_jsonl(prices_path, [_pit_price(NOW, 100.0)])
 
     result = monitor.run_decision_expectancy_monitor(
         decision_log_path=decision_log_path,
@@ -252,3 +417,614 @@ def test_decision_expectancy_monitor_cli_quiet_returns_exit_code(monitor, tmp_pa
     )
 
     assert exit_code == 1
+
+
+def test_compact_feedback_profile_matches_complete_actual_decisions(monitor, tmp_path) -> None:
+    decision_log_path = tmp_path / "briefing_decisions.jsonl"
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    events, prices = _losing_rows()
+    compact_path = _write_decisions_with_flat_compact(decision_log_path, events)
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
+    )
+
+    full = monitor.run_decision_expectancy_monitor(
+        decision_log_path=decision_log_path,
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=None,
+        monitor_json_path=tmp_path / "full-monitor.json",
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5),
+    )
+    compact = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=None,
+        monitor_json_path=tmp_path / "compact-monitor.json",
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5),
+    )
+
+    assert compact["profile"].to_dict() == full["profile"].to_dict()
+    assert compact["outcome_report"]["shadow_scoring"] == "not_requested"
+    assert compact["monitor"]["scope"] == "actual_decisions_only"
+    snapshot_paths = {
+        Path(row["source_path"]).name
+        for row in compact["monitor"]["runner"]["decision_source_snapshots"]
+    }
+    assert snapshot_paths == {"briefing_tf_journal.jsonl", "briefing_decisions.jsonl"}
+
+
+def test_feedback_refresh_preserves_prior_profile_when_price_is_stale(monitor, tmp_path) -> None:
+    decision_log_path = tmp_path / "briefing_decisions.jsonl"
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    feedback_path = tmp_path / "feedback.json"
+    compact_path = _write_decisions_with_flat_compact(decision_log_path, [_decision_event(NOW, 1)])
+    _write_jsonl(prices_path, [_pit_price(NOW, 100.0)])
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(hours=2),
+    )
+
+    assert result["exit_code"] == 1
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_complete_audit_rejects_malformed_full_tail_and_preserves_report(
+    monitor,
+    tmp_path,
+) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    _write_decisions(full_path, [_decision_event(NOW - timedelta(hours=2), 1)])
+    with full_path.open("ab") as handle:
+        handle.write(b"{malformed-tail\n")
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(prices_path, [_pit_price(NOW - timedelta(hours=1), 99.0)])
+    outcome_path = tmp_path / "outcomes.json"
+    outcome_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    with pytest.raises(monitor.journal.JournalIntegrityError, match="malformed JSON row"):
+        monitor.run_decision_expectancy_monitor(
+            decision_log_path=full_path,
+            prices_path=prices_path,
+            outcome_json_path=outcome_path,
+            feedback_json_path=None,
+            monitor_json_path=tmp_path / "audit-monitor.json",
+            now=NOW,
+        )
+
+    assert outcome_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+    assert not (tmp_path / "audit-monitor.json").exists()
+
+
+def test_required_price_contexts_matches_published_per_timeframe_consumer_scope(
+    monitor,
+) -> None:
+    report = {
+        "outcomes": [
+            {
+                "ts": (NOW - timedelta(minutes=5)).isoformat(),
+                "symbol": "USDJPY",
+                "mode": "fusion",
+                "timeframe": "fusion",
+            },
+            {
+                "ts": (NOW - timedelta(days=17)).isoformat(),
+                "symbol": "USDJPY",
+                "mode": "per_timeframe",
+                "timeframe": "1h",
+            },
+        ]
+    }
+
+    contexts = monitor._required_price_contexts(report)
+
+    assert contexts == (("USDJPY", "per_timeframe", "1h"),)
+
+
+def test_feedback_refresh_rejects_future_price_and_preserves_profile(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = _write_decisions_with_flat_compact(
+        full_path, [_decision_event(NOW - timedelta(hours=2), 1)]
+    )
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [
+            _pit_price(NOW - timedelta(hours=1), 99.0),
+            _pit_price(NOW + timedelta(hours=1), 99.0),
+        ],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW,
+    )
+
+    health = result["monitor"]["summary"]["price_health"]
+    assert result["exit_code"] == 1
+    assert health["quality"]["future_timestamp_rows"] == 1
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_complete_audit_excludes_future_price_and_preserves_feedback(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    _write_decisions(full_path, [_decision_event(NOW - timedelta(hours=2), 1)])
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(prices_path, [_pit_price(NOW + timedelta(hours=1), 99.0)])
+    feedback_path = tmp_path / "feedback.json"
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=full_path,
+        prices_path=prices_path,
+        outcome_json_path=tmp_path / "outcomes.json",
+        feedback_json_path=feedback_path,
+        monitor_json_path=tmp_path / "audit-monitor.json",
+        now=NOW,
+    )
+
+    outcomes = result["outcome_report"]["outcomes"]
+    health = result["monitor"]["summary"]["price_health"]
+    assert health["quality"]["future_timestamp_rows"] == 1
+    assert all(row["realized_r"] is None for row in outcomes)
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_feedback_refresh_rejects_malformed_price_tail(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = _write_decisions_with_flat_compact(full_path, [_decision_event(NOW, 1)])
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    valid = json.dumps(_pit_price(NOW, 100.0), ensure_ascii=False)
+    prices_path.write_text(f"{valid}\n{{bad json}}\n", encoding="utf-8")
+    feedback_path = tmp_path / "feedback.json"
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    with pytest.raises(monitor.journal.JournalIntegrityError, match="malformed JSONL"):
+        monitor.run_decision_expectancy_monitor(
+            decision_log_path=None,
+            decision_journal_paths=[compact_path],
+            prices_path=prices_path,
+            outcome_json_path=None,
+            feedback_json_path=feedback_path,
+            monitor_json_path=tmp_path / "refresh-monitor.json",
+            feedback_refresh_only=True,
+            allow_continuity_bootstrap=True,
+            now=NOW,
+        )
+
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_feedback_refresh_requires_fresh_price_for_scored_context(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = _write_decisions_with_flat_compact(
+        full_path, [_decision_event(NOW - timedelta(hours=2), 1)]
+    )
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [
+            _pit_price(NOW - timedelta(hours=1), 99.0),
+            _pit_price(NOW, 1.2, symbol="EURUSD"),
+        ],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW,
+    )
+
+    health = result["monitor"]["summary"]["price_health"]
+    assert result["exit_code"] == 1
+    assert health["failed_contexts"] == ["USDJPY|per_timeframe|1h"]
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_feedback_refresh_accepts_stale_fusion_with_fresh_active_and_shared_paths(
+    monitor,
+    tmp_path,
+) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = _write_decisions_with_flat_compact(
+        full_path, [_decision_event(NOW - timedelta(hours=2), 1)]
+    )
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [
+            _pit_price(NOW, 99.0),
+            _shared_path_price(NOW, 99.0),
+            _pit_price(NOW - timedelta(hours=4), 99.0, timeframe="fusion"),
+        ],
+    )
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=tmp_path / "feedback.json",
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        require_shared_price_path=True,
+        active_symbols=("USDJPY",),
+        active_timeframes=("1h",),
+        now=NOW,
+    )
+
+    health = result["monitor"]["summary"]["price_health"]
+    assert result["exit_code"] == 0
+    assert health["status"] == "pass"
+    assert health["failed_shared_path_symbols"] == []
+    assert health["shared_path_health"][0]["latest_ts"] == NOW.isoformat()
+
+
+def test_feedback_refresh_rejects_stale_shared_path_and_preserves_profile(
+    monitor,
+    tmp_path,
+) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = _write_decisions_with_flat_compact(
+        full_path, [_decision_event(NOW - timedelta(hours=2), 1)]
+    )
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [
+            _pit_price(NOW, 99.0),
+            _shared_path_price(NOW - timedelta(hours=4), 99.0),
+            # A scanner snapshot may use the reserved timeframe name, but its
+            # forming OHLC is not trusted shared-path evidence.
+            _pit_price(NOW, 99.0, timeframe="5m_datafeed"),
+        ],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        require_shared_price_path=True,
+        active_symbols=("USDJPY",),
+        active_timeframes=("1h",),
+        now=NOW,
+    )
+
+    health = result["monitor"]["summary"]["price_health"]
+    assert result["exit_code"] == 1
+    assert health["failed_shared_path_symbols"] == ["USDJPY"]
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_shared_path_freshness_uses_market_open_age_over_weekend(monitor, tmp_path) -> None:
+    friday = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+    sunday = datetime(2026, 7, 12, 23, 0, tzinfo=UTC)
+    prices_path = tmp_path / "prices.jsonl"
+    rows = [
+        _pit_price(sunday, 100.0),
+        _shared_path_price(friday, 100.0),
+    ]
+    _write_jsonl(prices_path, rows)
+
+    health = monitor._price_file_health(
+        prices_path,
+        rows,
+        now=sunday,
+        stale_minutes=15.0,
+        quality={
+            "strict_pit": True,
+            "invalid_timestamp_rows": 0,
+            "future_timestamp_rows": 0,
+            "invalid_canonical_rows": 0,
+        },
+        required_contexts=(("USDJPY", "per_timeframe", "1h"),),
+        required_shared_path_symbols=("USDJPY",),
+        shared_path_stale_minutes=180.0,
+    )
+
+    shared = health["shared_path_health"][0]
+    assert health["status"] == "pass"
+    assert shared["age_basis"] == "fx_market_open_time"
+    assert shared["age_minutes"] == 120.0
+    assert shared["wall_age_minutes"] == 3060.0
+
+
+def test_default_shared_path_freshness_covers_delayed_hourly_adapter(
+    monitor,
+    tmp_path,
+) -> None:
+    prices_path = tmp_path / "prices.jsonl"
+    rows = [
+        _pit_price(NOW, 100.0),
+        _shared_path_price(NOW - timedelta(minutes=200), 100.0),
+    ]
+    _write_jsonl(prices_path, rows)
+
+    health = monitor._price_file_health(
+        prices_path,
+        rows,
+        now=NOW,
+        stale_minutes=15.0,
+        quality={
+            "strict_pit": True,
+            "invalid_timestamp_rows": 0,
+            "future_timestamp_rows": 0,
+            "invalid_canonical_rows": 0,
+        },
+        required_contexts=(("USDJPY", "per_timeframe", "1h"),),
+        required_shared_path_symbols=("USDJPY",),
+    )
+
+    assert monitor.DEFAULT_SHARED_PRICE_PATH_STALE_MINUTES == 210.0
+    assert health["status"] == "pass"
+    assert health["shared_path_health"][0]["age_minutes"] == 200.0
+
+
+def test_retired_per_timeframe_symbol_is_scored_without_freshness_veto(
+    monitor,
+    tmp_path,
+) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    usd = _decision_event(NOW - timedelta(hours=2), 1)
+    retired = _decision_event(NOW - timedelta(hours=2), 2)
+    retired["symbol"] = "GBPUSD"
+    retired["decision"]["symbol"] = "GBPUSD"
+    compact_path = _write_decisions_with_flat_compact(full_path, [usd, retired])
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [
+            _pit_price(NOW, 99.0),
+            _shared_path_price(NOW, 99.0),
+            _pit_price(NOW - timedelta(hours=1), 99.0, symbol="GBPUSD"),
+        ],
+    )
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=tmp_path / "feedback.json",
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        require_shared_price_path=True,
+        active_symbols=("USDJPY",),
+        active_timeframes=("1h",),
+        now=NOW,
+    )
+
+    health = result["monitor"]["summary"]["price_health"]
+    assert result["exit_code"] == 0
+    assert result["outcome_report"]["scored_outcomes"] == 2
+    assert health["required_context_count"] == 1
+    assert health["failed_contexts"] == []
+
+
+def test_feedback_refresh_rejects_naive_price_timestamp(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    compact_path = _write_decisions_with_flat_compact(full_path, [_decision_event(NOW, 1)])
+    row = _pit_price(NOW, 100.0)
+    row["ts"] = NOW.replace(tzinfo=None).isoformat()
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(prices_path, [row])
+    feedback_path = tmp_path / "feedback.json"
+    feedback_path.write_text('{"preserved":true}\n', encoding="utf-8")
+
+    result = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=tmp_path / "refresh-monitor.json",
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW,
+    )
+
+    health = result["monitor"]["summary"]["price_health"]
+    assert result["exit_code"] == 1
+    assert health["quality"]["invalid_timestamp_rows"] == 1
+    assert feedback_path.read_text(encoding="utf-8") == '{"preserved":true}\n'
+
+
+def test_feedback_refresh_rejects_same_inode_prefix_rewrite(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    events, prices = _losing_rows()
+    compact_path = _write_decisions_with_flat_compact(full_path, events)
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    monitor_path = tmp_path / "refresh-monitor.json"
+    first = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5),
+    )
+    published = feedback_path.read_bytes()
+    original_inode = compact_path.stat().st_ino
+
+    with compact_path.open("r+b") as handle:
+        payload = handle.read()
+        changed = payload.replace(b'"close": 100.0', b'"close": 101.0', 1)
+        assert changed != payload
+        handle.seek(0)
+        handle.write(changed)
+        handle.seek(0, os.SEEK_END)
+        handle.write(b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    second = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5, minutes=1),
+    )
+
+    failures = second["monitor"]["summary"]["source_continuity"]["failures"]
+    assert first["exit_code"] == 0
+    assert compact_path.stat().st_ino == original_inode
+    assert any(item.startswith("source_prefix_changed:") for item in failures)
+    assert second["exit_code"] == 1
+    assert feedback_path.read_bytes() == published
+
+
+def test_feedback_refresh_rejects_source_inode_replacement(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    events, prices = _losing_rows()
+    compact_path = _write_decisions_with_flat_compact(full_path, events)
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    monitor_path = tmp_path / "refresh-monitor.json"
+    first = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5),
+    )
+    published = feedback_path.read_bytes()
+    old_inode = prices_path.stat().st_ino
+    replacement = tmp_path / "replacement-prices.jsonl"
+    replacement.write_bytes(prices_path.read_bytes())
+    replacement.replace(prices_path)
+
+    second = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5, minutes=1),
+    )
+
+    failures = second["monitor"]["summary"]["source_continuity"]["failures"]
+    assert first["exit_code"] == 0
+    assert prices_path.stat().st_ino != old_inode
+    assert any(item.startswith("source_identity_changed:") for item in failures)
+    assert second["exit_code"] == 1
+    assert feedback_path.read_bytes() == published
+
+
+def test_feedback_refresh_cannot_bootstrap_after_monitor_deletion(monitor, tmp_path) -> None:
+    full_path = tmp_path / "briefing_decisions.jsonl"
+    events, prices = _losing_rows()
+    compact_path = _write_decisions_with_flat_compact(full_path, events)
+    prices_path = tmp_path / "briefing_tf_prices.jsonl"
+    _write_jsonl(
+        prices_path,
+        [_pit_price(datetime.fromisoformat(row["ts"]), float(row["close"])) for row in prices],
+    )
+    feedback_path = tmp_path / "feedback.json"
+    monitor_path = tmp_path / "refresh-monitor.json"
+    first = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        allow_continuity_bootstrap=True,
+        now=NOW + timedelta(days=5),
+    )
+    published = feedback_path.read_bytes()
+    replacement = tmp_path / "replacement-prices.jsonl"
+    replacement.write_bytes(prices_path.read_bytes())
+    replacement.replace(prices_path)
+    monitor_path.unlink()
+
+    second = monitor.run_decision_expectancy_monitor(
+        decision_log_path=None,
+        decision_journal_paths=[compact_path],
+        prices_path=prices_path,
+        outcome_json_path=None,
+        feedback_json_path=feedback_path,
+        monitor_json_path=monitor_path,
+        price_stale_minutes=None,
+        feedback_refresh_only=True,
+        now=NOW + timedelta(days=5, minutes=1),
+    )
+
+    continuity = second["monitor"]["summary"]["source_continuity"]
+    assert first["exit_code"] == 0
+    assert continuity["bootstrap"] is False
+    assert continuity["failures"] == ["previous_monitor_missing"]
+    assert second["exit_code"] == 1
+    assert feedback_path.read_bytes() == published

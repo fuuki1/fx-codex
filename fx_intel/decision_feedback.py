@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import datetime, UTC
+import hashlib
 import json
 import math
 import os
@@ -253,9 +254,52 @@ def load_decision_outcome_report(path: str | Path) -> dict[str, object]:
 def load_decision_feedback(path: str | Path) -> DecisionFeedbackProfile:
     """Load the monitor-published feedback cache; malformed cells are ignored."""
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(Path(path).read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return DecisionFeedbackProfile()
+    return _decision_feedback_from_payload(payload)
+
+
+def load_published_decision_feedback(
+    path: str | Path,
+    refresh_monitor_path: str | Path,
+) -> DecisionFeedbackProfile:
+    """Load feedback only when its successful refresh manifest names exact bytes."""
+
+    target = Path(path).resolve()
+    try:
+        monitor = json.loads(Path(refresh_monitor_path).read_bytes())
+        body = target.read_bytes()
+        payload = json.loads(body)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return DecisionFeedbackProfile()
+    profile = _decision_feedback_from_payload(payload)
+    if not profile.generated_at or not isinstance(monitor, Mapping):
+        return DecisionFeedbackProfile()
+    summary = monitor.get("summary")
+    artifact = monitor.get("feedback_artifact")
+    if not isinstance(summary, Mapping) or not isinstance(artifact, Mapping):
+        return DecisionFeedbackProfile()
+    if (
+        monitor.get("monitor_contract") != "fx-codex-decision-feedback-refresh-v1"
+        or monitor.get("status") != "ok"
+        or monitor.get("generated_at") != profile.generated_at
+        or artifact.get("path") != str(target)
+        or artifact.get("size") != len(body)
+        or artifact.get("sha256") != hashlib.sha256(body).hexdigest()
+        or artifact.get("generated_at") != profile.generated_at
+    ):
+        return DecisionFeedbackProfile()
+    semantic_sha256 = feedback_semantic_sha256(profile)
+    if (
+        artifact.get("profile_semantic_sha256") != semantic_sha256
+        or summary.get("profile_semantic_sha256") != semantic_sha256
+    ):
+        return DecisionFeedbackProfile()
+    return profile
+
+
+def _decision_feedback_from_payload(payload: object) -> DecisionFeedbackProfile:
     if not isinstance(payload, Mapping):
         return DecisionFeedbackProfile()
     if payload.get("cache_contract") != DECISION_FEEDBACK_CACHE_CONTRACT:
@@ -279,6 +323,19 @@ def load_decision_feedback(path: str | Path) -> DecisionFeedbackProfile:
         cells=cells,
         notes_ja=[str(note) for note in raw_notes],
     )
+
+
+def feedback_semantic_sha256(profile: DecisionFeedbackProfile) -> str:
+    payload = profile.to_dict()
+    payload.pop("generated_at", None)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _feedback_cell_from_mapping(payload: object) -> DecisionFeedbackCell | None:

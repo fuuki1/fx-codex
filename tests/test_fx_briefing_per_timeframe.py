@@ -162,6 +162,7 @@ def patched_paths(tmp_path):
     decision_latest = tmp_path / "briefing_decisions_latest.json"
     decision_outcomes = tmp_path / "briefing_decision_outcomes.json"
     decision_feedback = tmp_path / "briefing_decision_feedback.json"
+    feedback_refresh_monitor = tmp_path / "decision_feedback_refresh_monitor.json"
     learning_monitor = tmp_path / "timeframe_learning_monitor.json"
     with (
         mock.patch.object(fx_briefing, "DEFAULT_TF_JOURNAL_PATH", tf_journal),
@@ -173,6 +174,11 @@ def patched_paths(tmp_path):
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_LATEST_PATH", decision_latest),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_OUTCOMES_PATH", decision_outcomes),
         mock.patch.object(fx_briefing, "DEFAULT_DECISION_FEEDBACK_PATH", decision_feedback),
+        mock.patch.object(
+            fx_briefing,
+            "DEFAULT_DECISION_FEEDBACK_REFRESH_MONITOR_PATH",
+            feedback_refresh_monitor,
+        ),
         mock.patch.object(fx_briefing, "DEFAULT_TF_LEARNING_MONITOR_PATH", learning_monitor),
     ):
         yield tf_journal, tf_learning
@@ -214,9 +220,30 @@ def _write_empty_learning_caches(generated_at: datetime) -> None:
         fx_briefing.maximization.TimeframeMaximization(generated_at=stamp),
         fx_briefing.DEFAULT_MAXIMIZATION_PATH,
     )
+    feedback_profile = fx_briefing.decision_feedback.DecisionFeedbackProfile(generated_at=stamp)
     fx_briefing.decision_feedback.save_decision_feedback(
-        fx_briefing.decision_feedback.DecisionFeedbackProfile(generated_at=stamp),
+        feedback_profile,
         fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH,
+    )
+    feedback_body = fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.read_bytes()
+    feedback_sha = fx_briefing.decision_feedback.feedback_semantic_sha256(feedback_profile)
+    fx_briefing.DEFAULT_DECISION_FEEDBACK_REFRESH_MONITOR_PATH.write_text(
+        json.dumps(
+            {
+                "monitor_contract": "fx-codex-decision-feedback-refresh-v1",
+                "generated_at": stamp,
+                "status": "ok",
+                "summary": {"profile_semantic_sha256": feedback_sha},
+                "feedback_artifact": {
+                    "path": str(fx_briefing.DEFAULT_DECISION_FEEDBACK_PATH.resolve()),
+                    "size": len(feedback_body),
+                    "sha256": hashlib.sha256(feedback_body).hexdigest(),
+                    "generated_at": stamp,
+                    "profile_semantic_sha256": feedback_sha,
+                },
+            }
+        ),
+        encoding="utf-8",
     )
     artifacts = {
         "timeframe_direction": fx_briefing.DEFAULT_TF_LEARNING_PATH,

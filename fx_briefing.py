@@ -151,6 +151,9 @@ DEFAULT_FUSION_DECISION_LATEST_PATH = (
 )
 DEFAULT_DECISION_OUTCOMES_PATH = PROJECT_ROOT / "logs" / "briefing_decision_outcomes.json"
 DEFAULT_DECISION_FEEDBACK_PATH = PROJECT_ROOT / "logs" / "briefing_decision_feedback.json"
+DEFAULT_DECISION_FEEDBACK_REFRESH_MONITOR_PATH = (
+    PROJECT_ROOT / "logs" / "decision_feedback_refresh_monitor.json"
+)
 JOURNAL_WRITE_FAILURE_EXIT_CODE = 4
 NOTIFICATION_FAILURE_EXIT_CODE = 5
 DEFAULT_FRESHNESS_REPORT_PATH = PROJECT_ROOT / "logs" / "freshness_report.json"
@@ -1364,7 +1367,10 @@ def _run_per_timeframe(
     with timing.stage("decision_feedback_load_and_derive"):
         if not args.no_learning and not args.no_trade_expectancy:
             decision_feedback_profile = (
-                decision_feedback.load_decision_feedback(DEFAULT_DECISION_FEEDBACK_PATH)
+                decision_feedback.load_published_decision_feedback(
+                    DEFAULT_DECISION_FEEDBACK_PATH,
+                    DEFAULT_DECISION_FEEDBACK_REFRESH_MONITOR_PATH,
+                )
                 if args.cached_timeframe_learning
                 else decision_feedback.derive_decision_feedback(
                     load_pit_decision_outcome_report(DEFAULT_DECISION_OUTCOMES_PATH),

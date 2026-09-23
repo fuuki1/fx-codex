@@ -338,6 +338,7 @@ def build_plan_rows(
                 "cost_quality_flags": list(plan.cost_quality_flags),
                 "direction_threshold": plan.direction_threshold,
                 "target_policy": plan.target_policy,
+                "price_frame": plan.price_frame,
                 **_pre_guard_plan(plan),
                 "data_quality": plan.data_quality,
                 "features": plan.features,
@@ -428,6 +429,7 @@ def build_timeframe_plan_rows(
                 "cost_quality_flags": list(plan.cost_quality_flags),
                 "direction_threshold": plan.direction_threshold,
                 "target_policy": plan.target_policy,
+                "price_frame": plan.price_frame,
                 **_pre_guard_plan(plan),
                 "data_quality": plan.data_quality,
                 "features": plan.features,
@@ -513,6 +515,7 @@ def _plan_execution(plan: object) -> dict[str, object]:
             "diagnostic_execution_cost_r": None,
             "diagnostic_net_expected_r": None,
             "diagnostic_cost_model": {},
+            "expected_r": None,
         }
     cost = checklist.get("execution_cost_r")
     net = checklist.get("net_expected_r")
@@ -523,6 +526,11 @@ def _plan_execution(plan: object) -> dict[str, object]:
         "diagnostic_execution_cost_r": (float(cost) if isinstance(cost, (int, float)) else None),
         "diagnostic_net_expected_r": (float(net) if isinstance(net, (int, float)) else None),
         "diagnostic_cost_model": (dict(cost_model) if isinstance(cost_model, Mapping) else {}),
+        "expected_r": (
+            float(checklist["expected_r"])
+            if isinstance(checklist.get("expected_r"), (int, float))
+            else None
+        ),
     }
 
 

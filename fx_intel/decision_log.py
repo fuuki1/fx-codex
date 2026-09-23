@@ -874,7 +874,13 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
 
     decision = event.get("decision")
     if not isinstance(decision, Mapping):
-        return None
+        # The compact journals are the canonical scoring projection.  They
+        # carry the same decision fields at the top level so the expensive
+        # explanatory audit envelope does not need to be decoded for every
+        # monitoring pass.
+        if not str(event.get("decision_id") or "").strip():
+            return None
+        decision = event
     ts = str(event.get("ts", "")).strip()
     symbol = str(event.get("symbol", decision.get("symbol", ""))).upper()
     if not ts or not symbol:
@@ -940,6 +946,13 @@ def decision_event_to_scoring_entry(event: Mapping[str, object]) -> dict[str, ob
         entry["diagnostic_net_expected_r"] = execution.get("diagnostic_net_expected_r")
         entry["diagnostic_cost_model"] = execution.get("diagnostic_cost_model", {})
         entry["expected_r"] = execution.get("expected_r")
+    elif decision is event:
+        entry["execution_cost_r"] = None
+        entry["net_expected_r"] = None
+        entry["diagnostic_execution_cost_r"] = decision.get("diagnostic_execution_cost_r")
+        entry["diagnostic_net_expected_r"] = decision.get("diagnostic_net_expected_r")
+        entry["diagnostic_cost_model"] = decision.get("diagnostic_cost_model", {})
+        entry["expected_r"] = decision.get("expected_r")
     return _json_ready_dict(entry)
 
 
@@ -1033,6 +1046,7 @@ def score_decision_events(
     price_entries: Iterable[Mapping[str, object]] = (),
     now: datetime | None = None,
     require_pit: bool = False,
+    include_shadow: bool = True,
 ) -> dict[str, object]:
     """Score complete decision logs by TP/SL first-touch, MFE, MAE, and realized R."""
 
@@ -1056,10 +1070,11 @@ def score_decision_events(
         entry = decision_event_to_scoring_entry(event)
         if entry is not None:
             event_entries.append(entry)
-        shadow_entries.extend(decision_event_to_shadow_entries(event))
-        inventory_view = _shadow_inventory_view(event)
-        if inventory_view is not None:
-            shadow_prediction_events.append(inventory_view)
+        if include_shadow:
+            shadow_entries.extend(decision_event_to_shadow_entries(event))
+            inventory_view = _shadow_inventory_view(event)
+            if inventory_view is not None:
+                shadow_prediction_events.append(inventory_view)
     shadow_predictions = _shadow_prediction_inventory(shadow_prediction_events)
     normalized_prices = [_normalize_price_entry(row) for row in price_entries]
     final_entries = event_entries + normalized_prices
@@ -1224,6 +1239,7 @@ def score_decision_events(
             "scored_outcomes": len(enriched_outcomes),
             "shadow_predictions": len(shadow_predictions),
             "shadow_scored_outcomes": len(shadow_outcomes),
+            "shadow_scoring": "complete" if include_shadow else "not_requested",
             "summary": summarize_expectancy(all_outcomes),
             "dimension_summary": summarize_outcome_dimensions(enriched_outcomes),
             "failure_reason_summary": _failure_reason_summary(enriched_outcomes),

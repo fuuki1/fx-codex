@@ -11,6 +11,7 @@
 #   com.fx-codex.horizon   5分毎の9ホライズンshadow予測
 #   com.fx-codex.monitors  15分毎の学習cache bundle公開
 #   com.fx-codex.monitor-diagnostics  15分毎の期待値・改善候補監視
+#   com.fx-codex.decision-outcome-audit  1日1回の完全監査ログ再採点
 #   com.fx-codex.dukascopy-history / quote-index  仮想約定用の遅延Bid/Askと索引
 #   com.fx-codex.virtual-portfolio  3分毎のcanonical仮想口座受付
 #   com.fx-codex.virtual-portfolio-postprocess / report / counterfactual  分離した後段処理
@@ -37,6 +38,7 @@ LABELS=(
   com.fx-codex.horizon
   com.fx-codex.monitors
   com.fx-codex.monitor-diagnostics
+  com.fx-codex.decision-outcome-audit
   com.fx-codex.dukascopy-history
   com.fx-codex.quote-index
   com.fx-codex.virtual-portfolio
