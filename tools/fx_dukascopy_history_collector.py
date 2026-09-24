@@ -192,80 +192,84 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     raw_store = ImmutableRawStore(output_root / "raw")
-    quote_log = QuoteLog(output_root / "log")
-    accepted = 0
-    quarantined = 0
-    completed = 0
-    errors: list[dict[str, str]] = []
-    connection_id = f"dukascopy-history:{socket.gethostname()}:{os.getpid()}:{now.isoformat()}"
-    for symbol, hours in plan.items():
-        for raw_hour in hours:
-            hour_start = datetime.fromisoformat(raw_hour)
-            try:
-                result = ingest_hour(
-                    symbol,
-                    hour_start,
-                    fetcher=requests_fetcher,
-                    store=raw_store,
-                    log=quote_log,
-                    connection_id=connection_id,
-                )
-            except (DukascopyFetchError, OSError, ValueError) as error:
-                errors.append({"instrument": symbol, "hour": raw_hour, "error": str(error)[:500]})
-                break
-            if result is not None:
-                accepted += result.accepted_count
-                quarantined += len(result.quarantined)
-            elif is_market_open(hour_start + timedelta(minutes=30)):
-                errors.append(
+    quote_log = QuoteLog(output_root / "log", disk_backed_dedup=True)
+    try:
+        accepted = 0
+        quarantined = 0
+        completed = 0
+        errors: list[dict[str, str]] = []
+        connection_id = f"dukascopy-history:{socket.gethostname()}:{os.getpid()}:{now.isoformat()}"
+        for symbol, hours in plan.items():
+            for raw_hour in hours:
+                hour_start = datetime.fromisoformat(raw_hour)
+                try:
+                    result = ingest_hour(
+                        symbol,
+                        hour_start,
+                        fetcher=requests_fetcher,
+                        store=raw_store,
+                        log=quote_log,
+                        connection_id=connection_id,
+                    )
+                except (DukascopyFetchError, OSError, ValueError) as error:
+                    errors.append({"instrument": symbol, "hour": raw_hour, "error": str(error)[:500]})
+                    break
+                if result is not None:
+                    accepted += result.accepted_count
+                    quarantined += len(result.quarantined)
+                elif is_market_open(hour_start + timedelta(minutes=30)):
+                    errors.append(
+                        {
+                            "instrument": symbol,
+                            "hour": raw_hour,
+                            "error": "market-open hour is not published yet; retrying later",
+                        }
+                    )
+                    break
+                raw_completed[symbol] = hour_start.isoformat()
+                completed += 1
+                state.update(
                     {
-                        "instrument": symbol,
-                        "hour": raw_hour,
-                        "error": "market-open hour is not published yet; retrying later",
+                        "schema_version": 1,
+                        "completed_hours": raw_completed,
+                        "updated_at": datetime.now(UTC).isoformat(),
+                        "broker_connected": False,
+                        "collection_mode": "historical_download",
                     }
                 )
-                break
-            raw_completed[symbol] = hour_start.isoformat()
-            completed += 1
-            state.update(
-                {
-                    "schema_version": 1,
-                    "completed_hours": raw_completed,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                    "broker_connected": False,
-                    "collection_mode": "historical_download",
-                }
-            )
-            _write_state(state_path, state)
-    state.update(
-        {
-            "schema_version": 1,
-            "completed_hours": raw_completed,
-            "heartbeat_at": datetime.now(UTC).isoformat(),
-            "heartbeat_ok": not errors,
-            "broker_connected": False,
-            "collection_mode": "historical_download",
-        }
-    )
-    _write_state(state_path, state)
-    print(
-        json.dumps(
+                _write_state(state_path, state)
+        state.update(
             {
-                "ok": not errors,
+                "schema_version": 1,
+                "completed_hours": raw_completed,
+                "heartbeat_at": datetime.now(UTC).isoformat(),
+                "heartbeat_ok": not errors,
                 "broker_connected": False,
                 "collection_mode": "historical_download",
-                "eligible_through": eligible.isoformat(),
-                "completed_hours_this_run": completed,
-                "accepted_quotes": accepted,
-                "quarantined_quotes": quarantined,
-                "errors": errors,
-            },
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
+            }
         )
-    )
-    return 0 if not errors else 1
+        _write_state(state_path, state)
+        print(
+            json.dumps(
+                {
+                    "ok": not errors,
+                    "broker_connected": False,
+                    "collection_mode": "historical_download",
+                    "eligible_through": eligible.isoformat(),
+                    "completed_hours_this_run": completed,
+                    "accepted_quotes": accepted,
+                    "quarantined_quotes": quarantined,
+                    "errors": errors,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0 if not errors else 1
+
+    finally:
+        quote_log.close()
 
 
 if __name__ == "__main__":

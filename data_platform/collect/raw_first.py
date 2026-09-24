@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from data_platform.collect.contract import CollectedQuote, QuoteContractError
+from data_platform.collect.disk_identity_set import DiskIdentitySet
 from data_platform.quality.state import QualityState
 from data_platform.raw.immutable_store import ImmutableRawStore
 
@@ -91,13 +92,23 @@ class QuoteLog:
     skipping it could allow a duplicate or out-of-order quote to be reaccepted.
     """
 
-    def __init__(self, directory: str | Path) -> None:
+    def __init__(self, directory: str | Path, *, disk_backed_dedup: bool = False) -> None:
         self.directory = Path(directory)
         self.accepted_path = self.directory / "quotes.jsonl"
         self.quarantine_path = self.directory / "quarantine.jsonl"
-        self._seen: set[tuple[str, str, str, int | None]] = set()
+        self._seen: set[tuple[str, str, str, int | None]] | DiskIdentitySet = (
+            DiskIdentitySet() if disk_backed_dedup else set()
+        )
         self._last_event: dict[tuple[str, str], datetime] = {}
-        self._bootstrap()
+        try:
+            self._bootstrap()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if isinstance(self._seen, DiskIdentitySet):
+            self._seen.close()
 
     def _bootstrap(self) -> None:
         if not self.accepted_path.is_file():
@@ -132,6 +143,11 @@ class QuoteLog:
 
     @staticmethod
     def _identity_from_dict(row: dict[str, Any]) -> tuple[str, str, str, int | None]:
+        sequence = row.get("sequence_id")
+        if sequence is not None and (
+            isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0
+        ):
+            raise ValueError("sequence_id must be a non-negative int or None")
         return (
             str(row["provider"]),
             str(row["instrument"]),

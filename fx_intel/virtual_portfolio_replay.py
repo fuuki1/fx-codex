@@ -81,6 +81,45 @@ class VirtualReplayCostPolicy:
 
 
 @dataclass(frozen=True)
+class VirtualReplayQuotePolicy:
+    """Admissibility of a delayed tick, on the ingest clock only.
+
+    Delayed replay reconciles against a historical tape published hours after the
+    market event, so it cannot reuse the live quote-freshness window. This policy
+    bounds only how late a tick may ARRIVE. The event-time entry window is owned by
+    ``VirtualPortfolioPolicy.quote_max_age_seconds`` and is never widened here.
+
+    Kept out of ``VirtualPortfolioPolicy`` deliberately: that dataclass is hashed
+    into the append-only ``portfolio_config`` row, so adding a field to it makes
+    every existing database unreconcilable. Like ``VirtualReplayCostPolicy``, this
+    is a replay reconciliation concern with its own audit hash.
+    """
+
+    quote_policy_id: str = "virtual-replay-quote-policy"
+    version: str = "v1"
+    # Dukascopy publishes hourly files: a tick at an event-hour's start waits the
+    # full hour to be included, then the publication delay (measured 126.9-144.2
+    # min, median 132.5). Structural worst case is ~204 min (144.2 + 60); the
+    # observed maximum over 70,706 ticks is 191.4 min. 210 min covers the mechanism;
+    # 180 would reject 854 already-observed ticks (one whole hourly file).
+    max_ingest_delay_seconds: int = 12_600
+
+    def validate(self) -> None:
+        if not self.quote_policy_id or not self.version:
+            raise ReplayDataError("quote policy identity is required")
+        if not isinstance(self.max_ingest_delay_seconds, int) or isinstance(
+            self.max_ingest_delay_seconds, bool
+        ):
+            raise ReplayDataError("max_ingest_delay_seconds must be an integer")
+        if self.max_ingest_delay_seconds <= 0:
+            raise ReplayDataError("max_ingest_delay_seconds must be positive")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256_json(asdict(self))
+
+
+@dataclass(frozen=True)
 class ReplayTick:
     symbol: str
     event_time: datetime
@@ -861,6 +900,7 @@ def run_replay_cycle(
     quote_index: str | Path | None = None,
     as_of: datetime,
     cost_policy: VirtualReplayCostPolicy | None = None,
+    quote_policy: VirtualReplayQuotePolicy | None = None,
     admission_rejection_reasons: list[str] | None = None,
 ) -> dict[str, object]:
     """Open queued decisions and settle mature trades in event-time order."""
@@ -868,6 +908,8 @@ def run_replay_cycle(
     moment = _aware(as_of, "replay as_of")
     costs = cost_policy or VirtualReplayCostPolicy()
     costs.validate()
+    quotes = quote_policy or VirtualReplayQuotePolicy()
+    quotes.validate()
     initial_pending = store.pending_decisions()
     pending: list[dict[str, object]] = []
     pre_abstained = 0
@@ -888,21 +930,13 @@ def run_replay_cycle(
         )
         assignment = classify_virtual_horizon(decision.get("timeframe"))
         if assignment["capacity_eligible"] is True:
-            if admission_reasons:
-                try:
-                    result = store.process_decision(
-                        decision,
-                        observed_at=_aware(intake["observed_at"], "observed_at"),
-                        additional_rejection_reasons=admission_reasons,
-                    )
-                    if result["inserted"] and result["disposition"] == "abstained":
-                        pre_abstained += 1
-                except Exception as error:
-                    pre_waiting += 1
-                    pre_conflicts.append(
-                        {"record_id": str(intake["decision_id"]), "error": str(error)}
-                    )
-                continue
+            # Live service heartbeats gate real-time admission: they attest that the
+            # quote pipeline is current enough to act on now. Delayed replay is a
+            # historical reconciliation that never acts on "now" -- its evidence is a
+            # published tape bounded by the replay ingest-delay budget and by
+            # validate_replay's PIT ordering. Applying a liveness gate to it would
+            # reject settled history for being observed late, which is what stalled
+            # measured net-R learning entirely.
             pending.append({**intake, "decision": decision})
             continue
         try:
@@ -1097,6 +1131,18 @@ def run_replay_cycle(
                 serial += 1
             else:
                 waiting += 1
+            continue
+        # Ingest-clock admissibility. The tick's event_time already sits inside the
+        # unchanged entry window; this bounds only how late it ARRIVED.
+        entry_ingest_delay = (entry.available_time - entry.event_time).total_seconds()
+        if entry_ingest_delay > quotes.max_ingest_delay_seconds:
+            payload = {
+                "decision": dict(decision),
+                "observed_at": observed_at,
+                "reasons": ["delayed quote exceeds the replay ingest delay budget"],
+            }
+            heapq.heappush(events, (deadline, 1, serial, "abstain", payload))
+            serial += 1
             continue
         conversion_rate, conversion_source, _ = _conversion_at(
             tape,
@@ -1312,6 +1358,11 @@ def run_replay_cycle(
         "waiting": waiting,
         "session_close_request": session_request,
         "cost_policy_sha256": costs.sha256,
+        "replay_quote_policy_sha256": quotes.sha256,
+        # Recorded, not enforced: replay is a historical reconciliation, so live
+        # service heartbeats do not gate admission. Kept for audit of what the live
+        # pipeline looked like when this reconciliation ran.
+        "live_admission_reasons_observed": admission_reasons,
         "valuation_v2": valuation_v2,
         "conflicts": conflicts,
     }

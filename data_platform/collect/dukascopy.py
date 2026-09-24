@@ -28,6 +28,7 @@ import os
 import random
 import socket
 import struct
+import time
 
 from data_platform.collect.contract import CollectedQuote
 from data_platform.collect.raw_first import IngestResult, QuoteLog, ingest_payload
@@ -85,7 +86,7 @@ def fetch_hour_payload(
 
     policy = backoff or BackoffPolicy(initial_seconds=2.0, max_seconds=30.0)
     randomness = rng or random.Random()
-    wait = sleeper or (lambda _s: None)
+    wait = sleeper if sleeper is not None else time.sleep
     url = hour_url(instrument, hour_start_utc)
     last_status = -1
     for attempt in range(max_attempts):

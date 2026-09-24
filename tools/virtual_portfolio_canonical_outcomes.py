@@ -38,6 +38,7 @@ from fx_intel.evaluation_labels import canonical_net_label_contract_flags  # noq
 from fx_intel.trade_outcome import CanonicalTradeOutcome  # noqa: E402
 from fx_intel.trade_outcome import assert_canonical_outcome_idempotent  # noqa: E402
 from fx_intel.virtual_portfolio import open_virtual_portfolio_reader  # noqa: E402
+from tools.run_exclusive import ExclusiveLock  # noqa: E402
 
 DEFAULT_DB = REPO_ROOT / "logs" / "fx_virtual_portfolio_canonical_v2.sqlite3"
 DEFAULT_STORE = REPO_ROOT / "logs" / "canonical_outcomes.jsonl"
@@ -76,6 +77,7 @@ def connect(
     label_evidence_store_path: Path | None = None,
     quote_log_path: Path | None = None,
     raw_store_root: Path | None = None,
+    lock_db_capture: bool = False,
 ) -> dict[str, object]:
     """Append eligible v3 outcomes and optional versioned label evidence."""
 
@@ -93,8 +95,14 @@ def connect(
     if (quote_log_path is None) != (raw_store_root is None):
         raise ValueError("quote log and immutable raw store must be supplied together")
 
-    with open_virtual_portfolio_reader(database) as store:
-        learning = store.export_learning_rows(as_of=as_of)
+    # The intake script already owns this lock. Independent raw replay jobs
+    # opt in here, releasing it before scanning raw data or writing JSONL.
+    with ExclusiveLock("fx-virtual-portfolio", database_resolved.parent / "locks") as lock:
+        if lock_db_capture and not lock.acquire():
+            raise RuntimeError("canonical portfolio DB busy; retry next cycle")
+        with open_virtual_portfolio_reader(database) as store:
+            store.connection.execute("BEGIN")
+            learning = store.export_learning_rows(as_of=as_of)
     rows = learning.get("rows")
     if not isinstance(rows, list):
         raise ValueError("virtual learning export rows are unavailable")
@@ -256,6 +264,7 @@ def main() -> int:
         default=DEFAULT_LABEL_EVIDENCE_STORE,
     )
     parser.add_argument("--as-of")
+    parser.add_argument("--lock-db-capture", action="store_true")
     parser.add_argument(
         "--quote-log",
         type=Path,
@@ -270,6 +279,7 @@ def main() -> int:
     try:
         result = connect(
             database=args.db.expanduser().resolve(),
+            lock_db_capture=args.lock_db_capture,
             store_path=args.store.expanduser().resolve(),
             as_of=_aware(args.as_of),
             label_evidence_store_path=args.label_evidence_store.expanduser().resolve(),
