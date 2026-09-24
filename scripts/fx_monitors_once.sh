@@ -34,6 +34,20 @@ run_monitor() {
   return 0
 }
 
+
+refresh_freshness_report() {
+  # 公開直後に鮮度レポートを作り直し、5分周期の health を待たずに新しい世代を
+  # briefing の鮮度ゲートへ反映する。health と同じ排他 lock を使い、実行中なら
+  # 譲る(直後の health が反映する)。失敗しても公開そのものの結果は変えない。
+  "$PYTHON" tools/run_exclusive.py --name fx-health --locks-dir "$PWD/logs/locks" \
+    --busy-exit-code 75 -- \
+    "$PYTHON" tools/data_freshness_monitor.py --root "$PWD" \
+    --config ops/freshness_targets_timeframe.json </dev/null >> logs/fx_monitors.log 2>&1 || true
+}
+
+publish_code=0
 run_monitor timeframe-learning logs/timeframe_learning_monitor.json \
   tools/timeframe_learning_monitor.py \
-  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl"
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || publish_code=$?
+[ "$publish_code" -eq 0 ] && refresh_freshness_report
+exit "$publish_code"

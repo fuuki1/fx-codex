@@ -35,7 +35,7 @@
     {
       "name": "learning_profile",
       "path": "logs/briefing_tf_learning.json",
-      "kind": "json",
+      "kind": "json_generated_at",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
@@ -44,7 +44,7 @@
     {
       "name": "tp_sl_learning_profile",
       "path": "logs/briefing_tp_sl_learning.json",
-      "kind": "json",
+      "kind": "json_generated_at",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
@@ -53,7 +53,7 @@
     {
       "name": "maximization_profile",
       "path": "logs/briefing_maximization.json",
-      "kind": "json",
+      "kind": "json_generated_at",
       "expected_interval_seconds": 900,
       "warn_after_seconds": 1800,
       "critical_after_seconds": 2700,
