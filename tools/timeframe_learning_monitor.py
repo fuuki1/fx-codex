@@ -39,7 +39,10 @@ DEFAULT_MAXIMIZATION = REPO_ROOT / "logs" / "briefing_maximization.json"
 DEFAULT_MONITOR = REPO_ROOT / "logs" / "timeframe_learning_monitor.json"
 MONITOR_CONTRACT = "fx-codex-timeframe-learning-monitor-v1"
 BUNDLE_LOCK_TIMEOUT_SECONDS = 5.0
-SOURCE_LOCK_TIMEOUT_SECONDS = 5.0
+# Writers hold LOCK_EX while re-reading the whole append-only file; under I/O
+# contention that exceeds a few seconds. Polling with LOCK_NB never delays the
+# writer, so a longer bound only avoids discarding a 20+ minute refresh.
+SOURCE_LOCK_TIMEOUT_SECONDS = 120.0
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:

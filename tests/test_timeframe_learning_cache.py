@@ -1530,3 +1530,40 @@ def test_timeframe_learning_rollback_check_device_change_requires_prefix_proof(
     else:
         with pytest.raises(RuntimeError, match="prices learning source identity changed"):
             module._assert_not_source_rollback(manifest_path, verified_prefixes=proofs, **call)
+
+
+def test_timeframe_learning_source_snapshot_waits_for_slow_writer(tmp_path, monkeypatch) -> None:
+    module = _load_learning_monitor("timeframe_learning_monitor_slow_writer")
+    source = tmp_path / "prices.jsonl"
+    source.write_bytes(b'{"id": 1}\n')
+    writer_locked = threading.Event()
+    release_writer = threading.Event()
+
+    def hold_writer() -> None:
+        with source.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            writer_locked.set()
+            assert release_writer.wait(timeout=10)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    writer = threading.Thread(target=hold_writer)
+    writer.start()
+    assert writer_locked.wait(timeout=5)
+    monkeypatch.setattr(module, "SOURCE_LOCK_TIMEOUT_SECONDS", 5.0)
+    timer = threading.Timer(0.3, release_writer.set)
+    timer.start()
+    try:
+        snapshot, _full = module._source_snapshot(source)
+    finally:
+        release_writer.set()
+        timer.cancel()
+        writer.join(timeout=5)
+
+    assert snapshot["read_offset_bytes"] == source.stat().st_size
+    assert module.SOURCE_LOCK_TIMEOUT_SECONDS == 5.0  # patched; production default below
+
+
+def test_timeframe_learning_source_lock_default_bound() -> None:
+    module = _load_learning_monitor("timeframe_learning_monitor_default_bound")
+    assert module.SOURCE_LOCK_TIMEOUT_SECONDS >= 120.0
+    assert module.BUNDLE_LOCK_TIMEOUT_SECONDS == 5.0
