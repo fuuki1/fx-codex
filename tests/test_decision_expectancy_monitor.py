@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1132,3 +1134,57 @@ def test_feedback_refresh_cannot_bootstrap_after_monitor_deletion(monitor, tmp_p
     assert continuity["failures"] == ["previous_monitor_missing"]
     assert second["exit_code"] == 1
     assert feedback_path.read_bytes() == published
+
+
+def _hold_exclusive(path: Path, release: threading.Event, locked: threading.Event) -> None:
+    with path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        locked.set()
+        assert release.wait(timeout=10)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def test_source_snapshot_times_out_only_after_the_configured_bound(
+    monitor, tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "briefing_tf_prices.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    release, locked = threading.Event(), threading.Event()
+    writer = threading.Thread(target=_hold_exclusive, args=(source, release, locked))
+    writer.start()
+    assert locked.wait(timeout=5)
+    monkeypatch.setattr(monitor, "SOURCE_LOCK_TIMEOUT_SECONDS", 0.05)
+    try:
+        with pytest.raises(TimeoutError, match="decision source lock timeout"):
+            monitor._snapshot_paths([source])
+    finally:
+        release.set()
+        writer.join(timeout=5)
+
+
+def test_source_snapshot_waits_for_a_slow_writer_within_the_bound(
+    monitor, tmp_path, monkeypatch
+) -> None:
+    # A writer re-reading the whole prices file under LOCK_EX can take longer
+    # than the old fixed 5s under I/O contention; the reader must wait it out.
+    source = tmp_path / "briefing_tf_prices.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    release, locked = threading.Event(), threading.Event()
+    writer = threading.Thread(target=_hold_exclusive, args=(source, release, locked))
+    writer.start()
+    assert locked.wait(timeout=5)
+    monkeypatch.setattr(monitor, "SOURCE_LOCK_TIMEOUT_SECONDS", 5.0)
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    try:
+        snapshots = monitor._snapshot_paths([source])
+    finally:
+        release.set()
+        timer.cancel()
+        writer.join(timeout=5)
+
+    assert snapshots[source.resolve()]["read_offset_bytes"] == source.stat().st_size
+
+
+def test_source_lock_bound_exceeds_observed_writer_hold_time(monitor) -> None:
+    assert monitor.SOURCE_LOCK_TIMEOUT_SECONDS >= 120.0

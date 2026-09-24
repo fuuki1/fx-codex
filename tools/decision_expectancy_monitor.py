@@ -58,6 +58,10 @@ DEFAULT_PRICE_STALE_MINUTES = 15.0
 # before the next healthy adapter run; 210 minutes preserves a small run-time
 # margin while still rejecting a missed hourly refresh on the following cycle.
 DEFAULT_SHARED_PRICE_PATH_STALE_MINUTES = 210.0
+# Writers hold LOCK_EX while re-reading the whole append-only file; under I/O
+# contention that exceeds a few seconds. Readers poll with LOCK_NB, so a longer
+# bounded wait never delays a writer; it only avoids discarding the whole run.
+SOURCE_LOCK_TIMEOUT_SECONDS = 120.0
 DEFAULT_ACTIVE_SYMBOLS = ("USDJPY", "EURUSD")
 DEFAULT_ACTIVE_TIMEFRAMES = timeframe_config.DEFAULT_TIMEFRAMES
 
@@ -663,7 +667,7 @@ def _snapshot_boundaries(sources: Sequence[Path]) -> dict[Path, dict[str, object
 def _snapshot_paths(paths: Iterable[Path]) -> dict[Path, dict[str, object]]:
     resolved_paths = {Path(path).resolve() for path in paths}
     handles: dict[Path, Any] = {}
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + SOURCE_LOCK_TIMEOUT_SECONDS
     try:
         for path in sorted(resolved_paths):
             handle = path.open("rb")
@@ -978,7 +982,7 @@ def _sha256_snapshot_prefix(
     )
     if type(boundary) is not int or boundary < 0:  # noqa: E721
         raise RuntimeError("source hash boundary is invalid")
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + SOURCE_LOCK_TIMEOUT_SECONDS
     with path.open("rb") as handle:
         while True:
             try:
