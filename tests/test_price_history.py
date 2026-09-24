@@ -432,3 +432,161 @@ def test_dense_5min_series_resolves_15m_future_close() -> None:
         + ph.snapshot_entries({"USDJPY": {"15m": 150.5}}, now=T0 + timedelta(hours=1))
     )[("USDJPY", "15m")]
     assert ph.future_close_from_series(hourly, T0, 0.25, 0.1) is None
+
+
+# --- snapshot key index(書き手が全行を LOCK_EX 下で読み直すのをやめる) -----------
+
+import shutil as _shutil  # noqa: E402
+
+from fx_intel.price_path_adapter import ClosedBar, build_rows  # noqa: E402
+
+_KI_BASE = datetime(2026, 9, 15, 9, 0, tzinfo=UTC)
+
+
+def _ki_bar(minutes: int, close: float, *, symbol: str = "EURUSD") -> dict:
+    start = _KI_BASE + timedelta(minutes=minutes)
+    bar = ClosedBar(
+        symbol=symbol,
+        bar_start=start,
+        bar_end=start + timedelta(minutes=5),
+        open=close,
+        high=close + 0.001,
+        low=close - 0.001,
+        close=close,
+        bid=close - 0.00002,
+        ask=close + 0.00002,
+        tick_count=3,
+        available_time=start + timedelta(hours=2),
+    )
+    return build_rows([bar], run_id=f"ki-{minutes}")[0]
+
+
+def _ki_snapshot(minutes: int, close: float) -> dict:
+    return ph.snapshot_entries(
+        {"USDJPY": {"15m": {"close": close, "high": close + 0.1, "low": close - 0.1}}},
+        now=_KI_BASE + timedelta(minutes=minutes),
+        run_id=f"snap-{minutes}",
+        writer_id="snapshot-writer",
+    )[0]
+
+
+def _ki_batches() -> list[list[dict]]:
+    return [
+        [_ki_bar(0, 1.15), _ki_bar(5, 1.16), _ki_snapshot(0, 150.0)],
+        [_ki_bar(5, 1.16), _ki_bar(10, 1.17)],  # 1 duplicate, 1 new
+        [_ki_snapshot(5, 150.2), _ki_bar(15, 1.18, symbol="USDJPY")],
+    ]
+
+
+def test_key_index_append_writes_identical_bytes_to_full_scan(tmp_path) -> None:
+    plain = tmp_path / "plain.jsonl"
+    indexed = tmp_path / "indexed.jsonl"
+    counts_plain = [ph.append_snapshot_entries(plain, batch) for batch in _ki_batches()]
+    counts_indexed = [
+        ph.append_snapshot_entries(indexed, batch, key_index=ph.snapshot_key_index_path(indexed))
+        for batch in _ki_batches()
+    ]
+
+    assert counts_indexed == counts_plain == [3, 1, 2]
+    assert indexed.read_bytes() == plain.read_bytes()
+
+
+def test_key_index_reads_only_the_appended_tail(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "prices.jsonl"
+    index = ph.snapshot_key_index_path(path)
+    ph.append_snapshot_entries(
+        path, [_ki_bar(m, 1.1 + m / 1000) for m in range(0, 500, 5)], key_index=index
+    )
+    size_before = path.stat().st_size
+    read_bytes: list[int] = []
+    original = ph._SnapshotKeyIndex._trusted_offset
+
+    def spy(self, handle):
+        offset = original(self, handle)
+        read_bytes.append(size_before - offset)
+        return offset
+
+    monkeypatch.setattr(ph._SnapshotKeyIndex, "_trusted_offset", spy)
+    ph.append_snapshot_entries(path, [_ki_bar(600, 1.5)], key_index=index)
+
+    assert read_bytes[0] == 0  # 既存 100 行は読み直さない
+
+
+def test_key_index_sees_rows_appended_by_a_writer_without_the_index(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    index = ph.snapshot_key_index_path(path)
+    ph.append_snapshot_entries(path, [_ki_bar(0, 1.15)], key_index=index)
+    ph.append_snapshot_entries(path, [_ki_bar(5, 1.16)])  # 旧 writer(索引を更新しない)
+
+    with pytest.raises(ph.PriceHistoryWriteError, match="duplicate writer"):
+        ph.append_snapshot_entries(path, [_ki_bar(5, 1.99)], key_index=index)
+    assert ph.append_snapshot_entries(path, [_ki_bar(5, 1.16)], key_index=index) == 0
+
+
+def test_key_index_detects_conflicts_already_inside_the_file(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    rows = [_ki_bar(0, 1.15), _ki_bar(0, 1.99)]
+    path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+    with pytest.raises(ph.PriceHistoryWriteError, match="conflicting existing snapshots"):
+        ph.append_snapshot_entries(
+            path, [_ki_bar(5, 1.2)], key_index=ph.snapshot_key_index_path(path)
+        )
+
+
+def test_key_index_refuses_to_append_after_an_incomplete_trailing_line(tmp_path) -> None:
+    path = tmp_path / "prices.jsonl"
+    path.write_text(json.dumps(_ki_bar(0, 1.15), sort_keys=True))  # 改行なし
+    with pytest.raises(ph.PriceHistoryWriteError, match="incomplete trailing"):
+        ph.append_snapshot_entries(
+            path, [_ki_bar(5, 1.2)], key_index=ph.snapshot_key_index_path(path)
+        )
+
+
+def test_key_index_raises_the_same_conflict_as_full_scan(tmp_path) -> None:
+    for mode in ("plain", "indexed"):
+        path = tmp_path / f"{mode}.jsonl"
+        kwargs = {"key_index": ph.snapshot_key_index_path(path)} if mode == "indexed" else {}
+        ph.append_snapshot_entries(path, [_ki_bar(0, 1.15), _ki_bar(5, 1.16)], **kwargs)
+        before = path.read_bytes()
+        with pytest.raises(ph.PriceHistoryWriteError, match="duplicate writer"):
+            ph.append_snapshot_entries(path, [_ki_bar(0, 1.99)], **kwargs)
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("change", ["replaced", "truncated", "last_line_rewritten"])
+def test_key_index_rebuilds_when_the_file_is_not_the_indexed_one(tmp_path, change) -> None:
+    path = tmp_path / "prices.jsonl"
+    index = ph.snapshot_key_index_path(path)
+    ph.append_snapshot_entries(path, [_ki_bar(0, 1.15), _ki_bar(5, 1.16)], key_index=index)
+    lines = path.read_bytes().splitlines(keepends=True)
+    if change == "replaced":
+        copy = tmp_path / "copy.jsonl"
+        _shutil.copyfile(path, copy)
+        copy.replace(path)
+    elif change == "truncated":
+        path.write_bytes(lines[0])
+    else:
+        row = json.loads(lines[1])
+        row["close"] = 1.99
+        path.write_bytes(lines[0] + (json.dumps(row, sort_keys=True) + "\n").encode())
+
+    if change == "truncated":
+        assert ph.append_snapshot_entries(path, [_ki_bar(5, 1.50)], key_index=index) == 1
+    else:
+        with pytest.raises(ph.PriceHistoryWriteError, match="duplicate writer"):
+            ph.append_snapshot_entries(path, [_ki_bar(5, 1.50)], key_index=index)
+        current = json.loads(path.read_bytes().splitlines()[1])
+        assert current["close"] == (1.16 if change == "replaced" else 1.99)
+        assert ph.append_snapshot_entries(path, [current], key_index=index) == 0
+
+
+def test_snapshot_writer_uses_the_key_index(tmp_path) -> None:
+    import fx_tf_snapshot
+
+    path = tmp_path / "briefing_tf_prices.jsonl"
+    rows = [_ki_snapshot(0, 150.0), _ki_snapshot(5, 150.1)]
+    fx_tf_snapshot.append_snapshot(path, rows)
+    fx_tf_snapshot.append_snapshot(path, rows)
+
+    assert ph.snapshot_key_index_path(path).is_file()
+    assert len(path.read_text().splitlines()) == 2
