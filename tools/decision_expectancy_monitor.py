@@ -875,18 +875,47 @@ def _source_continuity(
 
     prior_by_path = {str(row.get("source_path") or ""): row for row in anchor}
     current_by_path = {str(row.get("source_path") or ""): row for row in current}
+    pairs = [
+        (source_path, prior_by_path[source_path], current_by_path[source_path])
+        for source_path in sorted(set(prior_by_path) & set(current_by_path))
+    ]
+    # A relocated log (e.g. moved to another volume behind a symlink) keeps its
+    # file name but resolves to a new path. Pair it with its prior generation
+    # only when the name is unambiguous on both sides; the prefix digest below
+    # then decides whether the move preserved every previously scored byte.
+    unmatched_prior = sorted(set(prior_by_path) - set(current_by_path))
+    unmatched_current = sorted(set(current_by_path) - set(prior_by_path))
+    for prior_path in list(unmatched_prior):
+        name = Path(prior_path).name
+        same_prior = [path for path in unmatched_prior if Path(path).name == name]
+        same_current = [path for path in unmatched_current if Path(path).name == name]
+        if len(same_prior) != 1 or len(same_current) != 1:
+            continue
+        current_path = same_current[0]
+        pairs.append((current_path, prior_by_path[prior_path], current_by_path[current_path]))
+        unmatched_prior.remove(prior_path)
+        unmatched_current.remove(current_path)
     failures: list[str] = []
-    if set(prior_by_path) != set(current_by_path):
+    if unmatched_prior or unmatched_current:
         failures.append("source_set_changed")
     checked = 0
-    for source_path in sorted(set(prior_by_path) & set(current_by_path)):
-        prior = prior_by_path[source_path]
-        present = current_by_path[source_path]
+    relocated: list[dict[str, object]] = []
+    for source_path, prior, present in pairs:
         checked += 1
-        if (prior.get("device"), prior.get("inode")) != (
+        moved = (
+            prior.get("source_path"),
+            prior.get("device"),
+            prior.get("inode"),
+        ) != (
+            present.get("source_path"),
             present.get("device"),
             present.get("inode"),
+        )
+        if moved and not (
+            type(prior.get("read_offset_bytes")) is int  # noqa: E721
+            and int(prior["read_offset_bytes"]) > 0
         ):
+            # An empty prior range hashes the same for any file: no proof.
             failures.append(f"source_identity_changed:{source_path}")
             continue
         try:
@@ -916,11 +945,23 @@ def _source_continuity(
             continue
         if current_prefix_digest != prior_digest:
             failures.append(f"source_prefix_changed:{source_path}")
+            continue
+        if moved:
+            relocated.append(
+                {
+                    "source_path": source_path,
+                    "previous_source_path": prior.get("source_path"),
+                    "previous_device": prior.get("device"),
+                    "previous_inode": prior.get("inode"),
+                    "verified_prefix_bytes": prior_offset,
+                }
+            )
     return {
         "status": "fail" if failures else "pass",
         "bootstrap": False,
         "checked_sources": checked,
         "failures": failures,
+        "relocated_sources": relocated,
     }, anchor
 
 
