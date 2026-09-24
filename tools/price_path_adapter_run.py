@@ -57,6 +57,7 @@ from fx_intel.price_path_adapter import (  # noqa: E402
     build_rows,
     iter_quote_file,
     load_collector_completion,
+    quote_index_start_offset,
 )
 
 EX_NOINPUT = 66
@@ -67,6 +68,7 @@ DEFAULT_QUOTES = REPO_ROOT / "collect" / "log" / "quotes.jsonl"
 DEFAULT_PRICES = REPO_ROOT / "logs" / "briefing_tf_prices.jsonl"
 DEFAULT_COLLECTOR_STATE = REPO_ROOT / "collect" / "state" / "dukascopy_history.json"
 DEFAULT_CONFLICT_LEDGER = REPO_ROOT / "logs" / "price_path_adapter_conflicts.jsonl"
+DEFAULT_QUOTE_INDEX = REPO_ROOT / "collect" / "index" / "quotes.sqlite3"
 CONFLICT_LEDGER_CONTRACT = "fx-price-path-adapter-conflict-v1"
 _CONFLICT_FIELDS = ("open", "high", "low", "close", "bid", "ask", "spread", "tick_count")
 
@@ -175,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--collector-state", default=str(DEFAULT_COLLECTOR_STATE))
     parser.add_argument("--conflict-ledger", default=str(DEFAULT_CONFLICT_LEDGER))
     parser.add_argument(
+        "--quote-index",
+        default=str(DEFAULT_QUOTE_INDEX),
+        help="読み取り開始位置を決めるための quote index(使えなければ先頭から読む)",
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="実際に追記する(既定は dry-run で件数と内容だけ報告)",
@@ -198,8 +205,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         window_start = adapter_window_start(args.prices, complete_through)
+        read_start, seek_reason = quote_index_start_offset(
+            quotes_path,
+            args.quote_index,
+            symbols=complete_through,
+            since=window_start,
+            end_offset=quotes_end_offset,
+        )
         ticks = _Counted(
-            iter_quote_file(quotes_path, end_offset=quotes_end_offset, since=window_start)
+            iter_quote_file(
+                quotes_path,
+                end_offset=quotes_end_offset,
+                since=window_start,
+                start_offset=read_start,
+            )
         )
         bars = build_closed_bars(ticks, as_of=now, complete_through=complete_through)
     except PricePathAdapterError as error:
@@ -221,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
             symbol: moment.isoformat() for symbol, moment in sorted(complete_through.items())
         },
         "quotes_read_offset_bytes": quotes_end_offset,
+        "quotes_read_start_offset_bytes": read_start,
+        "quote_index_seek": seek_reason,
         "window_start": window_start.isoformat() if window_start else None,
         "ticks_usable": ticks.count,
         "closed_bars": len(bars),

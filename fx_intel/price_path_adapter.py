@@ -53,8 +53,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 from .price_history import SNAPSHOT_CADENCE_SECONDS, SNAPSHOT_SCHEMA_VERSION, _content_hash
 
@@ -79,6 +81,10 @@ COLLECTOR_PROVIDER = "dukascopy"
 # 既に書いた最新足より少し前から読み直し、境界の足を再検証する。
 WINDOW_LOOKBACK = timedelta(hours=1)
 _EVENT_TIME_MARKER = b'"provider_event_time": "'
+# quote_tape_index (fx-quote-tape-offset-index-v1) の契約名。読み取り専用で参照する。
+QUOTE_INDEX_CONTRACT = "fx-quote-tape-offset-index-v1"
+# index の event_time 文字列比較に持たせる余裕(厳密な絞り込みは読み取り側で行う)。
+INDEX_SEEK_MARGIN = timedelta(hours=1)
 
 
 class PricePathAdapterError(RuntimeError):
@@ -350,6 +356,7 @@ def iter_quote_file(
     *,
     end_offset: int,
     since: datetime | None = None,
+    start_offset: int = 0,
 ) -> Iterator[TickQuote]:
     """quotes.jsonl を先頭から `end_offset` バイトまでだけ流す。
 
@@ -364,9 +371,17 @@ def iter_quote_file(
     coarse: bytes | None = None
     if since is not None:
         coarse = (since - timedelta(days=1)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S").encode()
+    if start_offset < 0 or start_offset > end_offset:
+        raise PricePathAdapterError(f"読み取り開始位置が不正です: {start_offset}")
     try:
         with target.open("rb") as handle:
-            remaining = end_offset
+            if start_offset:
+                handle.seek(start_offset - 1)
+                if handle.read(1) != b"\n":
+                    raise PricePathAdapterError(
+                        f"読み取り開始位置が行頭ではありません: {start_offset}"
+                    )
+            remaining = end_offset - start_offset
             for raw in handle:
                 if remaining <= 0:
                     break
@@ -434,3 +449,78 @@ def adapter_window_start(
     if set(latest) != wanted:
         return None
     return min(latest.values()) - WINDOW_LOOKBACK
+
+
+def quote_index_start_offset(
+    quotes_path: str | Path,
+    index_path: str | Path,
+    *,
+    symbols: Iterable[str],
+    since: datetime | None,
+    end_offset: int,
+) -> tuple[int, str]:
+    """quote index から、`since` 以降の tick を取りこぼさない最小の読み取り開始位置を返す。
+
+    返す位置は「index 済みで event_time >= since - 余裕 の行の最小 start_offset」と
+    「index 済みの末尾」の小さい方。index に未反映の末尾は必ず読むので、index が
+    遅れていても取りこぼさない。index が同じファイルを指すと確認できない、
+    index が除外した行がある、などの場合は 0(先頭から全量)に戻す。
+    位置が変わっても読む tick の集合は変わらない(遅くなるか速くなるかだけ)。
+    """
+    if since is None or end_offset <= 0:
+        return 0, "no_window"
+    database = Path(index_path)
+    if not database.is_file():
+        return 0, "index_missing"
+    source = Path(quotes_path).resolve()
+    try:
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as error:
+        return 0, f"index_error:{type(error).__name__}"
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        contract = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'contract'"
+        ).fetchone()
+        if contract is None or str(contract[0]) != QUOTE_INDEX_CONTRACT:
+            return 0, "index_contract_mismatch"
+        state = connection.execute("""
+            SELECT source_path, inode, byte_offset, last_line_start_offset,
+                   last_line_end_offset, last_line_sha256, rejected_lines
+            FROM source_state WHERE singleton = 1
+            """).fetchone()
+        if state is None:
+            return 0, "index_uninitialized"
+        path, inode, byte_offset, line_start, line_end, line_sha, rejected = state
+        if Path(str(path)).resolve() != source:
+            return 0, "index_path_mismatch"
+        stat = source.stat()
+        if int(stat.st_ino) != int(inode):
+            return 0, "index_inode_mismatch"
+        if int(stat.st_size) < int(byte_offset):
+            return 0, "index_ahead_of_source"
+        if int(rejected) != 0:
+            # index が採らなかった行を adapter が使う可能性がある。位置を詰めない。
+            return 0, "index_has_rejected_lines"
+        if int(line_end) > int(line_start):
+            with source.open("rb") as handle:
+                handle.seek(int(line_start))
+                raw = handle.read(int(line_end) - int(line_start))
+            if hashlib.sha256(raw).hexdigest() != str(line_sha):
+                return 0, "index_last_line_mismatch"
+        lower = (since - INDEX_SEEK_MARGIN).astimezone(UTC).isoformat()
+        best: int | None = None
+        for symbol in sorted({str(value).strip().upper() for value in symbols}):
+            row = connection.execute(
+                "SELECT MIN(start_offset) FROM quote_offsets"
+                " WHERE instrument = ? AND event_time >= ?",
+                (symbol, lower),
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                best = int(row[0]) if best is None else min(best, int(row[0]))
+        start = int(byte_offset) if best is None else min(best, int(byte_offset))
+        return min(start, end_offset), "index_seek"
+    except (sqlite3.Error, OSError) as error:
+        return 0, f"index_error:{type(error).__name__}"
+    finally:
+        connection.close()

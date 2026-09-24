@@ -520,3 +520,233 @@ def test_runner_fails_closed_without_collector_state(tmp_path) -> None:
         )
         == runner.EX_NOINPUT
     )
+
+
+# --- quote index による読み取り開始位置(毎時 9GB 全読みの解消) --------------------
+
+import hashlib  # noqa: E402
+import shutil  # noqa: E402
+
+from fx_intel import quote_tape_index  # noqa: E402
+from fx_intel.price_path_adapter import quote_index_start_offset  # noqa: E402
+
+
+def _write_quotes(path: Path, payloads: list[dict]) -> list[tuple[int, int, dict]]:
+    spans: list[tuple[int, int, dict]] = []
+    offset = 0
+    with path.open("wb") as handle:
+        for payload in payloads:
+            raw = (json.dumps(payload) + "\n").encode()
+            handle.write(raw)
+            spans.append((offset, offset + len(raw), payload))
+            offset += len(raw)
+    return spans
+
+
+def _build_index(
+    database: Path,
+    quotes: Path,
+    spans: list[tuple[int, int, dict]],
+    *,
+    indexed_lines: int | None = None,
+    rejected: int = 0,
+) -> None:
+    connection = quote_tape_index._connect_writer(database)
+    indexed = spans if indexed_lines is None else spans[:indexed_lines]
+    for start, end, payload in indexed:
+        raw = quotes.read_bytes()[start:end]
+        connection.execute(
+            "INSERT INTO quote_offsets VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                start,
+                end,
+                payload["instrument"],
+                datetime.fromisoformat(payload["provider_event_time"]).isoformat(),
+                datetime.fromisoformat(payload["received_at"]).isoformat(),
+                hashlib.sha256(raw).hexdigest(),
+            ),
+        )
+    stat = quotes.stat()
+    last_start, last_end = (indexed[-1][0], indexed[-1][1]) if indexed else (0, 0)
+    connection.execute(
+        "INSERT INTO source_state VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            str(quotes.resolve()),
+            stat.st_dev,
+            stat.st_ino,
+            last_end,
+            stat.st_size,
+            last_start,
+            last_end,
+            hashlib.sha256(quotes.read_bytes()[last_start:last_end]).hexdigest(),
+            len(indexed),
+            rejected,
+            datetime.now(UTC).isoformat(),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+
+def _multi_day_payloads() -> list[dict]:
+    rows: list[dict] = []
+    start = INCIDENT_HOUR - timedelta(days=3)
+    for hour in range(0, 72 + 3):
+        for symbol in ("EURUSD", "USDJPY"):
+            base = 1.15 if symbol == "EURUSD" else 150.0
+            for i in range(3):
+                rows.append(
+                    _dk(start + timedelta(hours=hour, minutes=20 * i), base + i, symbol=symbol)
+                )
+    return rows
+
+
+def _tick_key(tick) -> tuple:
+    return (tick.symbol, tick.event_time, tick.mid)
+
+
+def test_index_seek_reads_exactly_the_ticks_a_full_scan_reads(tmp_path) -> None:
+    quotes = tmp_path / "quotes.jsonl"
+    database = tmp_path / "quotes.sqlite3"
+    spans = _write_quotes(quotes, _multi_day_payloads())
+    _build_index(database, quotes, spans)
+    since = INCIDENT_HOUR - timedelta(hours=5)
+    size = quotes.stat().st_size
+
+    start, reason = quote_index_start_offset(
+        quotes, database, symbols=["EURUSD", "USDJPY"], since=since, end_offset=size
+    )
+    seeked = list(iter_quote_file(quotes, end_offset=size, since=since, start_offset=start))
+    full = list(iter_quote_file(quotes, end_offset=size, since=since))
+
+    assert reason == "index_seek"
+    assert size // 2 < start < size  # 窓より前の約 9 割を読まずに済む
+    assert [_tick_key(t) for t in seeked] == [_tick_key(t) for t in full]
+
+
+def test_index_seek_still_reads_the_unindexed_tail(tmp_path) -> None:
+    quotes = tmp_path / "quotes.jsonl"
+    database = tmp_path / "quotes.sqlite3"
+    spans = _write_quotes(quotes, _multi_day_payloads())
+    _build_index(database, quotes, spans, indexed_lines=len(spans) // 2)
+    since = INCIDENT_HOUR  # 未 index の範囲にしか該当 tick がない
+    size = quotes.stat().st_size
+
+    start, reason = quote_index_start_offset(
+        quotes, database, symbols=["EURUSD", "USDJPY"], since=since, end_offset=size
+    )
+    seeked = list(iter_quote_file(quotes, end_offset=size, since=since, start_offset=start))
+    full = list(iter_quote_file(quotes, end_offset=size, since=since))
+
+    assert reason == "index_seek"
+    assert start == spans[len(spans) // 2 - 1][1]
+    assert seeked and [_tick_key(t) for t in seeked] == [_tick_key(t) for t in full]
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["missing", "replaced_file", "rewritten_last_line", "rejected_lines", "other_path"],
+)
+def test_index_seek_falls_back_to_full_scan_when_index_is_not_trustworthy(tmp_path, defect) -> None:
+    quotes = tmp_path / "quotes.jsonl"
+    database = tmp_path / "quotes.sqlite3"
+    spans = _write_quotes(quotes, _multi_day_payloads())
+    if defect != "missing":
+        _build_index(database, quotes, spans, rejected=1 if defect == "rejected_lines" else 0)
+    if defect == "replaced_file":
+        copy = tmp_path / "copy.jsonl"
+        shutil.copyfile(quotes, copy)
+        copy.replace(quotes)
+    elif defect == "rewritten_last_line":
+        data = bytearray(quotes.read_bytes())
+        data[spans[-1][0] + 5] ^= 1
+        quotes.write_bytes(bytes(data))
+    elif defect == "other_path":
+        other = tmp_path / "other.jsonl"
+        shutil.copyfile(quotes, other)
+        quotes = other
+
+    start, reason = quote_index_start_offset(
+        quotes,
+        database,
+        symbols=["EURUSD"],
+        since=INCIDENT_HOUR,
+        end_offset=quotes.stat().st_size,
+    )
+
+    assert start == 0
+    assert reason != "index_seek"
+
+
+def test_iter_quote_file_rejects_a_start_offset_inside_a_line(tmp_path) -> None:
+    quotes = tmp_path / "quotes.jsonl"
+    _write_quotes(quotes, [_dk(INCIDENT_HOUR, 1.1), _dk(INCIDENT_HOUR, 1.2)])
+    with pytest.raises(PricePathAdapterError, match="行頭"):
+        list(iter_quote_file(quotes, end_offset=quotes.stat().st_size, start_offset=3))
+
+
+def test_runner_with_index_writes_the_same_bars_as_a_full_scan(tmp_path, capsys) -> None:
+    runner = _load_runner()
+    payloads = _multi_day_payloads()
+    written: dict[str, list[dict]] = {}
+    for mode in ("full", "index"):
+        root = tmp_path / mode
+        root.mkdir()
+        quotes = root / "quotes.jsonl"
+        spans = _write_quotes(quotes, payloads)
+        state = root / "state.json"
+        state.write_text(
+            json.dumps(
+                {
+                    "completed_hours": {
+                        "EURUSD": (INCIDENT_HOUR + timedelta(hours=1)).isoformat(),
+                        "USDJPY": (INCIDENT_HOUR + timedelta(hours=1)).isoformat(),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        prices = root / "prices.jsonl"
+        # 既存の足があると時間窓が効き、index で開始位置を詰められる。
+        seed = build_rows(
+            build_closed_bars(
+                _dk_ticks(
+                    [
+                        _dk(INCIDENT_HOUR - timedelta(hours=10, minutes=-10), 1.1),
+                        _dk(
+                            INCIDENT_HOUR - timedelta(hours=10, minutes=-10), 150.0, symbol="USDJPY"
+                        ),
+                    ]
+                ),
+                as_of=INCIDENT_HOUR,
+            ),
+            run_id="seed",
+        )
+        append_snapshot_entries(prices, seed)
+        index = root / "quotes.sqlite3"
+        if mode == "index":
+            _build_index(index, quotes, spans)
+        args = [
+            "--quotes",
+            str(quotes),
+            "--prices",
+            str(prices),
+            "--collector-state",
+            str(state),
+            "--conflict-ledger",
+            str(root / "conflicts.jsonl"),
+            "--quote-index",
+            str(index),
+            "--write",
+        ]
+        capsys.readouterr()
+        assert runner.main(args) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert (report["quote_index_seek"] == "index_seek") == (mode == "index")
+        written[mode] = [
+            {k: v for k, v in json.loads(line).items() if k not in ("run_id", "content_hash")}
+            for line in prices.read_text().splitlines()
+        ]
+
+    assert len(written["index"]) > 2
+    assert written["index"] == written["full"]
