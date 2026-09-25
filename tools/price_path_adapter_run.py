@@ -46,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 from fx_intel.price_history import (  # noqa: E402
     PriceHistoryWriteError,
     append_snapshot_entries,
+    snapshot_key_index_path,
 )
 from fx_intel.price_path_adapter import (  # noqa: E402
     ADAPTER_TIMEFRAME,
@@ -258,7 +259,12 @@ def main(argv: list[str] | None = None) -> int:
 
     conflicts: list[dict[str, object]] = []
     try:
-        appended = append_snapshot_entries(args.prices, rows, conflicts=conflicts)
+        appended = append_snapshot_entries(
+            args.prices,
+            rows,
+            conflicts=conflicts,
+            key_index=snapshot_key_index_path(args.prices),
+        )
         fresh = _record_new_conflicts(Path(args.conflict_ledger), conflicts, run_id=run_id, now=now)
     except PriceHistoryWriteError as error:
         print(f"追記に失敗しました: {error}", file=sys.stderr)
