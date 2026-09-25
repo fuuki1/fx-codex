@@ -43,6 +43,7 @@ BUNDLE_LOCK_TIMEOUT_SECONDS = 5.0
 # contention that exceeds a few seconds. Polling with LOCK_NB never delays the
 # writer, so a longer bound only avoids discarding a 20+ minute refresh.
 SOURCE_LOCK_TIMEOUT_SECONDS = 120.0
+FULL_EVIDENCE_MEMO_CONTRACT = "fx-full-evidence-memo-v1"
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -65,11 +66,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     # relocated or cloned append-only log); see _assert_not_source_rollback.
     verified_prefixes: dict[str, tuple[int, str]] = {}
     decision_audit: dict[str, object] = {}
+    memo_path = _full_evidence_memo_path(monitor_path)
+    memo_record = _read_full_evidence_memo(memo_path)
     with timing.stage("timeframe_learning_journal_read"):
         decision_source, decision_full_source = _source_snapshot(
             journal_path,
             previous_source=previous_sources.get("decisions"),
             previous_full_source=previous_sources.get("cross_log_commit"),
+            full_checkpoint_offset=memo_record[0] if memo_record is not None else None,
+        )
+        full_evidence_memo, memo_status = _trusted_full_evidence_memo(
+            memo_record,
+            decision_full_source,
         )
         decisions = list(
             journal.read_entries(
@@ -81,6 +89,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     int(decision_full_source["read_offset_bytes"])
                     if decision_full_source is not None
                     else None
+                ),
+                full_evidence_memo=(
+                    full_evidence_memo if decision_full_source is not None else None
                 ),
             )
         )
@@ -111,6 +122,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         decision_source.pop("_previous_prefix_sha256", None)
         if decision_full_source is not None:
             decision_full_source.pop("_previous_prefix_sha256", None)
+    if decision_full_source is not None:
+        with timing.stage(
+            "timeframe_learning_full_evidence_memo_save",
+            memo_status=memo_status,
+            trusted_receipts=len(full_evidence_memo.trusted),
+            reused_receipts=full_evidence_memo.reused,
+            computed_receipts=full_evidence_memo.computed,
+        ) as memo_outcome:
+            if not _write_full_evidence_memo(memo_path, decision_full_source, full_evidence_memo):
+                # A lost memo only costs the next run a full re-verification.
+                memo_outcome.mark_handled_error("full evidence memo write failed")
     price_audit: dict[str, object] = {}
     with timing.stage("timeframe_learning_price_read"):
         price_source, _ = _source_snapshot(
@@ -504,8 +526,14 @@ def _source_snapshot(
     *,
     previous_source: dict[str, object] | None = None,
     previous_full_source: dict[str, object] | None = None,
+    full_checkpoint_offset: int | None = None,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
-    """Pin complete append-only source boundaries under the writers' file locks."""
+    """Pin complete append-only source boundaries under the writers' file locks.
+
+    ``full_checkpoint_offset`` additionally hashes the full decision log prefix
+    ending there (``_checkpoint_sha256``) in the same pass, or records ``None``
+    when the snapshot is shorter than that prefix.
+    """
 
     source = path.resolve()
     full_source = decision_commit.commit_path_for(source).resolve()
@@ -545,14 +573,26 @@ def _source_snapshot(
         for candidate, handle in handles:
             previous = previous_source if candidate == source else previous_full_source
             previous_end_offset = _evidence_offset(previous)
-            snapshot_sha256, previous_prefix_sha256 = _handle_prefix_hashes(
+            end_offset = int(identities[candidate]["read_offset_bytes"])
+            checkpoint = (
+                full_checkpoint_offset
+                if candidate == full_source and full_source != source
+                else None
+            )
+            if checkpoint is not None and checkpoint > end_offset:
+                identities[candidate]["_checkpoint_sha256"] = None
+                checkpoint = None
+            snapshot_sha256, previous_prefix_sha256, checkpoint_sha256 = _handle_prefix_hashes(
                 handle.fileno(),
-                int(identities[candidate]["read_offset_bytes"]),
+                end_offset,
                 previous_end_offset=previous_end_offset,
+                checkpoint_offset=checkpoint,
             )
             identities[candidate]["source_sha256"] = snapshot_sha256
             if previous_end_offset is not None:
                 identities[candidate]["_previous_prefix_sha256"] = previous_prefix_sha256
+            if checkpoint is not None:
+                identities[candidate]["_checkpoint_sha256"] = checkpoint_sha256
         return identities[source], identities.get(full_source) if full_source != source else None
     finally:
         for _candidate, handle in reversed(handles):
@@ -578,11 +618,16 @@ def _handle_prefix_hashes(
     end_offset: int,
     *,
     previous_end_offset: int | None,
-) -> tuple[str, str | None]:
+    checkpoint_offset: int | None = None,
+) -> tuple[str, str | None, str | None]:
     if previous_end_offset is not None and previous_end_offset > end_offset:
         raise RuntimeError("learning source regressed before previous snapshot boundary")
+    if checkpoint_offset is not None and not 0 <= checkpoint_offset <= end_offset:
+        raise ValueError("checkpoint must lie inside the snapshot")
     snapshot_digest = hashlib.sha256()
     previous_digest = hashlib.sha256() if previous_end_offset is not None else None
+    checkpoint_digest = hashlib.sha256() if checkpoint_offset is not None else None
+    checkpoint_end = checkpoint_offset if checkpoint_offset is not None else 0
     os.lseek(file_descriptor, 0, os.SEEK_SET)
     remaining = end_offset
     position = 0
@@ -593,12 +638,94 @@ def _handle_prefix_hashes(
         snapshot_digest.update(chunk)
         if previous_digest is not None and position < int(previous_end_offset):
             previous_digest.update(chunk[: int(previous_end_offset) - position])
+        if checkpoint_digest is not None and position < checkpoint_end:
+            checkpoint_digest.update(chunk[: checkpoint_end - position])
         position += len(chunk)
         remaining -= len(chunk)
     return (
         snapshot_digest.hexdigest(),
         previous_digest.hexdigest() if previous_digest is not None else None,
+        checkpoint_digest.hexdigest() if checkpoint_digest is not None else None,
     )
+
+
+def _full_evidence_memo_path(monitor_path: Path) -> Path:
+    return monitor_path.with_name(f"{monitor_path.stem}.full_evidence_memo.json")
+
+
+def _read_full_evidence_memo(path: Path) -> tuple[int, str, frozenset[str]] | None:
+    """Return (prefix end, prefix sha256, receipt keys) or None when unusable."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("contract") != FULL_EVIDENCE_MEMO_CONTRACT:
+        return None
+    offset = payload.get("full_log_read_offset_bytes")
+    digest = payload.get("full_log_prefix_sha256")
+    keys = payload.get("receipt_keys")
+    if (
+        type(offset) is not int  # noqa: E721
+        or offset <= 0
+        or not _is_sha256(digest)
+        or not isinstance(keys, list)
+        or not all(_is_sha256(key) for key in keys)
+    ):
+        return None
+    return offset, str(digest), frozenset(str(key) for key in keys)
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _trusted_full_evidence_memo(
+    record: tuple[int, str, frozenset[str]] | None,
+    full_source: dict[str, object] | None,
+) -> tuple[decision_commit.FullEvidenceMemo, str]:
+    """Trust recorded receipts only when their full-log prefix re-hashed identically."""
+
+    if full_source is None:
+        return decision_commit.FullEvidenceMemo(), "not_applicable"
+    observed = full_source.pop("_checkpoint_sha256", None)
+    if record is None:
+        return decision_commit.FullEvidenceMemo(), "absent"
+    offset, expected, keys = record
+    if observed is None:
+        return decision_commit.FullEvidenceMemo(), "prefix_beyond_snapshot"
+    if observed != expected:
+        return decision_commit.FullEvidenceMemo(), "prefix_changed"
+    return decision_commit.FullEvidenceMemo(keys, trusted_through=offset), "trusted"
+
+
+def _write_full_evidence_memo(
+    path: Path,
+    full_source: dict[str, object],
+    memo: decision_commit.FullEvidenceMemo,
+) -> bool:
+    # Receipts proven in this run end inside [0, read_offset_bytes), whose
+    # sha256 was pinned under the writer lock in the same snapshot pass.
+    offset = _evidence_offset(full_source)
+    if offset is None:
+        return False
+    try:
+        atomic_write_json(
+            path,
+            {
+                "contract": FULL_EVIDENCE_MEMO_CONTRACT,
+                "full_log_read_offset_bytes": offset,
+                "full_log_prefix_sha256": str(full_source["source_sha256"]),
+                "receipt_keys": sorted(memo.proven),
+            },
+        )
+    except OSError:
+        return False
+    return True
 
 
 def _assert_snapshot_prefix_available(

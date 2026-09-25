@@ -35,11 +35,15 @@ from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
 from collections.abc import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from .briefing import TradePlan
 from .market import open_hours_between
 from .provenance import decision_provenance
 from .timeframe import TimeframePlan
+
+if TYPE_CHECKING:
+    from .decision_commit import FullEvidenceMemo
 
 DEFAULT_HORIZON_HOURS = 24.0
 DEFAULT_TOLERANCE_HOURS = 2.0
@@ -635,6 +639,7 @@ def read_entries(
     audit: dict[str, object] | None = None,
     end_offset: int | None = None,
     full_log_end_offset: int | None = None,
+    full_evidence_memo: FullEvidenceMemo | None = None,
 ):
     """壊れた行はスキップしてJSONLジャーナルを読む(learning.pyの入力にも使う)。
 
@@ -684,6 +689,7 @@ def read_entries(
                     path,
                     compact_end_offset=end_offset,
                     full_end_offset=full_log_end_offset,
+                    full_evidence_memo=full_evidence_memo,
                 )
             except Exception:  # noqa: BLE001 - 証跡が読めない時は隠す側へ倒す
                 receipts = {}
