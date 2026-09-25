@@ -37,6 +37,55 @@ class DecisionCommitError(RuntimeError):
     """A decision transaction cannot be committed or verified."""
 
 
+class FullEvidenceMemo:
+    """Receipts whose full-log evidence passed inside an unchanged log prefix.
+
+    ``receipt_matches_full_evidence`` reads, hashes and re-canonicalizes the
+    full wrapper line named by every receipt, which dominates a compact read.
+    Its result depends only on the receipt and full-log bytes that end at or
+    before the snapshot boundary it ran under. A caller that has re-hashed the
+    full log prefix ``[0, trusted_through)`` and found it byte-identical to the
+    prefix those results were proven against may pass the receipt keys here to
+    skip the repeat check. Only positive results are ever trusted; everything
+    else is verified again.
+    """
+
+    def __init__(self, trusted: Iterable[str] = (), *, trusted_through: int = 0) -> None:
+        if type(trusted_through) is not int or trusted_through < 0:  # noqa: E721
+            raise ValueError("trusted_through must be a non-negative integer")
+        self.trusted = frozenset(trusted)
+        self.trusted_through = trusted_through
+        self.proven: set[str] = set()
+        self.reused = 0
+        self.computed = 0
+
+    def matches(
+        self,
+        receipt: Mapping[str, object],
+        full_handle: IO[bytes],
+        *,
+        end_offset: int | None,
+    ) -> bool:
+        key = canonical_sha256(receipt)
+        if key in self.trusted and _full_evidence_within(receipt, self.trusted_through):
+            self.reused += 1
+            self.proven.add(key)
+            return True
+        self.computed += 1
+        if receipt_matches_full_evidence(receipt, full_handle, end_offset=end_offset):
+            self.proven.add(key)
+            return True
+        return False
+
+
+def _full_evidence_within(receipt: Mapping[str, object], boundary: int) -> bool:
+    offsets = (
+        receipt.get("full_batch_line_start_offset"),
+        receipt.get("full_commit_line_start_offset"),
+    )
+    return all(type(offset) is int and 0 <= offset < boundary for offset in offsets)  # noqa: E721
+
+
 def commit_path_for(log_path: str | Path) -> Path:
     """Return the canonical full decision log containing commit markers."""
 
@@ -615,6 +664,7 @@ def load_compact_receipts(
     full_path: str | Path | None = None,
     compact_end_offset: int | None = None,
     full_end_offset: int | None = None,
+    full_evidence_memo: FullEvidenceMemo | None = None,
 ) -> dict[str, dict[str, object]]:
     """Load compact receipts proven by local batches and exact full-log lines."""
 
@@ -645,6 +695,7 @@ def load_compact_receipts(
                 expected_mode=_mode_for_compact_path(compact_path),
                 compact_end_offset=compact_end_offset,
                 full_end_offset=full_end_offset,
+                full_evidence_memo=full_evidence_memo,
             )
     except OSError:
         return {}
@@ -657,6 +708,7 @@ def _load_compact_receipts_from_handles(
     expected_mode: str,
     compact_end_offset: int | None = None,
     full_end_offset: int | None = None,
+    full_evidence_memo: FullEvidenceMemo | None = None,
 ) -> dict[str, dict[str, object]]:
     if not expected_mode:
         return {}
@@ -776,10 +828,14 @@ def _load_compact_receipts_from_handles(
                 byte_length=cast(int, batch["compact_batch_byte_length"]),
                 payload_sha256=str(batch["compact_batch_payload_sha256"]),
             )
-            and receipt_matches_full_evidence(
-                receipt,
-                full_handle,
-                end_offset=full_end_offset,
+            and (
+                full_evidence_memo.matches(receipt, full_handle, end_offset=full_end_offset)
+                if full_evidence_memo is not None
+                else receipt_matches_full_evidence(
+                    receipt,
+                    full_handle,
+                    end_offset=full_end_offset,
+                )
             )
         ]
         if len({str(receipt["full_commit_record_sha256"]) for receipt in matching}) == 1:
@@ -1334,6 +1390,7 @@ __all__ = [
     "COMPACT_FILENAMES",
     "DEFAULT_COMMIT_FILENAME",
     "DecisionCommitError",
+    "FullEvidenceMemo",
     "RECEIPT_EVENT_TYPE",
     "append_commit",
     "bind_commit_to_full_line",
