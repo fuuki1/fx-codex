@@ -76,8 +76,13 @@ def collect_price_snapshots(
 
 
 def append_snapshot(path: str | Path, rows: list[dict]) -> None:
-    """価格スナップショット行を JSONL へ追記する(1点1行、price_history が読める形)。"""
-    price_history.append_snapshot_entries(path, rows)
+    """価格スナップショット行を JSONL へ追記する(1点1行、price_history が読める形)。
+
+    自然キーは価格ファイル隣の SQLite 索引で引き、排他 lock 下で全行を読み直さない。
+    """
+    price_history.append_snapshot_entries(
+        path, rows, key_index=price_history.snapshot_key_index_path(path)
+    )
 
 
 def had_transient_failure(tech_map: dict[str, technicals.PairTechnicals]) -> bool:

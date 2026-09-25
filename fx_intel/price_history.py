@@ -36,6 +36,7 @@ import math
 import os
 from pathlib import Path
 import socket
+import sqlite3
 
 from .market import WEEKEND_CLOSURE, WeekendOpenHours
 
@@ -186,7 +187,12 @@ def snapshot_entries(
     return rows
 
 
-def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object]]) -> int:
+def append_snapshot_entries(
+    path: str | Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    key_index: str | Path | None = None,
+) -> int:
     """Append unique snapshots under an OS advisory lock.
 
     The natural key is ``(capture_slot, symbol, timeframe)``. Replaying the same
@@ -194,8 +200,17 @@ def append_snapshot_entries(path: str | Path, rows: Sequence[Mapping[str, object
     competing writer or a non-deterministic retry and is rejected instead of
     silently choosing a winner. ``flock`` is released by the kernel on process
     death, so it cannot leave a stale PID lock behind.
+
+    When ``key_index`` is given (see ``snapshot_key_index_path``), the natural
+    keys are looked up in a SQLite side index instead of re-reading the whole
+    file under the exclusive lock. The index only ever ingests the bytes
+    appended since its last sync, so rows written by writers that do not use
+    the index are still seen. An occupied key is decided by re-reading that one
+    existing row and applying the same ``_same_snapshot`` rule.
     """
 
+    if key_index is not None:
+        return _append_with_key_index(Path(path), rows, Path(key_index), None)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     appended = 0
@@ -416,6 +431,203 @@ def _capture_slot(value: object) -> str:
     epoch = int(utc.timestamp())
     slot_epoch = epoch - epoch % SNAPSHOT_CADENCE_SECONDS
     return datetime.fromtimestamp(slot_epoch, tz=UTC).isoformat()
+
+
+SNAPSHOT_KEY_INDEX_CONTRACT = "fx-snapshot-key-index-v1"
+_KEY_INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    inode INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0),
+    last_line_start INTEGER NOT NULL CHECK (last_line_start >= 0),
+    last_line_sha256 TEXT NOT NULL,
+    row_count INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot_keys (
+    capture_slot TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    PRIMARY KEY (capture_slot, symbol, timeframe)
+) WITHOUT ROWID;
+"""
+
+
+def snapshot_key_index_path(path: str | Path) -> Path:
+    """Default side index for ``append_snapshot_entries(..., key_index=...)``."""
+
+    return Path(f"{Path(path)}.keys.sqlite3")
+
+
+class _SnapshotKeyIndex:
+    """Natural-key -> byte-range index of an append-only snapshot JSONL file.
+
+    Only used while the caller holds ``LOCK_EX`` on the JSONL file, so there is a
+    single writer. The index is trusted only when the file keeps the same inode,
+    is at least as long as the indexed prefix, and the last indexed line still
+    has the same bytes; otherwise it is rebuilt from the start of the file.
+    """
+
+    def __init__(self, database: Path) -> None:
+        database.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(database, timeout=30)
+        self.connection.executescript(_KEY_INDEX_SCHEMA)
+        self.connection.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES ('contract', ?)",
+            (SNAPSHOT_KEY_INDEX_CONTRACT,),
+        )
+        contract = self.connection.execute(
+            "SELECT value FROM meta WHERE key = 'contract'"
+        ).fetchone()
+        if contract is None or contract[0] != SNAPSHOT_KEY_INDEX_CONTRACT:
+            self.connection.close()
+            raise PriceHistoryWriteError(f"snapshot key index contract mismatch: {database}")
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    @staticmethod
+    def _read(handle, start: int, end: int) -> bytes:
+        handle.seek(start)
+        return handle.read(end - start)
+
+    def _trusted_offset(self, handle) -> int:
+        state = self.connection.execute(
+            "SELECT inode, byte_offset, last_line_start, last_line_sha256 FROM state"
+        ).fetchone()
+        stat = os.fstat(handle.fileno())
+        if state is not None:
+            inode, byte_offset, line_start, line_sha = state
+            if int(inode) == int(stat.st_ino) and int(byte_offset) <= int(stat.st_size):
+                if int(byte_offset) == 0:
+                    return 0
+                last = self._read(handle, int(line_start), int(byte_offset))
+                if last.endswith(b"\n") and hashlib.sha256(last).hexdigest() == line_sha:
+                    return int(byte_offset)
+        self.connection.execute("DELETE FROM snapshot_keys")
+        self.connection.execute("DELETE FROM state")
+        return 0
+
+    def lookup(self, handle, key: tuple[str, str, str]) -> dict[str, object] | None:
+        found = self.connection.execute(
+            "SELECT start_offset, end_offset FROM snapshot_keys"
+            " WHERE capture_slot = ? AND symbol = ? AND timeframe = ?",
+            key,
+        ).fetchone()
+        if found is None:
+            return None
+        parsed = json.loads(self._read(handle, int(found[0]), int(found[1])))
+        if not isinstance(parsed, dict):
+            raise PriceHistoryWriteError(f"indexed snapshot row is not an object: {key}")
+        return parsed
+
+    def sync(self, handle, target: Path) -> None:
+        """Ingest every complete line appended since the last trusted sync."""
+
+        start = self._trusted_offset(handle)
+        handle.seek(start)
+        position = start
+        last_start = 0
+        last_line = b""
+        ingested = 0
+        for raw in handle:
+            line_start = position
+            position += len(raw)
+            if not raw.endswith(b"\n"):
+                raise PriceHistoryWriteError(f"incomplete trailing JSONL row at {target}")
+            last_start, last_line = line_start, raw
+            if not raw.strip():
+                continue
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise PriceHistoryWriteError(
+                    f"malformed JSONL at {target} byte {line_start}"
+                ) from error
+            if not isinstance(parsed, dict):
+                raise PriceHistoryWriteError(f"non-object JSONL row at {target} byte {line_start}")
+            key = _snapshot_key(parsed)
+            prior = self.lookup(handle, key)
+            if prior is not None:
+                handle.seek(position)
+                if not _same_snapshot(prior, parsed):
+                    raise PriceHistoryWriteError(
+                        f"conflicting existing snapshots for natural key {key}"
+                    )
+                continue
+            handle.seek(position)
+            self.connection.execute(
+                "INSERT INTO snapshot_keys VALUES (?, ?, ?, ?, ?)",
+                (*key, line_start, position),
+            )
+            ingested += 1
+        if position == start and start > 0:
+            return
+        if position > 0:
+            previous = self.connection.execute("SELECT row_count FROM state").fetchone()
+            stat = os.fstat(handle.fileno())
+            self.connection.execute(
+                "INSERT OR REPLACE INTO state VALUES (1, ?, ?, ?, ?, ?)",
+                (
+                    int(stat.st_ino),
+                    position,
+                    last_start,
+                    hashlib.sha256(last_line).hexdigest(),
+                    (int(previous[0]) if previous else 0) + ingested,
+                ),
+            )
+        self.connection.commit()
+
+
+def _append_with_key_index(
+    target: Path,
+    rows: Sequence[Mapping[str, object]],
+    database: Path,
+    conflicts: list[dict[str, object]] | None,
+) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        index = _SnapshotKeyIndex(database)
+        try:
+            index.sync(handle, target)
+            batch: dict[tuple[str, str, str], dict[str, object]] = {}
+            pending: list[dict[str, object]] = []
+            for raw in rows:
+                row = dict(raw)
+                key = _snapshot_key(row)
+                prior = batch.get(key) or index.lookup(handle, key)
+                if prior is not None:
+                    if not _same_snapshot(prior, row):
+                        if conflicts is None:
+                            raise PriceHistoryWriteError(
+                                f"conflicting snapshot from duplicate writer for natural key {key}"
+                            )
+                        conflicts.append(
+                            {"natural_key": list(key), "existing": dict(prior), "candidate": row}
+                        )
+                    continue
+                batch[key] = row
+                pending.append(row)
+            if pending:
+                handle.seek(0, os.SEEK_END)
+                payload = "".join(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in pending
+                ).encode("utf-8")
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+                index.sync(handle, target)
+            return len(pending)
+        finally:
+            index.close()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _snapshot_key(row: Mapping[str, object]) -> tuple[str, str, str]:
