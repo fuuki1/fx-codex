@@ -236,7 +236,7 @@ def check_target(target: TargetConfig, root: Path, now: datetime) -> TargetResul
     elif target.kind == "decision_expectancy_audit":
         _apply_decision_expectancy_audit_integrity(result, file_path)
     elif target.kind == "timeframe_learning_bundle":
-        _apply_timeframe_learning_bundle_integrity(result, file_path, root)
+        _apply_timeframe_learning_bundle_integrity(result, file_path, root, now)
     return result
 
 
@@ -307,7 +307,12 @@ def _apply_json_generated_at_freshness(
             result.status = STATUS_CRITICAL
             result.reason = "decision_feedback_publication_mismatch"
             return
-    raw = payload.get("generated_at")
+    _apply_generation_age(result, payload.get("generated_at"), now)
+
+
+def _apply_generation_age(result: TargetResult, raw: object, now: datetime) -> None:
+    """Age a target by its semantic generation time instead of file mtime."""
+
     try:
         generated_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except (TypeError, ValueError):
@@ -383,6 +388,7 @@ def _apply_timeframe_learning_bundle_integrity(
     result: TargetResult,
     manifest_path: Path,
     root: Path,
+    now: datetime,
 ) -> None:
     """Validate the complete cache generation, not only manifest freshness."""
 
@@ -390,7 +396,7 @@ def _apply_timeframe_learning_bundle_integrity(
     lock_path = resolved_manifest.with_suffix(f"{resolved_manifest.suffix}.lock")
     try:
         with advisory_file_lock(lock_path, exclusive=False, timeout_seconds=5.0):
-            _validate_timeframe_learning_bundle(result, resolved_manifest, root)
+            _validate_timeframe_learning_bundle(result, resolved_manifest, root, now)
     except TimeoutError:
         result.status = STATUS_CRITICAL
         result.reason = "learning_bundle_lock_timeout"
@@ -403,8 +409,14 @@ def _validate_timeframe_learning_bundle(
     result: TargetResult,
     manifest_path: Path,
     root: Path,
+    now: datetime,
 ) -> None:
-    """Read manifest and all cache bodies while holding the reader lock."""
+    """Read manifest and all cache bodies while holding the reader lock.
+
+    A valid generation is aged by its manifest ``generated_at``, the same clock
+    the briefing uses to accept the cached bundle, not by file mtime (the
+    publish happens 10-30 minutes after generation on the production host).
+    """
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -482,6 +494,7 @@ def _validate_timeframe_learning_bundle(
             result.status = STATUS_CRITICAL
             result.reason = "learning_bundle_generation_mismatch"
             return
+    _apply_generation_age(result, generated_at, now)
 
 
 def _read_recent_nonempty_lines(path: Path, chunk: int = 65536) -> list[str]:

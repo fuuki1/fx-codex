@@ -896,3 +896,83 @@ def test_unmonitored_timeframe_rows_do_not_break_coverage(monitor, tmp_path):
     assert target["status"] == "ok", "対象外の行で coverage を誤報している"
     assert target["observed_coverage"] == 4
     assert target["missing_coverage"] == []
+
+
+def _set_mtime(root: Path, moment: datetime) -> None:
+    stamp = moment.timestamp()
+    for path in (root / "logs").iterdir():
+        os.utime(path, (stamp, stamp))
+
+
+@pytest.mark.parametrize(
+    ("generated_ago", "files_touched_ago", "expected"),
+    [
+        (timedelta(minutes=40), timedelta(0), "warning"),  # 公開は新しくても世代は古い
+        (timedelta(minutes=5), timedelta(minutes=50), "ok"),  # mtime が古くても世代は新しい
+        (timedelta(minutes=50), timedelta(0), "critical"),
+    ],
+)
+def test_learning_bundle_is_aged_by_generation_not_mtime(
+    monitor, tmp_path, generated_ago, files_touched_ago, expected
+):
+    # briefing は manifest の generated_at から30分以内の bundle だけを使う。鮮度監視も
+    # 同じ時計で測らないと、ゲートが別の世代を見て開閉する。
+    _write_learning_bundle(tmp_path, generation=(NOW - generated_ago).isoformat())
+    _set_mtime(tmp_path, NOW - files_touched_ago)
+
+    result = monitor.check_target(_learning_bundle_target(monitor), tmp_path, NOW)
+
+    assert result.status == expected
+    assert result.last_update == (NOW - generated_ago).isoformat()
+
+
+def test_learning_cache_profile_is_aged_by_generation(monitor, tmp_path):
+    _write_learning_bundle(tmp_path, generation=(NOW - timedelta(minutes=40)).isoformat())
+    _set_mtime(tmp_path, NOW)
+    target = monitor.TargetConfig(
+        name="learning_profile",
+        path="logs/briefing_tf_learning.json",
+        kind="json_generated_at",
+        expected_interval_seconds=900,
+        warn_after_seconds=1800,
+        critical_after_seconds=2700,
+    )
+
+    result = monitor.check_target(target, tmp_path, NOW)
+
+    assert result.status == "warning"
+    assert result.reason == "stale_warning"
+
+
+def test_learning_targets_in_timeframe_config_use_generation_time():
+    config = json.loads(
+        (_MODULE_PATH.parents[1] / "ops" / "freshness_targets_timeframe.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    kinds = {row["name"]: row["kind"] for row in config["targets"]}
+
+    assert kinds["timeframe_learning_monitor"] == "timeframe_learning_bundle"
+    for name in ("learning_profile", "tp_sl_learning_profile", "maximization_profile"):
+        assert kinds[name] == "json_generated_at"
+
+
+@pytest.mark.parametrize(
+    ("script", "publisher"),
+    [
+        ("fx_monitors_once.sh", "timeframe-learning"),
+        ("fx_monitor_diagnostics_once.sh", "decision-feedback-refresh"),
+    ],
+)
+def test_publishers_refresh_the_freshness_report_after_success(script, publisher):
+    body = (_MODULE_PATH.parents[1] / "scripts" / script).read_text(encoding="utf-8")
+
+    assert "refresh_freshness_report()" in body
+    assert "--name fx-health" in body  # health と同じ排他 lock
+    assert "tools/data_freshness_monitor.py" in body
+    assert "--config ops/freshness_targets_timeframe.json" in body
+    assert "2>&1 || true" in body  # 再生成の失敗で公開結果を変えない
+    publish_at = body.index(f"run_monitor {publisher}")
+    refresh_at = body.index("refresh_freshness_report", publish_at)
+    guard = body[publish_at:refresh_at]
+    assert "-eq 0" in guard  # 公開に成功した時だけ

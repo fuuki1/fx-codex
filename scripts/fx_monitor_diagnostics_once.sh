@@ -32,14 +32,31 @@ run_monitor() {
   return 0
 }
 
+
+refresh_freshness_report() {
+  # 公開直後に鮮度レポートを作り直し、5分周期の health を待たずに新しい世代を
+  # briefing の鮮度ゲートへ反映する。health と同じ排他 lock を使い、実行中なら
+  # 譲る(直後の health が反映する)。失敗しても公開そのものの結果は変えない。
+  "$PYTHON" tools/run_exclusive.py --name fx-health --locks-dir "$PWD/logs/locks" \
+    --busy-exit-code 75 -- \
+    "$PYTHON" tools/data_freshness_monitor.py --root "$PWD" \
+    --config ops/freshness_targets_timeframe.json </dev/null >> logs/fx_monitors.log 2>&1 || true
+}
+
 overall=0
 # 旧fusion journalの再採点はhistorical/diagnostic専用。canonicalな判断方針を
 # 書き換えないよう、改善registryは読み取りのみとする。
 run_monitor trade-outcome logs/trade_outcome_monitor.json \
   tools/trade_outcome_monitor.py \
   --no-registry-update || overall=$?
+feedback_code=0
 run_monitor decision-feedback-refresh logs/decision_feedback_refresh_monitor.json \
   tools/decision_expectancy_monitor.py \
   --compact-feedback-refresh \
-  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || overall=$?
+  --stage-timing-log "$PWD/logs/decision_pipeline_stage_timings.jsonl" || feedback_code=$?
+if [ "$feedback_code" -eq 0 ]; then
+  refresh_freshness_report
+else
+  overall=$feedback_code
+fi
 exit "$overall"
