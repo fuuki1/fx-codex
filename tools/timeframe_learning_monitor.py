@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 import fcntl
@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import Any
 import unicodedata
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,18 @@ BUNDLE_LOCK_TIMEOUT_SECONDS = 5.0
 # writer, so a longer bound only avoids discarding a 20+ minute refresh.
 SOURCE_LOCK_TIMEOUT_SECONDS = 120.0
 FULL_EVIDENCE_MEMO_CONTRACT = "fx-full-evidence-memo-v1"
+# Decision fields written for audit and shadow evaluation that none of the three
+# learners reads. They are about half of each row, so they are dropped as rows
+# are read (after hashing the full row) to keep the learning working set out of
+# swap on the 8GB production host. tests/test_learning_row_compaction.py pins
+# that derivations are unchanged without them.
+LEARNING_UNUSED_DECISION_FIELDS = (
+    "shadow_predictions",
+    "input_features",
+    "input_feature_masks",
+    "price_frame",
+    "components",
+)
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -79,7 +92,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             memo_record,
             decision_full_source,
         )
-        decisions = list(
+        decision_digest = _EligibleRowsDigest(
+            _decision_eligible_at,
+            provisional_as_of=datetime.now(UTC),
+        )
+        decisions = _compact_learning_rows(
             journal.read_entries(
                 journal_path,
                 strict=True,
@@ -93,7 +110,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 full_evidence_memo=(
                     full_evidence_memo if decision_full_source is not None else None
                 ),
-            )
+            ),
+            digest=decision_digest,
+            drop_fields=LEARNING_UNUSED_DECISION_FIELDS,
         )
         _assert_snapshot_prefix_available(
             journal_path,
@@ -139,13 +158,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             prices_path,
             previous_source=previous_sources.get("prices"),
         )
-        raw_prices = list(
+        price_digest = _EligibleRowsDigest(
+            _price_eligible_at,
+            provisional_as_of=datetime.now(UTC),
+        )
+        raw_prices = _compact_learning_rows(
             journal.read_entries(
                 prices_path,
                 strict=True,
                 audit=price_audit,
                 end_offset=int(price_source["read_offset_bytes"]),
-            )
+            ),
+            digest=price_digest,
         )
         _assert_snapshot_prefix_available(
             prices_path,
@@ -162,17 +186,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         price_source.pop("_previous_prefix_sha256", None)
     generated_at = datetime.now(UTC)
     with timing.stage("timeframe_learning_pit_filter"):
-        pit_decisions = [
-            row
-            for row in decisions
-            if journal.is_pit_eligible_entry(row)
-            and _not_future(row.get("prediction_time"), generated_at)
-        ]
-        prices = [
-            row
-            for row in raw_prices
-            if price_history.is_pit_eligible_snapshot_entry(row, as_of=generated_at)
-        ]
+        pit_decisions = [row for row in decisions if _decision_eligible_at(row, generated_at)]
+        prices = [row for row in raw_prices if _price_eligible_at(row, generated_at)]
     scoring_entries = [*pit_decisions, *prices]
 
     with timing.stage("timeframe_direction_learning_refresh"):
@@ -182,14 +197,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     with timing.stage("timeframe_maximization_learning_refresh"):
         maximum = maximization.derive_timeframe_maximization(scoring_entries, now=generated_at)
 
-    # Hash the large input populations before taking the publication lock. The
-    # lock protects only the small cache/manifest swap, not minutes of JSON
-    # serialization that would delay the five-minute decision reader.
+    # The eligible-row hashes were streamed over the full rows while reading, so
+    # only the small manifest remains to assemble after generated_at.
     with timing.stage("timeframe_learning_manifest_prepare"):
+        decision_rows_sha256 = _finalized_digest(
+            decision_digest, generated_at, eligible_rows=len(pit_decisions), label="decision"
+        )
+        price_rows_sha256 = _finalized_digest(
+            price_digest, generated_at, eligible_rows=len(prices), label="price"
+        )
         input_watermarks = {
             "decisions": {
                 **decision_source,
-                "sha256": _rows_sha256(pit_decisions),
+                "sha256": decision_rows_sha256,
                 "source_sha256": _audit_digest(decision_audit),
                 "physical_rows": _audit_count(decision_audit, "physical_rows"),
                 "parsed_object_rows": _audit_count(decision_audit, "parsed_object_rows"),
@@ -200,7 +220,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             },
             "prices": {
                 **price_source,
-                "sha256": _rows_sha256(prices),
+                "sha256": price_rows_sha256,
                 "source_sha256": _audit_digest(price_audit),
                 "physical_rows": _audit_count(price_audit, "physical_rows"),
                 "parsed_object_rows": _audit_count(price_audit, "parsed_object_rows"),
@@ -459,20 +479,140 @@ def _not_future(value: object, now: datetime) -> bool:
     return parsed is not None and parsed <= now
 
 
+def _canonical_row(row: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
 def _rows_sha256(rows: Sequence[dict[str, object]]) -> str:
     digest = hashlib.sha256()
     for row in rows:
-        digest.update(
-            json.dumps(
-                row,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-        )
-        digest.update(b"\n")
+        digest.update(_canonical_row(row))
     return digest.hexdigest()
+
+
+class _EligibleRowsDigest:
+    """Stream ``_rows_sha256`` of the full rows eligible at a later ``as_of``.
+
+    ``eligible_at(row, as_of)`` must be monotone: once a row is eligible it stays
+    eligible for any later ``as_of`` (true for both PIT predicates, which only
+    compare the row's own timestamps with ``as_of``). Rows already eligible at
+    ``provisional_as_of`` are hashed as they stream by; rows never eligible are
+    skipped. From the first row that is eligible only later, every candidate is
+    buffered in file order and settled by ``finalize``, so the result always
+    equals hashing the rows eligible at the final ``as_of``.
+    """
+
+    def __init__(
+        self,
+        eligible_at: Callable[[Mapping[str, object], datetime], bool],
+        *,
+        provisional_as_of: datetime,
+    ) -> None:
+        self._eligible_at = eligible_at
+        self._provisional_as_of = provisional_as_of
+        self._digest = hashlib.sha256()
+        self._decided_rows = 0
+        self._pending: list[bytes] | None = None
+
+    def observe(self, row: Mapping[str, object]) -> None:
+        if self._eligible_at(row, self._provisional_as_of):
+            if self._pending is None:
+                self._digest.update(_canonical_row(row))
+                self._decided_rows += 1
+            else:
+                self._pending.append(_canonical_row(row))
+            return
+        if not self._eligible_at(row, _LATEST_AS_OF):
+            return
+        if self._pending is None:
+            self._pending = []
+        self._pending.append(_canonical_row(row))
+
+    def finalize(self, as_of: datetime) -> tuple[str, int]:
+        if as_of < self._provisional_as_of:
+            raise ValueError("eligible-row digest cannot be finalized before its provisional time")
+        digest = self._digest.copy()
+        rows = self._decided_rows
+        for payload in self._pending or ():
+            if self._eligible_at(json.loads(payload), as_of):
+                digest.update(payload)
+                rows += 1
+        return digest.hexdigest(), rows
+
+
+_LATEST_AS_OF = datetime.max.replace(tzinfo=UTC)
+
+
+def _decision_eligible_at(row: Mapping[str, object], as_of: datetime) -> bool:
+    return journal.is_pit_eligible_entry(row) and _not_future(row.get("prediction_time"), as_of)
+
+
+def _price_eligible_at(row: Mapping[str, object], as_of: datetime) -> bool:
+    return price_history.is_pit_eligible_snapshot_entry(row, as_of=as_of)
+
+
+def _finalized_digest(
+    digest: _EligibleRowsDigest,
+    as_of: datetime,
+    *,
+    eligible_rows: int,
+    label: str,
+) -> str:
+    sha256, hashed_rows = digest.finalize(as_of)
+    if hashed_rows != eligible_rows:
+        raise RuntimeError(
+            f"{label} eligible-row hash covered {hashed_rows} rows but PIT filter kept "
+            f"{eligible_rows}"
+        )
+    return sha256
+
+
+def _compact_learning_rows(
+    rows: Iterable[dict[str, object]],
+    *,
+    digest: _EligibleRowsDigest,
+    drop_fields: Sequence[str] = (),
+) -> list[dict[str, object]]:
+    """Hash each full row, then keep a smaller, value-identical copy for learning.
+
+    json.loads gives every row its own copy of every key and every repeated
+    short value; sharing them (sys.intern) plus dropping ``drop_fields`` cuts
+    the production learning working set by more than half without changing any
+    value the learners see.
+    """
+
+    compacted: list[dict[str, object]] = []
+    for row in rows:
+        digest.observe(row)
+        for key in drop_fields:
+            row.pop(key, None)
+        compacted.append(_shared_strings(row))
+    return compacted
+
+
+_SHARED_VALUE_MAX_LENGTH = 64
+
+
+def _shared_strings(value: Any) -> Any:
+    if type(value) is dict:
+        return {
+            (sys.intern(key) if type(key) is str else key): _shared_strings(item)
+            for key, item in value.items()
+        }
+    if type(value) is list:
+        return [_shared_strings(item) for item in value]
+    if type(value) is str and len(value) <= _SHARED_VALUE_MAX_LENGTH:
+        return sys.intern(value)
+    return value
 
 
 def _audit_count(audit: dict[str, object], key: str) -> int:
