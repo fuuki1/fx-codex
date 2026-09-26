@@ -12,10 +12,16 @@
          lower_timeframe_closed_bar を名乗れる。
 
        起動時刻:
-         datafeed-collector が毎時 7 分に前 1 時間分を取り込む。その完了後に
-         走らせたいので毎時 20 分にする。取りこぼしても次の実行が拾う
-         (処理は tick 全体から確定足を再生成する冪等な設計で、既に書いた行は
-          自然キーで重複スキップされる)。
+         毎時 10/25/40/55 分。decision feedback refresh(monitor-diagnostics、
+         毎時 14/29/44/59 分)の 4 分前に確定足を揃える。採点用の共有5分足は
+         feedback 側で 210 分(市場オープン時間)を超えると stale と判定されるが、
+         正常時でも xx:29 時点で最新足は 149 分前にあり、収集器が 1 時間分を
+         取りこぼす(Dukascopy HTTP 503 など)と、毎時 1 回の実行では次の実行まで
+         約 45 分 feedback が止まっていた。15 分毎なら、収集器が再取得した直後の
+         実行で追いつく。
+         確定判定は収集器の completed_hours に従うので、取り込み途中の時間帯は
+         書かない。何度走っても tick 全体から確定足を再生成する冪等な処理で、
+         既に書いた行は自然キーで重複スキップされる。
 
        この process は構造的に発注できない:
          読むのは収集済み JSONL だけで、ネットワークも broker 経路も持たない。 -->
@@ -34,10 +40,12 @@
   <key>RunAtLoad</key>
   <false/>
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Minute</key>
-    <integer>20</integer>
-  </dict>
+  <array>
+    <dict><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Minute</key><integer>40</integer></dict>
+    <dict><key>Minute</key><integer>55</integer></dict>
+  </array>
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>ProcessType</key>
