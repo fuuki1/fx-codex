@@ -218,6 +218,43 @@ def test_briefing_plist_runs_on_five_minute_boundaries():
     assert "RunAtLoad" not in keys
 
 
+def test_price_path_adapter_runs_before_each_feedback_refresh():
+    # monitor-diagnostics refreshes decision feedback at minutes 14/29/44/59 and
+    # rejects a shared 5m price path older than 210 open minutes. One missed
+    # collector hour must be recovered before the next refresh, not an hour later.
+    raw = (_ROOT / "ops" / "launchd" / "com.fx-codex.price-path-adapter.plist.tmpl").read_text(
+        encoding="utf-8"
+    )
+    root = ET.fromstring(raw.replace("__ROOT__", "/r").replace("__HOME__", "/h"))
+    dictionary = root.find("dict")
+    assert dictionary is not None
+    children = list(dictionary)
+    schedule_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "StartCalendarInterval"
+    )
+    schedule = children[schedule_index + 1]
+    assert schedule.tag == "array"
+    minutes = []
+    for entry in schedule.findall("dict"):
+        fields = list(entry)
+        minute_index = next(
+            index
+            for index, node in enumerate(fields)
+            if node.tag == "key" and node.text == "Minute"
+        )
+        minutes.append(int(fields[minute_index + 1].text or "-1"))
+    assert minutes == [10, 25, 40, 55]
+    assert [(minute + 4) % 60 for minute in minutes] == [14, 29, 44, 59]
+    run_at_load_index = next(
+        index
+        for index, node in enumerate(children)
+        if node.tag == "key" and node.text == "RunAtLoad"
+    )
+    assert children[run_at_load_index + 1].tag == "false"
+
+
 _ZSH = shutil.which("zsh")  # CI(ubuntu)にはzshが無いためスキップ。macOS実機で検証する
 
 
